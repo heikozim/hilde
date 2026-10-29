@@ -1,0 +1,1341 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Graph.  The node values are letters, so that an order of nodes
+-- can be held against a string: "abd" is the node a, then b, then d.  A
+-- path is held against the letters it passes, its first node included.  A
+-- list of edges is held against the letters of their ends, two per edge.
+-- The edge values are weights.
+import Standard.Tuples (
+    Pair
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    nthRef,
+    removeLast,
+    destroyFree as destroyFreeBuffer,
+    destroyEmpty as destroyEmptyBuffer
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length as stringLength
+);
+import Standard.Order (
+    equal
+);
+import Standard.Graph (
+    Graph,
+    NodeId,
+    EdgeId,
+    Weight,
+    weightOf,
+    NoPath,
+    makeGraph,
+    makeGraphRetiringAt,
+    destroyEmpty,
+    destroyFree,
+    nodeSlot,
+    nodeGeneration,
+    edgeSlot,
+    edgeGeneration,
+    nodeCount,
+    edgeCount,
+    containsNode,
+    containsEdge,
+    nodeValue,
+    nodeRef,
+    edgeValue,
+    edgeRef,
+    edgeSource,
+    edgeTarget,
+    addNode,
+    addEdge,
+    replaceNodeValue,
+    replaceEdgeValue,
+    removeEdge,
+    removeNode,
+    nodes,
+    edges,
+    outEdges,
+    inEdges,
+    breadthFirst,
+    depthFirst,
+    hasPath,
+    shortestPath,
+    lightestPath,
+    findCycle,
+    topologicalOrder
+);
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+
+module body Standard.Graph.Test is
+    ---
+    --- Reading a graph of letters
+    ---
+
+    -- The letter of a node, or 0 when the number names no node.
+    generic [E: Type, R: Region]
+    function letterOf(g: &[Graph[Nat8, E], R], node: NodeId): Nat8 is
+        case nodeValue(g, node) of
+            when Some(value as letter: Nat8) do
+                return letter;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [E: Type, R: Region]
+    function sourceLetter(g: &[Graph[Nat8, E], R], edge: EdgeId): Nat8 is
+        case edgeSource(g, edge) of
+            when Some(value as node: NodeId) do
+                return letterOf(g, node);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [E: Type, R: Region]
+    function targetLetter(g: &[Graph[Nat8, E], R], edge: EdgeId): Nat8 is
+        case edgeTarget(g, edge) of
+            when Some(value as node: NodeId) do
+                return letterOf(g, node);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Whether the nodes carry the letters of text, in order.
+    generic [E: Type, R: Region, S: Region]
+    function lettersAre(g: &[Graph[Nat8, E], R], ids: &[Buffer[NodeId], S], text: Span[Nat8, Static]): Bool is
+        if length(ids) /= spanLength(text) then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < length(ids) do
+            if letterOf(g, nth(ids, i)) /= text[i] then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    -- The same for an order that a search hands back, which is used up.
+    generic [E: Type, R: Region]
+    function orderIs(g: &[Graph[Nat8, E], R], found: Option[Buffer[NodeId]], text: Span[Nat8, Static]): Bool is
+        case found of
+            when Some(value as ids: Buffer[NodeId]) do
+                let same: Bool := lettersAre(g, &ids, text);
+                destroyFreeBuffer(ids);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether all nodes, in the order nodes gives them, carry the letters
+    -- of text.
+    generic [E: Type, R: Region]
+    function allNodesAre(g: &[Graph[Nat8, E], R], text: Span[Nat8, Static]): Bool is
+        let all: Buffer[NodeId] := nodes(g);
+        let same: Bool := lettersAre(g, &all, text);
+        destroyFreeBuffer(all);
+        return same;
+    end;
+
+    -- Whether each edge leads from the letter at 2i of text to the letter
+    -- at 2i + 1.
+    generic [E: Type, R: Region, S: Region]
+    function edgeLettersAre(g: &[Graph[Nat8, E], R], ids: &[Buffer[EdgeId], S], text: Span[Nat8, Static]): Bool is
+        if (length(ids) * 2) /= spanLength(text) then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < length(ids) do
+            let e: EdgeId := nth(ids, i);
+            if sourceLetter(g, e) /= text[i * 2] then
+                same := false;
+            end if;
+            if targetLetter(g, e) /= text[(i * 2) + 1] then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    generic [E: Type, R: Region]
+    function edgeListIs(g: &[Graph[Nat8, E], R], found: Option[Buffer[EdgeId]], text: Span[Nat8, Static]): Bool is
+        case found of
+            when Some(value as ids: Buffer[EdgeId]) do
+                let same: Bool := edgeLettersAre(g, &ids, text);
+                destroyFreeBuffer(ids);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [E: Type, R: Region]
+    function allEdgesAre(g: &[Graph[Nat8, E], R], text: Span[Nat8, Static]): Bool is
+        let all: Buffer[EdgeId] := edges(g);
+        let same: Bool := edgeLettersAre(g, &all, text);
+        destroyFreeBuffer(all);
+        return same;
+    end;
+
+    -- Whether a list of edges walks through the letters of text: edge i
+    -- leaves the letter at i and enters the letter at i + 1.
+    generic [E: Type, R: Region, S: Region]
+    function walkIs(g: &[Graph[Nat8, E], R], path: &[Buffer[EdgeId], S], text: Span[Nat8, Static]): Bool is
+        let n: Index := length(path);
+        if (n + 1) /= spanLength(text) then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < n do
+            let e: EdgeId := nth(path, i);
+            if sourceLetter(g, e) /= text[i] then
+                same := false;
+            end if;
+            if targetLetter(g, e) /= text[i + 1] then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    generic [E: Type, R: Region]
+    function pathIs(g: &[Graph[Nat8, E], R], found: Option[Buffer[EdgeId]], text: Span[Nat8, Static]): Bool is
+        case found of
+            when Some(value as path: Buffer[EdgeId]) do
+                let same: Bool := walkIs(g, &path, text);
+                destroyFreeBuffer(path);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isEmptyPath(found: Option[Buffer[EdgeId]]): Bool is
+        case found of
+            when Some(value as path: Buffer[EdgeId]) do
+                let empty: Bool := length(&path) = 0;
+                destroyFreeBuffer(path);
+                return empty;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNoPath(found: Option[Buffer[EdgeId]]): Bool is
+        case found of
+            when Some(value as path: Buffer[EdgeId]) do
+                destroyFreeBuffer(path);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function isNoOrder(found: Option[Buffer[NodeId]]): Bool is
+        case found of
+            when Some(value as order: Buffer[NodeId]) do
+                destroyFreeBuffer(order);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- The weights of the edges of a path, added up.
+    generic [E: Type(Weight), R: Region, S: Region]
+    function pathWeight(g: &[Graph[Nat8, E], R], path: &[Buffer[EdgeId], S]): Nat64 is
+        var sum: Nat64 := 0;
+        var i: Index := 0;
+        while i < length(path) do
+            case edgeRef(g, nth(path, i)) of
+                when Some(value as found: &[E, R]) do
+                    sum := sum + weightOf(found);
+                when None do
+                    abort("a path named an edge that is not in the graph");
+            end case;
+            i := i + 1;
+        end while;
+        return sum;
+    end;
+
+    -- Whether lightestPath gave weight and a path through the letters of
+    -- text whose edge weights add up to weight.
+    generic [E: Type(Weight), R: Region]
+    function lightestIs(g: &[Graph[Nat8, E], R], found: Either[NoPath, Pair[Nat64, Buffer[EdgeId]]], weight: Nat64, text: Span[Nat8, Static]): Bool is
+        case found of
+            when Right(right as p: Pair[Nat64, Buffer[EdgeId]]) do
+                let { first: Nat64, second: Buffer[EdgeId] } := p;
+                let walks: Bool := walkIs(g, &second, text);
+                let sum: Nat64 := pathWeight(g, &second);
+                destroyFreeBuffer(second);
+                return (first = weight) and (walks and (sum = weight));
+            when Left(left as reason: NoPath) do
+                return false;
+        end case;
+    end;
+
+    -- What lightestPath answered, as one letter: u for UnknownNode, n for
+    -- Unreachable, t for TooHeavy, and p when it found a path.
+    function reasonOf(found: Either[NoPath, Pair[Nat64, Buffer[EdgeId]]]): Nat8 is
+        case found of
+            when Right(right as p: Pair[Nat64, Buffer[EdgeId]]) do
+                let { first: Nat64, second: Buffer[EdgeId] } := p;
+                destroyFreeBuffer(second);
+                return 'p';
+            when Left(left as reason: NoPath) do
+                case reason of
+                    when UnknownNode do
+                        return 'u';
+                    when Unreachable do
+                        return 'n';
+                    when TooHeavy do
+                        return 't';
+                end case;
+        end case;
+    end;
+
+    -- Whether a list of edges is one cycle: each edge in the graph, each
+    -- entering the node the next one leaves, the last entering the node
+    -- the first leaves, and no node left by two of them.
+    generic [E: Type, R: Region, S: Region]
+    function isCycle(g: &[Graph[Nat8, E], R], cycle: &[Buffer[EdgeId], S]): Bool is
+        let n: Index := length(cycle);
+        if n = 0 then
+            return false;
+        end if;
+        var good: Bool := true;
+        var i: Index := 0;
+        while i < n do
+            let e: EdgeId := nth(cycle, i);
+            var j: Index := i + 1;
+            if j = n then
+                j := j - n;
+            end if;
+            if not containsEdge(g, e) then
+                good := false;
+            end if;
+            if not meets(g, e, nth(cycle, j)) then
+                good := false;
+            end if;
+            var k: Index := i + 1;
+            while k < n do
+                if leaveTheSameNode(g, e, nth(cycle, k)) then
+                    good := false;
+                end if;
+                k := k + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return good;
+    end;
+
+    -- Whether the first edge enters the node the second leaves.
+    generic [E: Type, R: Region]
+    function meets(g: &[Graph[Nat8, E], R], first: EdgeId, second: EdgeId): Bool is
+        case edgeTarget(g, first) of
+            when Some(value as entered: NodeId) do
+                case edgeSource(g, second) of
+                    when Some(value as left: NodeId) do
+                        return equal(&entered, &left);
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [E: Type, R: Region]
+    function leaveTheSameNode(g: &[Graph[Nat8, E], R], first: EdgeId, second: EdgeId): Bool is
+        case edgeSource(g, first) of
+            when Some(value as one: NodeId) do
+                case edgeSource(g, second) of
+                    when Some(value as other: NodeId) do
+                        return equal(&one, &other);
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether a list of edges is one cycle through the letters of text,
+    -- the first letter repeated at the end.  The list is used up.
+    generic [E: Type, R: Region]
+    function cycleIs(g: &[Graph[Nat8, E], R], found: Option[Buffer[EdgeId]], text: Span[Nat8, Static]): Bool is
+        case found of
+            when Some(value as cycle: Buffer[EdgeId]) do
+                let good: Bool := isCycle(g, &cycle) and walkIs(g, &cycle, text);
+                destroyFreeBuffer(cycle);
+                return good;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The position of the node with a letter in an order, or the length of
+    -- the order when no node there carries it.
+    generic [E: Type, R: Region, S: Region]
+    function positionOf(g: &[Graph[Nat8, E], R], order: &[Buffer[NodeId], S], letter: Nat8): Index is
+        var at: Index := length(order);
+        var i: Index := 0;
+        while i < length(order) do
+            if letterOf(g, nth(order, i)) = letter then
+                at := i;
+            end if;
+            i := i + 1;
+        end while;
+        return at;
+    end;
+
+    -- Whether an order holds every node once, and every edge leads from a
+    -- node earlier in it to a later one.
+    generic [E: Type, R: Region, S: Region]
+    function isTopological(g: &[Graph[Nat8, E], R], order: &[Buffer[NodeId], S]): Bool is
+        if length(order) /= nodeCount(g) then
+            return false;
+        end if;
+        let all: Buffer[EdgeId] := edges(g);
+        var good: Bool := true;
+        var i: Index := 0;
+        while i < length(&all) do
+            let e: EdgeId := nth(&all, i);
+            let before: Index := positionOf(g, order, sourceLetter(g, e));
+            let after: Index := positionOf(g, order, targetLetter(g, e));
+            if not (before < after) then
+                good := false;
+            end if;
+            if after = length(order) then
+                good := false;
+            end if;
+            i := i + 1;
+        end while;
+        destroyFreeBuffer(all);
+        return good;
+    end;
+
+    function isWeight(found: Option[Nat32], weight: Nat32): Bool is
+        case found of
+            when Some(value as w: Nat32) do
+                return w = weight;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNoWeight(found: Option[Nat32]): Bool is
+        case found of
+            when Some(value as w: Nat32) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function isNoLetter(found: Option[Nat8]): Bool is
+        case found of
+            when Some(value as letter: Nat8) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [R: Region]
+    function isNoRef(found: Option[&[Nat8, R]]): Bool is
+        case found of
+            when Some(value as r: &[Nat8, R]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function isNoNode(found: Option[NodeId]): Bool is
+        case found of
+            when Some(value as node: NodeId) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [R: Region]
+    function isNoWeightRef(found: Option[&[Nat32, R]]): Bool is
+        case found of
+            when Some(value as r: &[Nat32, R]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- Whether addEdge refused and handed weight back.
+    function isEdgeRefused(found: Either[Nat32, EdgeId], weight: Nat32): Bool is
+        case found of
+            when Left(left as back: Nat32) do
+                return back = weight;
+            when Right(right as edge: EdgeId) do
+                return false;
+        end case;
+    end;
+
+    -- Whether replaceEdgeValue refused and handed weight back.
+    function isWeightRefused(found: Either[Nat32, Nat32], weight: Nat32): Bool is
+        case found of
+            when Left(left as back: Nat32) do
+                return back = weight;
+            when Right(right as old: Nat32) do
+                return false;
+        end case;
+    end;
+
+    -- Whether replaceNodeValue refused and handed letter back.
+    function isLetterRefused(found: Either[Nat8, Nat8], letter: Nat8): Bool is
+        case found of
+            when Left(left as back: Nat8) do
+                return back = letter;
+            when Right(right as old: Nat8) do
+                return false;
+        end case;
+    end;
+
+    -- Every function that takes a node number, given one that names no node
+    -- of g: each answers None, false or Left, and g keeps every node and
+    -- edge.  other is a node of g, for the functions that take two numbers;
+    -- the number is tried in either place.
+    generic [R: Region]
+    function nodeRefused(g: &![Graph[Nat8, Nat32], R], stale: NodeId, other: NodeId): Unit is
+        let nodesBefore: Index := nodeCount(&g);
+        let edgesBefore: Index := edgeCount(&g);
+        assertTrue(containsNode(&g, other), "the other node is in the graph");
+        assertFalse(containsNode(&g, stale), "containsNode: false");
+        assertTrue(isNoLetter(nodeValue(&g, stale)), "nodeValue: None");
+        assertTrue(isNoRef(nodeRef(&g, stale)), "nodeRef: None");
+        assertTrue(isNoPath(outEdges(&g, stale)), "outEdges: None");
+        assertTrue(isNoPath(inEdges(&g, stale)), "inEdges: None");
+        assertTrue(isNoOrder(breadthFirst(&g, stale)), "breadthFirst: None");
+        assertTrue(isNoOrder(depthFirst(&g, stale)), "depthFirst: None");
+        assertFalse(hasPath(&g, stale, other), "hasPath from it: false");
+        assertFalse(hasPath(&g, other, stale), "hasPath to it: false");
+        assertFalse(hasPath(&g, stale, stale), "hasPath from it to itself: false");
+        assertTrue(isNoPath(shortestPath(&g, stale, other)), "shortestPath from it: None");
+        assertTrue(isNoPath(shortestPath(&g, other, stale)), "shortestPath to it: None");
+        assertTrue(reasonOf(lightestPath(&g, stale, other)) = 'u', "lightestPath from it: UnknownNode");
+        assertTrue(reasonOf(lightestPath(&g, other, stale)) = 'u', "lightestPath to it: UnknownNode");
+        assertTrue(isEdgeRefused(addEdge(&~g, stale, other, 91 : Nat32), 91), "addEdge from it: Left, the value handed back");
+        assertTrue(isEdgeRefused(addEdge(&~g, other, stale, 92 : Nat32), 92), "addEdge to it: Left, the value handed back");
+        assertTrue(isLetterRefused(replaceNodeValue(&~g, stale, 'x' : Nat8), 'x'), "replaceNodeValue: Left, the value handed back");
+        assertTrue(isNoRemoval(removeNode(&~g, stale)), "removeNode: None");
+        assertTrue(nodeCount(&g) = nodesBefore, "no node was added or removed");
+        assertTrue(edgeCount(&g) = edgesBefore, "no edge was added or removed");
+        return nil;
+    end;
+
+    -- Every function that takes an edge number, given one that names no
+    -- edge of g: each answers None or Left, and g keeps every node and edge.
+    generic [R: Region]
+    function edgeRefused(g: &![Graph[Nat8, Nat32], R], stale: EdgeId): Unit is
+        let nodesBefore: Index := nodeCount(&g);
+        let edgesBefore: Index := edgeCount(&g);
+        assertFalse(containsEdge(&g, stale), "containsEdge: false");
+        assertTrue(isNoWeight(edgeValue(&g, stale)), "edgeValue: None");
+        assertTrue(isNoWeightRef(edgeRef(&g, stale)), "edgeRef: None");
+        assertTrue(isNoNode(edgeSource(&g, stale)), "edgeSource: None");
+        assertTrue(isNoNode(edgeTarget(&g, stale)), "edgeTarget: None");
+        assertTrue(isWeightRefused(replaceEdgeValue(&~g, stale, 93 : Nat32), 93), "replaceEdgeValue: Left, the value handed back");
+        assertTrue(isNoWeight(removeEdge(&~g, stale)), "removeEdge: None");
+        assertTrue(nodeCount(&g) = nodesBefore, "no node was added or removed");
+        assertTrue(edgeCount(&g) = edgesBefore, "no edge was added or removed");
+        return nil;
+    end;
+
+    -- Whether removeNode handed back the node with a letter and edges whose
+    -- weights are the digits of text, in order.
+    function removedIs(found: Option[Pair[Nat8, Buffer[Nat32]]], letter: Nat8, text: Span[Nat8, Static]): Bool is
+        case found of
+            when Some(value as p: Pair[Nat8, Buffer[Nat32]]) do
+                let { first: Nat8, second: Buffer[Nat32] } := p;
+                var same: Bool := (first = letter) and (length(&second) = spanLength(text));
+                if same then
+                    var i: Index := 0;
+                    while i < length(&second) do
+                        if not isDigitOf(nth(&second, i), text[i]) then
+                            same := false;
+                        end if;
+                        i := i + 1;
+                    end while;
+                end if;
+                destroyFreeBuffer(second);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNoRemoval(found: Option[Pair[Nat8, Buffer[Nat32]]]): Bool is
+        case found of
+            when Some(value as p: Pair[Nat8, Buffer[Nat32]]) do
+                let { first: Nat8, second: Buffer[Nat32] } := p;
+                destroyFreeBuffer(second);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- Whether the weight is the digit written as the character.
+    function isDigitOf(weight: Nat32, character: Nat8): Bool is
+        case toNat32(character) of
+            when Some(value as code: Nat32) do
+                return (weight + 48) = code;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Two lists of node numbers of two graphs with the same slots and
+    -- generations in the same order.  The numbers themselves differ, as
+    -- each names its own graph.
+    generic [R: Region, S: Region]
+    function sameNodes(x: &[Buffer[NodeId], R], y: &[Buffer[NodeId], S]): Bool is
+        if length(x) /= length(y) then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < length(x) do
+            let one: NodeId := nth(x, i);
+            let two: NodeId := nth(y, i);
+            if (nodeSlot(one) /= nodeSlot(two)) or (nodeGeneration(one) /= nodeGeneration(two)) then
+                same := false;
+            end if;
+            if equal(&one, &two) then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameEdges(x: &[Buffer[EdgeId], R], y: &[Buffer[EdgeId], S]): Bool is
+        if length(x) /= length(y) then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < length(x) do
+            let one: EdgeId := nth(x, i);
+            let two: EdgeId := nth(y, i);
+            if (edgeSlot(one) /= edgeSlot(two)) or (edgeGeneration(one) /= edgeGeneration(two)) then
+                same := false;
+            end if;
+            if equal(&one, &two) then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    ---
+    --- Building
+    ---
+
+    -- A node with a letter.  The parameter gives the literal its type.
+    generic [E: Type, R: Region]
+    function place(g: &![Graph[Nat8, E], R], letter: Nat8): NodeId is
+        return addNode(g, letter);
+    end;
+
+    -- An edge between two nodes of the graph, for each type of weight the
+    -- tests use.  A refusal stops the test.
+    generic [E: Free, R: Region]
+    function linkAny(g: &![Graph[Nat8, E], R], source: NodeId, target: NodeId, weight: E): EdgeId is
+        case addEdge(g, source, target, weight) of
+            when Right(right as edge: EdgeId) do
+                return edge;
+            when Left(left as back: E) do
+                abort("addEdge refused two nodes of the graph");
+        end case;
+    end;
+
+    generic [R: Region]
+    function link(g: &![Graph[Nat8, Nat32], R], source: NodeId, target: NodeId, weight: Nat32): EdgeId is
+        return linkAny(g, source, target, weight);
+    end;
+
+    generic [R: Region]
+    function linkHeavy(g: &![Graph[Nat8, Nat64], R], source: NodeId, target: NodeId, weight: Nat64): EdgeId is
+        return linkAny(g, source, target, weight);
+    end;
+
+    generic [R: Region]
+    function linkRoad(g: &![Graph[Nat8, Road], R], source: NodeId, target: NodeId, weight: Road): EdgeId is
+        return linkAny(g, source, target, weight);
+    end;
+
+    ---
+    --- The tests
+    ---
+
+    -- an empty graph.
+    function testEmpty(): Unit is
+        let g: Graph[Nat8, Nat32] := makeGraph();
+        assertTrue(nodeCount(&g) = 0, "no node");
+        assertTrue(edgeCount(&g) = 0, "no edge");
+        assertTrue(allNodesAre(&g, ""), "nodes lists nothing");
+        assertTrue(isNoPath(findCycle(&g)), "no cycle");
+        case topologicalOrder(&g) of
+            when Right(right as order: Buffer[NodeId]) do
+                assertTrue(length(&order) = 0, "the empty order");
+                destroyFreeBuffer(order);
+            when Left(left as cycle: Buffer[EdgeId]) do
+                assertTrue(false, "the empty order");
+                destroyFreeBuffer(cycle);
+        end case;
+        destroyEmpty(g);
+        return nil;
+    end;
+
+    -- nodes and edges added and asked about.
+    function testAddAndAsk(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let ab: EdgeId := link(&!g, a, b, 5);
+        let bc: EdgeId := link(&!g, b, c, 7);
+        assertTrue(nodeCount(&g) = 3, "three nodes");
+        assertTrue(edgeCount(&g) = 2, "two edges");
+        assertTrue((nodeSlot(a) = 0) and (nodeSlot(c) = 2), "slots in the order of adding");
+        assertTrue((nodeGeneration(b) = 0) and (edgeGeneration(bc) = 0), "a new slot has generation 0");
+        assertTrue((edgeSlot(ab) = 0) and (edgeSlot(bc) = 1), "edge slots in the order of adding");
+        assertTrue(letterOf(&g, b) = 'b', "nodeValue b");
+        assertTrue(isWeight(edgeValue(&g, bc), 7), "edgeValue bc: 7");
+        assertTrue((sourceLetter(&g, ab) = 'a') and (targetLetter(&g, ab) = 'b'), "ab leads from a to b");
+        assertTrue(containsNode(&g, c) and containsEdge(&g, bc), "contains c and bc");
+        assertTrue(edgeListIs(&g, outEdges(&g, b), "bc"), "out of b: bc");
+        assertTrue(edgeListIs(&g, inEdges(&g, b), "ab"), "into b: ab");
+        assertTrue(allNodesAre(&g, "abc"), "nodes: abc");
+        assertTrue(allEdgesAre(&g, "abbc"), "edges: ab bc");
+        assertTrue(removedIs(removeNode(&!g, c), 'c', "7"), "remove c: c and the weight of bc");
+        case addEdge(&!g, a, c, 9 : Nat32) of
+            when Left(left as back: Nat32) do
+                assertTrue(back = 9, "addEdge to a removed node: Left, the value handed back");
+            when Right(right as edge: EdgeId) do
+                assertTrue(false, "addEdge to a removed node: Left, the value handed back");
+        end case;
+        assertTrue(edgeCount(&g) = 1, "one edge left");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- a has one edge out and one in; both go with it.  Then d takes the slot
+    -- of a, and the number of a still names nothing.
+    -- a removed node's number, before its slot is taken again.
+    function testStaleNode(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let ab: EdgeId := link(&!g, a, b, 5);
+        let ca: EdgeId := link(&!g, c, a, 6);
+        let bc: EdgeId := link(&!g, b, c, 7);
+        assertTrue(removedIs(removeNode(&!g, a), 'a', "56"), "remove a: its value and the weights of its edges");
+        nodeRefused(&!g, a, b);
+        edgeRefused(&!g, ab);
+        edgeRefused(&!g, ca);
+        -- A removed node's number, after its slot is taken again.
+        let d: NodeId := place(&!g, 'd');
+        assertTrue(nodeSlot(d) = nodeSlot(a), "d took the slot of a");
+        assertTrue(nodeGeneration(d) = (nodeGeneration(a) + 1), "one generation later");
+        assertFalse(equal(&a, &d), "the two numbers differ");
+        let db: EdgeId := link(&!g, d, b, 8);
+        assertTrue(edgeSlot(db) = edgeSlot(ca), "db took the slot of ca, the edge slot freed last");
+        edgeRefused(&!g, ca);
+        nodeRefused(&!g, a, b);
+        assertTrue(letterOf(&g, d) = 'd', "d keeps its own value");
+        assertTrue(edgeListIs(&g, outEdges(&g, d), "db"), "d keeps its own edge");
+        assertTrue(allNodesAre(&g, "dbc"), "nodes: d in the slot of a, then b and c");
+        assertTrue(allEdgesAre(&g, "dbbc"), "edges: db in the slot of ca, freed last, then bc");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- ab is removed, then ba takes its slot, and the number of ab still
+    -- names nothing while ba answers with its own value.
+    -- a removed edge's number, before its slot is taken again.
+    function testStaleEdge(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let ab: EdgeId := link(&!g, a, b, 5);
+        assertTrue(isWeight(removeEdge(&!g, ab), 5), "removeEdge ab: its value 5");
+        edgeRefused(&!g, ab);
+        -- A removed edge's number, after its slot is taken again.
+        let ba: EdgeId := link(&!g, b, a, 6);
+        assertTrue(edgeSlot(ba) = edgeSlot(ab), "ba took the slot of ab");
+        assertTrue(edgeGeneration(ba) = (edgeGeneration(ab) + 1), "one generation later");
+        assertFalse(equal(&ab, &ba), "the two numbers differ");
+        edgeRefused(&!g, ab);
+        assertTrue(isWeight(edgeValue(&g, ba), 6), "ba keeps its own value");
+        assertTrue(edgeListIs(&g, outEdges(&g, a), ""), "nothing leaves a");
+        assertTrue(edgeListIs(&g, outEdges(&g, b), "ba"), "ba leaves b");
+        case replaceEdgeValue(&!g, ba, 60 : Nat32) of
+            when Right(right as old: Nat32) do
+                assertTrue(old = 6, "replaceEdgeValue ba: Right, the old value 6");
+            when Left(left as back: Nat32) do
+                assertTrue(false, "replaceEdgeValue ba: Right, the old value 6");
+        end case;
+        assertTrue(isWeight(edgeValue(&g, ba), 60), "ba now weighs 60");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- Two graphs built by the same calls give out numbers with the same
+    -- slots and generations.  Neither graph takes the other's numbers, and
+    -- each keeps its own values.
+    -- a number of another graph with the same slot and generation.
+    function testForeign(): Unit is
+        var one: Graph[Nat8, Nat32] := makeGraph();
+        var two: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!one, 'a');
+        let b: NodeId := place(&!one, 'b');
+        let x: NodeId := place(&!two, 'x');
+        let y: NodeId := place(&!two, 'y');
+        let ab: EdgeId := link(&!one, a, b, 5);
+        let xy: EdgeId := link(&!two, x, y, 7);
+        assertTrue((nodeSlot(a) = nodeSlot(x)) and (nodeGeneration(a) = nodeGeneration(x)), "a and x: the same slot and generation");
+        assertTrue((edgeSlot(ab) = edgeSlot(xy)) and (edgeGeneration(ab) = edgeGeneration(xy)), "ab and xy: the same slot and generation");
+        assertFalse(equal(&a, &x), "the numbers of a and x differ");
+        assertFalse(equal(&ab, &xy), "the numbers of ab and xy differ");
+        nodeRefused(&!two, a, y);
+        edgeRefused(&!two, ab);
+        -- And the other way round.
+        nodeRefused(&!one, x, b);
+        edgeRefused(&!one, xy);
+        assertTrue((letterOf(&one, a) = 'a') and (letterOf(&two, x) = 'x'), "each graph keeps its own node values");
+        assertTrue(isWeight(edgeValue(&one, ab), 5) and isWeight(edgeValue(&two, xy), 7), "each graph keeps its own edge values");
+        assertTrue(allEdgesAre(&one, "ab") and allEdgesAre(&two, "xy"), "each graph keeps its own edges");
+        destroyFree(one);
+        destroyFree(two);
+        return nil;
+    end;
+
+    -- With the last generation 2 a slot is used three times, with the
+    -- generations 0, 1 and 2, and then never again.
+    -- a slot retires at the last generation and is not taken again.
+    function testRetire(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraphRetiringAt(2);
+        let a: NodeId := place(&!g, 'a');
+        assertTrue(removedIs(removeNode(&!g, a), 'a', ""), "remove a");
+        let b: NodeId := place(&!g, 'b');
+        assertTrue(removedIs(removeNode(&!g, b), 'b', ""), "remove b");
+        let c: NodeId := place(&!g, 'c');
+        assertTrue((nodeSlot(c) = 0) and (nodeGeneration(c) = 2), "c: slot 0, generation 2, the last");
+        assertTrue(removedIs(removeNode(&!g, c), 'c', ""), "remove c: slot 0 retires");
+        let d: NodeId := place(&!g, 'd');
+        let e: NodeId := place(&!g, 'e');
+        assertTrue((nodeSlot(d) = 1) and (nodeGeneration(d) = 0), "d takes a new slot, not the retired one");
+        assertTrue((nodeSlot(e) = 2) and (nodeGeneration(e) = 0), "and so does e");
+        nodeRefused(&!g, c, d);
+        nodeRefused(&!g, a, d);
+        assertTrue(allNodesAre(&g, "de"), "nodes: d and e, slot 0 left out");
+        let de0: EdgeId := link(&!g, d, e, 1);
+        assertTrue(isWeight(removeEdge(&!g, de0), 1), "remove the edge of generation 0");
+        let de1: EdgeId := link(&!g, d, e, 2);
+        assertTrue(isWeight(removeEdge(&!g, de1), 2), "remove the edge of generation 1");
+        let de2: EdgeId := link(&!g, d, e, 3);
+        assertTrue((edgeSlot(de2) = 0) and (edgeGeneration(de2) = 2), "the edge of generation 2 in slot 0");
+        assertTrue(isWeight(removeEdge(&!g, de2), 3), "remove it: edge slot 0 retires");
+        let ed: EdgeId := link(&!g, e, d, 4);
+        assertTrue((edgeSlot(ed) = 1) and (edgeGeneration(ed) = 0), "the next edge takes a new slot");
+        edgeRefused(&!g, de2);
+        edgeRefused(&!g, de0);
+        assertTrue(allEdgesAre(&g, "ed"), "edges: ed alone");
+        destroyFree(g);
+        var h: Graph[Nat8, Nat32] := makeGraphRetiringAt(0);
+        -- With the last generation 0 a slot is used once.
+        let p: NodeId := place(&!h, 'p');
+        assertTrue(removedIs(removeNode(&!h, p), 'p', ""), "remove p: slot 0 retires at once");
+        let q: NodeId := place(&!h, 'q');
+        assertTrue((nodeSlot(q) = 1) and (nodeGeneration(q) = 0), "q takes slot 1");
+        nodeRefused(&!h, p, q);
+        destroyFree(h);
+        return nil;
+    end;
+
+    -- removing a node removes every edge that leaves or enters it.
+    function testRemoveNode(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let d: NodeId := place(&!g, 'd');
+        let ab: EdgeId := link(&!g, a, b, 1);
+        let bc: EdgeId := link(&!g, b, c, 2);
+        let cb: EdgeId := link(&!g, c, b, 3);
+        let bb: EdgeId := link(&!g, b, b, 4);
+        let db: EdgeId := link(&!g, d, b, 5);
+        let bd: EdgeId := link(&!g, b, d, 6);
+        let ac: EdgeId := link(&!g, a, c, 7);
+        assertTrue(edgeCount(&g) = 7, "seven edges");
+        assertTrue(edgeListIs(&g, outEdges(&g, b), "bcbbbd"), "out of b, in the order added");
+        assertTrue(edgeListIs(&g, inEdges(&g, b), "abcbbbdb"), "into b, in the order added");
+        assertTrue(removedIs(removeNode(&!g, b), 'b', "246135"), "remove b: first the edges that left it, then those that entered it");
+        assertTrue(edgeCount(&g) = 1, "one edge left");
+        assertTrue(nodeCount(&g) = 3, "three nodes left");
+        assertFalse(containsEdge(&g, ab), "ab is gone");
+        assertFalse(containsEdge(&g, bc), "bc is gone");
+        assertFalse(containsEdge(&g, cb), "cb is gone");
+        assertFalse(containsEdge(&g, bb), "bb is gone");
+        assertFalse(containsEdge(&g, db), "db is gone");
+        assertFalse(containsEdge(&g, bd), "bd is gone");
+        assertTrue(containsEdge(&g, ac), "ac stays");
+        assertTrue(edgeListIs(&g, outEdges(&g, a), "ac"), "out of a: only ac");
+        assertTrue(edgeListIs(&g, inEdges(&g, c), "ac"), "into c: only ac");
+        assertTrue(edgeListIs(&g, outEdges(&g, c), ""), "nothing leaves c");
+        assertTrue(edgeListIs(&g, outEdges(&g, d), ""), "nothing leaves d");
+        assertTrue(edgeListIs(&g, inEdges(&g, d), ""), "nothing enters d");
+        assertTrue(allEdgesAre(&g, "ac"), "edges: ac");
+        let cd: EdgeId := link(&!g, c, d, 8);
+        assertTrue(edgeListIs(&g, inEdges(&g, d), "cd"), "a new edge enters d");
+        assertTrue(edgeListIs(&g, outEdges(&g, c), "cd"), "and leaves c");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- the edges of a node come in the order added, not in the order of their slots.
+    function testEdgeOrder(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let d: NodeId := place(&!g, 'd');
+        let e: NodeId := place(&!g, 'e');
+        let ab: EdgeId := link(&!g, a, b, 1);
+        let ac: EdgeId := link(&!g, a, c, 2);
+        let ad: EdgeId := link(&!g, a, d, 3);
+        assertTrue(isWeight(removeEdge(&!g, ac), 2), "remove ac");
+        let ae: EdgeId := link(&!g, a, e, 4);
+        let again: EdgeId := link(&!g, a, c, 5);
+        assertTrue(edgeSlot(ae) = edgeSlot(ac), "ae took the slot of ac");
+        assertTrue(edgeListIs(&g, outEdges(&g, a), "abadaeac"), "out of a: ab ad ae ac");
+        assertTrue(allEdgesAre(&g, "abaeadac"), "edges, by slot: ab ae ad ac");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- a to f with one edge back from f to a, and g on its own.
+    -- breadth first, depth first, hasPath and shortestPath.
+    function testSearch(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let d: NodeId := place(&!g, 'd');
+        let e: NodeId := place(&!g, 'e');
+        let f: NodeId := place(&!g, 'f');
+        let alone: NodeId := place(&!g, 'g');
+        let ab: EdgeId := link(&!g, a, b, 1);
+        let ac: EdgeId := link(&!g, a, c, 1);
+        let bd: EdgeId := link(&!g, b, d, 1);
+        let cd: EdgeId := link(&!g, c, d, 1);
+        let ce: EdgeId := link(&!g, c, e, 1);
+        let df: EdgeId := link(&!g, d, f, 1);
+        let ef: EdgeId := link(&!g, e, f, 1);
+        let fa: EdgeId := link(&!g, f, a, 1);
+        assertTrue(orderIs(&g, breadthFirst(&g, a), "abcdef"), "breadth first from a: abcdef");
+        assertTrue(orderIs(&g, depthFirst(&g, a), "abdfce"), "depth first from a: abdfce");
+        assertTrue(orderIs(&g, breadthFirst(&g, c), "cdefab"), "breadth first from c: cdefab");
+        assertTrue(orderIs(&g, depthFirst(&g, c), "cdfabe"), "depth first from c: cdfabe");
+        assertTrue(orderIs(&g, breadthFirst(&g, alone), "g"), "breadth first from g: g alone");
+        assertTrue(orderIs(&g, depthFirst(&g, alone), "g"), "depth first from g: g alone");
+        assertTrue(hasPath(&g, a, f), "a reaches f");
+        assertTrue(hasPath(&g, f, e), "f reaches e, back through a");
+        assertFalse(hasPath(&g, a, alone), "a does not reach g");
+        assertFalse(hasPath(&g, alone, a), "g does not reach a");
+        assertTrue(hasPath(&g, alone, alone), "g reaches itself");
+        assertTrue(pathIs(&g, shortestPath(&g, a, f), "abdf"), "shortest from a to f: abdf");
+        assertTrue(pathIs(&g, shortestPath(&g, f, e), "face"), "shortest from f to e: face");
+        assertTrue(isEmptyPath(shortestPath(&g, a, a)), "shortest from a to a: empty");
+        assertTrue(isNoPath(shortestPath(&g, a, alone)), "shortest from a to g: None");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- s to t: 7 over s a c t, 12 over s b t, and the lightest, 7, over
+    -- s b a c t, through the lighter of two edges from a to c.
+    -- lightestPath, Dijkstra, on a graph with a known answer.
+    function testLightest(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let s: NodeId := place(&!g, 's');
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let t: NodeId := place(&!g, 't');
+        let sa: EdgeId := link(&!g, s, a, 7);
+        let sb: EdgeId := link(&!g, s, b, 2);
+        let ba: EdgeId := link(&!g, b, a, 3);
+        let acHeavy: EdgeId := link(&!g, a, c, 5);
+        let acLight: EdgeId := link(&!g, a, c, 1);
+        let bc: EdgeId := link(&!g, b, c, 8);
+        let ct: EdgeId := link(&!g, c, t, 1);
+        let bt: EdgeId := link(&!g, b, t, 10);
+        assertTrue(lightestIs(&g, lightestPath(&g, s, t), 7, "sbact"), "lightest from s to t: 7 over s b a c t");
+        assertTrue(lightestIs(&g, lightestPath(&g, s, a), 5, "sba"), "lightest from s to a: 5 over s b a");
+        assertTrue(lightestIs(&g, lightestPath(&g, s, c), 6, "sbac"), "lightest from s to c: 6 over s b a c");
+        assertTrue(lightestIs(&g, lightestPath(&g, s, s), 0, "s"), "lightest from s to s: 0, no edge");
+        assertTrue(reasonOf(lightestPath(&g, t, s)) = 'n', "nothing leaves t: Unreachable");
+        assertTrue(pathIs(&g, shortestPath(&g, s, t), "sbt"), "the fewest edges from s to t: s b t");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- From s: x at 1, y at 5 directly and at one more than the largest
+    -- Nat64 through x, w at exactly the largest Nat64, v only through w and
+    -- so too heavy, z not reachable at all.  The searches from s to y, w, v
+    -- and z each pass over the sum through x to y on the way.
+    -- lightestPath tells a path too heavy for a Nat64 from no path at all.
+    function testHeavy(): Unit is
+        var g: Graph[Nat8, Nat64] := makeGraph();
+        let s: NodeId := place(&!g, 's');
+        let x: NodeId := place(&!g, 'x');
+        let y: NodeId := place(&!g, 'y');
+        let w: NodeId := place(&!g, 'w');
+        let v: NodeId := place(&!g, 'v');
+        let z: NodeId := place(&!g, 'z');
+        let sx: EdgeId := linkHeavy(&!g, s, x, 1);
+        let xy: EdgeId := linkHeavy(&!g, x, y, maximum_nat64);
+        let sy: EdgeId := linkHeavy(&!g, s, y, 5);
+        let sw: EdgeId := linkHeavy(&!g, s, w, maximum_nat64);
+        let wv: EdgeId := linkHeavy(&!g, w, v, 1);
+        assertTrue(lightestIs(&g, lightestPath(&g, s, y), 5, "sy"), "lightest from s to y: 5, the heavy way passed over");
+        assertTrue(lightestIs(&g, lightestPath(&g, s, x), 1, "sx"), "lightest from s to x: 1");
+        assertTrue(lightestIs(&g, lightestPath(&g, s, w), maximum_nat64, "sw"), "lightest from s to w: the largest Nat64, which fits");
+        assertTrue(reasonOf(lightestPath(&g, s, v)) = 't', "from s to v every path is too heavy: TooHeavy");
+        assertTrue(hasPath(&g, s, v), "and a path does lead there");
+        assertTrue(reasonOf(lightestPath(&g, s, z)) = 'n', "from s to z no path, a heavy sum passed over on the way: Unreachable");
+        assertTrue(reasonOf(lightestPath(&g, z, s)) = 'n', "from z nothing leads anywhere: Unreachable");
+        assertTrue(lightestIs(&g, lightestPath(&g, w, v), 1, "wv"), "from w to v: 1");
+        destroyFree(g);
+        return nil;
+    end;
+
+    record Road: Free is
+        kilometres: Nat64;
+    end;
+
+    instance Weight(Road) is
+        generic [R: Region]
+        method weightOf(edge: &[Road, R]): Nat64 is
+            return edge->kilometres;
+        end;
+    end;
+
+    -- lightestPath over a record whose instance of Weight is the test's own.
+    function testRoad(): Unit is
+        var g: Graph[Nat8, Road] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let ab: EdgeId := linkRoad(&!g, a, b, Road(kilometres => 4));
+        let bc: EdgeId := linkRoad(&!g, b, c, Road(kilometres => 3));
+        let ac: EdgeId := linkRoad(&!g, a, c, Road(kilometres => 9));
+        assertTrue(lightestIs(&g, lightestPath(&g, a, c), 7, "abc"), "lightest from a to c: 7 over a b c");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- topologicalOrder of graphs without a cycle.
+    function testTopological(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let d: NodeId := place(&!g, 'd');
+        let e: NodeId := place(&!g, 'e');
+        let f: NodeId := place(&!g, 'f');
+        let ad: EdgeId := link(&!g, a, d, 1);
+        let bd: EdgeId := link(&!g, b, d, 1);
+        let de: EdgeId := link(&!g, d, e, 1);
+        let ce: EdgeId := link(&!g, c, e, 1);
+        let ef: EdgeId := link(&!g, e, f, 1);
+        let bf: EdgeId := link(&!g, b, f, 1);
+        case topologicalOrder(&g) of
+            when Right(right as order: Buffer[NodeId]) do
+                assertTrue(isTopological(&g, &order), "every edge leads forward");
+                assertTrue(lettersAre(&g, &order, "abcdef"), "the order: abcdef");
+                destroyFreeBuffer(order);
+            when Left(left as cycle: Buffer[EdgeId]) do
+                assertTrue(false, "every edge leads forward");
+                destroyFreeBuffer(cycle);
+        end case;
+        assertTrue(isNoPath(findCycle(&g)), "findCycle: None");
+        destroyFree(g);
+        var h: Graph[Nat8, Nat32] := makeGraph();
+        let z: NodeId := place(&!h, 'z');
+        let y: NodeId := place(&!h, 'y');
+        let x: NodeId := place(&!h, 'x');
+        let xy: EdgeId := link(&!h, x, y, 1);
+        let yz: EdgeId := link(&!h, y, z, 1);
+        case topologicalOrder(&h) of
+            when Right(right as order: Buffer[NodeId]) do
+                assertTrue(isTopological(&h, &order), "against the order of the slots: every edge leads forward");
+                assertTrue(lettersAre(&h, &order, "xyz"), "the order: xyz");
+                destroyFreeBuffer(order);
+            when Left(left as cycle: Buffer[EdgeId]) do
+                assertTrue(false, "against the order of the slots: every edge leads forward");
+                destroyFreeBuffer(cycle);
+        end case;
+        destroyFree(h);
+        return nil;
+    end;
+
+    -- z comes first in the order of the slots and is behind the cycle of b
+    -- and c, not on it.
+    -- a graph with a cycle: topologicalOrder hands back exactly one cycle.
+    function testCycle(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let z: NodeId := place(&!g, 'z');
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let ab: EdgeId := link(&!g, a, b, 1);
+        let bc: EdgeId := link(&!g, b, c, 1);
+        let cb: EdgeId := link(&!g, c, b, 1);
+        let cz: EdgeId := link(&!g, c, z, 1);
+        case topologicalOrder(&g) of
+            when Left(left as cycle: Buffer[EdgeId]) do
+                assertTrue(isCycle(&g, &cycle), "Left holds a cycle");
+                assertTrue(length(&cycle) = 2, "of two edges");
+                assertTrue(walkIs(&g, &cycle, "cbc"), "c to b and back");
+                destroyFreeBuffer(cycle);
+            when Right(right as order: Buffer[NodeId]) do
+                assertTrue(false, "Left holds a cycle");
+                destroyFreeBuffer(order);
+        end case;
+        assertTrue(cycleIs(&g, findCycle(&g), "cbc"), "findCycle gives the same cycle");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- an edge from a node to itself is a cycle of one edge.
+    function testLoop(): Unit is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let ab: EdgeId := link(&!g, a, b, 1);
+        let bb: EdgeId := link(&!g, b, b, 1);
+        assertTrue(cycleIs(&g, findCycle(&g), "bb"), "findCycle: b to b");
+        assertTrue(orderIs(&g, breadthFirst(&g, a), "ab"), "the loop does not upset breadth first");
+        assertTrue(orderIs(&g, depthFirst(&g, b), "b"), "nor depth first");
+        destroyFree(g);
+        return nil;
+    end;
+
+    -- The same calls, with removals and slots taken again, build the same
+    -- graph: a, b, f in the slot c had, d and e.
+    function built(): Graph[Nat8, Nat32] is
+        var g: Graph[Nat8, Nat32] := makeGraph();
+        let a: NodeId := place(&!g, 'a');
+        let b: NodeId := place(&!g, 'b');
+        let c: NodeId := place(&!g, 'c');
+        let d: NodeId := place(&!g, 'd');
+        let e: NodeId := place(&!g, 'e');
+        let ab: EdgeId := link(&!g, a, b, 1);
+        let ac: EdgeId := link(&!g, a, c, 2);
+        let bd: EdgeId := link(&!g, b, d, 3);
+        let cd: EdgeId := link(&!g, c, d, 4);
+        let de: EdgeId := link(&!g, d, e, 5);
+        case removeNode(&!g, c) of
+            when Some(value as p: Pair[Nat8, Buffer[Nat32]]) do
+                let { first: Nat8, second: Buffer[Nat32] } := p;
+                destroyFreeBuffer(second);
+            when None do
+                abort("c was in the graph");
+        end case;
+        let f: NodeId := place(&!g, 'f');
+        let fd: EdgeId := link(&!g, f, d, 6);
+        let af: EdgeId := link(&!g, a, f, 7);
+        return g;
+    end;
+
+    -- the same calls give the same orders.
+    function testSameOrder(): Unit is
+        let one: Graph[Nat8, Nat32] := built();
+        let two: Graph[Nat8, Nat32] := built();
+        let nodesOne: Buffer[NodeId] := nodes(&one);
+        let nodesTwo: Buffer[NodeId] := nodes(&two);
+        assertTrue(sameNodes(&nodesOne, &nodesTwo), "nodes: the same slots and generations");
+        assertTrue(lettersAre(&one, &nodesOne, "abfde"), "nodes: abfde");
+        let startOne: NodeId := nth(&nodesOne, 0);
+        let startTwo: NodeId := nth(&nodesTwo, 0);
+        let edgesOne: Buffer[EdgeId] := edges(&one);
+        let edgesTwo: Buffer[EdgeId] := edges(&two);
+        assertTrue(sameEdges(&edgesOne, &edgesTwo), "edges: the same slots and generations");
+        assertTrue(edgeLettersAre(&one, &edgesOne, "abfdbdafde"), "edges: ab fd bd af de");
+        destroyFreeBuffer(edgesOne);
+        destroyFreeBuffer(edgesTwo);
+        assertTrue(sameOrders(breadthFirst(&one, startOne), breadthFirst(&two, startTwo)), "breadth first: the same slots and generations");
+        assertTrue(orderIs(&one, breadthFirst(&one, startOne), "abfde"), "breadth first: abfde");
+        assertTrue(sameOrders(depthFirst(&one, startOne), depthFirst(&two, startTwo)), "depth first: the same slots and generations");
+        assertTrue(orderIs(&one, depthFirst(&one, startOne), "abdef"), "depth first: abdef");
+        case topologicalOrder(&one) of
+            when Right(right as order: Buffer[NodeId]) do
+                assertTrue(sameOrders(Some(value => order), orderOf(&two)), "topologicalOrder: the same slots and generations");
+            when Left(left as cycle: Buffer[EdgeId]) do
+                assertTrue(false, "topologicalOrder: the same numbers");
+                destroyFreeBuffer(cycle);
+        end case;
+        assertTrue(orderIs(&one, orderOf(&one), "abfde"), "topologicalOrder: abfde");
+        destroyFreeBuffer(nodesOne);
+        destroyFreeBuffer(nodesTwo);
+        destroyFree(one);
+        destroyFree(two);
+        return nil;
+    end;
+
+    -- The topological order, or None for a graph with a cycle.
+    generic [R: Region]
+    function orderOf(g: &[Graph[Nat8, Nat32], R]): Option[Buffer[NodeId]] is
+        case topologicalOrder(g) of
+            when Right(right as order: Buffer[NodeId]) do
+                return Some(value => order);
+            when Left(left as cycle: Buffer[EdgeId]) do
+                destroyFreeBuffer(cycle);
+                return None();
+        end case;
+    end;
+
+    function sameOrders(x: Option[Buffer[NodeId]], y: Option[Buffer[NodeId]]): Bool is
+        case x of
+            when Some(value as one: Buffer[NodeId]) do
+                case y of
+                    when Some(value as two: Buffer[NodeId]) do
+                        let same: Bool := sameNodes(&one, &two);
+                        destroyFreeBuffer(one);
+                        destroyFreeBuffer(two);
+                        return same;
+                    when None do
+                        destroyFreeBuffer(one);
+                        return false;
+                end case;
+            when None do
+                return isNoOrder(y);
+        end case;
+    end;
+
+    ---
+    --- Linear values
+    ---
+
+    generic [R: Region]
+    function linkText(g: &![Graph[String, String], R], source: NodeId, target: NodeId, text: Span[Nat8, Static]): EdgeId is
+        case addEdge(g, source, target, fromLiteral(text)) of
+            when Right(right as edge: EdgeId) do
+                return edge;
+            when Left(left as back: String) do
+                destroyString(back);
+                abort("addEdge refused two nodes of the graph");
+        end case;
+    end;
+
+    generic [R: Region]
+    function textLengthIs(found: Option[&[String, R]], n: Index): Bool is
+        case found of
+            when Some(value as text: &[String, R]) do
+                return stringLength(text) = n;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var rest: Buffer[String] := strings;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmptyBuffer(rest);
+        return nil;
+    end;
+
+    -- String values: nothing is dropped, and the graph is emptied before destroyEmpty.
+    function testLinearValues(): Unit is
+        var g: Graph[String, String] := makeGraph();
+        let a: NodeId := addNode(&!g, fromLiteral("alpha"));
+        let b: NodeId := addNode(&!g, fromLiteral("be"));
+        let ab: EdgeId := linkText(&!g, a, b, "a to b");
+        let ba: EdgeId := linkText(&!g, b, a, "b to a!");
+        assertTrue(textLengthIs(nodeRef(&g, a), 5), "nodeRef a: alpha");
+        assertTrue(textLengthIs(edgeRef(&g, ab), 6), "edgeRef ab: a to b");
+        case replaceNodeValue(&!g, b, fromLiteral("beta")) of
+            when Right(right as old: String) do
+                assertTrue(stringLength(&old) = 2, "replaceNodeValue b: the old value be");
+                destroyString(old);
+            when Left(left as back: String) do
+                assertTrue(false, "replaceNodeValue b: the old value be");
+                destroyString(back);
+        end case;
+        assertTrue(textLengthIs(nodeRef(&g, b), 4), "nodeRef b: beta");
+        case removeEdge(&!g, ba) of
+            when Some(value as old: String) do
+                assertTrue(stringLength(&old) = 7, "removeEdge ba: b to a!");
+                destroyString(old);
+            when None do
+                assertTrue(false, "removeEdge ba: b to a!");
+        end case;
+        let again: EdgeId := linkText(&!g, b, a, "back");
+        case removeNode(&!g, a) of
+            when Some(value as p: Pair[String, Buffer[String]]) do
+                let { first: String, second: Buffer[String] } := p;
+                assertTrue(stringLength(&first) = 5, "removeNode a: alpha");
+                assertTrue(length(&second) = 2, "and its two edges");
+                assertTrue(stringLength(nthRef(&second, 0)) = 6, "first the edge that left it");
+                assertTrue(stringLength(nthRef(&second, 1)) = 4, "then the edge that entered it");
+                destroyString(first);
+                destroyStrings(second);
+            when None do
+                assertTrue(false, "removeNode a: alpha");
+        end case;
+        case removeNode(&!g, b) of
+            when Some(value as p: Pair[String, Buffer[String]]) do
+                let { first: String, second: Buffer[String] } := p;
+                assertTrue(length(&second) = 0, "removeNode b: no edge left");
+                destroyString(first);
+                destroyStrings(second);
+            when None do
+                assertTrue(false, "removeNode b: no edge left");
+        end case;
+        assertTrue(nodeCount(&g) = 0, "the graph is empty");
+        destroyEmpty(g);
+        return nil;
+    end;
+end module body.

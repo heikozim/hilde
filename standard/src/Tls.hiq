@@ -1,0 +1,227 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: a Client holds the connection of Bindings.Tls, which does
+-- the work with addresses, and every call goes there.  A client made over
+-- a socket also holds that socket, so that the descriptor cannot be closed
+-- while the connection still reads and writes through its number.
+import Standard.String (
+    String
+);
+import Standard.File (
+    FileDescriptor,
+    closeFile,
+    fileNumber
+);
+import Bindings.Tls (
+    Client as Connection,
+    connect as bindConnect,
+    connectSocket as bindConnectSocket,
+    connectAs as bindConnectAs,
+    connectSocketAs as bindConnectSocketAs,
+    connectSocketAsTls13 as bindConnectSocketAsTls13,
+    send as bindSend,
+    receive as bindReceive,
+    sendWithin as bindSendWithin,
+    receiveWithin as bindReceiveWithin,
+    closeClient as bindCloseClient,
+    Server as BindServer,
+    makeServer as bindMakeServer,
+    makeServerFromMemory as bindMakeServerFromMemory,
+    acceptSocket as bindAcceptSocket,
+    closeServer as bindCloseServer,
+    makeVerifyingServer as bindMakeVerifyingServer,
+    makeVerifyingServerTls13 as bindMakeVerifyingServerTls13,
+    makeVerifyingServerFromMemory as bindMakeVerifyingServerFromMemory,
+    peerCertificateProvided as bindPeerCertificateProvided,
+    peerSubject as bindPeerSubject,
+    peerHash as bindPeerHash
+);
+
+module body Standard.Tls is
+    record Client: Linear is
+        connection: Connection;
+        socket: Option[FileDescriptor];
+    end;
+
+    generic [H: Region, P: Region, C: Region]
+    function connect(host: Span[Nat8, H], port: Span[Nat8, P], caFile: Span[Nat8, C]): Either[String, Client] is
+        case bindConnect(host, port, caFile) of
+            when Left(left as message: String) do
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let none: Option[FileDescriptor] := None();
+                let made: Either[String, Client] := Right(right => Client(connection => connection, socket => none));
+                return made;
+        end case;
+    end;
+
+    generic [H: Region, C: Region]
+    function connectOver(socket: FileDescriptor, host: Span[Nat8, H], caFile: Span[Nat8, C], milliseconds: Nat32): Either[String, Client] is
+        let number: Int32 := fileNumber(&socket);
+        case bindConnectSocket(number, host, caFile, milliseconds) of
+            when Left(left as message: String) do
+                let closed: Bool := closeFile(socket);
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let held: Option[FileDescriptor] := Some(value => socket);
+                let made: Either[String, Client] := Right(right => Client(connection => connection, socket => held));
+                return made;
+        end case;
+    end;
+
+    function overSocket(made: Either[String, Connection], socket: FileDescriptor): Either[String, Client] is
+        case made of
+            when Left(left as message: String) do
+                let closed: Bool := closeFile(socket);
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let held: Option[FileDescriptor] := Some(value => socket);
+                let client: Either[String, Client] := Right(right => Client(connection => connection, socket => held));
+                return client;
+        end case;
+    end;
+
+    generic [H: Region, P: Region, C: Region, E: Region, K: Region]
+    function connectAs(host: Span[Nat8, H], port: Span[Nat8, P], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K]): Either[String, Client] is
+        case bindConnectAs(host, port, caFile, certificateFile, keyFile) of
+            when Left(left as message: String) do
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let none: Option[FileDescriptor] := None();
+                let made: Either[String, Client] := Right(right => Client(connection => connection, socket => none));
+                return made;
+        end case;
+    end;
+
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function connectOverAs(socket: FileDescriptor, host: Span[Nat8, H], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], milliseconds: Nat32): Either[String, Client] is
+        let number: Int32 := fileNumber(&socket);
+        return overSocket(bindConnectSocketAs(number, host, caFile, certificateFile, keyFile, milliseconds), socket);
+    end;
+
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function connectOverAsTls13(socket: FileDescriptor, host: Span[Nat8, H], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], milliseconds: Nat32): Either[String, Client] is
+        let number: Int32 := fileNumber(&socket);
+        return overSocket(bindConnectSocketAsTls13(number, host, caFile, certificateFile, keyFile, milliseconds), socket);
+    end;
+
+    generic [R: Region]
+    function peerCertificateProvided(client: &[Client, R]): Bool is
+        return bindPeerCertificateProvided(&(client->connection));
+    end;
+
+    generic [R: Region]
+    function peerSubject(client: &[Client, R]): Option[String] is
+        return bindPeerSubject(&(client->connection));
+    end;
+
+    generic [R: Region]
+    function peerHash(client: &[Client, R]): Option[String] is
+        return bindPeerHash(&(client->connection));
+    end;
+
+    generic [R: Region, S: Region]
+    function send(client: &![Client, R], data: Span[Nat8, S]): Either[String, Unit] is
+        return bindSend(&!(client->connection), data);
+    end;
+
+    generic [R: Region]
+    function receive(client: &![Client, R], most: Index): Either[String, String] is
+        return bindReceive(&!(client->connection), most);
+    end;
+
+    -- Bindings.Tls holds the socket's number as well and refuses a time
+    -- limit on a client made by connect, so these only pass on.
+    generic [R: Region, S: Region]
+    function sendWithin(client: &![Client, R], data: Span[Nat8, S], milliseconds: Nat32): Either[String, Unit] is
+        return bindSendWithin(&!(client->connection), data, milliseconds);
+    end;
+
+    generic [R: Region]
+    function receiveWithin(client: &![Client, R], most: Index, milliseconds: Nat32): Either[String, String] is
+        return bindReceiveWithin(&!(client->connection), most, milliseconds);
+    end;
+
+    function closeClient(client: Client): Unit is
+        let { connection: Connection, socket: Option[FileDescriptor] } := client;
+        bindCloseClient(connection);
+        case socket of
+            when Some(value as held: FileDescriptor) do
+                let closed: Bool := closeFile(held);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    record Server: Linear is
+        inner: BindServer;
+    end;
+
+    function wrapServer(made: Either[String, BindServer]): Either[String, Server] is
+        case made of
+            when Left(left as message: String) do
+                let failed: Either[String, Server] := Left(left => message);
+                return failed;
+            when Right(right as inner: BindServer) do
+                let server: Either[String, Server] := Right(right => Server(inner => inner));
+                return server;
+        end case;
+    end;
+
+    generic [C: Region, K: Region]
+    function makeServer(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K]): Either[String, Server] is
+        return wrapServer(bindMakeServer(certificateFile, keyFile));
+    end;
+
+    generic [C: Region, K: Region]
+    function makeServerFromMemory(certificate: Span[Nat8, C], key: Span[Nat8, K]): Either[String, Server] is
+        return wrapServer(bindMakeServerFromMemory(certificate, key));
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServer(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K], clientCaFile: Span[Nat8, A]): Either[String, Server] is
+        return wrapServer(bindMakeVerifyingServer(certificateFile, keyFile, clientCaFile));
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServerTls13(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K], clientCaFile: Span[Nat8, A]): Either[String, Server] is
+        return wrapServer(bindMakeVerifyingServerTls13(certificateFile, keyFile, clientCaFile));
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServerFromMemory(certificate: Span[Nat8, C], key: Span[Nat8, K], clientCa: Span[Nat8, A]): Either[String, Server] is
+        return wrapServer(bindMakeVerifyingServerFromMemory(certificate, key, clientCa));
+    end;
+
+    generic [R: Region]
+    function acceptOver(server: &[Server, R], socket: FileDescriptor, milliseconds: Nat32): Either[String, Client] is
+        let number: Int32 := fileNumber(&socket);
+        case bindAcceptSocket(&(server->inner), number, milliseconds) of
+            when Left(left as message: String) do
+                let closed: Bool := closeFile(socket);
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let held: Option[FileDescriptor] := Some(value => socket);
+                let made: Either[String, Client] := Right(right => Client(connection => connection, socket => held));
+                return made;
+        end case;
+    end;
+
+    function closeServer(server: Server): Unit is
+        let { inner: BindServer } := server;
+        bindCloseServer(inner);
+        return nil;
+    end;
+end module body.

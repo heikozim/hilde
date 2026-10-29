@@ -1,0 +1,502 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+One interface over SQLite, SQLCipher, PostgreSQL and MariaDB, the backend chosen at open.
+
+- A backend is in the programme only when its driver module is imported: Standard.Database.Sqlite, Standard.Database.Postgres or Standard.Database.MariaDB.
+- The code that reads and writes stays the same whatever backend was opened.
+- Values go to the question marks of a statement and never become part of its text.
+- For PostgreSQL each question mark outside strings, quoted names and comments becomes $1, $2, ...
+- Values are Int64, Float64, Bool, text, bytes, null and timestamps in microseconds since 1970 UTC.
+- On SQLite a Bool is stored as the integer 0 or 1 and a timestamp as its integer.
+- Database[M] is linear and must be closed; execute takes a Database[Writing] only.
+- A Transaction ends by commit or rollback, a Cursor by finish; a column's text lives for its row.
+- isUniqueViolation, isConstraintViolation and isBusy class a DbError the same on every backend.
+
+    case openSqlite("app.db") of
+        when Right(right as opened: Database[Writing]) do
+            var db: Database[Writing] := opened;
+            let values: Values := withText(withInt64(noValues(), 7), "Ada");
+            case execute(&!db, "INSERT INTO people (id, name) VALUES (?, ?)", values) of
+                ...
+            end case;
+            closeDatabase(db);
+        ...
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Graph (
+    Graph,
+    NodeId
+);
+import Standard.HashMap (
+    HashMap
+);
+import Bindings.Database (
+    Erased
+);
+
+module Standard.Database is
+    """
+    The mode of a database that may write.
+    """
+    record Writing: Free is
+    end;
+
+    """
+    The mode of a database that only reads.
+    """
+    record Reading: Free is
+    end;
+
+    """
+    An open database of one of the backends.  Linear: it must be closed.
+    """
+    type Database[M: Free]: Linear;
+
+    """
+    The backend of a database, and the dialect its statements are written
+    in.
+    """
+    union Backend: Free is
+        case SqliteBackend;
+        case SqlCipherBackend;
+        case PostgresBackend;
+        case MariaDBBackend;
+    end;
+
+    """
+    What went wrong: the backend and its own code, SQLite's extended result
+    code, PostgreSQL's SQLSTATE as Standard.Postgres numbers it, or
+    MariaDB's error number.
+    """
+    record DbError: Free is
+        backend: Backend;
+        code: Int32;
+    end;
+
+    """
+    A unique constraint or a primary key was violated.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isUniqueViolation(error: DbError): Bool;
+
+    """
+    Any constraint was violated: unique, primary key, foreign key, not null
+    or check.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isConstraintViolation(error: DbError): Bool;
+
+    """
+    The database was busy or the transaction lost a conflict; trying again
+    may succeed.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isBusy(error: DbError): Bool;
+
+    """
+    A short English description of the error, from its backend.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    function describe(error: DbError): Span[Nat8, Static];
+
+    """
+    Closes the handle it is given.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [M: Free]
+    function closeDatabase(db: Database[M]): Unit;
+
+    """
+    The backend of the database.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [M: Free, R: Region]
+    function backendOf(db: &[Database[M], R]): Backend;
+
+    """
+    sql with every question mark outside a string, a quoted name and a
+    comment replaced by $1, $2 and so on, in order: the form PostgreSQL
+    takes.  It never gets shorter.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region]
+    function numberPlaceholders(sql: Span[Nat8, R]): String;
+
+    """
+    Apply the migrations the backend has not seen, each in a transaction of
+    its own; SQLite counts them in user_version, PostgreSQL and MariaDB in
+    hilde_migrations.  MariaDB commits a change of a table's form at once,
+    so there a migration that fails half way is not undone.  Right carries
+    how many were applied now.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function migrate(db: &![Database[Writing], R], migrations: Span[Nat8, Static]): Either[DbError, Index];
+
+    type Transaction: Linear;
+
+    """
+    Begin a transaction.  On every backend it fails while a transaction is
+    open on the database already, so an inner begin never ends the outer
+    transaction.
+    No contract: the state is the backend's, an I/O result.
+    """
+    generic [M: Free, R: Region]
+    function begin(db: &![Database[M], R]): Either[DbError, Transaction];
+    """
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function commit(db: &![Database[M], R], transaction: Transaction): Either[DbError, Unit];
+    """
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [M: Free, R: Region]
+    function rollback(db: &![Database[M], R], transaction: Transaction): Unit;
+
+    """
+    The values of a statement, in the order of its question marks.
+    """
+    type Values: Linear;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function noValues(): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withInt64(values: Values, value: Int64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withFloat64(values: Values, value: Float64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withBool(values: Values, value: Bool): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withTimestamp(values: Values, value: Int64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withNull(values: Values): Values;
+
+    """
+    Give back values that will not be sent.
+    No contract: it only frees or closes what it is given.
+    """
+    function dropValues(values: Values): Unit;
+
+    """
+    No contract: a number the system or the build gives.
+    """
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index;
+
+    """
+    A statement that was run, its rows being read.  Linear: finish ends it.
+    """
+    type Cursor: Linear;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [M: Free, R: Region]
+    function start(db: &![Database[M], R], sql: Span[Nat8, Static], values: Values): Cursor;
+
+    """
+    Run a statement that writes.  Right carries the number of rows it
+    changed.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function execute(db: &![Database[Writing], R], sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64];
+
+    """
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool;
+
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool
+        requires index >= 0;
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64
+        requires index >= 0;
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64
+        requires index >= 0;
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool
+        requires index >= 0;
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64
+        requires index >= 0;
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R]
+        requires index >= 0;
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R]
+        requires index >= 0;
+
+    """
+    End the cursor.  Some carries the failure of the statement.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function finish(db: &![Database[M], R], cursor: Cursor): Option[DbError];
+
+    """
+    Make the table config, key and value as text, when it is not there.
+    On MariaDB the key is a text of at most 255 characters, because
+    MariaDB takes no column of unbounded text as a primary key.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function createConfigTable(db: &![Database[Writing], R]): Either[DbError, Unit];
+
+    """
+    Write value under key, replacing what was there, with the upsert of
+    the backend.
+    """
+    generic [R: Region, K: Region, V: Region]
+    function setConfig(db: &![Database[Writing], R], key: Span[Nat8, K], value: Span[Nat8, V]): Either[DbError, Unit]
+        requires spanLength(key) > 0;
+
+    """
+    The value under key; None in the Right when there is none.
+    """
+    generic [M: Free, R: Region, K: Region]
+    function getConfig(db: &![Database[M], R], key: Span[Nat8, K]): Either[DbError, Option[String]]
+        requires spanLength(key) > 0;
+
+    """
+    A graph read from the rows of two statements, and where each database
+    id went.  graph holds the id as the value of its node and the weight as
+    the value of its edge; nodes maps an id to its node.  A second row with
+    an id already read counts in duplicateNodes and adds nothing; an edge
+    whose end is no id of the node rows counts in unknownEnds and adds
+    nothing.
+    """
+    record LoadedGraph: Linear is
+        graph: Graph[Int64, Float64];
+        nodes: HashMap[Int64, NodeId];
+        duplicateNodes: Index;
+        unknownEnds: Index;
+    end;
+
+    """
+    Build a graph from two cursors the caller started and finishes: the
+    rows of nodes carry the database id in column 0, the rows of edges the
+    id of the source in column 0, of the target in column 1 and the weight
+    in column 2.  Both are read to their end.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region, S: Region]
+    function graphFromRows(nodes: &![Cursor, R], edges: &![Cursor, S]): LoadedGraph;
+
+    ---
+    --- For the driver modules
+    ---
+
+    """
+    One value of a statement, as a driver receives it.
+    """
+    union Value: Linear is
+        case IntValue is
+            value: Int64;
+        case FloatValue is
+            value: Float64;
+        case BoolValue is
+            value: Bool;
+        case TimeValue is
+            value: Int64;
+        case TextValue is
+            value: String;
+        case BytesValue is
+            value: String;
+        case NullValue;
+    end;
+
+    """
+    The values of a statement in the order of its question marks, for a
+    driver to bind.
+    No contract: the result is linear, and a contract cannot read it without consuming it.
+    """
+    function takeValues(values: Values): Buffer[Value];
+
+    """
+    What a driver is asked to read of a column: whether it is null, or its
+    value as one of the types of the cursor's readers.
+    """
+    union ColumnKind: Free is
+        case NullKind;
+        case IntKind;
+        case FloatKind;
+        case BoolKind;
+        case TimeKind;
+        case TextKind;
+        case BytesKind;
+    end;
+
+    """
+    What a driver read of a column, of the kind it was asked for: BoolColumn
+    for NullKind and BoolKind, IntColumn for IntKind and TimeKind,
+    TextColumn for TextKind and BytesKind.
+    """
+    union Column[R: Region]: Free is
+        case IntColumn is
+            value: Int64;
+        case FloatColumn is
+            value: Float64;
+        case BoolColumn is
+            value: Bool;
+        case TextColumn is
+            value: Span[Nat8, R];
+    end;
+
+    """
+    How a driver classes one of its error codes, and the description of the
+    code.
+    """
+    record ErrorKind: Free is
+        unique: Bool;
+        constraint: Bool;
+        busy: Bool;
+        text: Span[Nat8, Static];
+    end;
+
+    """
+    A database that may write, from the connection a driver erased and the
+    backend it speaks.
+    No contract: the result is linear and opaque.
+    """
+    function writerOf(connection: Erased, backend: Backend): Database[Writing];
+
+    """
+    A database that only reads, from the connection a driver erased.
+    No contract: the result is linear and opaque.
+    """
+    function readerOf(connection: Erased, backend: Backend): Database[Reading];
+
+    -- The slots a driver module implements, ten for each backend.  The
+    -- connection, transaction and cursor are the ones the same driver
+    -- erased; writing says which mode the connection was opened in.  The
+    -- default bodies are never reached, because a database of a backend
+    -- comes only from its driver; they stop the programme.
+    -- No contract: each slot is an I/O result of its driver.
+
+    pragma Slot;
+    function sqliteClose(connection: Erased, writing: Bool): Unit;
+    pragma Slot;
+    generic [R: Region]
+    function sqliteMigrate(connection: &![Erased, R], backend: Backend, migrations: Span[Nat8, Static]): Either[DbError, Index];
+    pragma Slot;
+    generic [R: Region]
+    function sqliteBegin(connection: &![Erased, R], backend: Backend, writing: Bool): Either[DbError, Erased];
+    pragma Slot;
+    generic [R: Region]
+    function sqliteEnd(connection: &![Erased, R], backend: Backend, writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit];
+    pragma Slot;
+    generic [R: Region]
+    function sqliteStart(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased;
+    pragma Slot;
+    generic [R: Region]
+    function sqliteExecute(connection: &![Erased, R], backend: Backend, sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64];
+    pragma Slot;
+    generic [R: Region]
+    function sqliteAdvance(rows: &![Erased, R]): Bool;
+    pragma Slot;
+    generic [R: Region]
+    function sqliteColumn(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R];
+    pragma Slot;
+    generic [R: Region]
+    function sqliteFinish(connection: &![Erased, R], backend: Backend, writing: Bool, rows: Erased): Option[DbError];
+    pragma Slot;
+    function sqliteKind(code: Int32): ErrorKind;
+
+    pragma Slot;
+    function postgresClose(connection: Erased, writing: Bool): Unit;
+    pragma Slot;
+    generic [R: Region]
+    function postgresMigrate(connection: &![Erased, R], migrations: Span[Nat8, Static]): Either[DbError, Index];
+    pragma Slot;
+    generic [R: Region]
+    function postgresBegin(connection: &![Erased, R], writing: Bool): Either[DbError, Erased];
+    pragma Slot;
+    generic [R: Region]
+    function postgresEnd(connection: &![Erased, R], writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit];
+    pragma Slot;
+    generic [R: Region]
+    function postgresStart(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased;
+    pragma Slot;
+    generic [R: Region]
+    function postgresExecute(connection: &![Erased, R], sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64];
+    pragma Slot;
+    generic [R: Region]
+    function postgresAdvance(rows: &![Erased, R]): Bool;
+    pragma Slot;
+    generic [R: Region]
+    function postgresColumn(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R];
+    pragma Slot;
+    generic [R: Region]
+    function postgresFinish(connection: &![Erased, R], writing: Bool, rows: Erased): Option[DbError];
+    pragma Slot;
+    function postgresKind(code: Int32): ErrorKind;
+
+    pragma Slot;
+    function mariadbClose(connection: Erased, writing: Bool): Unit;
+    pragma Slot;
+    generic [R: Region]
+    function mariadbMigrate(connection: &![Erased, R], migrations: Span[Nat8, Static]): Either[DbError, Index];
+    pragma Slot;
+    generic [R: Region]
+    function mariadbBegin(connection: &![Erased, R], writing: Bool): Either[DbError, Erased];
+    pragma Slot;
+    generic [R: Region]
+    function mariadbEnd(connection: &![Erased, R], writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit];
+    pragma Slot;
+    generic [R: Region]
+    function mariadbStart(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased;
+    pragma Slot;
+    generic [R: Region]
+    function mariadbExecute(connection: &![Erased, R], sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64];
+    pragma Slot;
+    generic [R: Region]
+    function mariadbAdvance(rows: &![Erased, R]): Bool;
+    pragma Slot;
+    generic [R: Region]
+    function mariadbColumn(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R];
+    pragma Slot;
+    generic [R: Region]
+    function mariadbFinish(connection: &![Erased, R], writing: Bool, rows: Erased): Option[DbError];
+    pragma Slot;
+    function mariadbKind(code: Int32): ErrorKind;
+end module.

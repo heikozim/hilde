@@ -1,0 +1,195 @@
+-- Where the same pattern and text give a different result in the two
+-- engines: every deviation of Standard.Regex, run through both, and two rows
+-- where they agree so that a harness which printed the same line twice
+-- could not pass.  Patterns and texts are written %xx where a byte is not
+-- printable ASCII, or is %, a quote or a backslash, and decoded here.
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Regex (
+    Regex as RegexLinear,
+    compile as compileLinear,
+    destroyRegex as destroyLinear,
+    Found as FoundLinear,
+    find as findLinear,
+    foundStart as startLinear,
+    foundEnd as endLinear,
+    destroyFound as destroyFoundLinear,
+    Hit as HitLinear,
+    find_all as allLinear
+);
+import Standard.Pcre (
+    Regex,
+    compile,
+    destroyRegex,
+    Found,
+    find,
+    foundStart,
+    foundEnd,
+    destroyFound,
+    Hit,
+    find_all
+);
+import Standard.Buffer (
+    Buffer,
+    destroyFree,
+    length as bufferLength
+);
+
+module body Test is
+    constant ten: Nat8 := 10;
+    constant sixteen: Nat8 := 16;
+    constant limit: Nat32 := 1000000;
+
+    function nibble(c: Nat8): Nat8 is
+        if c <= '9' then
+            return c - '0';
+        end if;
+        return (c - 'A') + ten;
+    end;
+
+    function decode(encoded: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(encoded);
+        var i: Index := 0;
+        while i < size do
+            let c: Nat8 := encoded[i];
+            if c = '%' then
+                let high: Nat8 := nibble(encoded[i + 1]);
+                let low: Nat8 := nibble(encoded[i + 2]);
+                writeByte(&!out, (high * sixteen) + low);
+                i := i + 3;
+            else
+                writeByte(&!out, c);
+                i := i + 1;
+            end if;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        let size: Index := length(text);
+        print("[");
+        if size > 0 then
+            print(getSpan(text, 0, size - 1));
+        end if;
+        printLn("]");
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function linear(pattern: &[String, R], text: &[String, S]): Unit is
+        print("  Standard.Regex: ");
+        let compiled: Either[String, RegexLinear] := compileLinear(getSpan(pattern, 0, length(pattern) - 1));
+        case compiled of
+            when Right(right as re: RegexLinear) do
+                case findLinear(&re, asSpan(text)) of
+                    when Some(value as f: FoundLinear) do
+                        print("find ");
+                        print(startLinear(&f));
+                        print(",");
+                        print(endLinear(&f));
+                        destroyFoundLinear(f);
+                    when None do
+                        print("find none");
+                end case;
+                let hits: Buffer[HitLinear] := allLinear(&re, asSpan(text));
+                print(" all ");
+                printLn(bufferLength(&hits));
+                destroyFree(hits);
+                destroyLinear(re);
+            when Left(left as message: String) do
+                print("error ");
+                printText(&message);
+                destroyString(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function backtracking(pattern: &[String, R], text: &[String, S]): Unit is
+        print("  Standard.Pcre:  ");
+        let compiled: Either[String, Regex] := compile(getSpan(pattern, 0, length(pattern) - 1), limit);
+        case compiled of
+            when Right(right as re: Regex) do
+                case find(&re, asSpan(text)) of
+                    when Right(right as result: Option[Found]) do
+                        case result of
+                            when Some(value as f: Found) do
+                                print("find ");
+                                print(foundStart(&f));
+                                print(",");
+                                print(foundEnd(&f));
+                                destroyFound(f);
+                            when None do
+                                print("find none");
+                        end case;
+                    when Left(left as message: String) do
+                        print("find failed ");
+                        printText(&message);
+                        destroyString(message);
+                end case;
+                case find_all(&re, asSpan(text)) of
+                    when Right(right as hits: Buffer[Hit]) do
+                        print(" all ");
+                        printLn(bufferLength(&hits));
+                        destroyFree(hits);
+                    when Left(left as message: String) do
+                        print(" all failed ");
+                        printText(&message);
+                        destroyString(message);
+                end case;
+                destroyRegex(re);
+            when Left(left as message: String) do
+                print("error ");
+                printText(&message);
+                destroyString(message);
+        end case;
+        return nil;
+    end;
+
+    function row(name: Span[Nat8, Static], pattern: Span[Nat8, Static], subject: Span[Nat8, Static]): Unit is
+        print("row ");
+        printLn(name);
+        let p: String := decode(pattern);
+        let t: String := decode(subject);
+        linear(&p, &t);
+        backtracking(&p, &t);
+        destroyString(p);
+        destroyString(t);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        -- The order's example: $ before a final newline.
+        row("dollar before a final newline", "a$", "ba%0A");
+        row("backslash Z", "a%5CZ", "ba%0A");
+        -- Code points against bytes.
+        row("dot over a two-byte letter", ".", "%C3%A9");
+        row("empty matches in a two-byte letter", "(?:)", "%C3%A9");
+        row("hex escape above 255", "%5Cx{263a}", "%E2%98%BA");
+        -- Escapes that mean something else.
+        row("backslash v", "%5Cv", "%0A");
+        row("backslash h", "%5Ch", "a b");
+        -- What only PCRE2 has.
+        row("backreference", "(a)%5C1", "aa");
+        row("lookahead", "a(?=b)", "ab");
+        row("branch reset", "(?|(a)|(b))", "b");
+        -- Where they agree.
+        row("same: leftmost-first alternation", "a|ab", "ab");
+        row("same: empty matches in ASCII", "x*", "ab");
+        row("same: backslash pL", "%5CpL", "a");
+        return ExitSuccess();
+    end;
+end module body.

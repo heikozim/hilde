@@ -1,0 +1,446 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Bits (
+    float32Bits,
+    float32FromBits,
+    float64Bits,
+    float64FromBits
+);
+import Standard.SperliError (
+    collectiveMismatch,
+    badCollective
+);
+
+module body Standard.SperliCollective is
+    constant byteMask: Nat64 := 255;
+    constant byteBase: Nat64 := 256;
+    constant signBit32: Nat64 := 2147483648;
+    constant signBit64: Nat64 := 9223372036854775808;
+    constant mask32: Nat64 := 4294967295;
+    constant mask64: Nat64 := 18446744073709551615;
+
+    function collectiveKind(): Nat8 is
+        return 3;
+    end;
+
+    function collectiveHeaderBytes(): Index is
+        return 16;
+    end;
+
+    function maxCollectiveData(): Index is
+        return 16777200;
+    end;
+
+    function collectiveTag(): Nat32 is
+        return 2147483648;
+    end;
+
+    function barrierOperation(): Nat8 is
+        return 1;
+    end;
+
+    function bcastOperation(): Nat8 is
+        return 2;
+    end;
+
+    function reduceOperation(): Nat8 is
+        return 3;
+    end;
+
+    function allreduceOperation(): Nat8 is
+        return 4;
+    end;
+
+    function gatherOperation(): Nat8 is
+        return 5;
+    end;
+
+    function scatterOperation(): Nat8 is
+        return 6;
+    end;
+
+    function bytesType(): Nat8 is
+        return 0;
+    end;
+
+    function int32Type(): Nat8 is
+        return 1;
+    end;
+
+    function int64Type(): Nat8 is
+        return 2;
+    end;
+
+    function uint32Type(): Nat8 is
+        return 3;
+    end;
+
+    function uint64Type(): Nat8 is
+        return 4;
+    end;
+
+    function float32Type(): Nat8 is
+        return 5;
+    end;
+
+    function float64Type(): Nat8 is
+        return 6;
+    end;
+
+    function noReduction(): Nat8 is
+        return 0;
+    end;
+
+    function sumReduction(): Nat8 is
+        return 1;
+    end;
+
+    function minReduction(): Nat8 is
+        return 2;
+    end;
+
+    function maxReduction(): Nat8 is
+        return 3;
+    end;
+
+    function prodReduction(): Nat8 is
+        return 4;
+    end;
+
+    function landReduction(): Nat8 is
+        return 5;
+    end;
+
+    function lorReduction(): Nat8 is
+        return 6;
+    end;
+
+    function lxorReduction(): Nat8 is
+        return 7;
+    end;
+
+    function bandReduction(): Nat8 is
+        return 8;
+    end;
+
+    function borReduction(): Nat8 is
+        return 9;
+    end;
+
+    function bxorReduction(): Nat8 is
+        return 10;
+    end;
+
+    function contributionPhase(): Nat8 is
+        return 0;
+    end;
+
+    function resultPhase(): Nat8 is
+        return 1;
+    end;
+
+    function elementWidth(elementType: Nat8): Index is
+        if elementType = 0 then
+            return 1;
+        end if;
+        if (elementType = 1) or ((elementType = 3) or (elementType = 5)) then
+            return 4;
+        end if;
+        return 8;
+    end;
+
+    function reductionFits(elementType: Nat8, reduction: Nat8): Bool is
+        if (reduction < 1) or (reduction > 10) then
+            return false;
+        end if;
+        if elementType = 0 then
+            return reduction >= 8;
+        end if;
+        if elementType > 6 then
+            return false;
+        end if;
+        if elementType >= 5 then
+            return reduction <= 4;
+        end if;
+        return true;
+    end;
+
+    function wide(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliCollective: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function wide32(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliCollective: a Nat32 did not fit a Nat64");
+        end case;
+    end;
+
+    function wide8(value: Nat8): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliCollective: a Nat8 did not fit a Nat64");
+        end case;
+    end;
+
+    function low32(value: Nat64): Nat32 is
+        case toNat32(bitwiseAnd(value, mask32)) of
+            when Some(value as at: Nat32) do
+                return at;
+            when None do
+                abort("Standard.SperliCollective: a number did not fit a Nat32");
+        end case;
+    end;
+
+    function lowByte(value: Nat64): Nat8 is
+        case toNat8(bitwiseAnd(value, byteMask)) of
+            when Some(value as at: Nat8) do
+                return at;
+            when None do
+                abort("Standard.SperliCollective: a byte did not fit a Nat8");
+        end case;
+    end;
+
+    -- value in width bytes, least significant first.
+    generic [R: Region]
+    function putNumber(out: &![StringBuilder, R], value: Nat64, width: Index): Unit is
+        var rest: Nat64 := value;
+        var i: Index := 0;
+        while i < width do
+            writeByte(&~out, lowByte(rest));
+            rest := rest / byteBase;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- width bytes of bytes from at on, least significant first.  The caller
+    -- has checked that they are there.
+    generic [B: Region]
+    function takeNumber(bytes: Span[Nat8, B], at: Index, width: Index): Nat64 is
+        var value: Nat64 := 0;
+        var i: Index := width;
+        while i > 0 do
+            i := i - 1;
+            value := modularAdd(modularMultiply(value, byteBase), wide8(bytes[at + i]));
+        end while;
+        return value;
+    end;
+
+    generic [D: Region]
+    function collectivePayload(operation: Nat8, elementType: Nat8, reduction: Nat8, phase: Nat8, root: Nat32, sequence: Nat64, data: Span[Nat8, D]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, operation);
+        writeByte(&!out, elementType);
+        writeByte(&!out, reduction);
+        writeByte(&!out, phase);
+        putNumber(&!out, wide32(root), 4);
+        putNumber(&!out, sequence, 8);
+        writeString(&!out, data);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function checkCollective(payload: Span[Nat8, P], operation: Nat8, elementType: Nat8, reduction: Nat8, phase: Nat8, root: Nat32, sequence: Nat64): Int32 is
+        if spanLength(payload) < 16 then
+            return collectiveMismatch();
+        end if;
+        if (payload[0] /= operation) or (payload[1] /= elementType) then
+            return collectiveMismatch();
+        end if;
+        if (payload[2] /= reduction) or (payload[3] /= phase) then
+            return collectiveMismatch();
+        end if;
+        if takeNumber(payload, 4, 4) /= wide32(root) then
+            return collectiveMismatch();
+        end if;
+        if takeNumber(payload, 8, 8) /= sequence then
+            return collectiveMismatch();
+        end if;
+        return 0;
+    end;
+
+    generic [P: Region]
+    function collectiveData(payload: Span[Nat8, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var at: Index := 16;
+        while at < spanLength(payload) do
+            writeByte(&!out, payload[at]);
+            at := at + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    ---
+    --- Reduction
+    ---
+
+    function truth(value: Nat64): Bool is
+        return value /= 0;
+    end;
+
+    function flag(value: Bool): Nat64 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    -- The two operands as unsigned numbers in a way that keeps the order of
+    -- the type: a signed number has its sign bit flipped.
+    function orderKey(elementType: Nat8, value: Nat64): Nat64 is
+        if elementType = 1 then
+            return bitwiseXor(value, signBit32);
+        end if;
+        if elementType = 2 then
+            return bitwiseXor(value, signBit64);
+        end if;
+        return value;
+    end;
+
+    -- One pair of elements of a type that is no float, as bit patterns of
+    -- the width of the type; the result is a pattern of that width.
+    function wholeElement(elementType: Nat8, reduction: Nat8, x: Nat64, y: Nat64, mask: Nat64): Nat64 is
+        if reduction = 1 then
+            return bitwiseAnd(modularAdd(x, y), mask);
+        end if;
+        if reduction = 4 then
+            return bitwiseAnd(modularMultiply(x, y), mask);
+        end if;
+        if reduction = 2 then
+            if orderKey(elementType, y) < orderKey(elementType, x) then
+                return y;
+            end if;
+            return x;
+        end if;
+        if reduction = 3 then
+            if orderKey(elementType, y) > orderKey(elementType, x) then
+                return y;
+            end if;
+            return x;
+        end if;
+        if reduction = 5 then
+            return flag(truth(x) and truth(y));
+        end if;
+        if reduction = 6 then
+            return flag(truth(x) or truth(y));
+        end if;
+        if reduction = 7 then
+            return flag(truth(x) /= truth(y));
+        end if;
+        if reduction = 8 then
+            return bitwiseAnd(x, y);
+        end if;
+        if reduction = 9 then
+            return bitwiseOr(x, y);
+        end if;
+        return bitwiseXor(x, y);
+    end;
+
+    function float64Element(reduction: Nat8, x: Nat64, y: Nat64): Nat64 is
+        let a: Float64 := float64FromBits(x);
+        let b: Float64 := float64FromBits(y);
+        if reduction = 1 then
+            return float64Bits(a + b);
+        end if;
+        if reduction = 4 then
+            return float64Bits(a * b);
+        end if;
+        if reduction = 2 then
+            if b < a then
+                return y;
+            end if;
+            return x;
+        end if;
+        if b > a then
+            return y;
+        end if;
+        return x;
+    end;
+
+    function float32Element(reduction: Nat8, x: Nat64, y: Nat64): Nat64 is
+        let a: Float32 := float32FromBits(low32(x));
+        let b: Float32 := float32FromBits(low32(y));
+        if reduction = 1 then
+            return wide32(float32Bits(a + b));
+        end if;
+        if reduction = 4 then
+            return wide32(float32Bits(a * b));
+        end if;
+        if reduction = 2 then
+            if b < a then
+                return y;
+            end if;
+            return x;
+        end if;
+        if b > a then
+            return y;
+        end if;
+        return x;
+    end;
+
+    function element(elementType: Nat8, reduction: Nat8, x: Nat64, y: Nat64): Nat64 is
+        if elementType = 6 then
+            return float64Element(reduction, x, y);
+        end if;
+        if elementType = 5 then
+            return float32Element(reduction, x, y);
+        end if;
+        if (elementType = 1) or (elementType = 3) then
+            return wholeElement(elementType, reduction, x, y, mask32);
+        end if;
+        if elementType = 0 then
+            return wholeElement(elementType, reduction, x, y, byteMask);
+        end if;
+        return wholeElement(elementType, reduction, x, y, mask64);
+    end;
+
+    generic [A: Region, B: Region]
+    function combine(elementType: Nat8, reduction: Nat8, first: Span[Nat8, A], second: Span[Nat8, B]): Either[Int32, String] is
+        if not reductionFits(elementType, reduction) then
+            let refused: Either[Int32, String] := Left(left => badCollective());
+            return refused;
+        end if;
+        let width: Index := elementWidth(elementType);
+        let total: Index := spanLength(first);
+        if (spanLength(second) /= total) or (((total / width) * width) /= total) then
+            let refused: Either[Int32, String] := Left(left => badCollective());
+            return refused;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        var at: Index := 0;
+        while at < total do
+            let x: Nat64 := takeNumber(first, at, width);
+            let y: Nat64 := takeNumber(second, at, width);
+            putNumber(&!out, element(elementType, reduction, x, y), width);
+            at := at + width;
+        end while;
+        let done: Either[Int32, String] := Right(right => finalize(out));
+        return done;
+    end;
+end module body.

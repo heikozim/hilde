@@ -1,0 +1,372 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: Bindings.Pcre compiles a pattern and runs one search;
+-- every search here is built on that one.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length as bufferLength,
+    nth,
+    insertBack
+);
+import Standard.String (
+    String,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Bindings.Pcre (
+    libraryVersion as bindLibraryVersion,
+    Code,
+    noSlot,
+    compileCode,
+    destroyCode,
+    codeGroups,
+    search as searchCode,
+    Searcher,
+    openSearcher,
+    closeSearcher,
+    searchWith,
+    errorText
+);
+
+module body Standard.Pcre is
+    -- An unset group, and no byte offset in a message.
+    constant none: Index := noSlot;
+    constant zero: Index := 0;
+
+    record Regex: Linear is
+        code: Code;
+        groups: Index;
+    end;
+
+    record Found: Linear is
+        slots: Buffer[Index];
+    end;
+
+    generic [B: Region]
+    function writeText(out: &![StringBuilder, B], text: Span[Nat8, Static]): Unit is
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        while i < size do
+            writeByte(&~out, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Compile
+    ---
+
+    generic [R: Region]
+    function compile(pattern: Span[Nat8, R], matchLimit: Nat32): Either[String, Regex] is
+        if matchLimit = 0 then
+            var out: StringBuilder := makeStringBuilder();
+            writeText(&!out, "Standard.Pcre: the match limit must be at least 1");
+            let left: Either[String, Regex] := Left(left => finalize(out));
+            return left;
+        end if;
+        case compileCode(pattern, matchLimit) of
+            when Left(left as message: String) do
+                let failed: Either[String, Regex] := Left(left => message);
+                return failed;
+            when Right(right as code: Code) do
+                let made: Either[String, Regex] := Right(right => fromCode(code));
+                return made;
+        end case;
+    end;
+
+    function fromCode(code: Code): Regex is
+        let groups: Index := codeGroups(&code);
+        return Regex(code => code, groups => groups);
+    end;
+
+    function destroyRegex(regex: Regex): Unit is
+        let { code: Code, groups: Index } := regex;
+        destroyCode(code);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function groupCount(regex: &[Regex, R]): Index is
+        return regex->groups;
+    end;
+
+    ---
+    --- Search
+    ---
+
+    -- One search from byte start, through the binding.
+    generic [R: Region, S: Region]
+    function search(regex: &[Regex, R], text: Span[Nat8, S], start: Index): Either[Int32, Option[Buffer[Index]]] is
+        return searchCode(&(regex->code), text, start);
+    end;
+
+    generic [R: Region, S: Region]
+    function match(regex: &[Regex, R], text: Span[Nat8, S]): Either[String, Bool] is
+        case search(regex, text, zero) of
+            when Right(right as result: Option[Buffer[Index]]) do
+                case result of
+                    when Some(value as slots: Buffer[Index]) do
+                        destroyFree(slots);
+                        let yes: Either[String, Bool] := Right(right => true);
+                        return yes;
+                    when None do
+                        let no: Either[String, Bool] := Right(right => false);
+                        return no;
+                end case;
+            when Left(left as code: Int32) do
+                let failed: Either[String, Bool] := Left(left => errorText(code, none));
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function find(regex: &[Regex, R], text: Span[Nat8, S]): Either[String, Option[Found]] is
+        case search(regex, text, zero) of
+            when Right(right as result: Option[Buffer[Index]]) do
+                case result of
+                    when Some(value as slots: Buffer[Index]) do
+                        let found: Either[String, Option[Found]] := Right(right => Some(value => Found(slots => slots)));
+                        return found;
+                    when None do
+                        let absent: Option[Found] := None();
+                        let nothing: Either[String, Option[Found]] := Right(right => absent);
+                        return nothing;
+                end case;
+            when Left(left as code: Int32) do
+                let failed: Either[String, Option[Found]] := Left(left => errorText(code, none));
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region]
+    function foundStart(found: &[Found, R]): Index is
+        return nth(&(found->slots), 0);
+    end;
+
+    generic [R: Region]
+    function foundEnd(found: &[Found, R]): Index is
+        return nth(&(found->slots), 1);
+    end;
+
+    generic [R: Region]
+    function slotOf(found: &[Found, R], slot: Index): Option[Index] is
+        if slot >= bufferLength(&(found->slots)) then
+            let nothing: Option[Index] := None();
+            return nothing;
+        end if;
+        let v: Index := nth(&(found->slots), slot);
+        if v = none then
+            let nothing: Option[Index] := None();
+            return nothing;
+        end if;
+        let some: Option[Index] := Some(value => v);
+        return some;
+    end;
+
+    -- Whether the match has a group of this number.  Asked before the
+    -- number is doubled into a slot, so that no number can overflow there.
+    generic [R: Region]
+    function hasGroup(found: &[Found, R], group: Index): Bool is
+        return group < (bufferLength(&(found->slots)) / 2);
+    end;
+
+    generic [R: Region]
+    function groupStart(found: &[Found, R], group: Index): Option[Index] is
+        if not hasGroup(found, group) then
+            let nothing: Option[Index] := None();
+            return nothing;
+        end if;
+        return slotOf(found, group * 2);
+    end;
+
+    generic [R: Region]
+    function groupEnd(found: &[Found, R], group: Index): Option[Index] is
+        if not hasGroup(found, group) then
+            let nothing: Option[Index] := None();
+            return nothing;
+        end if;
+        return slotOf(found, (group * 2) + 1);
+    end;
+
+    function destroyFound(found: Found): Unit is
+        let { slots: Buffer[Index] } := found;
+        destroyFree(slots);
+        return nil;
+    end;
+
+    ---
+    --- Every match
+    ---
+
+    -- The matches of find_all, each with all its slots, in one flat buffer:
+    -- (groups + 1) * 2 entries per match.
+    generic [R: Region, S: Region]
+    function allMatches(regex: &[Regex, R], text: Span[Nat8, S]): Either[String, Buffer[Index]] is
+        let size: Index := spanLength(text);
+        let perMatch: Index := (regex->groups + 1) * 2;
+        var all: Buffer[Index] := allocateEmpty();
+        var pos: Index := 0;
+        var previousEnd: Index := none;
+        var failed: Bool := false;
+        var failure: Int32 := 0;
+        var going: Bool := true;
+        var searcher: Searcher := openSearcher(&(regex->code));
+        while going and (pos <= size) do
+            case searchWith(&!searcher, &(regex->code), text, pos) of
+                when Right(right as result: Option[Buffer[Index]]) do
+                    case result of
+                        when Some(value as slots: Buffer[Index]) do
+                            let start: Index := nth(&slots, 0);
+                            let stop: Index := nth(&slots, 1);
+                            if (start = stop) and (start = previousEnd) then
+                                pos := start + 1;
+                            else
+                                var i: Index := 0;
+                                while i < perMatch do
+                                    insertBack(&!all, nth(&slots, i));
+                                    i := i + 1;
+                                end while;
+                                previousEnd := stop;
+                                if stop > start then
+                                    pos := stop;
+                                else
+                                    pos := start + 1;
+                                end if;
+                            end if;
+                            destroyFree(slots);
+                        when None do
+                            going := false;
+                    end case;
+                when Left(left as code: Int32) do
+                    failed := true;
+                    failure := code;
+                    going := false;
+            end case;
+        end while;
+        closeSearcher(searcher);
+        if failed then
+            destroyFree(all);
+            let left: Either[String, Buffer[Index]] := Left(left => errorText(failure, none));
+            return left;
+        else
+            let right: Either[String, Buffer[Index]] := Right(right => all);
+            return right;
+        end if;
+    end;
+
+    generic [R: Region, S: Region]
+    function find_all(regex: &[Regex, R], text: Span[Nat8, S]): Either[String, Buffer[Hit]] is
+        let perMatch: Index := (regex->groups + 1) * 2;
+        case allMatches(regex, text) of
+            when Right(right as all: Buffer[Index]) do
+                var hits: Buffer[Hit] := allocateEmpty();
+                var i: Index := 0;
+                while i < bufferLength(&all) do
+                    insertBack(&!hits, Hit(start => nth(&all, i), stop => nth(&all, i + 1)));
+                    i := i + perMatch;
+                end while;
+                destroyFree(all);
+                let found: Either[String, Buffer[Hit]] := Right(right => hits);
+                return found;
+            when Left(left as message: String) do
+                let failed: Either[String, Buffer[Hit]] := Left(left => message);
+                return failed;
+        end case;
+    end;
+
+    generic [B: Region, S: Region]
+    function copyBytes(out: &![StringBuilder, B], text: Span[Nat8, S], origin: Index, limit: Index): Unit is
+        var i: Index := origin;
+        while i < limit do
+            writeByte(&~out, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The rewrite of RE2: a backslash and a digit is that group, two
+    -- backslashes are one, any other backslash stands as it is.  The slots
+    -- of one match start at base in all.
+    generic [B: Region, S: Region, T: Region, U: Region]
+    function expand(out: &![StringBuilder, B], text: Span[Nat8, S], rewrite: Span[Nat8, T],
+        all: &[Buffer[Index], U], base: Index, perMatch: Index): Unit is
+        let size: Index := spanLength(rewrite);
+        var i: Index := 0;
+        while i < size do
+            let c: Nat8 := rewrite[i];
+            if (c = '\\') and ((i + 1) < size) then
+                let d: Nat8 := rewrite[i + 1];
+                if (d >= '0') and (d <= '9') then
+                    case toIndex(d - '0') of
+                        when Some(value as group: Index) do
+                            let slot: Index := group * 2;
+                            if (slot + 1) < perMatch then
+                                let origin: Index := nth(all, base + slot);
+                                let limit: Index := nth(all, (base + slot) + 1);
+                                if (origin /= none) and (limit /= none) then
+                                    copyBytes(&~out, text, origin, limit);
+                                end if;
+                            end if;
+                        when None do
+                            abort("Standard.Pcre: group digit");
+                    end case;
+                    i := i + 2;
+                else if d = '\\' then
+                    writeByte(&~out, '\\');
+                    i := i + 2;
+                else
+                    writeByte(&~out, c);
+                    i := i + 1;
+                end if;
+            else
+                writeByte(&~out, c);
+                i := i + 1;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function replace(regex: &[Regex, R], text: Span[Nat8, S], rewrite: Span[Nat8, T]): Either[String, String] is
+        let perMatch: Index := (regex->groups + 1) * 2;
+        case allMatches(regex, text) of
+            when Right(right as all: Buffer[Index]) do
+                var out: StringBuilder := makeStringBuilder();
+                var copied: Index := 0;
+                var base: Index := 0;
+                while base < bufferLength(&all) do
+                    let start: Index := nth(&all, base);
+                    copyBytes(&!out, text, copied, start);
+                    expand(&!out, text, rewrite, &all, base, perMatch);
+                    copied := nth(&all, base + 1);
+                    base := base + perMatch;
+                end while;
+                copyBytes(&!out, text, copied, spanLength(text));
+                destroyFree(all);
+                let done: Either[String, String] := Right(right => finalize(out));
+                return done;
+            when Left(left as message: String) do
+                let failed: Either[String, String] := Left(left => message);
+                return failed;
+        end case;
+    end;
+
+    function libraryVersion(): String is
+        return bindLibraryVersion();
+    end;
+end module body.

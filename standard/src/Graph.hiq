@@ -1,0 +1,1392 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The nodes are kept in two buffers side by side, the values and a free
+-- record per slot: its generation, whether a node is in it, and the ends
+-- of two doubly linked lists, the edges that leave the node and the edges
+-- that enter it.  The edges are kept the same way; an edge record holds
+-- its two nodes and its neighbours in both lists.  A link is a slot plus
+-- one, so that zero can mean no edge.  Freed slots wait on a stack.  Each
+-- graph draws a serial from a count shared by the process, and every
+-- number it gives out carries that serial.  There are no pointers.
+
+import Bindings.Serial (
+    nextSerial
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    destroyEmpty as destroyEmptyBuffer,
+    destroyFree as destroyFreeBuffer,
+    length,
+    nth,
+    nthRef,
+    storeNth,
+    swapNth,
+    swapIndex,
+    insertBack,
+    removeLast,
+    reverse
+);
+import Standard.Order (
+    Ordering,
+    LessThan,
+    Equal,
+    GreaterThan,
+    TotalOrder
+);
+
+module body Standard.Graph is
+    -- A number names its graph, a slot and the generation of that slot, so
+    -- a number of a removed node or edge, or of another graph, matches none.
+    record NodeId: Free is
+        graph: Nat64;
+        slot: Index;
+        generation: Nat32;
+    end;
+
+    record EdgeId: Free is
+        graph: Nat64;
+        slot: Index;
+        generation: Nat32;
+    end;
+
+    -- Everything about a node slot but its value.
+    record NodeSlot: Free is
+        generation: Nat32;
+        used: Bool;
+        firstOut: Index;
+        lastOut: Index;
+        firstIn: Index;
+        lastIn: Index;
+    end;
+
+    -- Everything about an edge slot but its value: its two nodes, by slot,
+    -- and its neighbours in the list of the source and in that of the
+    -- target.
+    record EdgeSlot: Free is
+        generation: Nat32;
+        used: Bool;
+        source: Index;
+        target: Index;
+        prevOut: Index;
+        nextOut: Index;
+        prevIn: Index;
+        nextIn: Index;
+    end;
+
+    -- serial is the graph's own number, which no other graph of the process
+    -- has; lastGeneration is the generation at which a slot retires.
+    record Graph[N: Type, E: Type]: Linear is
+        serial: Nat64;
+        lastGeneration: Nat32;
+        nodeSlots: Buffer[NodeSlot];
+        nodeValues: Buffer[Option[N]];
+        freeNodes: Buffer[Index];
+        liveNodes: Index;
+        edgeSlots: Buffer[EdgeSlot];
+        edgeValues: Buffer[Option[E]];
+        freeEdges: Buffer[Index];
+        liveEdges: Index;
+        invariant length(&nodeSlots) = length(&nodeValues);
+        invariant length(&edgeSlots) = length(&edgeValues);
+        invariant liveNodes <= length(&nodeSlots);
+        invariant liveEdges <= length(&edgeSlots);
+    end;
+
+    """
+    The link that names no edge.  Any other link is an edge slot plus one.
+    """
+    constant noLink: Index := 0;
+
+    ---
+    --- Ordering numbers
+    ---
+
+    instance TotalOrder(NodeId) is
+        generic [R: Region, S: Region]
+        method compare(a: &[NodeId, R], b: &[NodeId, S]): Ordering is
+            return compareNumbers(a->slot, a->generation, a->graph, b->slot, b->generation, b->graph);
+        end;
+    end;
+
+    instance TotalOrder(EdgeId) is
+        generic [R: Region, S: Region]
+        method compare(a: &[EdgeId, R], b: &[EdgeId, S]): Ordering is
+            return compareNumbers(a->slot, a->generation, a->graph, b->slot, b->generation, b->graph);
+        end;
+    end;
+
+    function compareNumbers(slotA: Index, generationA: Nat32, graphA: Nat64, slotB: Index, generationB: Nat32, graphB: Nat64): Ordering is
+        if slotA < slotB then
+            return LessThan();
+        end if;
+        if slotA > slotB then
+            return GreaterThan();
+        end if;
+        if generationA < generationB then
+            return LessThan();
+        end if;
+        if generationA > generationB then
+            return GreaterThan();
+        end if;
+        if graphA < graphB then
+            return LessThan();
+        end if;
+        if graphA > graphB then
+            return GreaterThan();
+        end if;
+        return Equal();
+    end;
+
+    ---
+    --- Weights
+    ---
+
+    instance Weight(Nat8) is
+        generic [R: Region]
+        method weightOf(edge: &[Nat8, R]): Nat64 is
+            return widen(toNat64(!edge));
+        end;
+    end;
+
+    instance Weight(Nat16) is
+        generic [R: Region]
+        method weightOf(edge: &[Nat16, R]): Nat64 is
+            return widen(toNat64(!edge));
+        end;
+    end;
+
+    instance Weight(Nat32) is
+        generic [R: Region]
+        method weightOf(edge: &[Nat32, R]): Nat64 is
+            return widen(toNat64(!edge));
+        end;
+    end;
+
+    instance Weight(Nat64) is
+        generic [R: Region]
+        method weightOf(edge: &[Nat64, R]): Nat64 is
+            return !edge;
+        end;
+    end;
+
+    -- A narrower unsigned number always fits a Nat64.
+    function widen(value: Option[Nat64]): Nat64 is
+        case value of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                abort("Standard.Graph: an unsigned weight did not fit a Nat64");
+        end case;
+    end;
+
+    ---
+    --- Lifecycle
+    ---
+
+    generic [N: Type, E: Type]
+    function makeGraph(): Graph[N, E] is
+        return makeGraphRetiringAt(maximum_nat32);
+    end;
+
+    -- A serial of 0 means that the count of the process wrapped round, and
+    -- a graph made with it could share its serial with an earlier one.
+    generic [N: Type, E: Type]
+    function makeGraphRetiringAt(lastGeneration: Nat32): Graph[N, E] is
+        let serial: Nat64 := nextSerial();
+        if serial = 0 then
+            abort("Standard.Graph: the process has used up the numbers of its graphs");
+        end if;
+        let nodeSlots: Buffer[NodeSlot] := allocateEmpty();
+        let nodeValues: Buffer[Option[N]] := allocateEmpty();
+        let freeNodes: Buffer[Index] := allocateEmpty();
+        let edgeSlots: Buffer[EdgeSlot] := allocateEmpty();
+        let edgeValues: Buffer[Option[E]] := allocateEmpty();
+        let freeEdges: Buffer[Index] := allocateEmpty();
+        return Graph(
+            serial => serial,
+            lastGeneration => lastGeneration,
+            nodeSlots => nodeSlots,
+            nodeValues => nodeValues,
+            freeNodes => freeNodes,
+            liveNodes => 0,
+            edgeSlots => edgeSlots,
+            edgeValues => edgeValues,
+            freeEdges => freeEdges,
+            liveEdges => 0
+        );
+    end;
+
+    generic [N: Type, E: Type]
+    function destroyEmpty(graph: Graph[N, E]): Unit is
+        let {
+            serial: Nat64,
+            lastGeneration: Nat32,
+            nodeSlots: Buffer[NodeSlot],
+            nodeValues: Buffer[Option[N]],
+            freeNodes: Buffer[Index],
+            liveNodes: Index,
+            edgeSlots: Buffer[EdgeSlot],
+            edgeValues: Buffer[Option[E]],
+            freeEdges: Buffer[Index],
+            liveEdges: Index
+        } := graph;
+        destroyFreeBuffer(nodeSlots);
+        destroyNoneValues(nodeValues);
+        destroyFreeBuffer(freeNodes);
+        destroyFreeBuffer(edgeSlots);
+        destroyNoneValues(edgeValues);
+        destroyFreeBuffer(freeEdges);
+        return nil;
+    end;
+
+    generic [N: Free, E: Free]
+    function destroyFree(graph: Graph[N, E]): Unit is
+        let {
+            serial: Nat64,
+            lastGeneration: Nat32,
+            nodeSlots: Buffer[NodeSlot],
+            nodeValues: Buffer[Option[N]],
+            freeNodes: Buffer[Index],
+            liveNodes: Index,
+            edgeSlots: Buffer[EdgeSlot],
+            edgeValues: Buffer[Option[E]],
+            freeEdges: Buffer[Index],
+            liveEdges: Index
+        } := graph;
+        destroyFreeBuffer(nodeSlots);
+        destroyFreeBuffer(nodeValues);
+        destroyFreeBuffer(freeNodes);
+        destroyFreeBuffer(edgeSlots);
+        destroyFreeBuffer(edgeValues);
+        destroyFreeBuffer(freeEdges);
+        return nil;
+    end;
+
+    -- A buffer of values of free slots, each None, emptied and destroyed.
+    generic [T: Type]
+    function destroyNoneValues(values: Buffer[Option[T]]): Unit is
+        var rest: Buffer[Option[T]] := values;
+        while length(&rest) > 0 do
+            expectNone(removeLast(&!rest));
+        end while;
+        destroyEmptyBuffer(rest);
+        return nil;
+    end;
+
+    -- A free slot holds None.  A value here would mean that the records of
+    -- the graph are broken, and the programme stops.  The lines after abort
+    -- never run; they hand the value to a buffer destroyed while it holds
+    -- it, because the linearity check asks that a linear value be used on
+    -- every path, also on one that does not return.
+    generic [T: Type]
+    function expectNone(old: Option[T]): Unit is
+        case old of
+            when None do
+                skip;
+            when Some(value as stray: T) do
+                abort("Standard.Graph: a free slot held a value");
+                var trap: Buffer[T] := allocateEmpty();
+                insertBack(&!trap, stray);
+                destroyEmptyBuffer(trap);
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Numbers
+    ---
+
+    function nodeSlot(node: NodeId): Index is
+        return node.slot;
+    end;
+
+    function nodeGeneration(node: NodeId): Nat32 is
+        return node.generation;
+    end;
+
+    function edgeSlot(edge: EdgeId): Index is
+        return edge.slot;
+    end;
+
+    function edgeGeneration(edge: EdgeId): Nat32 is
+        return edge.generation;
+    end;
+
+    ---
+    --- The parts of a graph
+    ---
+
+    -- Each buffer through the kind of reference the graph is held by.  A
+    -- caller with a write reference that only reads passes a read borrow
+    -- of it; one that writes passes a reborrow.
+
+    generic [N: Type, E: Type, R: Region]
+    function nodeSlotsOf(graph: &[Graph[N, E], R]): &[Buffer[NodeSlot], R] is
+        return &(graph->nodeSlots);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edgeSlotsOf(graph: &[Graph[N, E], R]): &[Buffer[EdgeSlot], R] is
+        return &(graph->edgeSlots);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function freeNodesOf(graph: &[Graph[N, E], R]): &[Buffer[Index], R] is
+        return &(graph->freeNodes);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function freeEdgesOf(graph: &[Graph[N, E], R]): &[Buffer[Index], R] is
+        return &(graph->freeEdges);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function nodeSlotsMut(graph: &![Graph[N, E], R]): &![Buffer[NodeSlot], R] is
+        return &!(graph->nodeSlots);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function nodeValuesMut(graph: &![Graph[N, E], R]): &![Buffer[Option[N]], R] is
+        return &!(graph->nodeValues);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function freeNodesMut(graph: &![Graph[N, E], R]): &![Buffer[Index], R] is
+        return &!(graph->freeNodes);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edgeSlotsMut(graph: &![Graph[N, E], R]): &![Buffer[EdgeSlot], R] is
+        return &!(graph->edgeSlots);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edgeValuesMut(graph: &![Graph[N, E], R]): &![Buffer[Option[E]], R] is
+        return &!(graph->edgeValues);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function freeEdgesMut(graph: &![Graph[N, E], R]): &![Buffer[Index], R] is
+        return &!(graph->freeEdges);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function nodeSlotAt(graph: &[Graph[N, E], R], slot: Index): NodeSlot is
+        return nth(nodeSlotsOf(graph), slot);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edgeSlotAt(graph: &[Graph[N, E], R], slot: Index): EdgeSlot is
+        return nth(edgeSlotsOf(graph), slot);
+    end;
+
+    -- Whether a number names a node in use: this graph gave it out, its
+    -- slot exists, holds a node, and has not been freed since.
+    generic [N: Type, E: Type, R: Region]
+    function nodeUsed(graph: &[Graph[N, E], R], node: NodeId): Bool is
+        if node.graph /= graph->serial then
+            return false;
+        end if;
+        if node.slot >= length(nodeSlotsOf(graph)) then
+            return false;
+        end if;
+        let s: NodeSlot := nodeSlotAt(graph, node.slot);
+        return s.used and (s.generation = node.generation);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edgeUsed(graph: &[Graph[N, E], R], edge: EdgeId): Bool is
+        if edge.graph /= graph->serial then
+            return false;
+        end if;
+        if edge.slot >= length(edgeSlotsOf(graph)) then
+            return false;
+        end if;
+        let s: EdgeSlot := edgeSlotAt(graph, edge.slot);
+        return s.used and (s.generation = edge.generation);
+    end;
+
+    -- The number of the node in a slot that holds one.
+    generic [N: Type, E: Type, R: Region]
+    function nodeIn(graph: &[Graph[N, E], R], slot: Index): NodeId is
+        let s: NodeSlot := nodeSlotAt(graph, slot);
+        return NodeId(graph => graph->serial, slot => slot, generation => s.generation);
+    end;
+
+    -- The number of the edge in a slot that holds one.
+    generic [N: Type, E: Type, R: Region]
+    function edgeIn(graph: &[Graph[N, E], R], slot: Index): EdgeId is
+        let s: EdgeSlot := edgeSlotAt(graph, slot);
+        return EdgeId(graph => graph->serial, slot => slot, generation => s.generation);
+    end;
+
+    function openNode(generation: Nat32): NodeSlot is
+        return NodeSlot(
+            generation => generation,
+            used => true,
+            firstOut => noLink,
+            lastOut => noLink,
+            firstIn => noLink,
+            lastIn => noLink
+        );
+    end;
+
+    function closedNode(generation: Nat32): NodeSlot is
+        return NodeSlot(
+            generation => generation,
+            used => false,
+            firstOut => noLink,
+            lastOut => noLink,
+            firstIn => noLink,
+            lastIn => noLink
+        );
+    end;
+
+    function openEdge(generation: Nat32, source: Index, target: Index, prevOut: Index, prevIn: Index): EdgeSlot is
+        return EdgeSlot(
+            generation => generation,
+            used => true,
+            source => source,
+            target => target,
+            prevOut => prevOut,
+            nextOut => noLink,
+            prevIn => prevIn,
+            nextIn => noLink
+        );
+    end;
+
+    function closedEdge(generation: Nat32): EdgeSlot is
+        return EdgeSlot(
+            generation => generation,
+            used => false,
+            source => 0,
+            target => 0,
+            prevOut => noLink,
+            nextOut => noLink,
+            prevIn => noLink,
+            nextIn => noLink
+        );
+    end;
+
+    -- The links of the lists, one field at a time.  Each reads the record
+    -- afresh, so that two changes to the same slot do not undo each other.
+
+    generic [N: Type, E: Type, R: Region]
+    function setFirstOut(graph: &![Graph[N, E], R], slot: Index, link: Index): Unit is
+        var s: NodeSlot := nodeSlotAt(&graph, slot);
+        s.firstOut := link;
+        storeNth(nodeSlotsMut(graph), slot, s);
+        return nil;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function setLastOut(graph: &![Graph[N, E], R], slot: Index, link: Index): Unit is
+        var s: NodeSlot := nodeSlotAt(&graph, slot);
+        s.lastOut := link;
+        storeNth(nodeSlotsMut(graph), slot, s);
+        return nil;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function setFirstIn(graph: &![Graph[N, E], R], slot: Index, link: Index): Unit is
+        var s: NodeSlot := nodeSlotAt(&graph, slot);
+        s.firstIn := link;
+        storeNth(nodeSlotsMut(graph), slot, s);
+        return nil;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function setLastIn(graph: &![Graph[N, E], R], slot: Index, link: Index): Unit is
+        var s: NodeSlot := nodeSlotAt(&graph, slot);
+        s.lastIn := link;
+        storeNth(nodeSlotsMut(graph), slot, s);
+        return nil;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function setPrevOut(graph: &![Graph[N, E], R], slot: Index, link: Index): Unit is
+        var s: EdgeSlot := edgeSlotAt(&graph, slot);
+        s.prevOut := link;
+        storeNth(edgeSlotsMut(graph), slot, s);
+        return nil;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function setNextOut(graph: &![Graph[N, E], R], slot: Index, link: Index): Unit is
+        var s: EdgeSlot := edgeSlotAt(&graph, slot);
+        s.nextOut := link;
+        storeNth(edgeSlotsMut(graph), slot, s);
+        return nil;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function setPrevIn(graph: &![Graph[N, E], R], slot: Index, link: Index): Unit is
+        var s: EdgeSlot := edgeSlotAt(&graph, slot);
+        s.prevIn := link;
+        storeNth(edgeSlotsMut(graph), slot, s);
+        return nil;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function setNextIn(graph: &![Graph[N, E], R], slot: Index, link: Index): Unit is
+        var s: EdgeSlot := edgeSlotAt(&graph, slot);
+        s.nextIn := link;
+        storeNth(edgeSlotsMut(graph), slot, s);
+        return nil;
+    end;
+
+    -- Free a slot.  Its generation counts up, so that no number given out
+    -- for it matches again.  A slot whose generation has reached the last
+    -- one of the graph is not put on the stack and stays unused, so that an
+    -- old number can never come to name a new node.  The last generation
+    -- is never above the largest Nat32, so the count cannot overflow.
+
+    generic [N: Type, E: Type, R: Region]
+    function releaseNode(graph: &![Graph[N, E], R], slot: Index): Unit is
+        let old: NodeSlot := nodeSlotAt(&graph, slot);
+        if old.generation >= graph->lastGeneration then
+            storeNth(nodeSlotsMut(&~graph), slot, closedNode(old.generation));
+        else
+            storeNth(nodeSlotsMut(&~graph), slot, closedNode(old.generation + 1));
+            insertBack(freeNodesMut(&~graph), slot);
+        end if;
+        graph->liveNodes := graph->liveNodes - 1;
+        return nil;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function releaseEdge(graph: &![Graph[N, E], R], slot: Index): Unit is
+        let old: EdgeSlot := edgeSlotAt(&graph, slot);
+        if old.generation >= graph->lastGeneration then
+            storeNth(edgeSlotsMut(&~graph), slot, closedEdge(old.generation));
+        else
+            storeNth(edgeSlotsMut(&~graph), slot, closedEdge(old.generation + 1));
+            insertBack(freeEdgesMut(&~graph), slot);
+        end if;
+        graph->liveEdges := graph->liveEdges - 1;
+        return nil;
+    end;
+
+    ---
+    --- Asking
+    ---
+
+    generic [N: Type, E: Type, R: Region]
+    function nodeCount(graph: &[Graph[N, E], R]): Index is
+        return graph->liveNodes;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edgeCount(graph: &[Graph[N, E], R]): Index is
+        return graph->liveEdges;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function containsNode(graph: &[Graph[N, E], R], node: NodeId): Bool is
+        return nodeUsed(graph, node);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function containsEdge(graph: &[Graph[N, E], R], edge: EdgeId): Bool is
+        return edgeUsed(graph, edge);
+    end;
+
+    generic [N: Free, E: Type, R: Region]
+    function nodeValue(graph: &[Graph[N, E], R], node: NodeId): Option[N] is
+        if nodeUsed(graph, node) then
+            return nth(&(graph->nodeValues), node.slot);
+        else
+            return None();
+        end if;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function nodeRef(graph: &[Graph[N, E], R], node: NodeId): Option[&[N, R]] is
+        if nodeUsed(graph, node) then
+            case nthRef(&(graph->nodeValues), node.slot) of
+                when Some(value as found: &[N, R]) do
+                    return Some(value => found);
+                when None do
+                    return None();
+            end case;
+        else
+            return None();
+        end if;
+    end;
+
+    generic [N: Type, E: Free, R: Region]
+    function edgeValue(graph: &[Graph[N, E], R], edge: EdgeId): Option[E] is
+        if edgeUsed(graph, edge) then
+            return nth(&(graph->edgeValues), edge.slot);
+        else
+            return None();
+        end if;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edgeRef(graph: &[Graph[N, E], R], edge: EdgeId): Option[&[E, R]] is
+        if edgeUsed(graph, edge) then
+            case nthRef(&(graph->edgeValues), edge.slot) of
+                when Some(value as found: &[E, R]) do
+                    return Some(value => found);
+                when None do
+                    return None();
+            end case;
+        else
+            return None();
+        end if;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edgeSource(graph: &[Graph[N, E], R], edge: EdgeId): Option[NodeId] is
+        if edgeUsed(graph, edge) then
+            let s: EdgeSlot := edgeSlotAt(graph, edge.slot);
+            return Some(value => nodeIn(graph, s.source));
+        else
+            return None();
+        end if;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edgeTarget(graph: &[Graph[N, E], R], edge: EdgeId): Option[NodeId] is
+        if edgeUsed(graph, edge) then
+            let s: EdgeSlot := edgeSlotAt(graph, edge.slot);
+            return Some(value => nodeIn(graph, s.target));
+        else
+            return None();
+        end if;
+    end;
+
+    ---
+    --- Changing
+    ---
+
+    generic [N: Type, E: Type, R: Region]
+    function addNode(graph: &![Graph[N, E], R], value: N): NodeId is
+        let waiting: Index := length(freeNodesOf(&graph));
+        if waiting > 0 then
+            let slot: Index := removeLast(freeNodesMut(&~graph));
+            let old: NodeSlot := nodeSlotAt(&graph, slot);
+            storeNth(nodeSlotsMut(&~graph), slot, openNode(old.generation));
+            expectNone(swapNth(nodeValuesMut(&~graph), slot, Some(value => value)));
+            graph->liveNodes := graph->liveNodes + 1;
+            return NodeId(graph => graph->serial, slot => slot, generation => old.generation);
+        else
+            let slot: Index := length(nodeSlotsOf(&graph));
+            insertBack(nodeSlotsMut(&~graph), openNode(0));
+            insertBack(nodeValuesMut(&~graph), Some(value => value));
+            graph->liveNodes := graph->liveNodes + 1;
+            return NodeId(graph => graph->serial, slot => slot, generation => 0);
+        end if;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function addEdge(graph: &![Graph[N, E], R], source: NodeId, target: NodeId, value: E): Either[E, EdgeId] is
+        let sourceUsed: Bool := nodeUsed(&graph, source);
+        let targetUsed: Bool := nodeUsed(&graph, target);
+        if sourceUsed and targetUsed then
+            return Right(right => insertEdge(&~graph, source.slot, target.slot, value));
+        else
+            return Left(left => value);
+        end if;
+    end;
+
+    -- The new edge goes to the end of the list of the source and to the end
+    -- of the list of the target.  For an edge from a node to itself both
+    -- lists belong to the same slot; they are separate fields, and each
+    -- change reads the record afresh.
+    generic [N: Type, E: Type, R: Region]
+    function insertEdge(graph: &![Graph[N, E], R], source: Index, target: Index, value: E): EdgeId is
+        let sourceSlot: NodeSlot := nodeSlotAt(&graph, source);
+        let targetSlot: NodeSlot := nodeSlotAt(&graph, target);
+        var slot: Index := length(edgeSlotsOf(&graph));
+        var generation: Nat32 := 0;
+        let waiting: Index := length(freeEdgesOf(&graph));
+        if waiting > 0 then
+            slot := removeLast(freeEdgesMut(&~graph));
+            let old: EdgeSlot := edgeSlotAt(&graph, slot);
+            generation := old.generation;
+            storeNth(edgeSlotsMut(&~graph), slot, openEdge(generation, source, target, sourceSlot.lastOut, targetSlot.lastIn));
+            expectNone(swapNth(edgeValuesMut(&~graph), slot, Some(value => value)));
+        else
+            insertBack(edgeSlotsMut(&~graph), openEdge(generation, source, target, sourceSlot.lastOut, targetSlot.lastIn));
+            insertBack(edgeValuesMut(&~graph), Some(value => value));
+        end if;
+        let link: Index := slot + 1;
+        if sourceSlot.lastOut = noLink then
+            setFirstOut(&~graph, source, link);
+        else
+            setNextOut(&~graph, sourceSlot.lastOut - 1, link);
+        end if;
+        setLastOut(&~graph, source, link);
+        if targetSlot.lastIn = noLink then
+            setFirstIn(&~graph, target, link);
+        else
+            setNextIn(&~graph, targetSlot.lastIn - 1, link);
+        end if;
+        setLastIn(&~graph, target, link);
+        graph->liveEdges := graph->liveEdges + 1;
+        return EdgeId(graph => graph->serial, slot => slot, generation => generation);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function replaceNodeValue(graph: &![Graph[N, E], R], node: NodeId, value: N): Either[N, N] is
+        let used: Bool := nodeUsed(&graph, node);
+        if used then
+            case swapNth(nodeValuesMut(&~graph), node.slot, Some(value => value)) of
+                when Some(value as old: N) do
+                    return Right(right => old);
+                when None do
+                    abort("Standard.Graph: a node in use held no value");
+            end case;
+        else
+            return Left(left => value);
+        end if;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function replaceEdgeValue(graph: &![Graph[N, E], R], edge: EdgeId, value: E): Either[E, E] is
+        let used: Bool := edgeUsed(&graph, edge);
+        if used then
+            case swapNth(edgeValuesMut(&~graph), edge.slot, Some(value => value)) of
+                when Some(value as old: E) do
+                    return Right(right => old);
+                when None do
+                    abort("Standard.Graph: an edge in use held no value");
+            end case;
+        else
+            return Left(left => value);
+        end if;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function removeEdge(graph: &![Graph[N, E], R], edge: EdgeId): Option[E] is
+        let used: Bool := edgeUsed(&graph, edge);
+        if used then
+            return takeEdge(&~graph, edge.slot);
+        else
+            return None();
+        end if;
+    end;
+
+    -- Unlink the edge in a slot from both of its lists, free the slot, and
+    -- hand back the value.
+    generic [N: Type, E: Type, R: Region]
+    function takeEdge(graph: &![Graph[N, E], R], slot: Index): Option[E] is
+        let e: EdgeSlot := edgeSlotAt(&graph, slot);
+        if e.prevOut = noLink then
+            setFirstOut(&~graph, e.source, e.nextOut);
+        else
+            setNextOut(&~graph, e.prevOut - 1, e.nextOut);
+        end if;
+        if e.nextOut = noLink then
+            setLastOut(&~graph, e.source, e.prevOut);
+        else
+            setPrevOut(&~graph, e.nextOut - 1, e.prevOut);
+        end if;
+        if e.prevIn = noLink then
+            setFirstIn(&~graph, e.target, e.nextIn);
+        else
+            setNextIn(&~graph, e.prevIn - 1, e.nextIn);
+        end if;
+        if e.nextIn = noLink then
+            setLastIn(&~graph, e.target, e.prevIn);
+        else
+            setPrevIn(&~graph, e.nextIn - 1, e.prevIn);
+        end if;
+        releaseEdge(&~graph, slot);
+        let empty: Option[E] := None();
+        return swapNth(edgeValuesMut(graph), slot, empty);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function removeNode(graph: &![Graph[N, E], R], node: NodeId): Option[Pair[N, Buffer[E]]] is
+        let used: Bool := nodeUsed(&graph, node);
+        if used then
+            return Some(value => takeNode(&~graph, node.slot));
+        else
+            return None();
+        end if;
+    end;
+
+    -- The value comes out first.  Then the edges, the leaving ones and then
+    -- the entering ones, each list emptied from its head; an edge from the
+    -- node to itself leaves both lists with its first removal.
+    generic [N: Type, E: Type, R: Region]
+    function takeNode(graph: &![Graph[N, E], R], slot: Index): Pair[N, Buffer[E]] is
+        let empty: Option[N] := None();
+        let old: Option[N] := swapNth(nodeValuesMut(&~graph), slot, empty);
+        case old of
+            when Some(value as taken: N) do
+                var removed: Buffer[E] := allocateEmpty();
+                var s: NodeSlot := nodeSlotAt(&graph, slot);
+                while s.firstOut /= noLink do
+                    keepValue(&!removed, takeEdge(&~graph, s.firstOut - 1));
+                    s := nodeSlotAt(&graph, slot);
+                end while;
+                while s.firstIn /= noLink do
+                    keepValue(&!removed, takeEdge(&~graph, s.firstIn - 1));
+                    s := nodeSlotAt(&graph, slot);
+                end while;
+                releaseNode(&~graph, slot);
+                return Pair(first => taken, second => removed);
+            when None do
+                abort("Standard.Graph: a node in use held no value");
+        end case;
+    end;
+
+    generic [T: Type, R: Region]
+    function keepValue(into: &![Buffer[T], R], found: Option[T]): Unit is
+        case found of
+            when Some(value as kept: T) do
+                insertBack(&~into, kept);
+            when None do
+                abort("Standard.Graph: an edge in use held no value");
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Walking
+    ---
+
+    generic [N: Type, E: Type, R: Region]
+    function nodes(graph: &[Graph[N, E], R]): Buffer[NodeId] is
+        var found: Buffer[NodeId] := allocateEmpty();
+        let total: Index := length(nodeSlotsOf(graph));
+        var slot: Index := 0;
+        while slot < total do
+            let s: NodeSlot := nodeSlotAt(graph, slot);
+            if s.used then
+                insertBack(&!found, NodeId(graph => graph->serial, slot => slot, generation => s.generation));
+            end if;
+            slot := slot + 1;
+        end while;
+        return found;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function edges(graph: &[Graph[N, E], R]): Buffer[EdgeId] is
+        var found: Buffer[EdgeId] := allocateEmpty();
+        let total: Index := length(edgeSlotsOf(graph));
+        var slot: Index := 0;
+        while slot < total do
+            let s: EdgeSlot := edgeSlotAt(graph, slot);
+            if s.used then
+                insertBack(&!found, EdgeId(graph => graph->serial, slot => slot, generation => s.generation));
+            end if;
+            slot := slot + 1;
+        end while;
+        return found;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function outEdges(graph: &[Graph[N, E], R], node: NodeId): Option[Buffer[EdgeId]] is
+        if nodeUsed(graph, node) then
+            var found: Buffer[EdgeId] := allocateEmpty();
+            let s: NodeSlot := nodeSlotAt(graph, node.slot);
+            var link: Index := s.firstOut;
+            while link /= noLink do
+                let e: EdgeSlot := edgeSlotAt(graph, link - 1);
+                insertBack(&!found, EdgeId(graph => graph->serial, slot => link - 1, generation => e.generation));
+                link := e.nextOut;
+            end while;
+            return Some(value => found);
+        else
+            return None();
+        end if;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function inEdges(graph: &[Graph[N, E], R], node: NodeId): Option[Buffer[EdgeId]] is
+        if nodeUsed(graph, node) then
+            var found: Buffer[EdgeId] := allocateEmpty();
+            let s: NodeSlot := nodeSlotAt(graph, node.slot);
+            var link: Index := s.firstIn;
+            while link /= noLink do
+                let e: EdgeSlot := edgeSlotAt(graph, link - 1);
+                insertBack(&!found, EdgeId(graph => graph->serial, slot => link - 1, generation => e.generation));
+                link := e.nextIn;
+            end while;
+            return Some(value => found);
+        else
+            return None();
+        end if;
+    end;
+
+    ---
+    --- Searching
+    ---
+
+    -- The order found so far is the queue: its head is the next node whose
+    -- leaving edges are followed.
+    generic [N: Type, E: Type, R: Region]
+    function breadthFirst(graph: &[Graph[N, E], R], start: NodeId): Option[Buffer[NodeId]] is
+        if nodeUsed(graph, start) then
+            var seen: Buffer[Bool] := initialize(length(nodeSlotsOf(graph)), false);
+            var order: Buffer[NodeId] := allocateEmpty();
+            storeNth(&!seen, start.slot, true);
+            insertBack(&!order, start);
+            var head: Index := 0;
+            while head < length(&order) do
+                let current: NodeId := nth(&order, head);
+                head := head + 1;
+                let s: NodeSlot := nodeSlotAt(graph, current.slot);
+                var link: Index := s.firstOut;
+                while link /= noLink do
+                    let e: EdgeSlot := edgeSlotAt(graph, link - 1);
+                    if not nth(&seen, e.target) then
+                        storeNth(&!seen, e.target, true);
+                        insertBack(&!order, nodeIn(graph, e.target));
+                    end if;
+                    link := e.nextOut;
+                end while;
+            end while;
+            destroyFreeBuffer(seen);
+            return Some(value => order);
+        else
+            return None();
+        end if;
+    end;
+
+    -- The recursion of a depth first search, written as a loop: the stack
+    -- holds, for each node on the current path, its slot and the link of
+    -- the next leaving edge still to follow.
+    generic [N: Type, E: Type, R: Region]
+    function depthFirst(graph: &[Graph[N, E], R], start: NodeId): Option[Buffer[NodeId]] is
+        if nodeUsed(graph, start) then
+            var seen: Buffer[Bool] := initialize(length(nodeSlotsOf(graph)), false);
+            var order: Buffer[NodeId] := allocateEmpty();
+            var pathSlots: Buffer[Index] := allocateEmpty();
+            var pathLinks: Buffer[Index] := allocateEmpty();
+            storeNth(&!seen, start.slot, true);
+            insertBack(&!order, start);
+            let first: NodeSlot := nodeSlotAt(graph, start.slot);
+            insertBack(&!pathSlots, start.slot);
+            insertBack(&!pathLinks, first.firstOut);
+            while length(&pathSlots) > 0 do
+                let top: Index := length(&pathSlots) - 1;
+                let link: Index := nth(&pathLinks, top);
+                if link = noLink then
+                    let doneSlot: Index := removeLast(&!pathSlots);
+                    let doneLink: Index := removeLast(&!pathLinks);
+                else
+                    let e: EdgeSlot := edgeSlotAt(graph, link - 1);
+                    storeNth(&!pathLinks, top, e.nextOut);
+                    if not nth(&seen, e.target) then
+                        storeNth(&!seen, e.target, true);
+                        insertBack(&!order, nodeIn(graph, e.target));
+                        let next: NodeSlot := nodeSlotAt(graph, e.target);
+                        insertBack(&!pathSlots, e.target);
+                        insertBack(&!pathLinks, next.firstOut);
+                    end if;
+                end if;
+            end while;
+            destroyFreeBuffer(seen);
+            destroyEmptyBuffer(pathSlots);
+            destroyEmptyBuffer(pathLinks);
+            return Some(value => order);
+        else
+            return None();
+        end if;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function hasPath(graph: &[Graph[N, E], R], start: NodeId, goal: NodeId): Bool is
+        case shortestPath(graph, start, goal) of
+            when Some(value as path: Buffer[EdgeId]) do
+                destroyFreeBuffer(path);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- A breadth first search that stops when it meets goal.  parent holds,
+    -- per slot, the link of the edge the search first reached it by.
+    generic [N: Type, E: Type, R: Region]
+    function shortestPath(graph: &[Graph[N, E], R], start: NodeId, goal: NodeId): Option[Buffer[EdgeId]] is
+        let startUsed: Bool := nodeUsed(graph, start);
+        let goalUsed: Bool := nodeUsed(graph, goal);
+        if not (startUsed and goalUsed) then
+            return None();
+        end if;
+        let total: Index := length(nodeSlotsOf(graph));
+        var seen: Buffer[Bool] := initialize(total, false);
+        var parent: Buffer[Index] := initialize(total, noLink);
+        var queue: Buffer[Index] := allocateEmpty();
+        storeNth(&!seen, start.slot, true);
+        insertBack(&!queue, start.slot);
+        var head: Index := 0;
+        var found: Bool := start.slot = goal.slot;
+        while (not found) and (head < length(&queue)) do
+            let current: Index := nth(&queue, head);
+            head := head + 1;
+            let s: NodeSlot := nodeSlotAt(graph, current);
+            var link: Index := s.firstOut;
+            while (not found) and (link /= noLink) do
+                let e: EdgeSlot := edgeSlotAt(graph, link - 1);
+                if not nth(&seen, e.target) then
+                    storeNth(&!seen, e.target, true);
+                    storeNth(&!parent, e.target, link);
+                    insertBack(&!queue, e.target);
+                    if e.target = goal.slot then
+                        found := true;
+                    end if;
+                end if;
+                link := e.nextOut;
+            end while;
+        end while;
+        destroyFreeBuffer(seen);
+        destroyFreeBuffer(queue);
+        if found then
+            let path: Buffer[EdgeId] := pathTo(graph, &parent, start.slot, goal.slot);
+            destroyFreeBuffer(parent);
+            return Some(value => path);
+        else
+            destroyFreeBuffer(parent);
+            return None();
+        end if;
+    end;
+
+    -- The edges from start to goal, read backwards from goal through the
+    -- parent links and turned round.
+    generic [N: Type, E: Type, R: Region, S: Region]
+    function pathTo(graph: &[Graph[N, E], R], parent: &[Buffer[Index], S], start: Index, goal: Index): Buffer[EdgeId] is
+        var path: Buffer[EdgeId] := allocateEmpty();
+        var at: Index := goal;
+        while at /= start do
+            let link: Index := nth(parent, at);
+            let e: EdgeSlot := edgeSlotAt(graph, link - 1);
+            insertBack(&!path, EdgeId(graph => graph->serial, slot => link - 1, generation => e.generation));
+            at := e.source;
+        end while;
+        reverse(&!path);
+        return path;
+    end;
+
+    -- A node is settled when it comes off the heap for the first time;
+    -- later entries for it are stale and passed over.  A distance only ever
+    -- moves to a strictly smaller one, so of two equal paths the one found
+    -- first stays.  A sum that would not fit a Nat64 is not taken: it is
+    -- larger than every distance that fits, so passing it over cannot change
+    -- an answer that fits.  When goal is not reached and such a sum was
+    -- passed over, a breadth first search tells the two answers apart: a
+    -- path exists, and every path is too heavy, or none exists at all.
+    generic [N: Type, E: Type(Weight), R: Region]
+    function lightestPath(graph: &[Graph[N, E], R], start: NodeId, goal: NodeId): Either[NoPath, Pair[Nat64, Buffer[EdgeId]]] is
+        let startUsed: Bool := nodeUsed(graph, start);
+        let goalUsed: Bool := nodeUsed(graph, goal);
+        if not (startUsed and goalUsed) then
+            return Left(left => UnknownNode());
+        end if;
+        let total: Index := length(nodeSlotsOf(graph));
+        let nothing: Nat64 := 0;
+        var settled: Buffer[Bool] := initialize(total, false);
+        var reached: Buffer[Bool] := initialize(total, false);
+        var distance: Buffer[Nat64] := initialize(total, nothing);
+        var parent: Buffer[Index] := initialize(total, noLink);
+        var keys: Buffer[Nat64] := allocateEmpty();
+        var slots: Buffer[Index] := allocateEmpty();
+        var tooHeavy: Bool := false;
+        var finished: Bool := false;
+        storeNth(&!reached, start.slot, true);
+        heapPush(&!keys, &!slots, nothing, start.slot);
+        while (not finished) and (length(&slots) > 0) do
+            let top: Pair[Nat64, Index] := heapPop(&!keys, &!slots);
+            let d: Nat64 := top.first;
+            let current: Index := top.second;
+            if not nth(&settled, current) then
+                storeNth(&!settled, current, true);
+                if current = goal.slot then
+                    finished := true;
+                else
+                    let s: NodeSlot := nodeSlotAt(graph, current);
+                    var link: Index := s.firstOut;
+                    while link /= noLink do
+                        let e: EdgeSlot := edgeSlotAt(graph, link - 1);
+                        if not nth(&settled, e.target) then
+                            let w: Nat64 := weightAt(graph, link - 1);
+                            if w > (maximum_nat64 - d) then
+                                tooHeavy := true;
+                            else
+                                let candidate: Nat64 := d + w;
+                                let known: Bool := nth(&reached, e.target);
+                                if (not known) or (candidate < nth(&distance, e.target)) then
+                                    storeNth(&!reached, e.target, true);
+                                    storeNth(&!distance, e.target, candidate);
+                                    storeNth(&!parent, e.target, link);
+                                    heapPush(&!keys, &!slots, candidate, e.target);
+                                end if;
+                            end if;
+                        end if;
+                        link := e.nextOut;
+                    end while;
+                end if;
+            end if;
+        end while;
+        destroyFreeBuffer(settled);
+        destroyFreeBuffer(reached);
+        destroyFreeBuffer(keys);
+        destroyFreeBuffer(slots);
+        if finished then
+            let sum: Nat64 := nth(&distance, goal.slot);
+            let path: Buffer[EdgeId] := pathTo(graph, &parent, start.slot, goal.slot);
+            destroyFreeBuffer(distance);
+            destroyFreeBuffer(parent);
+            return Right(right => Pair(first => sum, second => path));
+        else
+            destroyFreeBuffer(distance);
+            destroyFreeBuffer(parent);
+            if tooHeavy then
+                if hasPath(graph, start, goal) then
+                    return Left(left => TooHeavy());
+                end if;
+            end if;
+            return Left(left => Unreachable());
+        end if;
+    end;
+
+    generic [N: Type, E: Type(Weight), R: Region]
+    function weightAt(graph: &[Graph[N, E], R], slot: Index): Nat64 is
+        case nthRef(&(graph->edgeValues), slot) of
+            when Some(value as found: &[E, R]) do
+                return weightOf(found);
+            when None do
+                abort("Standard.Graph: an edge in use held no value");
+        end case;
+    end;
+
+    -- A binary heap of distances and slots in two buffers side by side.  The
+    -- root holds the smallest distance; of two equal distances the lower
+    -- slot comes first, so the order in which entries leave the heap
+    -- depends on the entries alone.
+
+    generic [R: Region, S: Region]
+    function heapLess(keys: &[Buffer[Nat64], R], slots: &[Buffer[Index], S], a: Index, b: Index): Bool is
+        let ka: Nat64 := nth(keys, a);
+        let kb: Nat64 := nth(keys, b);
+        if ka = kb then
+            return nth(slots, a) < nth(slots, b);
+        end if;
+        return ka < kb;
+    end;
+
+    generic [R: Region, S: Region]
+    function heapPush(keys: &![Buffer[Nat64], R], slots: &![Buffer[Index], S], key: Nat64, slot: Index): Unit is
+        insertBack(&~keys, key);
+        insertBack(&~slots, slot);
+        var at: Index := length(&keys) - 1;
+        var moving: Bool := at > 0;
+        while moving do
+            let up: Index := (at - 1) / 2;
+            if heapLess(&keys, &slots, at, up) then
+                swapIndex(&~keys, at, up);
+                swapIndex(&~slots, at, up);
+                at := up;
+                moving := at > 0;
+            else
+                moving := false;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function heapPop(keys: &![Buffer[Nat64], R], slots: &![Buffer[Index], S]): Pair[Nat64, Index] is
+        let last: Index := length(&keys) - 1;
+        swapIndex(&~keys, 0, last);
+        swapIndex(&~slots, 0, last);
+        let key: Nat64 := removeLast(&~keys);
+        let slot: Index := removeLast(&~slots);
+        var at: Index := 0;
+        var moving: Bool := true;
+        while moving do
+            let low: Index := (at * 2) + 1;
+            let high: Index := low + 1;
+            var least: Index := at;
+            if low < last then
+                if heapLess(&keys, &slots, low, least) then
+                    least := low;
+                end if;
+            end if;
+            if high < last then
+                if heapLess(&keys, &slots, high, least) then
+                    least := high;
+                end if;
+            end if;
+            if least = at then
+                moving := false;
+            else
+                swapIndex(&~keys, at, least);
+                swapIndex(&~slots, at, least);
+                at := least;
+            end if;
+        end while;
+        return Pair(first => key, second => slot);
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function findCycle(graph: &[Graph[N, E], R]): Option[Buffer[EdgeId]] is
+        case topologicalOrder(graph) of
+            when Left(left as cycle: Buffer[EdgeId]) do
+                return Some(value => cycle);
+            when Right(right as order: Buffer[NodeId]) do
+                destroyFreeBuffer(order);
+                return None();
+        end case;
+    end;
+
+    generic [N: Type, E: Type, R: Region]
+    function topologicalOrder(graph: &[Graph[N, E], R]): Either[Buffer[EdgeId], Buffer[NodeId]] is
+        let placed: Pair[Buffer[NodeId], Buffer[Index]] := placeNodes(graph);
+        let { first as order: Buffer[NodeId], second as entering: Buffer[Index] } := placed;
+        if length(&order) = graph->liveNodes then
+            destroyFreeBuffer(entering);
+            return Right(right => order);
+        else
+            destroyFreeBuffer(order);
+            let cycle: Buffer[EdgeId] := cycleAmong(graph, &entering);
+            destroyFreeBuffer(entering);
+            return Left(left => cycle);
+        end if;
+    end;
+
+    -- The sort, with the order found so far as its queue.  The nodes that
+    -- no edge enters come first, in the order of their slots; then the
+    -- placed nodes are taken in turn, their leaving edges in order, and a
+    -- node is placed when the last edge entering it from an unplaced node
+    -- has been passed.  The second buffer holds, per slot, the number of
+    -- edges entering it from nodes that were never placed: zero for a
+    -- placed node and for a free slot, more than zero for a node on a cycle
+    -- or behind one.
+    generic [N: Type, E: Type, R: Region]
+    function placeNodes(graph: &[Graph[N, E], R]): Pair[Buffer[NodeId], Buffer[Index]] is
+        let nodeTotal: Index := length(nodeSlotsOf(graph));
+        let edgeTotal: Index := length(edgeSlotsOf(graph));
+        let none: Index := 0;
+        var entering: Buffer[Index] := initialize(nodeTotal, none);
+        var edgeAt: Index := 0;
+        while edgeAt < edgeTotal do
+            let e: EdgeSlot := edgeSlotAt(graph, edgeAt);
+            if e.used then
+                let count: Index := nth(&entering, e.target);
+                storeNth(&!entering, e.target, count + 1);
+            end if;
+            edgeAt := edgeAt + 1;
+        end while;
+        var order: Buffer[NodeId] := allocateEmpty();
+        var slot: Index := 0;
+        while slot < nodeTotal do
+            let s: NodeSlot := nodeSlotAt(graph, slot);
+            if s.used then
+                if nth(&entering, slot) = 0 then
+                    insertBack(&!order, NodeId(graph => graph->serial, slot => slot, generation => s.generation));
+                end if;
+            end if;
+            slot := slot + 1;
+        end while;
+        var head: Index := 0;
+        while head < length(&order) do
+            let current: NodeId := nth(&order, head);
+            head := head + 1;
+            let s: NodeSlot := nodeSlotAt(graph, current.slot);
+            var link: Index := s.firstOut;
+            while link /= noLink do
+                let e: EdgeSlot := edgeSlotAt(graph, link - 1);
+                let count: Index := nth(&entering, e.target) - 1;
+                storeNth(&!entering, e.target, count);
+                if count = 0 then
+                    insertBack(&!order, nodeIn(graph, e.target));
+                end if;
+                link := e.nextOut;
+            end while;
+        end while;
+        return Pair(first => order, second => entering);
+    end;
+
+    -- A cycle among the nodes the sort left unplaced.  Each of them
+    -- has an entering edge from another unplaced node, so a walk backwards
+    -- along such edges, begun at the lowest unplaced slot, must come back to
+    -- a node it passed.  The edges walked since that node, turned round, are
+    -- the cycle, and no node is on it twice.  seenAt holds, per slot, the
+    -- step at which the walk passed it, counted from one; taken holds the
+    -- edge slots walked.
+    generic [N: Type, E: Type, R: Region, S: Region]
+    function cycleAmong(graph: &[Graph[N, E], R], entering: &[Buffer[Index], S]): Buffer[EdgeId] is
+        let nodeTotal: Index := length(entering);
+        var at: Index := 0;
+        var looking: Bool := true;
+        while looking do
+            if at = nodeTotal then
+                abort("Standard.Graph: the sort left no node unplaced");
+            end if;
+            if nth(entering, at) > 0 then
+                looking := false;
+            else
+                at := at + 1;
+            end if;
+        end while;
+        let never: Index := 0;
+        var seenAt: Buffer[Index] := initialize(nodeTotal, never);
+        var taken: Buffer[Index] := allocateEmpty();
+        var step: Index := 1;
+        storeNth(&!seenAt, at, step);
+        var closed: Bool := false;
+        var begin: Index := 0;
+        while not closed do
+            let slot: Index := enteringFromUnplaced(graph, entering, at);
+            let e: EdgeSlot := edgeSlotAt(graph, slot);
+            insertBack(&!taken, slot);
+            at := e.source;
+            let passed: Index := nth(&seenAt, at);
+            if passed /= 0 then
+                begin := passed - 1;
+                closed := true;
+            else
+                step := step + 1;
+                storeNth(&!seenAt, at, step);
+            end if;
+        end while;
+        var cycle: Buffer[EdgeId] := allocateEmpty();
+        var i: Index := length(&taken);
+        while i > begin do
+            i := i - 1;
+            insertBack(&!cycle, edgeIn(graph, nth(&taken, i)));
+        end while;
+        destroyFreeBuffer(seenAt);
+        destroyFreeBuffer(taken);
+        return cycle;
+    end;
+
+    -- The slot of the first edge entering a node, in the order of its list,
+    -- whose source the sort left unplaced.
+    generic [N: Type, E: Type, R: Region, S: Region]
+    function enteringFromUnplaced(graph: &[Graph[N, E], R], entering: &[Buffer[Index], S], node: Index): Index is
+        let s: NodeSlot := nodeSlotAt(graph, node);
+        var link: Index := s.firstIn;
+        var found: Index := noLink;
+        while (found = noLink) and (link /= noLink) do
+            let e: EdgeSlot := edgeSlotAt(graph, link - 1);
+            if nth(entering, e.source) > 0 then
+                found := link;
+            else
+                link := e.nextIn;
+            end if;
+        end while;
+        if found = noLink then
+            abort("Standard.Graph: an unplaced node has no edge from another unplaced node");
+        end if;
+        return found - 1;
+    end;
+end module body.

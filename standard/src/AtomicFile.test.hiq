@@ -1,0 +1,409 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test works in a directory of its own, made at its start and
+-- removed at its end, and checks after every write that no temporary
+-- file is left in it.  Keeping the owner of a file that belongs to
+-- another account needs privilege and is measured outside these tests.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    FileStatus,
+    FileFound,
+    FileMissing,
+    FileUnreadable,
+    kindRegular,
+    sameKind,
+    statusOf,
+    openRead,
+    readAll,
+    closeFile,
+    removeFile,
+    createDirectory,
+    removeDirectory,
+    createSymlink,
+    Directory,
+    openDirectory,
+    nextEntry,
+    closeDirectory
+);
+import Standard.AtomicFile (
+    AtomicFailure,
+    BadInput,
+    NotAFile,
+    LookFailed,
+    TemporaryFailed,
+    WriteFailed,
+    OwnerFailed,
+    ModeFailed,
+    BackupFailed,
+    RenameFailed,
+    NotDurable,
+    Change,
+    Unchanged,
+    Created,
+    Replaced,
+    describeAtomicFailure,
+    backupName,
+    writeAtomically,
+    writeWithBackup,
+    writeIfChanged,
+    restoreBackup
+);
+
+module body Standard.AtomicFile.Test is
+    constant modeUserOnly: Nat32 := 384;
+    constant modeGroupRead: Nat32 := 416;
+    constant modeAllRead: Nat32 := 420;
+    constant modeBeyond: Nat32 := 4096;
+
+    ---
+    --- Helpers
+    ---
+
+    -- dir, a slash and name, as one string.
+    function inside(dir: Span[Nat8, Static], name: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, dir);
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function sameAs(left: &[String, R], right: Span[Nat8, Static]): Bool is
+        let size: Index := length(left);
+        if size /= spanLength(right) then
+            return false;
+        end if;
+        var same: Bool := true;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if nthByte(left, i) /= right[i] then
+                    same := false;
+                end if;
+            end for;
+        end if;
+        return same;
+    end;
+
+    -- Whether the file at path holds exactly expected.
+    generic [R: Region]
+    function holds(path: &[String, R], expected: Span[Nat8, Static]): Bool is
+        case openRead(asSpan(path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let content: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case content of
+                    when Some(value as text: String) do
+                        let same: Bool := sameAs(&text, expected);
+                        destroyString(text);
+                        return same and closed;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The mode of the ordinary file at path, or octal 10000 when there is
+    -- none.
+    generic [R: Region]
+    function modeOf(path: &[String, R]): Nat32 is
+        case statusOf(asSpan(path)) of
+            when FileFound(status: FileStatus) do
+                if sameKind(status.kind, kindRegular) then
+                    return status.mode;
+                end if;
+                return modeBeyond;
+            when FileMissing do
+                return modeBeyond;
+            when FileUnreadable do
+                return modeBeyond;
+        end case;
+    end;
+
+    generic [R: Region]
+    function missing(path: &[String, R]): Bool is
+        case statusOf(asSpan(path)) of
+            when FileFound(status: FileStatus) do
+                return false;
+            when FileMissing do
+                return true;
+            when FileUnreadable do
+                return false;
+        end case;
+    end;
+
+    -- How many names in the directory begin with .atomic-, the names of
+    -- temporary files; -1 when the directory cannot be read.
+    function temporaries(dir: Span[Nat8, Static]): Int32 is
+        case openDirectory(dir) of
+            when Some(value as opened: Directory) do
+                var directory: Directory := opened;
+                var count: Int32 := 0;
+                var going: Bool := true;
+                while going do
+                    case nextEntry(&!directory) of
+                        when Some(value as name: String) do
+                            if startsAtomic(&name) then
+                                count := count + 1;
+                            end if;
+                            destroyString(name);
+                        when None do
+                            going := false;
+                    end case;
+                end while;
+                let closed: Bool := closeDirectory(directory);
+                return count;
+            when None do
+                return -1;
+        end case;
+    end;
+
+    generic [R: Region]
+    function startsAtomic(name: &[String, R]): Bool is
+        let stem: Span[Nat8, Static] := ".atomic-";
+        let size: Index := spanLength(stem);
+        if length(name) < size then
+            return false;
+        end if;
+        var same: Bool := true;
+        for i from 0 to size - 1 do
+            if nthByte(name, i) /= stem[i] then
+                same := false;
+            end if;
+        end for;
+        return same;
+    end;
+
+    function isRight(result: Either[AtomicFailure, Unit]): Bool is
+        case result of
+            when Right(right: Unit) do
+                return true;
+            when Left(left: AtomicFailure) do
+                return false;
+        end case;
+    end;
+
+    -- The number of a failure, so that a test can say which one it wants:
+    -- the cases in the order of the union, from 1; 0 for Right.
+    function failureNumber(failure: AtomicFailure): Int32 is
+        case failure of
+            when BadInput do
+                return 1;
+            when NotAFile do
+                return 2;
+            when LookFailed do
+                return 3;
+            when TemporaryFailed do
+                return 4;
+            when WriteFailed do
+                return 5;
+            when OwnerFailed do
+                return 6;
+            when ModeFailed do
+                return 7;
+            when BackupFailed do
+                return 8;
+            when RenameFailed do
+                return 9;
+            when NotDurable do
+                return 10;
+        end case;
+    end;
+
+    function unitNumber(result: Either[AtomicFailure, Unit]): Int32 is
+        case result of
+            when Right(right: Unit) do
+                return 0;
+            when Left(left as failure: AtomicFailure) do
+                return failureNumber(failure);
+        end case;
+    end;
+
+    -- Right true as 1, Right false as 0, a failure as its number plus 10.
+    function boolNumber(result: Either[AtomicFailure, Bool]): Int32 is
+        case result of
+            when Right(right as value: Bool) do
+                if value then
+                    return 1;
+                end if;
+                return 0;
+            when Left(left as failure: AtomicFailure) do
+                return failureNumber(failure) + 10;
+        end case;
+    end;
+
+    -- Unchanged 1, Created 2, Replaced 3, a failure its number plus 10.
+    function changeNumber(result: Either[AtomicFailure, Change]): Int32 is
+        case result of
+            when Right(right as change: Change) do
+                case change of
+                    when Unchanged do
+                        return 1;
+                    when Created do
+                        return 2;
+                    when Replaced do
+                        return 3;
+                end case;
+            when Left(left as failure: AtomicFailure) do
+                return failureNumber(failure) + 10;
+        end case;
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    function testWriteNewAndOverwrite(): Unit is
+        let dir: Span[Nat8, Static] := "atomicfile-test-1.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let path: String := inside(dir, "config");
+        assertTrue(isRight(writeAtomically(asSpan(&path), "first\n", modeGroupRead)), "a new file is written");
+        assertTrue(holds(&path, "first\n"), "the new file holds its content");
+        assertTrue(modeOf(&path) = modeGroupRead, "the new file has mode 0640");
+        assertTrue(temporaries(dir) = 0, "no temporary file after a write");
+        assertTrue(isRight(writeAtomically(asSpan(&path), "second, longer\n", modeUserOnly)), "the file is replaced");
+        assertTrue(holds(&path, "second, longer\n"), "the replaced file holds the new content");
+        assertTrue(modeOf(&path) = modeUserOnly, "the replaced file has mode 0600");
+        assertTrue(isRight(writeAtomically(asSpan(&path), "", modeAllRead)), "an empty content is written");
+        assertTrue(holds(&path, ""), "the file is empty");
+        assertTrue(modeOf(&path) = modeAllRead, "the empty file has mode 0644");
+        let backup: String := backupName(asSpan(&path));
+        assertTrue(missing(&backup), "writeAtomically keeps no backup");
+        assertTrue(temporaries(dir) = 0, "no temporary file after three writes");
+        assertTrue(removeFile(asSpan(&path)), "the file was removed");
+        destroyString(backup);
+        destroyString(path);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testBackupAndRestore(): Unit is
+        let dir: Span[Nat8, Static] := "atomicfile-test-2.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let path: String := inside(dir, "state");
+        let backup: String := backupName(asSpan(&path));
+        assertTrue(boolNumber(writeWithBackup(asSpan(&path), "one", modeUserOnly)) = 0, "a new file has nothing to keep");
+        assertTrue(missing(&backup), "no backup for a new file");
+        assertTrue(boolNumber(writeWithBackup(asSpan(&path), "two", modeUserOnly)) = 1, "the old file is kept");
+        assertTrue(holds(&path, "two"), "the file holds the new content");
+        assertTrue(holds(&backup, "one"), "the backup holds the old content");
+        assertTrue(boolNumber(writeWithBackup(asSpan(&path), "three", modeUserOnly)) = 1, "the old file is kept again");
+        assertTrue(holds(&backup, "two"), "the older backup was replaced");
+        assertTrue(temporaries(dir) = 0, "no temporary file after the backups");
+        assertTrue(boolNumber(restoreBackup(asSpan(&path))) = 1, "the backup is put back");
+        assertTrue(holds(&path, "two"), "the file holds the backup's content");
+        assertTrue(missing(&backup), "the backup's name is gone after the restore");
+        assertTrue(boolNumber(restoreBackup(asSpan(&path))) = 0, "a second restore finds no backup");
+        assertTrue(holds(&path, "two"), "a restore without backup changes nothing");
+        assertTrue(removeFile(asSpan(&path)), "the file was removed");
+        assertTrue(boolNumber(restoreBackup(asSpan(&path))) = 0, "a restore without file and backup finds nothing");
+        destroyString(backup);
+        destroyString(path);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testIfChanged(): Unit is
+        let dir: Span[Nat8, Static] := "atomicfile-test-3.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let path: String := inside(dir, "page");
+        let backup: String := backupName(asSpan(&path));
+        assertTrue(changeNumber(writeIfChanged(asSpan(&path), "same", modeAllRead)) = 2, "a new file is created");
+        assertTrue(missing(&backup), "no backup for a created file");
+        assertTrue(changeNumber(writeIfChanged(asSpan(&path), "same", modeAllRead)) = 1, "the same content is not written");
+        assertTrue(missing(&backup), "no backup when nothing was written");
+        assertTrue(changeNumber(writeIfChanged(asSpan(&path), "sane", modeAllRead)) = 3, "a byte of difference replaces the file");
+        assertTrue(holds(&path, "sane"), "the file holds the new content");
+        assertTrue(holds(&backup, "same"), "the backup holds the old content");
+        assertTrue(changeNumber(writeIfChanged(asSpan(&path), "sane", modeUserOnly)) = 3, "another mode replaces the file");
+        assertTrue(modeOf(&path) = modeUserOnly, "the file has the new mode");
+        assertTrue(changeNumber(writeIfChanged(asSpan(&path), "saner", modeUserOnly)) = 3, "another size replaces the file");
+        assertTrue(holds(&backup, "sane"), "the backup holds the content before");
+        assertTrue(changeNumber(writeIfChanged(asSpan(&path), "", modeUserOnly)) = 3, "an empty content replaces the file");
+        assertTrue(changeNumber(writeIfChanged(asSpan(&path), "", modeUserOnly)) = 1, "an empty file stays when content is empty");
+        assertTrue(temporaries(dir) = 0, "no temporary file after the writes");
+        assertTrue(removeFile(asSpan(&path)), "the file was removed");
+        assertTrue(removeFile(asSpan(&backup)), "the backup was removed");
+        destroyString(backup);
+        destroyString(path);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        let dir: Span[Nat8, Static] := "atomicfile-test-4.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        assertTrue(unitNumber(writeAtomically("", "x", modeUserOnly)) = 1, "an empty path is refused");
+        let slash: String := inside(dir, "");
+        assertTrue(unitNumber(writeAtomically(asSpan(&slash), "x", modeUserOnly)) = 1, "a path ending in a slash is refused");
+        destroyString(slash);
+        var zeroed: StringBuilder := makeStringBuilder();
+        writeString(&!zeroed, dir);
+        writeString(&!zeroed, "/a");
+        writeByte(&!zeroed, 0);
+        writeString(&!zeroed, "b");
+        let withZero: String := finalize(zeroed);
+        assertTrue(unitNumber(writeAtomically(asSpan(&withZero), "x", modeUserOnly)) = 1, "a zero byte is refused");
+        destroyString(withZero);
+        let path: String := inside(dir, "file");
+        assertTrue(unitNumber(writeAtomically(asSpan(&path), "x", modeBeyond)) = 1, "a mode beyond 7777 is refused");
+        assertTrue(missing(&path), "a refused write makes no file");
+        let sub: String := inside(dir, "sub");
+        assertTrue(createDirectory(asSpan(&sub)), "a directory inside was made");
+        assertTrue(unitNumber(writeAtomically(asSpan(&sub), "x", modeUserOnly)) = 2, "a directory is not replaced");
+        assertTrue(boolNumber(writeWithBackup(asSpan(&sub), "x", modeUserOnly)) = 12, "a directory is not kept as a backup");
+        assertTrue(changeNumber(writeIfChanged(asSpan(&sub), "x", modeUserOnly)) = 12, "a directory is not compared");
+        let link: String := inside(dir, "link");
+        assertTrue(createSymlink("file", asSpan(&link)), "a link was made");
+        assertTrue(unitNumber(writeAtomically(asSpan(&link), "x", modeUserOnly)) = 2, "a link is neither followed nor replaced");
+        assertTrue(missing(&path), "the link's target was not written");
+        let deeper: String := inside(dir, "none/file");
+        assertTrue(unitNumber(writeAtomically(asSpan(&deeper), "x", modeUserOnly)) = 4, "a missing directory leaves no place for the temporary file");
+        destroyString(deeper);
+        let backupLink: String := inside(dir, "file.bak");
+        assertTrue(createSymlink("elsewhere", asSpan(&backupLink)), "a link at the backup's name was made");
+        assertTrue(isRight(writeAtomically(asSpan(&path), "x", modeUserOnly)), "the file was written");
+        assertTrue(boolNumber(writeWithBackup(asSpan(&path), "y", modeUserOnly)) = 18, "a link at the backup's name is not removed");
+        assertTrue(holds(&path, "x"), "the file is as it was after the refused backup");
+        assertTrue(boolNumber(restoreBackup(asSpan(&path))) = 12, "a link is not restored");
+        assertTrue(temporaries(dir) = 0, "no temporary file after the refusals");
+        let text: String := describeAtomicFailure(BackupFailed());
+        assertTrue(sameAs(&text, "could not keep the backup"), "a failure has words");
+        destroyString(text);
+        assertTrue(removeFile(asSpan(&backupLink)), "the backup link was removed");
+        assertTrue(removeFile(asSpan(&path)), "the file was removed");
+        assertTrue(removeFile(asSpan(&link)), "the link was removed");
+        assertTrue(removeDirectory(asSpan(&sub)), "the directory inside was removed");
+        destroyString(backupLink);
+        destroyString(link);
+        destroyString(sub);
+        destroyString(path);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+end module body.

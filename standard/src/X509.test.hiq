@@ -1,0 +1,606 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.Base64 (
+    decode
+);
+import Standard.X509 (
+    KeyKind,
+    EcP256,
+    EcP384,
+    EcP521,
+    Ed25519Key,
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
+    PrivateKey,
+    Certificate,
+    generateKey,
+    keyKindOf,
+    privateKeyToPem,
+    privateKeyFromPem,
+    publicKeyDer,
+    signMessage,
+    verifyMessage,
+    destroyPrivateKey,
+    certificateFromPem,
+    certificateFromDer,
+    certificateToPem,
+    certificateToDer,
+    subjectName,
+    issuerName,
+    dnsNamesOf,
+    validFrom,
+    validUntil,
+    serialNumber,
+    fingerprintSha256,
+    belongsTo,
+    isAuthority,
+    destroyCertificate,
+    isDnsNameList,
+    selfSigned,
+    issue,
+    certificateRequest,
+    issueFromRequest,
+    verifyChain
+);
+
+module body Standard.X509.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameStrings(left: &[String, R], right: &[String, S]): Bool is
+        if length(left) /= length(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(left) do
+            if nthByte(left, i) /= nthByte(right, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function now(): Int64 is
+        case toInt64(wallNanos() / 1000000000) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                abort("the clock does not fit");
+        end case;
+    end;
+
+    function key(kind: KeyKind): PrivateKey is
+        case generateKey(kind) of
+            when Some(value as made: PrivateKey) do
+                return made;
+            when None do
+                abort("no key");
+        end case;
+    end;
+
+    function isKind(kind: KeyKind, number: Int32): Bool is
+        case kind of
+            when EcP256 do
+                return number = 1;
+            when EcP384 do
+                return number = 2;
+            when Ed25519Key do
+                return number = 3;
+            when Rsa2048 do
+                return number = 4;
+            when Rsa3072 do
+                return number = 5;
+            when Rsa4096 do
+                return number = 6;
+            when EcP521 do
+                return number = 7;
+            when MlDsa44 do
+                return number = 8;
+            when MlDsa65 do
+                return number = 9;
+            when MlDsa87 do
+                return number = 10;
+        end case;
+    end;
+
+    -- A key of kind signs, verifies, and comes back from its PEM.
+    function signsAndReads(kind: KeyKind, number: Int32): Unit is
+        let made: PrivateKey := key(kind);
+        assertTrue(isKind(keyKindOf(&made), number), "the kind");
+        case publicKeyDer(&made) of
+            when Some(value as public: String) do
+                case signMessage(&made, "the message") of
+                    when Some(value as signature: String) do
+                        assertTrue(verifyMessage(asSpan(&public), "the message", asSpan(&signature)), "the signature holds");
+                        assertFalse(verifyMessage(asSpan(&public), "the massage", asSpan(&signature)), "not for another message");
+                        let other: PrivateKey := key(kind);
+                        case publicKeyDer(&other) of
+                            when Some(value as otherPublic: String) do
+                                assertFalse(verifyMessage(asSpan(&otherPublic), "the message", asSpan(&signature)), "not under another key");
+                                destroyString(otherPublic);
+                            when None do
+                                assertFailure("no public key");
+                        end case;
+                        destroyPrivateKey(other);
+                        destroyString(signature);
+                    when None do
+                        assertFailure("no signature");
+                end case;
+                case privateKeyToPem(&made) of
+                    when Some(value as pem: String) do
+                        case privateKeyFromPem(asSpan(&pem)) of
+                            when Some(value as back: PrivateKey) do
+                                assertTrue(isKind(keyKindOf(&back), number), "the kind after PEM");
+                                case publicKeyDer(&back) of
+                                    when Some(value as backPublic: String) do
+                                        assertTrue(sameStrings(&public, &backPublic), "the same public key after PEM");
+                                        destroyString(backPublic);
+                                    when None do
+                                        assertFailure("no public key after PEM");
+                                end case;
+                                destroyPrivateKey(back);
+                            when None do
+                                assertFailure("the PEM did not read back");
+                        end case;
+                        destroyString(pem);
+                    when None do
+                        assertFailure("no PEM");
+                end case;
+                destroyString(public);
+            when None do
+                assertFailure("no public key");
+        end case;
+        destroyPrivateKey(made);
+        return nil;
+    end;
+
+    function testKeys(): Unit is
+        signsAndReads(EcP256(), 1);
+        signsAndReads(EcP384(), 2);
+        signsAndReads(Ed25519Key(), 3);
+        case privateKeyFromPem("not a key") of
+            when Some(value as wrong: PrivateKey) do
+                destroyPrivateKey(wrong);
+                assertFailure("text that is no key was read");
+            when None do
+                assertSuccess("text that is no key is refused");
+        end case;
+        return nil;
+    end;
+
+    -- P-521, RSA of 2048 and 3072 bits and the three ML-DSA kinds sign and
+    -- are read back.
+    function testMoreKeys(): Unit is
+        signsAndReads(EcP521(), 7);
+        signsAndReads(Rsa2048(), 4);
+        signsAndReads(Rsa3072(), 5);
+        signsAndReads(MlDsa44(), 8);
+        signsAndReads(MlDsa65(), 9);
+        signsAndReads(MlDsa87(), 10);
+        return nil;
+    end;
+
+    -- One key of 4096 bits, which takes long to make.
+    function testRsa4096(): Unit is
+        signsAndReads(Rsa4096(), 6);
+        return nil;
+    end;
+
+    -- An ML-DSA key makes no certificate and no request, is no subject an
+    -- authority issues for, and belongs to no certificate.
+    function testMlDsaMakesNoCertificate(): Unit is
+        let lattice: PrivateKey := key(MlDsa65());
+        let caKey: PrivateKey := key(EcP256());
+        case selfSigned(&lattice, "Hilde ML-DSA CA", "", 5, true) of
+            when Some(value as made: Certificate) do
+                destroyCertificate(made);
+                assertFailure("an ML-DSA key made a certificate");
+            when None do
+                assertSuccess("an ML-DSA key makes no certificate");
+        end case;
+        case certificateRequest(&lattice, "pq.example", "pq.example") of
+            when Some(value as request: String) do
+                destroyString(request);
+                assertFailure("an ML-DSA key made a request");
+            when None do
+                assertSuccess("an ML-DSA key makes no request");
+        end case;
+        case selfSigned(&caKey, "Hilde CA", "", 5, true) of
+            when Some(value as ca: Certificate) do
+                assertFalse(belongsTo(&ca, &lattice), "an ML-DSA key belongs to no certificate");
+                case issue(&ca, &caKey, &lattice, "pq.example", "pq.example", 5, false) of
+                    when Some(value as leaf: Certificate) do
+                        destroyCertificate(leaf);
+                        assertFailure("a certificate was issued for an ML-DSA key");
+                    when None do
+                        assertSuccess("no certificate is issued for an ML-DSA key");
+                end case;
+                destroyCertificate(ca);
+            when None do
+                assertFailure("no CA");
+        end case;
+        destroyPrivateKey(caKey);
+        destroyPrivateKey(lattice);
+        return nil;
+    end;
+
+    function testNames(): Unit is
+        assertTrue(isDnsNameList("example.org"), "one name");
+        assertTrue(isDnsNameList("www.example.org,example.org"), "two names");
+        assertTrue(isDnsNameList("*.example.org"), "a star as the first label");
+        assertTrue(isDnsNameList("localhost"), "one label");
+        assertFalse(isDnsNameList(""), "nothing");
+        assertFalse(isDnsNameList("example.org,"), "an empty name at the end");
+        assertFalse(isDnsNameList("a..b"), "an empty label");
+        assertFalse(isDnsNameList("-a.b"), "a hyphen first");
+        assertFalse(isDnsNameList("a-.b"), "a hyphen last");
+        assertFalse(isDnsNameList("www.*.org"), "a star inside");
+        assertFalse(isDnsNameList("example.org,IP:1.2.3.4"), "another kind of name");
+        assertFalse(isDnsNameList("example.org, x.org"), "a space");
+        assertFalse(isDnsNameList("a_b.org"), "an underscore");
+        assertFalse(isDnsNameList("0123456789012345678901234567890123456789012345678901234567890123.org"), "a label of 64 bytes");
+        assertTrue(isDnsNameList("012345678901234567890123456789012345678901234567890123456789012.org"), "a label of 63 bytes");
+        return nil;
+    end;
+
+    function authorityOf(cakey: &[PrivateKey, Static]): Certificate is
+        case selfSigned(cakey, "Hilde Test CA", "", 30, true) of
+            when Some(value as made: Certificate) do
+                return made;
+            when None do
+                abort("no CA");
+        end case;
+    end;
+
+    -- A CA that signs itself, a leaf from a request, a chain that verifies
+    -- and four that do not.
+    function testAuthorityAndLeaf(): Unit is
+        let caKey: PrivateKey := key(EcP256());
+        case selfSigned(&caKey, "Hilde Test CA", "", 30, true) of
+            when Some(value as ca: Certificate) do
+                assertTrue(isAuthority(&ca), "a CA");
+                assertTrue(belongsTo(&ca, &caKey), "for its key");
+                case subjectName(&ca) of
+                    when Some(value as name: String) do
+                        assertTrue(same(&name, "Hilde Test CA"), "its name");
+                        destroyString(name);
+                    when None do
+                        assertFailure("no name");
+                end case;
+                let start: Int64 := now();
+                case validFrom(&ca) of
+                    when Some(value as begins: Int64) do
+                        assertTrue((begins >= (start - 120)) and (begins <= (start + 120)), "valid from now");
+                        case validUntil(&ca) of
+                            when Some(value as ends: Int64) do
+                                assertTrue((ends - begins) = 2592000, "valid for 30 days");
+                            when None do
+                                assertFailure("no end");
+                        end case;
+                    when None do
+                        assertFailure("no start");
+                end case;
+                case fingerprintSha256(&ca) of
+                    when Some(value as digest: String) do
+                        assertTrue(length(&digest) = 32, "a fingerprint of 32 bytes");
+                        case certificateToPem(&ca) of
+                            when Some(value as pem: String) do
+                                case certificateFromPem(asSpan(&pem)) of
+                                    when Some(value as back: Certificate) do
+                                        case fingerprintSha256(&back) of
+                                            when Some(value as backPrint: String) do
+                                                assertTrue(sameStrings(&digest, &backPrint), "the same certificate after PEM");
+                                                destroyString(backPrint);
+                                            when None do
+                                                assertFailure("no fingerprint after PEM");
+                                        end case;
+                                        destroyCertificate(back);
+                                    when None do
+                                        assertFailure("the PEM did not read back");
+                                end case;
+                                leafFromRequest(&ca, &caKey, &pem);
+                                destroyString(pem);
+                            when None do
+                                assertFailure("no PEM");
+                        end case;
+                        destroyString(digest);
+                    when None do
+                        assertFailure("no fingerprint");
+                end case;
+                case serialNumber(&ca) of
+                    when Some(value as serial: String) do
+                        assertTrue(length(&serial) > 8, "a long serial number");
+                        destroyString(serial);
+                    when None do
+                        assertFailure("no serial");
+                end case;
+                case certificateToDer(&ca) of
+                    when Some(value as der: String) do
+                        case certificateFromDer(asSpan(&der)) of
+                            when Some(value as back: Certificate) do
+                                assertTrue(isAuthority(&back), "the DER reads back");
+                                destroyCertificate(back);
+                            when None do
+                                assertFailure("the DER did not read back");
+                        end case;
+                        destroyString(der);
+                    when None do
+                        assertFailure("no DER");
+                end case;
+                destroyCertificate(ca);
+            when None do
+                assertFailure("no CA");
+        end case;
+        destroyPrivateKey(caKey);
+        return nil;
+    end;
+
+    generic [A: Region, K: Region, P: Region]
+    function leafFromRequest(ca: &[Certificate, A], caKey: &[PrivateKey, K], caPem: &[String, P]): Unit is
+        let leafKey: PrivateKey := key(Ed25519Key());
+        case certificateRequest(&leafKey, "", "www.example.org,example.org") of
+            when Some(value as request: String) do
+                case issueFromRequest(ca, caKey, asSpan(&request), 10) of
+                    when Some(value as leaf: Certificate) do
+                        assertFalse(isAuthority(&leaf), "a leaf");
+                        assertTrue(belongsTo(&leaf, &leafKey), "for the key of the request");
+                        let names: String := dnsNamesOf(&leaf);
+                        assertTrue(same(&names, "www.example.org,example.org"), "the names of the request");
+                        destroyString(names);
+                        case subjectName(&leaf) of
+                            when Some(value as name: String) do
+                                assertTrue(same(&name, "www.example.org"), "the first name as its common name");
+                                destroyString(name);
+                            when None do
+                                assertFailure("no subject name");
+                        end case;
+                        case issuerName(&leaf) of
+                            when Some(value as name: String) do
+                                assertTrue(same(&name, "Hilde Test CA"), "issued by the CA");
+                                destroyString(name);
+                            when None do
+                                assertFailure("no issuer name");
+                        end case;
+                        case certificateToPem(&leaf) of
+                            when Some(value as leafPem: String) do
+                                verifies(&leafPem, caPem);
+                                destroyString(leafPem);
+                            when None do
+                                assertFailure("no leaf PEM");
+                        end case;
+                        destroyCertificate(leaf);
+                    when None do
+                        assertFailure("nothing issued from the request");
+                end case;
+                destroyString(request);
+            when None do
+                assertFailure("no request");
+        end case;
+        destroyPrivateKey(leafKey);
+        return nil;
+    end;
+
+    generic [L: Region, C: Region]
+    function verifies(leafPem: &[String, L], caPem: &[String, C]): Unit is
+        let at: Int64 := now();
+        case verifyChain(asSpan(leafPem), asSpan(caPem), "example.org", at) of
+            when Some(value as why: String) do
+                destroyString(why);
+                assertFailure("the chain does not verify");
+            when None do
+                assertSuccess("the chain verifies for its name");
+        end case;
+        case verifyChain(asSpan(leafPem), asSpan(caPem), "evil.example", at) of
+            when Some(value as why: String) do
+                destroyString(why);
+                assertSuccess("not for another name");
+            when None do
+                assertFailure("verified for another name");
+        end case;
+        case verifyChain(asSpan(leafPem), asSpan(caPem), "", at + 867600) of
+            when Some(value as why: String) do
+                destroyString(why);
+                assertSuccess("not after its end");
+            when None do
+                assertFailure("verified after its end");
+        end case;
+        case verifyChain(asSpan(leafPem), asSpan(leafPem), "", at) of
+            when Some(value as why: String) do
+                destroyString(why);
+                assertSuccess("not against a trust that is not its CA");
+            when None do
+                assertFailure("verified against itself");
+        end case;
+        case verifyChain(asSpan(leafPem), "", "", at) of
+            when Some(value as why: String) do
+                assertTrue(same(&why, "no trusted certificate"), "no trust at all");
+                destroyString(why);
+            when None do
+                assertFailure("verified without trust");
+        end case;
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        let made: PrivateKey := key(EcP256());
+        refused(selfSigned(&made, "x", "a.org,DNS:b.org", 10, false), "a name with another kind in it");
+        refused(selfSigned(&made, "two\nlines", "", 10, false), "a common name with a line break");
+        refused(selfSigned(&made, "", "", 10, false), "an empty common name");
+        refused(selfSigned(&made, "x", "", 0, false), "no days");
+        refused(selfSigned(&made, "x", "", 36501, false), "too many days");
+        case selfSigned(&made, "a leaf", "leaf.example", 10, false) of
+            when Some(value as leaf: Certificate) do
+                let other: PrivateKey := key(EcP256());
+                refused(issue(&leaf, &made, &other, "x", "", 10, false), "issued by what is no CA");
+                destroyPrivateKey(other);
+                destroyCertificate(leaf);
+            when None do
+                assertFailure("no leaf");
+        end case;
+        case certificateFromPem("not a certificate") of
+            when Some(value as wrong: Certificate) do
+                destroyCertificate(wrong);
+                assertFailure("text that is no certificate was read");
+            when None do
+                assertSuccess("text that is no certificate is refused");
+        end case;
+        destroyPrivateKey(made);
+        return nil;
+    end;
+
+    -- Fixtures made with the openssl command line 3.5.7, all for one P-256
+    -- key made only for these tests.  keyCertSignOnly has keyUsage
+    -- keyCertSign and no basicConstraints, for which X509_check_ca answers
+    -- 4; caFixture has basicConstraints with the CA flag set, for which it
+    -- answers 1.
+    function fixtureKeyPem(): Span[Nat8, Static] is
+        return "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIO2cHPoF34/LuQLOYxB+HDsUqq+JiV12Z1dOd90WXKOcoAoGCCqGSM49\nAwEHoUQDQgAES6oOkWOubdYbfbHgVE+WWBOWRpd00xOpduN2mwEsz4Q41/xarcOG\nbVIXHtfdr98AD+UHKno3tt3GY2YHl77tKg==\n-----END EC PRIVATE KEY-----\n";
+    end;
+
+    function keyCertSignOnlyPem(): Span[Nat8, Static] is
+        return "-----BEGIN CERTIFICATE-----\nMIIBeDCCAR2gAwIBAgIUXFvqxS/DxCq5WlSee4kyZ3+UdVQwCgYIKoZIzj0EAwIw\nITEfMB0GA1UEAwwWSGlsZGUga2V5Q2VydFNpZ24gb25seTAgFw0yNjEwMTYwODM1\nNTZaGA8yMTI2MDkyMjA4MzU1NlowITEfMB0GA1UEAwwWSGlsZGUga2V5Q2VydFNp\nZ24gb25seTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABEuqDpFjrm3WG32x4FRP\nllgTlkaXdNMTqXbjdpsBLM+EONf8Wq3Dhm1SFx7X3a/fAA/lByp6N7bdxmNmB5e+\n7SqjMTAvMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUQKb8+NmdlaKXhPwhmEPZ\n4JQ5kEgwCgYIKoZIzj0EAwIDSQAwRgIhAI+fS6QUe+DkRS9DrGnhndS7Ji7y0rDn\nHyelgaDuL5knAiEAgO3YAAwdiIY/Dej6+/GU94djirDjY16jQTiAielFGDQ=\n-----END CERTIFICATE-----\n";
+    end;
+
+    function caFixturePem(): Span[Nat8, Static] is
+        return "-----BEGIN CERTIFICATE-----\nMIIBbTCCARKgAwIBAgIUGpFKeyfNiDbCI3S2nSV7xb4nWswwCgYIKoZIzj0EAwIw\nEzERMA8GA1UEAwwISGlsZGUgQ0EwIBcNMjYxMDE2MDgzNTU2WhgPMjEyNjA5MjIw\nODM1NTZaMBMxETAPBgNVBAMMCEhpbGRlIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0D\nAQcDQgAES6oOkWOubdYbfbHgVE+WWBOWRpd00xOpduN2mwEsz4Q41/xarcOGbVIX\nHtfdr98AD+UHKno3tt3GY2YHl77tKqNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNV\nHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFECm/PjZnZWil4T8IZhD2eCUOZBIMAoGCCqG\nSM49BAMCA0kAMEYCIQCdcVIFAiRZnbNh31Cb5sITOB6XyrSxaUbwyK2kG486MwIh\nAKHg/C0AVq3yV+bEEZWtGv9JBqSWqYlfzvgJo0OGipBB\n-----END CERTIFICATE-----\n";
+    end;
+
+    -- Requests signed by the fixture key, in Base64 of their DER: the first
+    -- asks for bad.example with a subject alternative name that holds a
+    -- null value where the names belong, the second for good.example.
+    function unreadableNamesRequest(): Span[Nat8, Static] is
+        return "MIHtMIGUAgEAMBYxFDASBgNVBAMMC2JhZC5leGFtcGxlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAES6oOkWOubdYbfbHgVE+WWBOWRpd00xOpduN2mwEsz4Q41/xarcOGbVIXHtfdr98AD+UHKno3tt3GY2YHl77tKqAcMBoGCSqGSIb3DQEJDjENMAswCQYDVR0RBAIFADAKBggqhkjOPQQDAgNIADBFAiAFLRJ8FqUPYCZTj2T51zcmpcTLARF5pZ4Ey5x8GjzqVQIhANNsS7RYf/Q43nePLMqQd4HIPD6sSUPFBJfWgpeM1PQM";
+    end;
+
+    function readableNamesRequest(): Span[Nat8, Static] is
+        return "MIH8MIGjAgEAMBcxFTATBgNVBAMMDGdvb2QuZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABEuqDpFjrm3WG32x4FRPllgTlkaXdNMTqXbjdpsBLM+EONf8Wq3Dhm1SFx7X3a/fAA/lByp6N7bdxmNmB5e+7SqgKjAoBgkqhkiG9w0BCQ4xGzAZMBcGA1UdEQQQMA6CDGdvb2QuZXhhbXBsZTAKBggqhkjOPQQDAgNIADBFAiEA5jtrZrd2VKWPx9B+U8P+SKjIXKg8ubkDde1GdxCVE58CIFs5dg8C3BI+X1N9/yl/XUAFpAgATZduwAg2y87IpvAJ";
+    end;
+
+    -- Only basicConstraints with the CA flag set makes a CA.  keyCertSign
+    -- alone, which
+    -- X509_check_ca answers with 4 and not 1, is none, and nothing is
+    -- issued under it with its own key.
+    function testAuthorityNeedsBasicConstraints(): Unit is
+        case privateKeyFromPem(fixtureKeyPem()) of
+            when Some(value as fixtureKey: PrivateKey) do
+                case certificateFromPem(keyCertSignOnlyPem()) of
+                    when Some(value as signer: Certificate) do
+                        assertFalse(isAuthority(&signer), "keyCertSign without basicConstraints is no CA");
+                        let subject: PrivateKey := key(EcP256());
+                        refused(issue(&signer, &fixtureKey, &subject, "leaf.example", "", 10, false), "nothing is issued under keyCertSign alone");
+                        destroyPrivateKey(subject);
+                        destroyCertificate(signer);
+                    when None do
+                        assertFailure("the keyCertSign fixture is read");
+                end case;
+                case certificateFromPem(caFixturePem()) of
+                    when Some(value as ca: Certificate) do
+                        assertTrue(isAuthority(&ca), "basicConstraints CA:TRUE is a CA");
+                        let subject: PrivateKey := key(EcP256());
+                        case issue(&ca, &fixtureKey, &subject, "leaf.example", "", 10, false) of
+                            when Some(value as leaf: Certificate) do
+                                assertSuccess("a leaf is issued under CA:TRUE");
+                                destroyCertificate(leaf);
+                            when None do
+                                assertFailure("a leaf is issued under CA:TRUE");
+                        end case;
+                        destroyPrivateKey(subject);
+                        destroyCertificate(ca);
+                    when None do
+                        assertFailure("the CA fixture is read");
+                end case;
+                destroyPrivateKey(fixtureKey);
+            when None do
+                assertFailure("the fixture key is read");
+        end case;
+        return nil;
+    end;
+
+    -- A request whose names do not decode is refused, and not issued for
+    -- its common name alone; the same request with readable names is
+    -- issued with them.
+    function testRequestWithUnreadableNames(): Unit is
+        let caKey: PrivateKey := key(EcP256());
+        case selfSigned(&caKey, "Hilde Test CA", "", 30, true) of
+            when Some(value as ca: Certificate) do
+                case decode(unreadableNamesRequest()) of
+                    when Some(value as der: String) do
+                        refused(issueFromRequest(&ca, &caKey, asSpan(&der), 10), "a request whose names do not decode");
+                        destroyString(der);
+                    when None do
+                        assertFailure("the first request fixture decodes");
+                end case;
+                case decode(readableNamesRequest()) of
+                    when Some(value as der: String) do
+                        case issueFromRequest(&ca, &caKey, asSpan(&der), 10) of
+                            when Some(value as leaf: Certificate) do
+                                let names: String := dnsNamesOf(&leaf);
+                                assertTrue(same(&names, "good.example"), "the names of the request");
+                                destroyString(names);
+                                destroyCertificate(leaf);
+                            when None do
+                                assertFailure("a request with readable names is issued");
+                        end case;
+                        destroyString(der);
+                    when None do
+                        assertFailure("the second request fixture decodes");
+                end case;
+                destroyCertificate(ca);
+            when None do
+                assertFailure("no CA");
+        end case;
+        destroyPrivateKey(caKey);
+        return nil;
+    end;
+
+    function refused(made: Option[Certificate], message: Span[Nat8, Static]): Unit is
+        case made of
+            when Some(value as certificate: Certificate) do
+                destroyCertificate(certificate);
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+end module body.

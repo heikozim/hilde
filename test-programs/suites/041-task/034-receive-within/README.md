@@ -1,0 +1,1 @@
+receiveWithin: the time runs out on an empty channel whose sender is open, a value sent later comes before a long limit, a closed channel answers closed, and on a channel of capacity 0 the time runs out.

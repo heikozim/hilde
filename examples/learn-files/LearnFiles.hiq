@@ -1,0 +1,222 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Files and their names.  Standard.Path takes a path apart and puts one
+-- together, Standard.AtomicFile writes a file so that a reader sees the
+-- old content or the new one and never half of it, Standard.FileHelpers
+-- copies files and measures a directory, and Standard.Watch sees a file
+-- change.  Everything the programme makes it removes again, so its
+-- directory holds what it held before.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Failure (
+    Failure,
+    destroyFailure
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile,
+    removeFileIfThere,
+    createDirectory,
+    removeDirectory
+);
+import Standard.Path (
+    baseName,
+    directoryName,
+    extension,
+    joinPath,
+    isAbsolute
+);
+import Standard.AtomicFile (
+    AtomicFailure,
+    Change,
+    Unchanged,
+    Created,
+    Replaced,
+    backupName,
+    writeAtomically,
+    writeWithBackup,
+    writeIfChanged
+);
+import Standard.FileHelpers (
+    copyFile,
+    directorySize,
+    formatSize
+);
+import Standard.Watch (
+    Watcher,
+    WatchResult,
+    WaitedOut,
+    WatchFailed,
+    Changed,
+    makeWatcher,
+    watchFile,
+    waitForChange,
+    destroyWatcher
+);
+
+import Standard.Sandbox (
+    Report,
+    makePolicy,
+    allowPromises,
+    allowPath,
+    applyPolicy,
+    reportRefused
+);
+
+module body Example.LearnFiles is
+    -- Before anything else the programme gives up what it does not need:
+    -- of the file system only its own directory, and of the system calls
+    -- only those of the promises.  On OpenBSD that is pledge and unveil, on
+    -- Linux Landlock and seccomp, elsewhere nothing.  A policy that is not
+    -- valid is a mistake in this programme, and it stops.
+    function confine(): Unit is
+        let applied: Report := applyPolicy(allowPath(allowPromises(makePolicy(), "stdio rpath wpath cpath fattr chown"), ".", "rwc"));
+        if reportRefused(applied) then
+            abort("the sandbox policy is not valid");
+        end if;
+        return nil;
+    end;
+
+    function printString(label: Span[Nat8, Static], s: String): Unit is
+        print(label);
+        printLn(asSpan(&s));
+        destroyString(s);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function contentOf(path: Span[Nat8, R]): Unit is
+        print(path);
+        print(" holds: ");
+        case openRead(path) of
+            when Some(value as file: FileDescriptor) do
+                var f: FileDescriptor := file;
+                case readAll(&!f) of
+                    when Some(value as text: String) do
+                        print(asSpan(&text));
+                        destroyString(text);
+                    when None do
+                        printLn("(unreadable)");
+                end case;
+                let closed: Bool := closeFile(f);
+            when None do
+                printLn("(not there)");
+        end case;
+        return nil;
+    end;
+
+    function changeName(change: Change): Span[Nat8, Static] is
+        case change of
+            when Unchanged do
+                return "unchanged";
+            when Created do
+                return "created";
+            when Replaced do
+                return "replaced";
+        end case;
+    end;
+
+    function main(): ExitCode is
+        confine();
+        -- A path taken apart and put together.
+        let path: Span[Nat8, Static] := "/srv/www/site/index.html";
+        printString("base name: ", baseName(path));
+        printString("directory: ", directoryName(path));
+        case extension(path) of
+            when Some(value as e: String) do
+                printString("extension: ", e);
+            when None do
+                printLn("extension: none");
+        end case;
+        printString("joined: ", joinPath("/srv/www", "notes.txt"));
+        print("absolute: ");
+        printLn(isAbsolute("notes.txt"));
+        -- A file written whole, then again with a backup of the old one.
+        let mode: Nat32 := 420;
+        case writeAtomically("notes.txt", "first line\n", mode) of
+            when Right(right as u: Unit) do
+                contentOf("notes.txt");
+            when Left(left as f: AtomicFailure) do
+                printLn("the first write failed");
+        end case;
+        case writeWithBackup("notes.txt", "second line\n", mode) of
+            when Right(right as made: Bool) do
+                print("a backup was made: ");
+                printLn(made);
+            when Left(left as f: AtomicFailure) do
+                printLn("the second write failed");
+        end case;
+        contentOf("notes.txt");
+        let backup: String := backupName("notes.txt");
+        contentOf(asSpan(&backup));
+        case writeIfChanged("notes.txt", "second line\n", mode) of
+            when Right(right as c: Change) do
+                print("the same content again: ");
+                printLn(changeName(c));
+            when Left(left as f: AtomicFailure) do
+                printLn("the third write failed");
+        end case;
+        -- A copy in a directory of its own, and the size of that directory.
+        if not createDirectory("copies") then
+            printLn("the directory of copies could not be made");
+        end if;
+        case copyFile("notes.txt", "copies/notes.txt") of
+            when Right(right as u: Unit) do
+                case directorySize("copies") of
+                    when Right(right as size: Nat64) do
+                        printString("the directory of copies: ", formatSize(size));
+                    when Left(left as f: Failure) do
+                        printLn("the directory could not be measured");
+                        destroyFailure(f);
+                end case;
+            when Left(left as f: Failure) do
+                printLn("the copy failed");
+                destroyFailure(f);
+        end case;
+        -- A watch on the file sees it change.
+        case makeWatcher() of
+            when Some(value as w: Watcher) do
+                var watcher: Watcher := w;
+                case watchFile(&!watcher, "notes.txt") of
+                    when Some(value as number: Index) do
+                        case writeAtomically("notes.txt", "third line\n", mode) of
+                            when Right(right as u: Unit) do
+                                skip;
+                            when Left(left as f: AtomicFailure) do
+                                printLn("the write under watch failed");
+                        end case;
+                        let wait: Nat32 := 2000;
+                        case waitForChange(&!watcher, wait) of
+                            when Changed(watch as n: Index) do
+                                print("the watch saw a change: ");
+                                printLn(n = number);
+                            when WaitedOut do
+                                printLn("the watch saw nothing");
+                            when WatchFailed do
+                                printLn("the watch failed");
+                        end case;
+                    when None do
+                        printLn("the file could not be watched");
+                end case;
+                destroyWatcher(watcher);
+            when None do
+                printLn("no watcher on this system");
+        end case;
+        -- Everything made is removed again.
+        let gone: Bool := ((removeFileIfThere("copies/notes.txt") and removeDirectory("copies")) and removeFileIfThere(asSpan(&backup))) and removeFileIfThere("notes.txt");
+        destroyString(backup);
+        print("all removed: ");
+        printLn(gone);
+        return ExitSuccess();
+    end;
+end module body.

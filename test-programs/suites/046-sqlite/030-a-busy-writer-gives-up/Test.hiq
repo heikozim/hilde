@@ -1,0 +1,112 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.File (
+    removeFile
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Sqlite (
+    Connection,
+    Writing,
+    SqlError,
+    Transaction,
+    openWriter,
+    closeDatabase,
+    begin,
+    rollback,
+    execute,
+    noValues
+);
+
+module body Test is
+    constant databasePath: Span[Nat8, Static] := "/tmp/hilde-046-030.db";
+
+    function removeDatabase(): Unit is
+        let file: String := fromLiteral(databasePath);
+        let wal: String := fromLiteral("/tmp/hilde-046-030.db-wal");
+        let shm: String := fromLiteral("/tmp/hilde-046-030.db-shm");
+        let a: Bool := removeFile(asSpan(&file));
+        let b: Bool := removeFile(asSpan(&wal));
+        let c: Bool := removeFile(asSpan(&shm));
+        destroyString(file);
+        destroyString(wal);
+        destroyString(shm);
+        return nil;
+    end;
+
+    function nowNanos(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as n: Nat64) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function refused(result: Either[SqlError, Nat64]): Bool is
+        case result of
+            when Left(left as error: SqlError) do
+                return true;
+            when Right(right as rows: Nat64) do
+                return false;
+        end case;
+    end;
+
+    -- A second writer while the first holds the write lock: it waits,
+    -- tries again, and gives up after five seconds, not more.
+    generic [R: Region]
+    function secondWriter(holder: &![Connection[Writing], R]): Unit is
+        case openWriter(databasePath) of
+            when Right(right as opened: Connection[Writing]) do
+                var other: Connection[Writing] := opened;
+                let before: Nat64 := nowNanos();
+                let tried: Either[SqlError, Nat64] := execute(&!other, "INSERT INTO t VALUES (2)", noValues());
+                let after: Nat64 := nowNanos();
+                if refused(tried) then
+                    printLn("the second writer is refused");
+                else
+                    printLn("the second writer wrote");
+                end if;
+                let waited: Nat64 := (after - before) / 1000000;
+                if (waited >= 5000) and (waited < 6000) then
+                    printLn("it gave up after five seconds");
+                else
+                    printLn(waited);
+                end if;
+                closeDatabase(other);
+            when Left(left as error: SqlError) do
+                printLn("no second connection");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        removeDatabase();
+        case openWriter(databasePath) of
+            when Right(right as opened: Connection[Writing]) do
+                var holder: Connection[Writing] := opened;
+                let made: Either[SqlError, Nat64] := execute(&!holder, "CREATE TABLE t (x INTEGER)", noValues());
+                case begin(&!holder) of
+                    when Right(right as transaction: Transaction) do
+                        let first: Either[SqlError, Nat64] := execute(&!holder, "INSERT INTO t VALUES (1)", noValues());
+                        if refused(first) then
+                            printLn("the first writer is refused");
+                        end if;
+                        secondWriter(&!holder);
+                        rollback(&!holder, transaction);
+                    when Left(left as error: SqlError) do
+                        printLn("no transaction");
+                end case;
+                closeDatabase(holder);
+            when Left(left as error: SqlError) do
+                printLn("no first connection");
+        end case;
+        removeDatabase();
+        return ExitSuccess();
+    end;
+end module body.

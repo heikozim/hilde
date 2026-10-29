@@ -1,0 +1,356 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The slots of Standard.Database for PostgreSQL.  A connection, a
+-- transaction and a cursor of Standard.Postgres are erased into the
+-- database's own types and revealed here, as the type they were erased
+-- with: writing says whether a connection was opened for writing.
+import Standard.Buffer (
+    Buffer,
+    destroyEmpty,
+    remove,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Bindings.Database (
+    Erased,
+    erase,
+    unerase,
+    reveal,
+    revealWrite
+);
+import Standard.Database (
+    Database,
+    Writing,
+    Reading,
+    PostgresBackend,
+    DbError,
+    Values,
+    Value,
+    IntValue,
+    FloatValue,
+    BoolValue,
+    TimeValue,
+    TextValue,
+    BytesValue,
+    NullValue,
+    takeValues,
+    numberPlaceholders,
+    ColumnKind,
+    NullKind,
+    IntKind,
+    FloatKind,
+    BoolKind,
+    TimeKind,
+    TextKind,
+    BytesKind,
+    Column,
+    IntColumn,
+    FloatColumn,
+    BoolColumn,
+    TextColumn,
+    ErrorKind,
+    writerOf,
+    readerOf,
+    postgresClose,
+    postgresMigrate,
+    postgresBegin,
+    postgresEnd,
+    postgresStart,
+    postgresExecute,
+    postgresAdvance,
+    postgresColumn,
+    postgresFinish,
+    postgresKind
+);
+import Standard.Postgres (
+    Connection,
+    Writing as PgWriting,
+    Reading as PgReading,
+    PgError,
+    Transaction as PgTransaction,
+    Values as PgValues,
+    Cursor as PgCursor,
+    describe as pgDescribe,
+    isUniqueViolation as pgIsUniqueViolation,
+    isConstraintViolation as pgIsConstraintViolation,
+    isBusy as pgIsBusy,
+    openWriter as pgOpenWriter,
+    openReader as pgOpenReader,
+    closeDatabase as pgClose,
+    migrate as pgMigrate,
+    begin as pgBegin,
+    commit as pgCommit,
+    rollback as pgRollback,
+    noValues as pgNoValues,
+    withInt64 as pgWithInt64,
+    withFloat64 as pgWithFloat64,
+    withBool as pgWithBool,
+    withTimestamp as pgWithTimestamp,
+    withText as pgWithText,
+    withBytes as pgWithBytes,
+    withNull as pgWithNull,
+    start as pgStart,
+    execute as pgExecute,
+    advance as pgAdvance,
+    columnInt64 as pgColumnInt64,
+    columnFloat64 as pgColumnFloat64,
+    columnBool as pgColumnBool,
+    columnTimestamp as pgColumnTimestamp,
+    columnText as pgColumnText,
+    columnBytes as pgColumnBytes,
+    isNullColumn as pgIsNullColumn,
+    finish as pgFinish
+);
+
+module body Standard.Database.Postgres is
+    ---
+    --- The connection, transaction and cursor behind an erased box
+    ---
+
+    generic [R: Region]
+    function writer(connection: &![Erased, R]): &![Connection[PgWriting], R] is
+        return revealWrite(connection);
+    end;
+
+    generic [R: Region]
+    function reader(connection: &![Erased, R]): &![Connection[PgReading], R] is
+        return revealWrite(connection);
+    end;
+
+    generic [R: Region]
+    function rowsToAdvance(rows: &![Erased, R]): &![PgCursor, R] is
+        return revealWrite(rows);
+    end;
+
+    generic [R: Region]
+    function rowsToRead(rows: &[Erased, R]): &[PgCursor, R] is
+        return reveal(rows);
+    end;
+
+    function failed(error: PgError): DbError is
+        return DbError(backend => PostgresBackend(), code => error.code);
+    end;
+
+    ---
+    --- Opening
+    ---
+
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openPostgres(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F]): Either[DbError, Database[Writing]] is
+        case pgOpenWriter(host, port, database, user, password, caFile) of
+            when Left(left as error: PgError) do
+                return Left(left => failed(error));
+            when Right(right as connection: Connection[PgWriting]) do
+                return Right(right => writerOf(erase(connection), PostgresBackend()));
+        end case;
+    end;
+
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openPostgresReader(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F]): Either[DbError, Database[Reading]] is
+        case pgOpenReader(host, port, database, user, password, caFile) of
+            when Left(left as error: PgError) do
+                return Left(left => failed(error));
+            when Right(right as connection: Connection[PgReading]) do
+                return Right(right => readerOf(erase(connection), PostgresBackend()));
+        end case;
+    end;
+
+    ---
+    --- The slots
+    ---
+
+    pragma Implements(Name => "Standard.Database.postgresClose");
+    function closePostgres(connection: Erased, writing: Bool): Unit is
+        if writing then
+            let open: Connection[PgWriting] := unerase(connection);
+            pgClose(open);
+        else
+            let open: Connection[PgReading] := unerase(connection);
+            pgClose(open);
+        end if;
+        return nil;
+    end;
+
+    pragma Implements(Name => "Standard.Database.postgresMigrate");
+    generic [R: Region]
+    function migratePostgres(connection: &![Erased, R], migrations: Span[Nat8, Static]): Either[DbError, Index] is
+        case pgMigrate(writer(connection), migrations) of
+            when Left(left as error: PgError) do
+                return Left(left => failed(error));
+            when Right(right as count: Index) do
+                return Right(right => count);
+        end case;
+    end;
+
+    function begun(result: Either[PgError, PgTransaction]): Either[DbError, Erased] is
+        case result of
+            when Left(left as error: PgError) do
+                return Left(left => failed(error));
+            when Right(right as transaction: PgTransaction) do
+                return Right(right => erase(transaction));
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.postgresBegin");
+    generic [R: Region]
+    function beginPostgres(connection: &![Erased, R], writing: Bool): Either[DbError, Erased] is
+        if writing then
+            return begun(pgBegin(writer(connection)));
+        else
+            return begun(pgBegin(reader(connection)));
+        end if;
+    end;
+
+    function done(result: Either[PgError, Unit]): Either[DbError, Unit] is
+        case result of
+            when Left(left as error: PgError) do
+                return Left(left => failed(error));
+            when Right(right as ended: Unit) do
+                return Right(right => nil);
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.postgresEnd");
+    generic [R: Region]
+    function endPostgres(connection: &![Erased, R], writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit] is
+        let inner: PgTransaction := unerase(transaction);
+        if writing then
+            if keep then
+                return done(pgCommit(writer(connection), inner));
+            else
+                pgRollback(writer(connection), inner);
+            end if;
+        else
+            if keep then
+                return done(pgCommit(reader(connection), inner));
+            else
+                pgRollback(reader(connection), inner);
+            end if;
+        end if;
+        return Right(right => nil);
+    end;
+
+    function toPg(values: Values): PgValues is
+        var list: Buffer[Value] := takeValues(values);
+        var out: PgValues := pgNoValues();
+        while bufferLength(&list) > 0 do
+            case remove(&!list, 0) of
+                when IntValue(value as v: Int64) do
+                    out := pgWithInt64(out, v);
+                when FloatValue(value as v: Float64) do
+                    out := pgWithFloat64(out, v);
+                when BoolValue(value as v: Bool) do
+                    out := pgWithBool(out, v);
+                when TimeValue(value as v: Int64) do
+                    out := pgWithTimestamp(out, v);
+                when TextValue(value as s: String) do
+                    out := pgWithText(out, asSpan(&s));
+                    destroyString(s);
+                when BytesValue(value as s: String) do
+                    out := pgWithBytes(out, asSpan(&s));
+                    destroyString(s);
+                when NullValue do
+                    out := pgWithNull(out);
+            end case;
+        end while;
+        destroyEmpty(list);
+        return out;
+    end;
+
+    -- Run sql with its question marks numbered.
+    generic [M: Free, R: Region]
+    function run(connection: &![Connection[M], R], sql: Span[Nat8, Static], values: Values): Erased is
+        let numbered: String := numberPlaceholders(sql);
+        let rows: PgCursor := pgStart(connection, asSpan(&numbered), toPg(values));
+        destroyString(numbered);
+        return erase(rows);
+    end;
+
+    pragma Implements(Name => "Standard.Database.postgresStart");
+    generic [R: Region]
+    function startPostgres(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased is
+        if writing then
+            return run(writer(connection), sql, values);
+        else
+            return run(reader(connection), sql, values);
+        end if;
+    end;
+
+    pragma Implements(Name => "Standard.Database.postgresExecute");
+    generic [R: Region]
+    function executePostgres(connection: &![Erased, R], sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64] is
+        let numbered: String := numberPlaceholders(sql);
+        let result: Either[PgError, Nat64] := pgExecute(writer(connection), asSpan(&numbered), toPg(values));
+        destroyString(numbered);
+        case result of
+            when Left(left as error: PgError) do
+                return Left(left => failed(error));
+            when Right(right as count: Nat64) do
+                return Right(right => count);
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.postgresAdvance");
+    generic [R: Region]
+    function advancePostgres(rows: &![Erased, R]): Bool is
+        return pgAdvance(rowsToAdvance(rows));
+    end;
+
+    pragma Implements(Name => "Standard.Database.postgresColumn");
+    generic [R: Region]
+    function columnPostgres(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R] is
+        let cursor: &[PgCursor, R] := rowsToRead(rows);
+        case kind of
+            when NullKind do
+                return BoolColumn(value => pgIsNullColumn(cursor, index));
+            when IntKind do
+                return IntColumn(value => pgColumnInt64(cursor, index));
+            when FloatKind do
+                return FloatColumn(value => pgColumnFloat64(cursor, index));
+            when BoolKind do
+                return BoolColumn(value => pgColumnBool(cursor, index));
+            when TimeKind do
+                return IntColumn(value => pgColumnTimestamp(cursor, index));
+            when TextKind do
+                return TextColumn(value => pgColumnText(cursor, index));
+            when BytesKind do
+                return TextColumn(value => pgColumnBytes(cursor, index));
+        end case;
+    end;
+
+    function finished(result: Option[PgError]): Option[DbError] is
+        case result of
+            when Some(value as error: PgError) do
+                return Some(value => failed(error));
+            when None do
+                return None();
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.postgresFinish");
+    generic [R: Region]
+    function finishPostgres(connection: &![Erased, R], writing: Bool, rows: Erased): Option[DbError] is
+        let cursor: PgCursor := unerase(rows);
+        if writing then
+            return finished(pgFinish(writer(connection), cursor));
+        else
+            return finished(pgFinish(reader(connection), cursor));
+        end if;
+    end;
+
+    pragma Implements(Name => "Standard.Database.postgresKind");
+    function kindPostgres(code: Int32): ErrorKind is
+        let error: PgError := PgError(code => code);
+        return ErrorKind(unique => pgIsUniqueViolation(error), constraint => pgIsConstraintViolation(error), busy => pgIsBusy(error), text => pgDescribe(error));
+    end;
+end module body.

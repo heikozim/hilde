@@ -1,0 +1,137 @@
+pragma Unsafe_Module;
+
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    makeString,
+    storeNth,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    closeFile,
+    readAll,
+    writeAll,
+    fileNumber,
+    Pipe,
+    openPipe,
+    closePipe,
+    readEnd,
+    Command,
+    makeCommand,
+    addArgument,
+    discardCommand,
+    Process,
+    Running,
+    spawnProcess,
+    processId,
+    terminateProcess,
+    waitProcess,
+    ProcessStatus,
+    exitedNormally,
+    exitCode,
+    endedBySignal,
+    signalNumber,
+    waitFailed,
+    terminationSignal
+);
+
+module body Test is
+    function widen(value: Bool): Int32 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(left: &[String, R], right: &[String, S]): Bool is
+        let size: Index := length(left);
+        if size /= length(right) then
+            return false;
+        end if;
+        if size = 0 then
+            return true;
+        end if;
+        var same: Bool := true;
+        for i from 0 to size - 1 do
+            if nthByte(left, i) /= nthByte(right, i) then
+                same := false;
+            end if;
+        end for;
+        return same;
+    end;
+
+    -- Read a pipe end to its end, compare, and close it.
+    generic [R: Region]
+    function drainIs(file: FileDescriptor, expected: &[String, R]): Bool is
+        var pipeEnd: FileDescriptor := file;
+        var verdict: Bool := false;
+        case readAll(&!pipeEnd) of
+            when Some(value as got: String) do
+                verdict := sameBytes(&got, expected);
+                destroyString(got);
+            when None do
+                verdict := false;
+        end case;
+        closeFile(pipeEnd);
+        return verdict;
+    end;
+
+    -- /bin/sh -c <script>, with the script as the only argument after
+    -- the name the script sees as $0.
+    generic [R: Region]
+    function shell(script: &[String, R]): Command is
+        var sh: String := fromLiteral("/bin/sh");
+        var dashC: String := fromLiteral("-c");
+        var zero: String := fromLiteral("hilde-040");
+        let c1: Command := makeCommand(asSpan(&sh));
+        let c2: Command := addArgument(c1, asSpan(&dashC));
+        let c3: Command := addArgument(c2, asSpan(script));
+        let c4: Command := addArgument(c3, asSpan(&zero));
+        destroyString(sh);
+        destroyString(dashC);
+        destroyString(zero);
+        return c4;
+    end;
+
+    -- Run a script with nothing on its input, and compare its output.
+    generic [R: Region, S: Region]
+    function outputOf(script: &[String, R], expected: &[String, S]): Bool is
+        case spawnProcess(shell(script)) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                let same: Bool := drainIs(output, expected);
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                if exitedNormally(status) then
+                    return same;
+                end if;
+                return false;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function main(): ExitCode is
+        -- 1. A write into a pipe whose reader is closed fails with EPIPE;
+        --    with SIGPIPE at its default the programme would end here.
+        let refused: Int32 := @embed(Int32, "__extension__ ({ int hilde_ends[2]; int32_t hilde_got = -1; if (pipe(hilde_ends) == 0) { close(hilde_ends[0]); hilde_got = (write(hilde_ends[1], \"x\", 1) < 0 && errno == EPIPE) ? 1 : 0; close(hilde_ends[1]); } (int32_t) hilde_got; })");
+        print("write without a reader fails with EPIPE: ");
+        printLn(refused);
+        -- 2. A child has SIGPIPE at its default again: the shell lists no
+        --    trap, where an inherited ignore would show as a trap of it.
+        var script: String := fromLiteral("trap");
+        var nothing: String := fromLiteral("");
+        print("the child lists no trap: ");
+        printLn(widen(outputOf(&script, &nothing)));
+        destroyString(script);
+        destroyString(nothing);
+        return ExitSuccess();
+    end;
+end module body.

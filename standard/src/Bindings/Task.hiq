@@ -1,0 +1,464 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Binds the fibers, scopes and channels of the runtime.  A task's argument
+-- and result live in raw memory between the spawn and the join, and the
+-- runtime is C, so it is an unsafe module; Standard.Task is the safe module
+-- built on it, and the compiler checks what a task is handed at the calls
+-- of Standard.Task.  Every handle is linear, and each raw cell is written
+-- once and read once.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullCheck,
+    allocate,
+    allocateBuffer,
+    load,
+    store,
+    deallocate,
+    pointerCast,
+    positiveOffset
+);
+import Standard.File (
+    FileDescriptor,
+    fileNumber
+);
+
+module body Bindings.Task is
+    function tasksAvailable(): Bool is
+        return @embed(Int32, "hilde_task_available()") = 1;
+    end;
+
+    ---
+    --- Scopes
+    ---
+
+    record Scope: Linear is
+        handle: Pointer[Nat8];
+    end;
+
+    function openScope(): Option[Scope] is
+        let address: Address[Nat8] :=
+            @embed(Address[Nat8], "hilde_task_scope_open()");
+        case nullCheck(address) of
+            when Some(value as handle: Pointer[Nat8]) do
+                let some: Option[Scope] := Some(value => Scope(handle => handle));
+                return some;
+            when None do
+                let none: Option[Scope] := None();
+                return none;
+        end case;
+    end;
+
+    function openScopeSized(stackBytes: Index): Option[Scope] is
+        let address: Address[Nat8] :=
+            @embed(Address[Nat8], "hilde_task_scope_open_sized($1)", stackBytes);
+        case nullCheck(address) of
+            when Some(value as handle: Pointer[Nat8]) do
+                let some: Option[Scope] := Some(value => Scope(handle => handle));
+                return some;
+            when None do
+                let none: Option[Scope] := None();
+                return none;
+        end case;
+    end;
+
+    function closeScope(scope: Scope): Unit is
+        let { handle: Pointer[Nat8] } := scope;
+        @embed(Unit, "hilde_task_scope_close($1)", handle);
+        return nil;
+    end;
+
+    ---
+    --- Tasks
+    ---
+
+    record Task[T: Type]: Linear is
+        -- The runtime's fiber, opaque here.
+        fiber: Pointer[Nat8];
+        -- Where the task leaves its result.  Holds None until the task has
+        -- ended, and Some exactly once after.
+        result: Pointer[Option[T]];
+    end;
+
+    -- What a task starts with, in raw memory from the spawn until the task
+    -- reads it -- once, at its very beginning.
+    record Cell[A: Type, T: Type]: Linear is
+        work: Fn[A, T];
+        argument: A;
+        result: Pointer[Option[T]];
+    end;
+
+    -- The first thing every task runs.  Its signature names A and T so
+    -- that the function value in spawn can be made for them; the runtime
+    -- calls it through a function pointer taking one data pointer, which is
+    -- how both ABIs this runtime supports pass any data pointer.
+    generic [A: Type, T: Type]
+    function runCell(cellPointer: Pointer[Cell[A, T]]): Unit is
+        let cell: Cell[A, T] := load(cellPointer);
+        deallocate(cellPointer);
+        let { work: Fn[A, T], argument: A, result: Pointer[Option[T]] } := cell;
+        let value: T := work(argument);
+        let some: Option[T] := Some(value => value);
+        store(result, some);
+        return nil;
+    end;
+
+    generic [A: Type, T: Type, R: Region]
+    function spawn(scope: &![Scope, R], work: Fn[A, T], argument: A): Either[A, Task[T]] is
+        let resultAddress: Address[Option[T]] := allocate();
+        case nullCheck(resultAddress) of
+            when Some(value as result: Pointer[Option[T]]) do
+                let nothingYet: Option[T] := None();
+                store(result, nothingYet);
+                let handle: Pointer[Nat8] := scope->handle;
+                return spawnWith(handle, work, argument, result);
+            when None do
+                let left: Either[A, Task[T]] := Left(left => argument);
+                return left;
+        end case;
+    end;
+
+    -- The part of spawn and spawnLending that runs once the result cell
+    -- exists; handle is the runtime's scope, of either kind.  Every path
+    -- either hands the task back or gives the argument back.  The checks
+    -- of the compiler stand at the calls of Standard.Task, and no program
+    -- can import this module (H2045).
+    generic [A: Type, T: Type]
+    function spawnWith(handle: Pointer[Nat8], work: Fn[A, T], argument: A,
+        result: Pointer[Option[T]]): Either[A, Task[T]] is
+        let cellAddress: Address[Cell[A, T]] := allocateBuffer(1);
+        case nullCheck(cellAddress) of
+            when Some(value as cellPointer: Pointer[Cell[A, T]]) do
+                let cell: Cell[A, T] :=
+                    Cell(work => work, argument => argument, result => result);
+                store(cellPointer, cell);
+                let entry: Fn[Pointer[Cell[A, T]], Unit] := runCell;
+                let fiberAddress: Address[Nat8] :=
+                    @embed(Address[Nat8], "hilde_task_spawn($1, $2, (uint8_t*) $3)",
+                    handle, entry, cellPointer);
+                case nullCheck(fiberAddress) of
+                    when Some(value as fiber: Pointer[Nat8]) do
+                        let task: Task[T] := Task(fiber => fiber, result => result);
+                        let right: Either[A, Task[T]] := Right(right => task);
+                        return right;
+                    when None do
+                        -- No task: the cell was never read, so the argument
+                        -- is still in it, and it goes back to the caller.
+                        let back: Cell[A, T] := load(cellPointer);
+                        deallocate(cellPointer);
+                        let { work as backWork: Fn[A, T],
+                            argument as backArgument: A,
+                            result as backResult: Pointer[Option[T]] } := back;
+                        deallocate(backResult);
+                        let left: Either[A, Task[T]] := Left(left => backArgument);
+                        return left;
+                end case;
+            when None do
+                deallocate(result);
+                let left: Either[A, Task[T]] := Left(left => argument);
+                return left;
+        end case;
+    end;
+
+    generic [T: Type]
+    function join(task: Task[T]): T is
+        let { fiber: Pointer[Nat8], result: Pointer[Option[T]] } := task;
+        @embed(Unit, "hilde_task_join($1)", fiber);
+        let answer: Option[T] := load(result);
+        deallocate(result);
+        case answer of
+            when Some(value as finished: T) do
+                return finished;
+            when None do
+                -- A task that ended has stored Some; the runtime returns
+                -- from hilde_task_join only for a task that ended.
+                abort("Standard.Task.join: a task ended without a result");
+        end case;
+    end;
+
+    generic [T: Type, R: Region]
+    function taskDone(task: &[Task[T], R]): Bool is
+        let done: Int32 := @embed(Int32, "hilde_task_done($1)", task->fiber);
+        return done = 1;
+    end;
+
+    generic [R: Region]
+    function waitScopeBelow(scope: &![Scope, R], count: Index): Unit is
+        @embed(Unit, "hilde_task_scope_wait_below($1, $2)", scope->handle, count);
+        return nil;
+    end;
+
+    function yieldNow(): Unit is
+        @embed(Unit, "hilde_task_yield()");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function waitReadable(file: &[FileDescriptor, R]): Bool is
+        let number: Int32 := fileNumber(file);
+        return @embed(Int32, "hilde_task_wait_fd($1, 1)", number) = 1;
+    end;
+
+    generic [R: Region]
+    function waitWritable(file: &[FileDescriptor, R]): Bool is
+        let number: Int32 := fileNumber(file);
+        return @embed(Int32, "hilde_task_wait_fd($1, 2)", number) = 1;
+    end;
+
+    ---
+    --- Lending scopes
+    ---
+
+    -- The runtime's scope, the same as a Scope's; the region is only in
+    -- the type, where it keeps the value inside its borrow.
+    record Lending[R: Region]: Linear is
+        handle: Pointer[Nat8];
+    end;
+
+    generic [T: Type, R: Region]
+    function openLending(anchor: &[T, R]): Option[Lending[R]] is
+        let address: Address[Nat8] :=
+            @embed(Address[Nat8], "hilde_task_scope_open()");
+        case nullCheck(address) of
+            when Some(value as handle: Pointer[Nat8]) do
+                let scope: Lending[R] := Lending(handle => handle);
+                let some: Option[Lending[R]] := Some(value => scope);
+                return some;
+            when None do
+                let none: Option[Lending[R]] := None();
+                return none;
+        end case;
+    end;
+
+    generic [T: Type, R: Region]
+    function openLendingSized(anchor: &[T, R], stackBytes: Index): Option[Lending[R]] is
+        let address: Address[Nat8] :=
+            @embed(Address[Nat8], "hilde_task_scope_open_sized($1)", stackBytes);
+        case nullCheck(address) of
+            when Some(value as handle: Pointer[Nat8]) do
+                let scope: Lending[R] := Lending(handle => handle);
+                let some: Option[Lending[R]] := Some(value => scope);
+                return some;
+            when None do
+                let none: Option[Lending[R]] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function closeLending(scope: Lending[R]): Unit is
+        let { handle: Pointer[Nat8] } := scope;
+        @embed(Unit, "hilde_task_scope_close($1)", handle);
+        return nil;
+    end;
+
+    generic [A: Type, T: Type, R: Region, S: Region]
+    function spawnLending(scope: &![Lending[R], S], work: Fn[A, T], argument: A): Either[A, Task[T]] is
+        let resultAddress: Address[Option[T]] := allocate();
+        case nullCheck(resultAddress) of
+            when Some(value as result: Pointer[Option[T]]) do
+                let nothingYet: Option[T] := None();
+                store(result, nothingYet);
+                let handle: Pointer[Nat8] := scope->handle;
+                return spawnWith(handle, work, argument, result);
+            when None do
+                let left: Either[A, Task[T]] := Left(left => argument);
+                return left;
+        end case;
+    end;
+
+    ---
+    --- Channels
+    ---
+
+    -- Both ends hold the same two pointers: the runtime's bookkeeping, and
+    -- the slots, which only Hilde can read and write because only Hilde
+    -- knows what a T is.  Whichever end closes last gives both back.
+    record Sender[T: Type]: Linear is
+        channel: Pointer[Nat8];
+        slots: Pointer[T];
+    end;
+
+    record Receiver[T: Type]: Linear is
+        channel: Pointer[Nat8];
+        slots: Pointer[T];
+    end;
+
+    generic [T: Type]
+    function openChannel(capacity: Index): Option[Channel[T]] is
+        let address: Address[Nat8] :=
+            @embed(Address[Nat8], "hilde_channel_open($1)", capacity);
+        case nullCheck(address) of
+            when Some(value as channel: Pointer[Nat8]) do
+                let physical: Index :=
+                    @embed(Index, "hilde_channel_slots($1)", channel);
+                let slotsAddress: Address[T] := allocateBuffer(physical);
+                case nullCheck(slotsAddress) of
+                    when Some(value as slots: Pointer[T]) do
+                        let ends: Channel[T] := Channel(
+                            sender => Sender(channel => channel, slots => slots),
+                            receiver => Receiver(channel => channel, slots => slots)
+                        );
+                        let some: Option[Channel[T]] := Some(value => ends);
+                        return some;
+                    when None do
+                        @embed(Unit, "hilde_channel_free($1)", channel);
+                        let none: Option[Channel[T]] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Channel[T]] := None();
+                return none;
+        end case;
+    end;
+
+    generic [T: Type, R: Region]
+    function send(sender: &![Sender[T], R], value: T): Option[T] is
+        let channel: Pointer[Nat8] := sender->channel;
+        let slots: Pointer[T] := sender->slots;
+        let slot: Int64 := @embed(Int64, "hilde_channel_send_slot($1)", channel);
+        -- Both branches consume value.
+        if slot < 0 then
+            let back: Option[T] := Some(value => value);
+            return back;
+        else
+            store(positiveOffset(slots, slotIndex(slot)), value);
+            @embed(Unit, "hilde_channel_sent($1)", channel);
+            let delivered: Option[T] := None();
+            return delivered;
+        end if;
+    end;
+
+    generic [T: Type, R: Region]
+    function receive(receiver: &![Receiver[T], R]): Option[T] is
+        let channel: Pointer[Nat8] := receiver->channel;
+        let slots: Pointer[T] := receiver->slots;
+        let slot: Int64 := @embed(Int64, "hilde_channel_receive_slot($1)", channel);
+        if slot < 0 then
+            let none: Option[T] := None();
+            return none;
+        end if;
+        let value: T := load(positiveOffset(slots, slotIndex(slot)));
+        @embed(Unit, "hilde_channel_received($1)", channel);
+        let some: Option[T] := Some(value => value);
+        return some;
+    end;
+
+    -- The value at slot of a channel's slots, taken out; the runtime then
+    -- counts it as received.  slot is one the runtime handed out for a
+    -- value that is there.
+    generic [T: Type]
+    function takeAt(channel: Pointer[Nat8], slots: Pointer[T], slot: Int64): T is
+        let value: T := load(positiveOffset(slots, slotIndex(slot)));
+        @embed(Unit, "hilde_channel_received($1)", channel);
+        return value;
+    end;
+
+    generic [T: Type, R: Region]
+    function tryReceive(receiver: &![Receiver[T], R]): Polled[T] is
+        let channel: Pointer[Nat8] := receiver->channel;
+        let slots: Pointer[T] := receiver->slots;
+        let slot: Int64 := @embed(Int64, "hilde_channel_poll_slot($1)", channel);
+        if slot >= 0 then
+            let took: Polled[T] := Took(value => takeAt(channel, slots, slot));
+            return took;
+        else
+            if slot = -1 then
+                let finished: Polled[T] := Finished();
+                return finished;
+            else
+                let nothing: Polled[T] := Nothing();
+                return nothing;
+            end if;
+        end if;
+    end;
+
+    generic [T: Type, R: Region]
+    function receiveWithin(receiver: &![Receiver[T], R], nanos: Int64): Polled[T] is
+        let channel: Pointer[Nat8] := receiver->channel;
+        let slots: Pointer[T] := receiver->slots;
+        let slot: Int64 := @embed(Int64, "hilde_channel_receive_slot_within($1, $2)", channel, nanos);
+        if slot >= 0 then
+            let took: Polled[T] := Took(value => takeAt(channel, slots, slot));
+            return took;
+        else
+            if slot = -1 then
+                let finished: Polled[T] := Finished();
+                return finished;
+            else
+                let nothing: Polled[T] := Nothing();
+                return nothing;
+            end if;
+        end if;
+    end;
+
+    function sleepNanos(nanos: Int64): Unit is
+        return @embed(Unit, "hilde_task_sleep_ns($1)", nanos);
+    end;
+
+    -- The runtime waits until one of the two channels holds a value or both
+    -- are done, and says which; that channel's value is then there to take.
+    generic [T: Type, U: Type, R: Region, S: Region]
+    function receiveEither(first: &![Receiver[T], R], second: &![Receiver[U], S]): Selected[T, U] is
+        let a: Pointer[Nat8] := first->channel;
+        let aSlots: Pointer[T] := first->slots;
+        let b: Pointer[Nat8] := second->channel;
+        let bSlots: Pointer[U] := second->slots;
+        let chosen: Int32 := @embed(Int32, "hilde_channel_select2($1, $2)", a, b);
+        if chosen = 1 then
+            let slot: Int64 := @embed(Int64, "hilde_channel_poll_slot($1)", a);
+            let got: Selected[T, U] := First(value => takeAt(a, aSlots, slot));
+            return got;
+        else
+            if chosen = 2 then
+                let slot: Int64 := @embed(Int64, "hilde_channel_poll_slot($1)", b);
+                let got: Selected[T, U] := Second(value => takeAt(b, bSlots, slot));
+                return got;
+            else
+                let neither: Selected[T, U] := Neither();
+                return neither;
+            end if;
+        end if;
+    end;
+
+    -- A slot number from the runtime as an Index.  The runtime hands out
+    -- only numbers below the slot count, which is an Index.
+    function slotIndex(slot: Int64): Index is
+        case toIndex(slot) of
+            when Some(value as index: Index) do
+                return index;
+            when None do
+                abort("Standard.Task: the runtime handed out a slot that is not an index");
+        end case;
+    end;
+
+    generic [T: Type]
+    function closeSender(sender: Sender[T]): Unit is
+        let { channel: Pointer[Nat8], slots: Pointer[T] } := sender;
+        let last: Bool := @embed(Int32, "hilde_channel_close_sender($1)", channel) = 1;
+        if last then
+            deallocate(slots);
+            @embed(Unit, "hilde_channel_free($1)", channel);
+        end if;
+        return nil;
+    end;
+
+    generic [T: Type]
+    function closeReceiver(receiver: Receiver[T]): Unit is
+        let { channel: Pointer[Nat8], slots: Pointer[T] } := receiver;
+        let last: Bool := @embed(Int32, "hilde_channel_close_receiver($1)", channel) = 1;
+        if last then
+            deallocate(slots);
+            @embed(Unit, "hilde_channel_free($1)", channel);
+        end if;
+        return nil;
+    end;
+end module body.

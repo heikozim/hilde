@@ -1,0 +1,291 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertFailure
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Task (
+    Lending,
+    Task,
+    openLending,
+    closeLending,
+    spawnLending,
+    join,
+    sleepFor
+);
+import Standard.Resource (
+    Resource,
+    OpenFiles,
+    Limit,
+    readLimit,
+    setLimit
+);
+import Standard.Context (
+    Context,
+    Canceller,
+    Derived,
+    Done,
+    NotDone,
+    Cancelled,
+    DeadlineExceeded,
+    maxDepth,
+    background,
+    withCancel,
+    withTimeout,
+    cancel,
+    done,
+    isDone,
+    waitDone,
+    remainingMilliseconds,
+    destroyContext
+);
+
+module body Standard.Context.Test is
+    function isCancelled(state: Done): Bool is
+        case state of
+            when Cancelled do
+                return true;
+            when NotDone do
+                return false;
+            when DeadlineExceeded do
+                return false;
+        end case;
+    end;
+
+    function isLate(state: Done): Bool is
+        case state of
+            when DeadlineExceeded do
+                return true;
+            when NotDone do
+                return false;
+            when Cancelled do
+                return false;
+        end case;
+    end;
+
+    function now(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as nanos: Nat64) do
+                return nanos;
+            when None do
+                abort("no monotonic clock");
+        end case;
+    end;
+
+    generic [R: Region]
+    function derived(parent: &[Context, R]): Derived is
+        case withCancel(parent) of
+            when Some(value as made: Derived) do
+                return made;
+            when None do
+                abort("withCancel failed");
+        end case;
+    end;
+
+    function testBackgroundIsNeverDone(): Unit is
+        let root: Context := background();
+        assertFalse(isDone(&root), "the background is not done");
+        assertFalse(isCancelled(waitDone(&root, 50)), "waiting on it ends with the time");
+        assertTrue(remainingMilliseconds(&root, 1234) = 1234, "no deadline");
+        destroyContext(root);
+        return nil;
+    end;
+
+    -- A cancel at the top reaches two levels below; a cancel below leaves
+    -- the parent as it was.
+    function testCancelReachesTheChain(): Unit is
+        let root: Context := background();
+        let made1: Derived := derived(&root);
+        let { context as top: Context, canceller as stopTop: Canceller } := made1;
+        let made2: Derived := derived(&top);
+        let { context as middle: Context, canceller as stopMiddle: Canceller } := made2;
+        let made3: Derived := derived(&middle);
+        let { context as bottom: Context, canceller as stopBottom: Canceller } := made3;
+        assertFalse(isDone(&bottom), "nothing is done yet");
+        cancel(stopBottom);
+        assertTrue(isCancelled(done(&bottom)), "the bottom is cancelled");
+        assertFalse(isDone(&middle), "its parent is not");
+        cancel(stopTop);
+        assertTrue(isCancelled(done(&top)), "the top is cancelled");
+        assertTrue(isCancelled(done(&middle)), "the middle sees the top");
+        assertTrue(isCancelled(waitDone(&middle, 5000)), "and does not wait");
+        assertTrue(remainingMilliseconds(&middle, 1000) = 0, "no time is left");
+        cancel(stopMiddle);
+        destroyContext(bottom);
+        destroyContext(middle);
+        destroyContext(top);
+        destroyContext(root);
+        return nil;
+    end;
+
+    -- A context destroyed before its children leaves them working.
+    function testChildOutlivesParent(): Unit is
+        let root: Context := background();
+        let made4: Derived := derived(&root);
+        let { context as top: Context, canceller as stopTop: Canceller } := made4;
+        let made5: Derived := derived(&top);
+        let { context as child: Context, canceller as stopChild: Canceller } := made5;
+        destroyContext(top);
+        assertFalse(isDone(&child), "the child is not done");
+        cancel(stopTop);
+        assertTrue(isCancelled(done(&child)), "the top's cancel still reaches it");
+        cancel(stopChild);
+        destroyContext(child);
+        destroyContext(root);
+        return nil;
+    end;
+
+    -- A deadline of 1 s: waiting ends there, not after the 5 s asked for.
+    -- The time is taken before the context is made, because the deadline
+    -- counts from then: under a slow runtime the steps before the wait use
+    -- part of the second, and the wait itself is shorter.
+    function testDeadline(): Unit is
+        let root: Context := background();
+        let before: Nat64 := now();
+        case withTimeout(&root, 1000) of
+            when Some(value as made: Derived) do
+                let { context: Context, canceller: Canceller } := made;
+                assertFalse(isDone(&context), "not yet");
+                let left: Nat32 := remainingMilliseconds(&context, 5000);
+                assertTrue((left > 0) and (left <= 1000), "at most the deadline is left");
+                assertTrue(isLate(waitDone(&context, 5000)), "the deadline passed");
+                let waited: Nat64 := now() - before;
+                assertTrue(waited < 4500000000, "the wait ended at the deadline, not after 5 s");
+                assertTrue(waited >= 1000000000, "and not before it");
+                -- A child with a later deadline keeps the parent's.
+                case withTimeout(&context, 60000) of
+                    when Some(value as later: Derived) do
+                        let { context as child: Context, canceller as stopChild: Canceller } := later;
+                        assertTrue(isLate(done(&child)), "the parent's deadline holds below");
+                        cancel(stopChild);
+                        destroyContext(child);
+                    when None do
+                        assertFailure("no child");
+                end case;
+                cancel(canceller);
+                destroyContext(context);
+            when None do
+                assertFailure("withTimeout failed");
+        end case;
+        destroyContext(root);
+        return nil;
+    end;
+
+    -- The chain is at most maxDepth deep.
+    function testDepth(): Unit is
+        let root: Context := background();
+        assertTrue(maxDepth() = 64, "64 levels");
+        let made6: Derived := derived(&root);
+        let { context as top: Context, canceller as stopTop: Canceller } := made6;
+        assertTrue(depthReached(&top, 1) = 64, "the 64th level is made, the 65th refused");
+        cancel(stopTop);
+        destroyContext(top);
+        destroyContext(root);
+        return nil;
+    end;
+
+    -- A chain of maxDepth levels holds a reading and a writing end per
+    -- level and shares the reading ends of the levels above, so it fits
+    -- under a soft limit of 256 open files.  A chain that copied the
+    -- reading ends of every ancestor into every level held 2147 at once.
+    function testDepthFitsALowLimit(): Unit is
+        case readLimit(OpenFiles()) of
+            when Some(value as before: Limit) do
+                let low: Nat64 := 256;
+                assertTrue(before.soft >= low, "the open files limit is at least 256 to start with");
+                assertTrue(setLimit(OpenFiles(), Limit(soft => low, hard => before.hard)), "the soft limit is lowered to 256");
+                let root: Context := background();
+                let made: Derived := derived(&root);
+                let { context as top: Context, canceller as stopTop: Canceller } := made;
+                let reached: Index := depthReached(&top, 1);
+                cancel(stopTop);
+                destroyContext(top);
+                destroyContext(root);
+                assertTrue(setLimit(OpenFiles(), before), "the soft limit is raised again");
+                assertTrue(reached = 64, "the 64th level is made under 256 open files");
+            when None do
+                assertFailure("the open files limit does not read");
+        end case;
+        return nil;
+    end;
+
+    -- Derives below context until withCancel refuses; the depth reached.
+    generic [R: Region]
+    function depthReached(context: &[Context, R], level: Index): Index is
+        case withCancel(context) of
+            when Some(value as made: Derived) do
+                let { context as child: Context, canceller as stop: Canceller } := made;
+                let reached: Index := depthReached(&child, level + 1);
+                cancel(stop);
+                destroyContext(child);
+                return reached;
+            when None do
+                return level;
+        end case;
+    end;
+
+    -- Two tasks wait on one context they were lent; a cancel of its parent
+    -- ends both.
+    generic [R: Region]
+    function spin(context: &[Context, R]): Index is
+        var rounds: Index := 0;
+        while not isDone(context) do
+            sleepFor(5);
+            rounds := rounds + 1;
+        end while;
+        return rounds;
+    end;
+
+    function testTasksSeeTheCancel(): Unit is
+        let root: Context := background();
+        let made7: Derived := derived(&root);
+        let { context as top: Context, canceller as stopTop: Canceller } := made7;
+        let made8: Derived := derived(&top);
+        let { context as child: Context, canceller as stopChild: Canceller } := made8;
+        borrow lent: &[Context, rho] := &child do
+            case openLending(lent) of
+                when Some(value as opened: Lending[rho]) do
+                    var scope: Lending[rho] := opened;
+                    let work: Fn[&[Context, rho], Index] := spin;
+                    case spawnLending(&!scope, work, lent) of
+                        when Right(right as first: Task[Index]) do
+                            case spawnLending(&!scope, work, lent) of
+                                when Right(right as second: Task[Index]) do
+                                    sleepFor(100);
+                                    cancel(stopTop);
+                                    closeLending(scope);
+                                    assertTrue(join(first) > 0, "the first task ran until the cancel");
+                                    assertTrue(join(second) > 0, "the second as well");
+                                when Left(left as back: &[Context, rho]) do
+                                    cancel(stopTop);
+                                    closeLending(scope);
+                                    let ended: Index := join(first);
+                                    assertFailure("the second task did not start");
+                            end case;
+                        when Left(left as back: &[Context, rho]) do
+                            cancel(stopTop);
+                            closeLending(scope);
+                            assertFailure("the first task did not start");
+                    end case;
+                when None do
+                    cancel(stopTop);
+                    assertFailure("no lending scope");
+            end case;
+        end borrow;
+        assertTrue(isCancelled(done(&child)), "the child is cancelled");
+        cancel(stopChild);
+        destroyContext(child);
+        destroyContext(top);
+        destroyContext(root);
+        return nil;
+    end;
+end module body.

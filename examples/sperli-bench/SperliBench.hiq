@@ -1,0 +1,375 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Latency and bandwidth between two ranks of a Sperli job over TLS 1.3.
+-- ping sends a message with tag 1 and waits for the same message back;
+-- echo sends back what it gets.  stream sends messages with tag 2 and waits
+-- for the count of bytes that sink answers with.
+import Standard.Arguments (
+    processArguments
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    removeLast,
+    destroyEmpty
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    asSpan,
+    nthByte,
+    length as textLength
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    equal,
+    parseNat
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal
+);
+import Standard.IO.Terminal (
+    StandardInput,
+    acquireInput,
+    releaseInput,
+    readLine
+);
+import Standard.Sperli (
+    Job,
+    Comm,
+    readJobText,
+    init,
+    rank,
+    size,
+    send,
+    recv,
+    finish
+);
+
+module body Example.SperliBench is
+    function meanMicroseconds(nanoseconds: Nat64, count: Nat64): Nat64 is
+        return (nanoseconds / count) / 1000;
+    end;
+
+    function tenthsOfMegabytes(bytes: Nat64, nanoseconds: Nat64): Nat64 is
+        return (bytes * 10000) / nanoseconds;
+    end;
+
+    function now(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("this build has no monotonic clock");
+        end case;
+    end;
+
+    function widenIndex(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The number in the first eight bytes of text, least significant first.
+    generic [R: Region]
+    function numberOf(text: &[String, R]): Nat64 is
+        var total: Nat64 := 0;
+        var scale: Nat64 := 1;
+        var i: Index := 0;
+        while (i < 8) and (i < textLength(text)) do
+            case toNat64(nthByte(text, i)) of
+                when Some(value as byte: Nat64) do
+                    total := total + (byte * scale);
+                when None do
+                    total := total;
+            end case;
+            if i < 7 then
+                scale := scale * 256;
+            end if;
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    function eightBytes(value: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        var rest: Nat64 := value;
+        var i: Nat64 := 0;
+        while i < 8 do
+            case toNat8(rest - ((rest / 256) * 256)) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&!out, byte);
+                when None do
+                    writeByte(&!out, 0);
+            end case;
+            rest := rest / 256;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function messageOf(bytes: Index): String is
+        return makeString(bytes, 97);
+    end;
+
+    -- Sends count messages of bytes bytes to rank peer, each waited for
+    -- before the next, and prints the mean and the least time of a round.
+    generic [R: Region]
+    function ping(comm: &![Comm, R], peer: Nat32, count: Nat64, bytes: Index): Int32 is
+        var done: Nat64 := 0;
+        var total: Nat64 := 0;
+        var least: Nat64 := 18446744073709;
+        while done < count do
+            let start: Nat64 := now();
+            if send(&~comm, peer, 1, messageOf(bytes)) /= 0 then
+                printLn("send failed");
+                return 1;
+            end if;
+            case recv(&~comm, peer, 1) of
+                when Right(right as text: String) do
+                    let wrong: Bool := textLength(&text) /= bytes;
+                    destroyString(text);
+                    if wrong then
+                        printLn("the echo has another length");
+                        return 1;
+                    end if;
+                when Left(left as code: Int32) do
+                    print("recv failed with ");
+                    printLn(code);
+                    return 1;
+            end case;
+            let spent: Nat64 := now() - start;
+            total := total + spent;
+            if spent < least then
+                least := spent;
+            end if;
+            done := done + 1;
+        end while;
+        print("ping count=");
+        print(count);
+        print(" bytes=");
+        print(widenIndex(bytes));
+        print(" mean_us=");
+        print(meanMicroseconds(total, count));
+        print(" min_us=");
+        printLn(least / 1000);
+        return 0;
+    end;
+
+    generic [R: Region]
+    function echo(comm: &![Comm, R], peer: Nat32, count: Nat64): Int32 is
+        var done: Nat64 := 0;
+        while done < count do
+            case recv(&~comm, peer, 1) of
+                when Right(right as text: String) do
+                    if send(&~comm, peer, 1, text) /= 0 then
+                        printLn("send failed");
+                        return 1;
+                    end if;
+                when Left(left as code: Int32) do
+                    print("recv failed with ");
+                    printLn(code);
+                    return 1;
+            end case;
+            done := done + 1;
+        end while;
+        return 0;
+    end;
+
+    -- Sends count messages of bytes bytes one way and waits for the count of
+    -- bytes the sink has taken; prints the rate.
+    generic [R: Region]
+    function stream(comm: &![Comm, R], peer: Nat32, count: Nat64, bytes: Index): Int32 is
+        let start: Nat64 := now();
+        var done: Nat64 := 0;
+        while done < count do
+            if send(&~comm, peer, 2, messageOf(bytes)) /= 0 then
+                printLn("send failed");
+                return 1;
+            end if;
+            done := done + 1;
+        end while;
+        case recv(&~comm, peer, 2) of
+            when Right(right as text: String) do
+                let spent: Nat64 := now() - start;
+                let sent: Nat64 := count * widenIndex(bytes);
+                let answer: Nat64 := numberOf(&text);
+                destroyString(text);
+                if answer /= sent then
+                    print("the sink counted ");
+                    printLn(answer);
+                    return 1;
+                end if;
+                let tenths: Nat64 := tenthsOfMegabytes(sent, spent);
+                print("stream count=");
+                print(count);
+                print(" bytes=");
+                print(widenIndex(bytes));
+                print(" total_bytes=");
+                print(sent);
+                print(" ms=");
+                print(spent / 1000000);
+                print(" mb_per_s=");
+                print(tenths / 10);
+                print(".");
+                printLn(tenths - ((tenths / 10) * 10));
+                return 0;
+            when Left(left as code: Int32) do
+                print("recv failed with ");
+                printLn(code);
+                return 1;
+        end case;
+    end;
+
+    generic [R: Region]
+    function sink(comm: &![Comm, R], peer: Nat32, count: Nat64): Int32 is
+        var done: Nat64 := 0;
+        var total: Nat64 := 0;
+        while done < count do
+            case recv(&~comm, peer, 2) of
+                when Right(right as text: String) do
+                    total := total + widenIndex(textLength(&text));
+                    destroyString(text);
+                when Left(left as code: Int32) do
+                    print("recv failed with ");
+                    printLn(code);
+                    return 1;
+            end case;
+            done := done + 1;
+        end while;
+        return send(&~comm, peer, 2, eightBytes(total));
+    end;
+
+    generic [M: Region]
+    function runMode(opened: Comm, mode: Span[Nat8, M], count: Nat64, bytes: Index): Int32 is
+        var comm: Comm := opened;
+        var status: Int32 := 2;
+        let peer: Nat32 := 1 - rank(&comm);
+        if size(&comm) /= 2 then
+            printLn("the job must have two ranks");
+        else
+            if equal(mode, "ping") then
+                status := ping(&!comm, peer, count, bytes);
+            end if;
+            if equal(mode, "echo") then
+                status := echo(&!comm, peer, count);
+            end if;
+            if equal(mode, "stream") then
+                status := stream(&!comm, peer, count, bytes);
+            end if;
+            if equal(mode, "sink") then
+                status := sink(&!comm, peer, count);
+            end if;
+        end if;
+        finish(comm);
+        return status;
+    end;
+
+    generic [M: Region]
+    function joinAndRun(line: String, mode: Span[Nat8, M], count: Nat64, bytes: Index): Int32 is
+        case readJobText(asSpan(&line)) of
+            when Left(left as why: Int32) do
+                destroyString(line);
+                print("the job was refused with ");
+                printLn(why);
+                return 4;
+            when Right(right as given: Job) do
+                destroyString(line);
+                case init(given) of
+                    when Left(left as why: Int32) do
+                        print("init failed with ");
+                        printLn(why);
+                        return 5;
+                    when Right(right as comm: Comm) do
+                        return runMode(comm, mode, count, bytes);
+                end case;
+        end case;
+    end;
+
+    function readJobLine(root: RootCapability): String is
+        var mutRoot: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!mutRoot);
+        var input: StandardInput := acquireInput(&!terminal);
+        let line: String := readLine(&!input);
+        releaseInput(input);
+        releaseTerminal(terminal);
+        surrenderRoot(mutRoot);
+        return line;
+    end;
+
+    function destroyWords(words: Buffer[String]): Unit is
+        var rest: Buffer[String] := words;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function numberWord(word: String, low: Nat64, high: Nat64): Nat64 is
+        var out: Nat64 := 0;
+        case parseNat(asSpan(&word)) of
+            when Some(value as number: Nat64) do
+                if (number >= low) and (number <= high) then
+                    out := number;
+                end if;
+            when None do
+                out := 0;
+        end case;
+        destroyString(word);
+        return out;
+    end;
+
+    -- The arguments are mode, count (1 to 10000000) and message size (1 to
+    -- 16777216).  Anything else ends the programme with status 2.
+    function main(root: RootCapability): ExitCode is
+        var words: Buffer[String] := processArguments();
+        if length(&words) /= 3 then
+            destroyWords(words);
+            surrenderRoot(root);
+            printLn("usage: SperliBench mode count bytes");
+            return ExitFailure();
+        end if;
+        let sizeWord: String := removeLast(&!words);
+        let countWord: String := removeLast(&!words);
+        let mode: String := removeLast(&!words);
+        destroyWords(words);
+        let count: Nat64 := numberWord(countWord, 1, 10000000);
+        let bytes: Nat64 := numberWord(sizeWord, 1, 16777216);
+        var status: Int32 := 2;
+        case toIndex(bytes) of
+            when Some(value as width: Index) do
+                if (count > 0) and (bytes > 0) then
+                    status := joinAndRun(readJobLine(root), asSpan(&mode), count, width);
+                else
+                    surrenderRoot(root);
+                end if;
+            when None do
+                surrenderRoot(root);
+        end case;
+        destroyString(mode);
+        if status = 0 then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+end module body.

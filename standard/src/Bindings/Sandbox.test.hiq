@@ -1,0 +1,135 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Tests for Bindings.Sandbox: a string it hands to C must end in one zero
+-- byte and hold no other, and it refuses one that does not with 0 before
+-- any call.  Nothing here confines the test programme: on Linux pledge and
+-- unveil answer -1 when they are reached, which tells a refusal of the
+-- binding (0) from a call that reached the runtime; on OpenBSD a call
+-- that reached the kernel would confine the rest of the tests, so only the
+-- refusals are asked there.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth
+);
+import Bindings.Sandbox (
+    platform,
+    pledge,
+    unveil,
+    pledgeWithExec,
+    unveilProbe
+);
+
+module body Standard.Bindings.Sandbox.Test is
+    -- The bytes of text and one zero byte after them.
+    function withZero(text: Span[Nat8, Static]): String is
+        let source: String := fromLiteral(text);
+        let size: Index := length(&source);
+        var copy: String := makeString(size + 1, 0);
+        if size > 0 then
+            for i from 0 to size - 1 do
+                storeNth(&!copy, i, nthByte(&source, i));
+            end for;
+        end if;
+        destroyString(source);
+        return copy;
+    end;
+
+    -- a string without its zero byte, or with one inside, is refused.
+    function testRefusal(): Unit is
+        let bare: String := fromLiteral("stdio");
+        assertTrue(pledge(&bare) = 0, "promises without the zero byte are refused");
+        let empty: String := makeString(0, 0);
+        assertTrue(pledge(&empty) = 0, "empty promises are refused");
+        -- stdio, a zero byte, x, a zero byte.
+        var inner: String := withZero("stdio x");
+        storeNth(&!inner, 5, 0);
+        assertTrue(pledge(&inner) = 0, "promises with a zero byte inside are refused");
+        let path: String := withZero("/tmp");
+        let read: String := withZero("r");
+        assertTrue(unveil(&bare, &read) = 0, "a path without the zero byte is refused");
+        assertTrue(unveil(&path, &bare) = 0, "permissions without the zero byte are refused");
+        assertTrue(unveil(&inner, &read) = 0, "a path with a zero byte inside is refused");
+        destroyString(bare);
+        destroyString(empty);
+        destroyString(inner);
+        destroyString(path);
+        destroyString(read);
+        return nil;
+    end;
+
+    -- The pair /tmp and r, each ending in a zero byte, as Standard.Sandbox
+    -- packs a path and its permissions.
+    function onePair(): String is
+        var pair: String := withZero("/tmp r");
+        storeNth(&!pair, 4, 0);
+        return pair;
+    end;
+
+    -- pledgeWithExec refuses a string that is not readable, even one whose
+    -- flag leaves it out, and unveilProbe refuses grants that are not the
+    -- given number of pairs.
+    function testExecAndProbeRefusal(): Unit is
+        let bare: String := fromLiteral("stdio");
+        let promises: String := withZero("stdio");
+        assertTrue(pledgeWithExec(&bare, true, &promises, true) = 0, "promises without the zero byte are refused");
+        assertTrue(pledgeWithExec(&promises, true, &bare, false) = 0, "execpromises left out must still be readable");
+        let pair: String := onePair();
+        assertTrue(unveilProbe(&pair, 2) = -2, "a count past the pairs is refused");
+        assertTrue(unveilProbe(&pair, 0) = -2, "no pair is refused");
+        assertTrue(unveilProbe(&bare, 1) = -2, "grants without a zero byte are refused");
+        let path: String := withZero("/tmp");
+        assertTrue(unveilProbe(&path, 1) = -2, "a path without its permissions is refused");
+        destroyString(bare);
+        destroyString(promises);
+        destroyString(pair);
+        destroyString(path);
+        return nil;
+    end;
+
+    -- unveilProbe runs its unveil in a child, so it is asked on every
+    -- platform: one path fits on OpenBSD, and elsewhere there is no unveil.
+    function testProbeReached(): Unit is
+        let pair: String := onePair();
+        let answer: Int32 := unveilProbe(&pair, 1);
+        if platform() = 1 then
+            assertTrue(answer = -1, "one path fits unveil's room");
+        else
+            assertTrue(answer = -3, "the probe reaches the runtime, which has no unveil here");
+        end if;
+        destroyString(pair);
+        return nil;
+    end;
+
+    -- well formed strings reach the runtime, where it has no pledge.
+    function testReached(): Unit is
+        if platform() = 1 then
+            -- OpenBSD: reaching the kernel would pledge this programme.
+            assertTrue(true, "on OpenBSD only the refusals are asked");
+        else
+            let promises: String := withZero("stdio");
+            let path: String := withZero("/tmp");
+            let read: String := withZero("r");
+            assertTrue(pledge(&promises) = -1, "pledge reaches the runtime, which has none here");
+            assertTrue(unveil(&path, &read) = -1, "unveil reaches the runtime, which has none here");
+            assertTrue(pledgeWithExec(&promises, true, &promises, true) = -1, "pledge with execpromises reaches the runtime, which has none here");
+            destroyString(promises);
+            destroyString(path);
+            destroyString(read);
+        end if;
+        return nil;
+    end;
+end module body.

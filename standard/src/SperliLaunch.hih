@@ -1,0 +1,256 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The launcher of a Sperli job: reads the host list, makes the keys and certificates of the job, and starts the ranks.
+
+- A host list has one host a line, with an optional port; a line that starts with a hash is a comment.
+- A host that hostRefused of Standard.SperliWire refuses is refused even if listed; a deny file only adds names.
+- One CA and one pair of keys of Standard.CompositeSig are made for each job, and one certificate and one token for each rank.
+- A rank on this machine is started directly, every other rank over ssh at port 62222.
+- A rank is told its job on its standard input, as one line of hexadecimal digits.
+- The ranks' output is shown, rank by rank, when they have ended.
+- With a checkpoint directory the job is started again after a failure, at most restartMax times, and a lost rank goes to the next unused host of the list.
+
+    let hosts: Either[Int32, HostList] := parseHostList(text, "");
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Standard.SperliLaunch is
+    """
+    The port of the ssh connection to a remote host: 62222.
+    """
+    function sshPort(): Nat16
+        ensures result = 62222;
+
+    """
+    The base of the ports given to remote ranks that name none: 47000.
+    """
+    function basePort(): Nat16
+        ensures result = 47000;
+
+    """
+    The hosts of a job in order, each with a port, 0 when none is named.
+    It is linear: destroyHostList gives it back.
+    """
+    type HostList: Linear;
+
+    """
+    The host list in text: a host and an optional port on each line.  deny
+    is a list of names to refuse besides those hostRefused of
+    Standard.SperliWire refuses, one on each line.
+    Left refusedHost for a host that is refused, badLaunch for a line
+    that is no host and port, a port above 65535, or no host at all.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [T: Region, D: Region]
+    function parseHostList(text: Span[Nat8, T], deny: Span[Nat8, D]): Either[Int32, HostList];
+
+    """
+    How many hosts the list has.
+    """
+    generic [R: Region]
+    function hostCount(hosts: &[HostList, R]): Index
+        ensures result <= 4096;
+
+    """
+    Gives back what the list held.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyHostList(list: HostList): Unit;
+
+    """
+    The keys and certificates of one job: the id, the number of ranks, the
+    incarnation, the hosts and ports, the CA, the key pair of the tokens
+    and the time the tokens end.  It is linear: destroyLaunch wipes the keys.
+    """
+    type Launch: Linear;
+
+    """
+    A job of ranks ranks on the first hosts of the list, at incarnation,
+    whose tokens and certificates hold for lifetime seconds.  Ranks on
+    this machine get a free port, other ranks the port of their line or
+    basePort and their number.  Left badLaunch when the list has fewer
+    hosts than ranks, startFailed when a key or a certificate could not
+    be made.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function newLaunch(hosts: &[HostList, R], ranks: Nat32, incarnation: Nat32, lifetime: Nat32): Either[Int32, Launch]
+        requires ((ranks >= 1) and (ranks <= 4096)) and ((incarnation >= 1) and (lifetime > 0));
+
+    """
+    The job id, 16 bytes.
+    """
+    generic [R: Region]
+    function launchId(launch: &[Launch, R]): String
+        ensures length(&result) = 16;
+
+    """
+    The number of ranks.
+    """
+    generic [R: Region]
+    function launchRanks(launch: &[Launch, R]): Nat32
+        ensures (result >= 1) and (result <= 4096);
+
+    """
+    The public key of the launch that verifies its tokens, 1344 bytes.
+    """
+    generic [R: Region]
+    function launchPublicKey(launch: &[Launch, R]): String
+        ensures length(&result) = 1344;
+
+    """
+    The port that rank listens at.
+    """
+    generic [R: Region]
+    function launchPort(launch: &[Launch, R], rank: Nat32): Nat16
+        requires rank < 4096
+        ensures result > 0;
+
+    """
+    The host of rank.
+    """
+    generic [R: Region]
+    function launchHost(launch: &[Launch, R], rank: Nat32): String
+        requires rank < 4096
+        ensures length(&result) > 0;
+
+    """
+    The description of rank for its standard input: the bytes that
+    Standard.Sperli.readJob reads, with a new key and certificate for the
+    rank.  None when the certificate or the token could not be made.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function describeRank(launch: &[Launch, R], rank: Nat32): Option[String]
+        requires rank < 4096;
+
+    """
+    The join token of rank with the id job (16 bytes), the host and the
+    expiry, signed with the key of the launch.  It is for a test of a rank
+    that is handed a token it should refuse.  None when signing failed.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, J: Region, H: Region]
+    function tokenWith(launch: &[Launch, R], job: Span[Nat8, J], rank: Nat32, expiry: Nat64, host: Span[Nat8, H]): Option[String]
+        requires ((spanLength(job) = 16) and (spanLength(host) > 0)) and (spanLength(host) <= 255);
+
+    """
+    The certificate of the CA of the job as PEM text: what a client needs
+    to check the certificate of a rank.
+    """
+    generic [R: Region]
+    function launchCaPem(launch: &[Launch, R]): String
+        ensures length(&result) > 0;
+
+    """
+    The time, seconds since 1970, at which the tokens of the launch end.
+    """
+    generic [R: Region]
+    function launchExpiry(launch: &[Launch, R]): Nat64
+        ensures result > 0;
+
+    """
+    Makes the launch the next incarnation: the one a restarted job runs at.
+    No contract: its effect is on the launch, which a condition cannot read.
+    """
+    generic [R: Region]
+    function nextIncarnation(launch: &![Launch, R]): Unit;
+
+    """
+    Puts rank on host number spare of hosts, with the port that line names,
+    else the port it had on this machine, else basePort and the number.
+    false, and nothing changed, when rank is not a rank of the launch or
+    the list has no such host.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, H: Region]
+    function relocateRank(launch: &![Launch, R], hosts: &[HostList, H], rank: Nat32, spare: Nat32): Bool
+        requires rank < 4096;
+
+    """
+    Wipes the keys and gives back what the launch held.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyLaunch(launch: Launch): Unit;
+
+    ---
+    --- The command line of hilde run
+    ---
+
+    """
+    What hilde run was asked: the number of ranks, the files, the options
+    of the checkpoints, and the programme with its arguments.  An option
+    that is not given is empty or 0.  checkpointDir and restartMax act: with
+    a directory a failed job is started again.  checkpointEvery and resume
+    are read and kept; a programme calls checkpoint and resume itself.
+    """
+    record RunOptions: Linear is
+        ranks: Nat32;
+        hostsFile: String;
+        denyFile: String;
+        checkpointDir: String;
+        checkpointEvery: Nat32;
+        restartMax: Nat32;
+        resume: String;
+        program: String;
+        arguments: Buffer[String];
+    end;
+
+    """
+    Gives back what the options held.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyRunOptions(options: RunOptions): Unit;
+
+    """
+    The words after run: -n with the number of ranks and --hosts with a
+    file, which are required, then --deny-hosts, --checkpoint-dir,
+    --checkpoint-every, --restart-max and --resume, each with a value,
+    then the programme and its arguments.  The words after the programme
+    are its own.  Left badLaunch when a required word is missing, a number
+    is no number or out of range (the ranks are 1 to 4096), an option is
+    unknown or has no value, or there is no
+    programme.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function parseRunArguments(words: &[Buffer[String], R]): Either[Int32, RunOptions];
+
+    ---
+    --- Running
+    ---
+
+    """
+    Starts every rank of the launch, hands each its description, waits for
+    all of them and shows what they wrote, rank by rank.  The programme is
+    the path of an executable, the same on every host.  The result is 0
+    when every rank ended with 0, else the largest exit status, or
+    startFailed when a rank could not be started.
+    No contract: the result is that of the ranks.
+    """
+    generic [L: Region, H: Region, P: Region, A: Region]
+    function runRanks(launch: &[Launch, L], hosts: &[HostList, H], program: Span[Nat8, P], arguments: &[Buffer[String], A]): Int32;
+
+    """
+    The whole of hilde run: reads the host list and the deny file named in
+    options, makes the launch and runs the ranks, again after a failure
+    when checkpointDir is set.  The programme names the directory to its
+    ranks itself.  0 when the job ended well, else the code or the exit
+    status; the reason is written to the standard output.
+    No contract: the result is that of the ranks.
+    """
+    function runJob(options: RunOptions): Int32;
+end module.

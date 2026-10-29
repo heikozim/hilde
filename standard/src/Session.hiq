@@ -1,0 +1,491 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module over Standard.Database with SQL of its own: the statements
+-- are constants and every value is bound.  Only the statement that makes
+-- the table differs between the backends; on SQLite and SQLCipher the
+-- table is strict.  A token
+-- is looked up only by the hexadecimal SHA-256 of its text, and only when
+-- it has the form of a token.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    bytesToHex
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sha256
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Backend,
+    SqliteBackend,
+    SqlCipherBackend,
+    PostgresBackend,
+    MariaDBBackend,
+    Transaction,
+    Cursor,
+    Values,
+    backendOf,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    withInt64,
+    withText,
+    withBytes,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnBytes,
+    finish
+);
+
+module body Standard.Session is
+    constant tokenBytes: Index := 32;
+    constant tokenLength: Index := 64;
+
+    record SessionLimits: Free is
+        idleSeconds: Int64;
+        absoluteSeconds: Int64;
+    end;
+
+    function defaultSessionLimits(): SessionLimits is
+        let limits: SessionLimits := SessionLimits(idleSeconds => 1800, absoluteSeconds => 43200);
+        return limits;
+    end;
+
+    function stored(error: DbError): SessionError is
+        return StorageFailed(error => error);
+    end;
+
+    -- The table in the types of each backend: MariaDB takes no column of
+    -- unbounded text as a primary key, and the digest has 64 characters.
+    generic [R: Region]
+    function prepareSessions(db: &![Database[Writing], R]): Either[SessionError, Unit] is
+        let zero: Nat64 := 0;
+        var result: Either[DbError, Nat64] := Right(right => zero);
+        let backend: Backend := backendOf(&db);
+        case backend of
+            when PostgresBackend do
+                result := execute(&~db, "CREATE TABLE IF NOT EXISTS hilde_sessions (digest TEXT PRIMARY KEY NOT NULL, created BIGINT NOT NULL, seen BIGINT NOT NULL, data BYTEA NOT NULL)", noValues());
+            when MariaDBBackend do
+                result := execute(&~db, "CREATE TABLE IF NOT EXISTS hilde_sessions (digest CHAR(64) PRIMARY KEY NOT NULL, created BIGINT NOT NULL, seen BIGINT NOT NULL, data LONGBLOB NOT NULL)", noValues());
+            when SqliteBackend do
+                result := execute(&~db, "CREATE TABLE IF NOT EXISTS hilde_sessions (digest TEXT PRIMARY KEY NOT NULL, created INTEGER NOT NULL, seen INTEGER NOT NULL, data BLOB NOT NULL) STRICT", noValues());
+            when SqlCipherBackend do
+                result := execute(&~db, "CREATE TABLE IF NOT EXISTS hilde_sessions (digest TEXT PRIMARY KEY NOT NULL, created INTEGER NOT NULL, seen INTEGER NOT NULL, data BLOB NOT NULL) STRICT", noValues());
+        end case;
+        case result of
+            when Right(right as changed: Nat64) do
+                let done: Either[SessionError, Unit] := Right(right => nil);
+                return done;
+            when Left(left as error: DbError) do
+                let failed: Either[SessionError, Unit] := Left(left => stored(error));
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region]
+    function isSessionToken(token: Span[Nat8, R]): Bool is
+        if spanLength(token) /= tokenLength then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < tokenLength do
+            let byte: Nat8 := token[i];
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let letter: Bool := (byte >= 'a') and (byte <= 'f');
+            if not (digit or letter) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The hexadecimal SHA-256 of token, the key of its row.
+    generic [T: Region]
+    function digestOf(token: Span[Nat8, T]): Option[String] is
+        case sha256(token) of
+            when Some(value as raw: String) do
+                let hex: String := bytesToHex(asSpan(&raw));
+                destroyString(raw);
+                let some: Option[String] := Some(value => hex);
+                return some;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- A fresh token and its digest.  The bytes of a token come from the
+    -- random source of libcrypto, through Standard.Libcrypto.
+    record Fresh: Linear is
+        token: String;
+        digest: String;
+    end;
+
+    function freshToken(): Option[Fresh] is
+        case randomBytes(tokenBytes) of
+            when Some(value as raw: String) do
+                let token: String := bytesToHex(asSpan(&raw));
+                destroyString(raw);
+                case digestOf(asSpan(&token)) of
+                    when Some(value as digest: String) do
+                        let some: Option[Fresh] := Some(value => Fresh(token => token, digest => digest));
+                        return some;
+                    when None do
+                        destroyString(token);
+                        let none: Option[Fresh] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Fresh] := None();
+                return none;
+        end case;
+    end;
+
+    -- Inserts a row for digest.
+    generic [R: Region, G: Region, D: Region]
+    function insertRow(db: &![Database[Writing], R], digest: Span[Nat8, G], created: Int64, data: Span[Nat8, D]): Option[DbError] is
+        let values: Values := withBytes(withInt64(withInt64(withText(noValues(), digest), created), created), data);
+        case execute(&~db, "INSERT INTO hilde_sessions (digest, created, seen, data) VALUES (?, ?, ?, ?)", values) of
+            when Right(right as changed: Nat64) do
+                let none: Option[DbError] := None();
+                return none;
+            when Left(left as error: DbError) do
+                let some: Option[DbError] := Some(value => error);
+                return some;
+        end case;
+    end;
+
+    generic [R: Region, D: Region]
+    function createSession(db: &![Database[Writing], R], data: Span[Nat8, D], now: Int64): Either[SessionError, String] is
+        if now < 0 then
+            let late: Either[SessionError, String] := Left(left => BadTime());
+            return late;
+        end if;
+        case freshToken() of
+            when Some(value as fresh: Fresh) do
+                let { token: String, digest: String } := fresh;
+                case insertRow(&~db, asSpan(&digest), now, data) of
+                    when None do
+                        destroyString(digest);
+                        let made: Either[SessionError, String] := Right(right => token);
+                        return made;
+                    when Some(value as error: DbError) do
+                        destroyString(digest);
+                        destroyString(token);
+                        let failed: Either[SessionError, String] := Left(left => stored(error));
+                        return failed;
+                end case;
+            when None do
+                let failed: Either[SessionError, String] := Left(left => CryptoFailed());
+                return failed;
+        end case;
+    end;
+
+    -- What the row of a digest holds.
+    record Row: Linear is
+        created: Int64;
+        seen: Int64;
+        data: String;
+    end;
+
+    union Lookup: Linear is
+        case Found is
+            row: Row;
+        case Absent;
+        case LookupFailed is
+            error: DbError;
+    end;
+
+    generic [R: Region, G: Region]
+    function lookup(db: &![Database[Writing], R], digest: Span[Nat8, G]): Lookup is
+        var cursor: Cursor := start(&~db, "SELECT created, seen, data FROM hilde_sessions WHERE digest = ?", withText(noValues(), digest));
+        if advance(&!cursor) then
+            let created: Int64 := columnInt64(&cursor, 0);
+            let seen: Int64 := columnInt64(&cursor, 1);
+            let data: String := fromSpan(columnBytes(&cursor, 2));
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    destroyString(data);
+                    return LookupFailed(error => error);
+                when None do
+                    return Found(row => Row(created => created, seen => seen, data => data));
+            end case;
+        else
+            case finish(&~db, cursor) of
+                when Some(value as error: DbError) do
+                    return LookupFailed(error => error);
+                when None do
+                    return Absent();
+            end case;
+        end if;
+    end;
+
+    -- Whether a row made at created and last used at seen is over its
+    -- limits at now.  A clock that went back counts as no time passed.
+    function expired(created: Int64, seen: Int64, limits: SessionLimits, now: Int64): Bool is
+        if (now > seen) and ((now - seen) > limits.idleSeconds) then
+            return true;
+        end if;
+        return (now > created) and ((now - created) > limits.absoluteSeconds);
+    end;
+
+    generic [R: Region, G: Region]
+    function deleteRow(db: &![Database[Writing], R], digest: Span[Nat8, G]): Option[DbError] is
+        case execute(&~db, "DELETE FROM hilde_sessions WHERE digest = ?", withText(noValues(), digest)) of
+            when Right(right as changed: Nat64) do
+                let none: Option[DbError] := None();
+                return none;
+            when Left(left as error: DbError) do
+                let some: Option[DbError] := Some(value => error);
+                return some;
+        end case;
+    end;
+
+    generic [R: Region, G: Region]
+    function touchRow(db: &![Database[Writing], R], digest: Span[Nat8, G], now: Int64): Option[DbError] is
+        case execute(&~db, "UPDATE hilde_sessions SET seen = ? WHERE digest = ?", withText(withInt64(noValues(), now), digest)) of
+            when Right(right as changed: Nat64) do
+                let none: Option[DbError] := None();
+                return none;
+            when Left(left as error: DbError) do
+                let some: Option[DbError] := Some(value => error);
+                return some;
+        end case;
+    end;
+
+    -- The row of token when it is live at now; an expired one is removed.
+    union Live: Linear is
+        case LiveRow is
+            digest: String;
+            data: String;
+            created: Int64;
+        case NotLive;
+        case LiveFailed is
+            reason: SessionError;
+    end;
+
+    generic [R: Region, T: Region]
+    function liveRow(db: &![Database[Writing], R], token: Span[Nat8, T], limits: SessionLimits, now: Int64): Live is
+        if now < 0 then
+            return LiveFailed(reason => BadTime());
+        end if;
+        if not isSessionToken(token) then
+            return NotLive();
+        end if;
+        case digestOf(token) of
+            when Some(value as digest: String) do
+                case lookup(&~db, asSpan(&digest)) of
+                    when Found(row: Row) do
+                        let { created: Int64, seen: Int64, data: String } := row;
+                        if expired(created, seen, limits, now) then
+                            destroyString(data);
+                            case deleteRow(&~db, asSpan(&digest)) of
+                                when None do
+                                    destroyString(digest);
+                                    return NotLive();
+                                when Some(value as error: DbError) do
+                                    destroyString(digest);
+                                    return LiveFailed(reason => stored(error));
+                            end case;
+                        else
+                            return LiveRow(digest => digest, data => data, created => created);
+                        end if;
+                    when Absent do
+                        destroyString(digest);
+                        return NotLive();
+                    when LookupFailed(error: DbError) do
+                        destroyString(digest);
+                        return LiveFailed(reason => stored(error));
+                end case;
+            when None do
+                return LiveFailed(reason => CryptoFailed());
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function loadSession(db: &![Database[Writing], R], token: Span[Nat8, T], limits: SessionLimits, now: Int64): Either[SessionError, Option[String]] is
+        case liveRow(&~db, token, limits, now) of
+            when LiveRow(digest: String, data: String, created: Int64) do
+                case touchRow(&~db, asSpan(&digest), now) of
+                    when None do
+                        destroyString(digest);
+                        let some: Option[String] := Some(value => data);
+                        let found: Either[SessionError, Option[String]] := Right(right => some);
+                        return found;
+                    when Some(value as error: DbError) do
+                        destroyString(digest);
+                        destroyString(data);
+                        let failed: Either[SessionError, Option[String]] := Left(left => stored(error));
+                        return failed;
+                end case;
+            when NotLive do
+                let none: Option[String] := None();
+                let absent: Either[SessionError, Option[String]] := Right(right => none);
+                return absent;
+            when LiveFailed(reason: SessionError) do
+                let failed: Either[SessionError, Option[String]] := Left(left => reason);
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, T: Region, D: Region]
+    function saveSession(db: &![Database[Writing], R], token: Span[Nat8, T], data: Span[Nat8, D], now: Int64): Either[SessionError, Bool] is
+        if now < 0 then
+            let late: Either[SessionError, Bool] := Left(left => BadTime());
+            return late;
+        end if;
+        if not isSessionToken(token) then
+            let absent: Either[SessionError, Bool] := Right(right => false);
+            return absent;
+        end if;
+        case digestOf(token) of
+            when Some(value as digest: String) do
+                let values: Values := withText(withInt64(withBytes(noValues(), data), now), asSpan(&digest));
+                case execute(&~db, "UPDATE hilde_sessions SET data = ?, seen = ? WHERE digest = ?", values) of
+                    when Right(right as changed: Nat64) do
+                        destroyString(digest);
+                        let done: Either[SessionError, Bool] := Right(right => changed > 0);
+                        return done;
+                    when Left(left as error: DbError) do
+                        destroyString(digest);
+                        let failed: Either[SessionError, Bool] := Left(left => stored(error));
+                        return failed;
+                end case;
+            when None do
+                let failed: Either[SessionError, Bool] := Left(left => CryptoFailed());
+                return failed;
+        end case;
+    end;
+
+    -- The move of a live row to a fresh token, inside a transaction the
+    -- caller commits or rolls back.
+    generic [R: Region, G: Region, D: Region]
+    function moveRow(db: &![Database[Writing], R], digest: Span[Nat8, G], data: Span[Nat8, D], now: Int64): Either[SessionError, String] is
+        case freshToken() of
+            when Some(value as fresh: Fresh) do
+                let { token: String, digest as newDigest: String } := fresh;
+                case insertRow(&~db, asSpan(&newDigest), now, data) of
+                    when None do
+                        destroyString(newDigest);
+                        case deleteRow(&~db, digest) of
+                            when None do
+                                let moved: Either[SessionError, String] := Right(right => token);
+                                return moved;
+                            when Some(value as error: DbError) do
+                                destroyString(token);
+                                let failed: Either[SessionError, String] := Left(left => stored(error));
+                                return failed;
+                        end case;
+                    when Some(value as error: DbError) do
+                        destroyString(newDigest);
+                        destroyString(token);
+                        let failed: Either[SessionError, String] := Left(left => stored(error));
+                        return failed;
+                end case;
+            when None do
+                let failed: Either[SessionError, String] := Left(left => CryptoFailed());
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function rotateSession(db: &![Database[Writing], R], token: Span[Nat8, T], limits: SessionLimits, now: Int64): Either[SessionError, Option[String]] is
+        case liveRow(&~db, token, limits, now) of
+            when LiveRow(digest: String, data: String, created: Int64) do
+                case begin(&~db) of
+                    when Right(right as transaction: Transaction) do
+                        case moveRow(&~db, asSpan(&digest), asSpan(&data), now) of
+                            when Right(right as fresh: String) do
+                                destroyString(digest);
+                                destroyString(data);
+                                case commit(&~db, transaction) of
+                                    when Right(right as done: Unit) do
+                                        let some: Option[String] := Some(value => fresh);
+                                        let rotated: Either[SessionError, Option[String]] := Right(right => some);
+                                        return rotated;
+                                    when Left(left as error: DbError) do
+                                        destroyString(fresh);
+                                        let failed: Either[SessionError, Option[String]] := Left(left => stored(error));
+                                        return failed;
+                                end case;
+                            when Left(left as reason: SessionError) do
+                                destroyString(digest);
+                                destroyString(data);
+                                rollback(&~db, transaction);
+                                let failed: Either[SessionError, Option[String]] := Left(left => reason);
+                                return failed;
+                        end case;
+                    when Left(left as error: DbError) do
+                        destroyString(digest);
+                        destroyString(data);
+                        let failed: Either[SessionError, Option[String]] := Left(left => stored(error));
+                        return failed;
+                end case;
+            when NotLive do
+                let none: Option[String] := None();
+                let absent: Either[SessionError, Option[String]] := Right(right => none);
+                return absent;
+            when LiveFailed(reason: SessionError) do
+                let failed: Either[SessionError, Option[String]] := Left(left => reason);
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function destroySession(db: &![Database[Writing], R], token: Span[Nat8, T]): Either[SessionError, Unit] is
+        if not isSessionToken(token) then
+            let done: Either[SessionError, Unit] := Right(right => nil);
+            return done;
+        end if;
+        case digestOf(token) of
+            when Some(value as digest: String) do
+                case deleteRow(&~db, asSpan(&digest)) of
+                    when None do
+                        destroyString(digest);
+                        let done: Either[SessionError, Unit] := Right(right => nil);
+                        return done;
+                    when Some(value as error: DbError) do
+                        destroyString(digest);
+                        let failed: Either[SessionError, Unit] := Left(left => stored(error));
+                        return failed;
+                end case;
+            when None do
+                let failed: Either[SessionError, Unit] := Left(left => CryptoFailed());
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region]
+    function purgeSessions(db: &![Database[Writing], R], limits: SessionLimits, now: Int64): Either[SessionError, Nat64] is
+        if now < 0 then
+            let late: Either[SessionError, Nat64] := Left(left => BadTime());
+            return late;
+        end if;
+        let values: Values := withInt64(withInt64(noValues(), now - limits.idleSeconds), now - limits.absoluteSeconds);
+        case execute(&~db, "DELETE FROM hilde_sessions WHERE seen < ? OR created < ?", values) of
+            when Right(right as changed: Nat64) do
+                let done: Either[SessionError, Nat64] := Right(right => changed);
+                return done;
+            when Left(left as error: DbError) do
+                let failed: Either[SessionError, Nat64] := Left(left => stored(error));
+                return failed;
+        end case;
+    end;
+end module body.

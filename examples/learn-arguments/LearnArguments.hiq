@@ -1,0 +1,296 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Reading a command line with Standard.Arguments: a command with two
+-- subcommands is declared, each declaration handing back a key, and
+-- command lines are parsed against it.  The programme parses lines it
+-- builds itself, so that its output is the same on every run, and then
+-- counts the words it was started with.  A word that begins with @ names
+-- a file whose words stand in its place, as in gcc: one line is read
+-- from a file the programme writes and removes.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nthRef,
+    insertBack
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFileIfThere
+);
+import Standard.Arguments (
+    Command,
+    FlagKey,
+    WholeKey,
+    ChoiceKey,
+    PathKey,
+    SubcommandKey,
+    ArgumentError,
+    Outcome,
+    Run,
+    Help,
+    Version,
+    Matches,
+    makeCommand,
+    destroyCommand,
+    setVersion,
+    addAlias,
+    option,
+    repeatable,
+    global,
+    addFlag,
+    addWhole,
+    addChoice,
+    addPositionalPath,
+    addSubcommand,
+    processArguments,
+    destroyArguments,
+    expandArgumentFiles,
+    parse,
+    destroyMatches,
+    describeError,
+    destroyError,
+    flagCount,
+    wholeOf,
+    choiceOf,
+    pathCount,
+    pathAt,
+    chosen,
+    addVerbose,
+    addJson
+);
+
+import Standard.Sandbox (
+    Report,
+    makePolicy,
+    allowPromises,
+    allowPath,
+    applyPolicy,
+    reportRefused
+);
+
+module body Example.LearnArguments is
+    -- Before anything else the programme gives up what it does not need:
+    -- of the file system only its own directory, and of the system calls
+    -- only those of the promises.  On OpenBSD that is pledge and unveil, on
+    -- Linux Landlock and seccomp, elsewhere nothing.  A policy that is not
+    -- valid is a mistake in this programme, and it stops.
+    function confine(): Unit is
+        let applied: Report := applyPolicy(allowPath(allowPromises(makePolicy(), "stdio rpath wpath cpath"), ".", "rwc"));
+        if reportRefused(applied) then
+            abort("the sandbox policy is not valid");
+        end if;
+        return nil;
+    end;
+
+    -- The keys of the programme's command, one for every thing it asks
+    -- the matches for.  A key is a value: a name misspelt in the programme
+    -- is a variable the compiler does not know.
+    record Keys: Free is
+        verbose: FlagKey;
+        level: WholeKey;
+        mode: ChoiceKey;
+        dryRun: FlagKey;
+        sources: PathKey;
+        json: FlagKey;
+        run: SubcommandKey;
+        list: SubcommandKey;
+    end;
+
+    -- backup, with -v global to both subcommands; run, which copies, with
+    -- a level from 1 to 9, a mode, a flag and one or more sources; and
+    -- list, also called ls.
+    function main(): ExitCode is
+        confine();
+        var root: Command := makeCommand("backup", "Copy files to a safe place.");
+        setVersion(&!root, "1.0.0");
+        let verbose: FlagKey := addVerbose(&!root, "Say more");
+        var run: Command := makeCommand("run", "Copy the sources.");
+        let level: WholeKey := addWhole(&!run, option("level", 'l', "How hard to compress"), 1, 9, "6");
+        let mode: ChoiceKey := addChoice(&!run, option("mode", 'm', "How to copy"), "fast|safe", "safe");
+        let dryRun: FlagKey := addFlag(&!run, option("dry-run", 'n', "Copy nothing"));
+        let sources: PathKey := addPositionalPath(&!run, "source", "What to copy", true, true);
+        var list: Command := makeCommand("list", "List the copies.");
+        addAlias(&!list, "ls");
+        let none: Nat8 := 0;
+        let json: FlagKey := addJson(&!list);
+        let runKey: SubcommandKey := addSubcommand(&!root, run);
+        let listKey: SubcommandKey := addSubcommand(&!root, list);
+        let keys: Keys := Keys(verbose => verbose, level => level, mode => mode, dryRun => dryRun,
+            sources => sources, json => json, run => runKey, list => listKey);
+        -- A global flag before the subcommand, a value in the next word,
+        -- two sources.
+        show(&root, keys, words5("-v", "run", "-l", "9", "a.txt"), "b.txt");
+        -- The alias, and a default: run's level is 6 when not given.
+        show(&root, keys, words5("ls", "--json", "-v", "-v", ""), "");
+        show(&root, keys, words5("run", "--mode=fast", "-n", "notes.txt", ""), "");
+        -- Three lines the command refuses, each with its message.
+        show(&root, keys, words5("run", "--mode", "saf", "a.txt", ""), "");
+        show(&root, keys, words5("run", "--level=12", "a.txt", "", ""), "");
+        show(&root, keys, words5("copy", "a.txt", "", "", ""), "");
+        -- An argument file: the words of backup.args stand where it is
+        -- named, a quote groups, and a file that is not there is an error.
+        writeArgumentFile();
+        show(&root, keys, words5("run", "@backup.args", "c.txt", "", ""), "");
+        show(&root, keys, words5("run", "@missing.args", "", "", ""), "");
+        let removed: Bool := removeFileIfThere("backup.args");
+        -- The help of a subcommand, and the version.
+        show(&root, keys, words5("help", "run", "", "", ""), "");
+        show(&root, keys, words5("--version", "", "", "", ""), "");
+        let own: Buffer[String] := processArguments();
+        print("words of this run: ");
+        printLn(bufferLength(&own));
+        destroyArguments(own);
+        destroyCommand(root);
+        return ExitSuccess();
+    end;
+
+    -- Up to five words; an empty one is left out.
+    function words5(a: Span[Nat8, Static], b: Span[Nat8, Static], c: Span[Nat8, Static], d: Span[Nat8, Static], e: Span[Nat8, Static]): Buffer[String] is
+        var w: Buffer[String] := allocateEmpty();
+        addWord(&!w, a);
+        addWord(&!w, b);
+        addWord(&!w, c);
+        addWord(&!w, d);
+        addWord(&!w, e);
+        return w;
+    end;
+
+    generic [R: Region]
+    function addWord(words: &![Buffer[String], R], word: Span[Nat8, Static]): Unit is
+        if spanLength(word) > 0 then
+            insertBack(&~words, fromLiteral(word));
+        end if;
+        return nil;
+    end;
+
+    -- Show a command line, parse it and say what came out.  The words are
+    -- destroyed here.
+    generic [R: Region]
+    function show(root: &[Command, R], keys: Keys, first: Buffer[String], last: Span[Nat8, Static]): Unit is
+        var words: Buffer[String] := first;
+        addWord(&!words, last);
+        print("command line:");
+        for i from 0 to bufferLength(&words) - 1 do
+            print(" ");
+            print(asSpan(nthRef(&words, i)));
+        end for;
+        printLn("");
+        case expandArgumentFiles(&words) of
+            when Right(right as expanded: Buffer[String]) do
+                answer(root, keys, expanded);
+            when Left(left as error: ArgumentError) do
+                tell(root, error);
+        end case;
+        destroyArguments(words);
+        return nil;
+    end;
+
+    -- Parse the words, which are destroyed here, and say what came out.
+    generic [R: Region]
+    function answer(root: &[Command, R], keys: Keys, words: Buffer[String]): Unit is
+        case parse(root, &words) of
+            when Right(right as outcome: Outcome) do
+                case outcome of
+                    when Run(matches as m: Matches) do
+                        report(&m, keys);
+                        destroyMatches(m);
+                    when Help(text as t: String) do
+                        print(asSpan(&t));
+                        destroyString(t);
+                    when Version(text as t: String) do
+                        print(asSpan(&t));
+                        destroyString(t);
+                end case;
+            when Left(left as error: ArgumentError) do
+                tell(root, error);
+        end case;
+        destroyArguments(words);
+        return nil;
+    end;
+
+    -- The message of a mistake, with its usage line.
+    generic [R: Region]
+    function tell(root: &[Command, R], error: ArgumentError): Unit is
+        let message: String := describeError(root, &error);
+        print(asSpan(&message));
+        destroyString(message);
+        destroyError(error);
+        return nil;
+    end;
+
+    -- The file backup.args, one line of options and a line with a quoted
+    -- source.
+    function writeArgumentFile(): Unit is
+        case openWrite("backup.args") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, "-v --level 3\n--dry-run \"my notes.txt\"\n");
+                let closed: Bool := closeFile(file);
+                if not (wrote and closed) then
+                    printLn("backup.args could not be written");
+                end if;
+            when None do
+                printLn("backup.args could not be made");
+        end case;
+        return nil;
+    end;
+
+    -- What a parse found.
+    generic [R: Region]
+    function report(m: &[Matches, R], keys: Keys): Unit is
+        print("  verbose: ");
+        printLn(flagCount(m, keys.verbose));
+        if chosen(m, keys.run) then
+            print("  run, level ");
+            case wholeOf(m, keys.level) of
+                when Some(value as l: Int64) do
+                    printLn(l);
+                when None do
+                    printLn("none");
+            end case;
+            print("  mode: ");
+            case choiceOf(m, keys.mode) of
+                when Some(value as i: Index) do
+                    if i = 0 then
+                        printLn("fast");
+                    else
+                        printLn("safe");
+                    end if;
+                when None do
+                    printLn("none");
+            end case;
+            print("  dry run: ");
+            printLn(flagCount(m, keys.dryRun));
+            let n: Index := pathCount(m, keys.sources);
+            for i from 0 to n - 1 do
+                case pathAt(m, keys.sources, i) of
+                    when Some(value as p: &[String, R]) do
+                        print("  source: ");
+                        printLn(asSpan(p));
+                    when None do
+                        skip;
+                end case;
+            end for;
+        end if;
+        if chosen(m, keys.list) then
+            print("  list, json: ");
+            printLn(flagCount(m, keys.json));
+        end if;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,507 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module over Standard.Database with SQL of its own: the statements
+-- are constants and every value is bound, the query of FTS5 too, which this
+-- module builds from quoted words only.  SQLite marks the words found in a
+-- snippet with the bytes 1 and 2, which a body never holds because they are
+-- taken out when it is indexed; the snippet is then escaped and the two
+-- bytes replaced by the caller's markers.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    lengthMut
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Backend,
+    SqliteBackend,
+    SqlCipherBackend,
+    PostgresBackend,
+    MariaDBBackend,
+    backendOf,
+    Transaction,
+    Cursor,
+    Values,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    withInt64,
+    withText,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnFloat64,
+    columnText,
+    finish
+);
+
+module body Standard.Search is
+    constant mostWords: Index := 16;
+    constant mostWordBytes: Index := 64;
+    constant markOpen: Nat8 := 1;
+    constant markClose: Nat8 := 2;
+
+    function stored(error: DbError): SearchError is
+        return SearchStorageFailed(error => error);
+    end;
+
+    -- One statement without values; the error when the database refuses it.
+    generic [R: Region]
+    function run(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Option[DbError] is
+        case execute(&~db, sql, noValues()) of
+            when Right(right as changed: Nat64) do
+                let none: Option[DbError] := None();
+                return none;
+            when Left(left as error: DbError) do
+                let some: Option[DbError] := Some(value => error);
+                return some;
+        end case;
+    end;
+
+    function failureOf(result: Either[DbError, Nat64]): Option[DbError] is
+        case result of
+            when Right(right as changed: Nat64) do
+                let none: Option[DbError] := None();
+                return none;
+            when Left(left as error: DbError) do
+                let some: Option[DbError] := Some(value => error);
+                return some;
+        end case;
+    end;
+
+    -- Whether hilde_search_keys holds a row; Left when the database refuses.
+    generic [R: Region]
+    function keysFilled(db: &![Database[Writing], R]): Either[DbError, Bool] is
+        var cursor: Cursor := start(&~db, "SELECT 1 FROM hilde_search_keys LIMIT 1", noValues());
+        let filled: Bool := advance(&!cursor);
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                let failed: Either[DbError, Bool] := Left(left => error);
+                return failed;
+            when None do
+                let answer: Either[DbError, Bool] := Right(right => filled);
+                return answer;
+        end case;
+    end;
+
+    -- The map is filled only while it is empty: an index made without it
+    -- gets a key for each row once, under the row's present rowid, and a
+    -- later call reads one row of the map and none of hilde_search.
+    generic [R: Region]
+    function fillKeys(db: &![Database[Writing], R]): Option[DbError] is
+        case keysFilled(&~db) of
+            when Right(right as filled: Bool) do
+                if filled then
+                    let none: Option[DbError] := None();
+                    return none;
+                end if;
+                return run(&~db, "INSERT OR IGNORE INTO hilde_search_keys (key, id) SELECT key, rowid FROM hilde_search");
+            when Left(left as error: DbError) do
+                let some: Option[DbError] := Some(value => error);
+                return some;
+        end case;
+    end;
+
+    -- The key column of hilde_search is not indexed, so a lookup by key
+    -- there reads every row.  hilde_search_keys holds each key once, as
+    -- its primary key, with the rowid of its document in hilde_search; a
+    -- key is found through that index and its document through the rowid.
+    generic [R: Region]
+    function prepareSearch(db: &![Database[Writing], R]): Either[SearchError, Unit] is
+        let backend: Backend := backendOf(&db);
+        case backend of
+            when PostgresBackend do
+                let refused: Either[SearchError, Unit] := Left(left => SearchUnsupported());
+                return refused;
+            when MariaDBBackend do
+                let refused: Either[SearchError, Unit] := Left(left => SearchUnsupported());
+                return refused;
+            when SqliteBackend do
+                skip;
+            when SqlCipherBackend do
+                skip;
+        end case;
+        case run(&~db, "CREATE VIRTUAL TABLE IF NOT EXISTS hilde_search USING fts5(key UNINDEXED, title, body, tokenize = 'unicode61 remove_diacritics 2')") of
+            when None do
+                case run(&~db, "CREATE TABLE IF NOT EXISTS hilde_search_keys (key TEXT PRIMARY KEY, id INTEGER NOT NULL)") of
+                    when None do
+                        case fillKeys(&~db) of
+                            when None do
+                                let done: Either[SearchError, Unit] := Right(right => nil);
+                                return done;
+                            when Some(value as error: DbError) do
+                                let failed: Either[SearchError, Unit] := Left(left => stored(error));
+                                return failed;
+                        end case;
+                    when Some(value as error: DbError) do
+                        let failed: Either[SearchError, Unit] := Left(left => stored(error));
+                        return failed;
+                end case;
+            when Some(value as error: DbError) do
+                let failed: Either[SearchError, Unit] := Left(left => stored(error));
+                return failed;
+        end case;
+    end;
+
+    -- The rowid of the document of key, None when key has none.
+    generic [R: Region, K: Region]
+    function findRow(db: &![Database[Writing], R], key: Span[Nat8, K]): Either[DbError, Option[Int64]] is
+        var cursor: Cursor := start(&~db, "SELECT id FROM hilde_search_keys WHERE key = ?", withText(noValues(), key));
+        var row: Option[Int64] := None();
+        if advance(&!cursor) then
+            row := Some(value => columnInt64(&cursor, 0));
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                let failed: Either[DbError, Option[Int64]] := Left(left => error);
+                return failed;
+            when None do
+                let found: Either[DbError, Option[Int64]] := Right(right => row);
+                return found;
+        end case;
+    end;
+
+    -- text without the bytes that mark the words of a snippet.
+    generic [T: Region]
+    function withoutMarks(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if (text[i] /= markOpen) and (text[i] /= markClose) then
+                writeByte(&!out, text[i]);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- A key seen before keeps its rowid: its document is deleted by it and
+    -- the new one inserted under it.  A new key gets the rowid FTS5 gives
+    -- its document, which is never that of a row already in the table,
+    -- and is put into the map with it.
+    generic [R: Region, K: Region, T: Region, B: Region]
+    function replaceRow(db: &![Database[Writing], R], key: Span[Nat8, K], title: Span[Nat8, T], content: Span[Nat8, B]): Option[DbError] is
+        case findRow(&~db, key) of
+            when Right(right as row: Option[Int64]) do
+                case row of
+                    when Some(value as id: Int64) do
+                        case execute(&~db, "DELETE FROM hilde_search WHERE rowid = ?", withInt64(noValues(), id)) of
+                            when Right(right as removed: Nat64) do
+                                let clean: String := withoutMarks(content);
+                                let values: Values := withText(withText(withText(withInt64(noValues(), id), key), title), asSpan(&clean));
+                                let inserted: Either[DbError, Nat64] := execute(&~db, "INSERT INTO hilde_search (rowid, key, title, body) VALUES (?, ?, ?, ?)", values);
+                                destroyString(clean);
+                                return failureOf(inserted);
+                            when Left(left as error: DbError) do
+                                let some: Option[DbError] := Some(value => error);
+                                return some;
+                        end case;
+                    when None do
+                        let clean: String := withoutMarks(content);
+                        let values: Values := withText(withText(withText(noValues(), key), title), asSpan(&clean));
+                        let inserted: Either[DbError, Nat64] := execute(&~db, "INSERT INTO hilde_search (key, title, body) VALUES (?, ?, ?)", values);
+                        destroyString(clean);
+                        case inserted of
+                            when Right(right as count: Nat64) do
+                                return failureOf(execute(&~db, "INSERT INTO hilde_search_keys (key, id) VALUES (?, last_insert_rowid())", withText(noValues(), key)));
+                            when Left(left as error: DbError) do
+                                let some: Option[DbError] := Some(value => error);
+                                return some;
+                        end case;
+                end case;
+            when Left(left as error: DbError) do
+                let some: Option[DbError] := Some(value => error);
+                return some;
+        end case;
+    end;
+
+    generic [R: Region, K: Region, T: Region, B: Region]
+    function indexDocument(db: &![Database[Writing], R], key: Span[Nat8, K], title: Span[Nat8, T], content: Span[Nat8, B]): Either[SearchError, Unit] is
+        case begin(&~db) of
+            when Right(right as transaction: Transaction) do
+                case replaceRow(&~db, key, title, content) of
+                    when None do
+                        case commit(&~db, transaction) of
+                            when Right(right as done: Unit) do
+                                let indexed: Either[SearchError, Unit] := Right(right => nil);
+                                return indexed;
+                            when Left(left as error: DbError) do
+                                let failed: Either[SearchError, Unit] := Left(left => stored(error));
+                                return failed;
+                        end case;
+                    when Some(value as error: DbError) do
+                        rollback(&~db, transaction);
+                        let failed: Either[SearchError, Unit] := Left(left => stored(error));
+                        return failed;
+                end case;
+            when Left(left as error: DbError) do
+                let failed: Either[SearchError, Unit] := Left(left => stored(error));
+                return failed;
+        end case;
+    end;
+
+    -- The borrowed transaction is the proof that the caller holds one;
+    -- the statements are those of indexDocument without its begin and
+    -- commit.
+    generic [R: Region, X: Region, K: Region, T: Region, B: Region]
+    function indexDocumentIn(db: &![Database[Writing], R], transaction: &[Transaction, X], key: Span[Nat8, K], title: Span[Nat8, T], content: Span[Nat8, B]): Either[SearchError, Unit] is
+        case replaceRow(&~db, key, title, content) of
+            when None do
+                let indexed: Either[SearchError, Unit] := Right(right => nil);
+                return indexed;
+            when Some(value as error: DbError) do
+                let failed: Either[SearchError, Unit] := Left(left => stored(error));
+                return failed;
+        end case;
+    end;
+
+    -- The document goes first and its key after it: a step that fails in
+    -- between leaves a key without a document, which the next indexing of
+    -- that key fills again, and never a document no key reaches.
+    generic [R: Region, K: Region]
+    function removeDocument(db: &![Database[Writing], R], key: Span[Nat8, K]): Either[SearchError, Bool] is
+        case findRow(&~db, key) of
+            when Right(right as row: Option[Int64]) do
+                case row of
+                    when Some(value as id: Int64) do
+                        case execute(&~db, "DELETE FROM hilde_search WHERE rowid = ?", withInt64(noValues(), id)) of
+                            when Right(right as removed: Nat64) do
+                                case execute(&~db, "DELETE FROM hilde_search_keys WHERE key = ?", withText(noValues(), key)) of
+                                    when Right(right as dropped: Nat64) do
+                                        let some: Either[SearchError, Bool] := Right(right => removed > 0);
+                                        return some;
+                                    when Left(left as error: DbError) do
+                                        let failed: Either[SearchError, Bool] := Left(left => stored(error));
+                                        return failed;
+                                end case;
+                            when Left(left as error: DbError) do
+                                let failed: Either[SearchError, Bool] := Left(left => stored(error));
+                                return failed;
+                        end case;
+                    when None do
+                        let none: Either[SearchError, Bool] := Right(right => false);
+                        return none;
+                end case;
+            when Left(left as error: DbError) do
+                let failed: Either[SearchError, Bool] := Left(left => stored(error));
+                return failed;
+        end case;
+    end;
+
+    ---
+    --- The query
+    ---
+
+    -- Whether byte ends a word: a space, a control byte or punctuation of
+    -- ASCII.
+    function isBreak(byte: Nat8): Bool is
+        if byte <= 32 then
+            return true;
+        end if;
+        if byte >= 127 then
+            return byte = 127;
+        end if;
+        let digit: Bool := (byte >= '0') and (byte <= '9');
+        let small: Bool := (byte >= 'a') and (byte <= 'z');
+        let capital: Bool := (byte >= 'A') and (byte <= 'Z');
+        return not ((digit or small) or capital);
+    end;
+
+    generic [R: Region]
+    function searchQuery(text: Span[Nat8, R]): Option[String] is
+        var out: StringBuilder := makeStringBuilder();
+        var words: Index := 0;
+        var i: Index := 0;
+        let size: Index := spanLength(text);
+        while (i < size) and (words < mostWords) do
+            if isBreak(text[i]) then
+                i := i + 1;
+            else
+                let first: Index := i;
+                while (i < size) and (not isBreak(text[i])) do
+                    i := i + 1;
+                end while;
+                if (i - first) <= mostWordBytes then
+                    if words > 0 then
+                        writeByte(&!out, ' ');
+                    end if;
+                    writeByte(&!out, '"');
+                    var k: Index := first;
+                    while k < i do
+                        writeByte(&!out, text[k]);
+                        k := k + 1;
+                    end while;
+                    writeByte(&!out, '"');
+                    if (i < size) and (text[i] = '*') then
+                        writeByte(&!out, '*');
+                    end if;
+                    words := words + 1;
+                end if;
+            end if;
+        end while;
+        let query: String := finalize(out);
+        if words = 0 then
+            destroyString(query);
+            let none: Option[String] := None();
+            return none;
+        else
+            let some: Option[String] := Some(value => query);
+            return some;
+        end if;
+    end;
+
+    ---
+    --- Searching
+    ---
+
+    -- The snippet SQLite wrote, escaped for HTML, with the bytes that mark
+    -- the words found replaced by before and after.
+    generic [S: Region, B: Region, A: Region]
+    function markedSnippet(snippet: Span[Nat8, S], before: Span[Nat8, B], after: Span[Nat8, A]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(snippet) do
+            let byte: Nat8 := snippet[i];
+            if byte = markOpen then
+                writeString(&!out, before);
+            else if byte = markClose then
+                writeString(&!out, after);
+            else if byte = '&' then
+                writeString(&!out, "&amp;");
+            else if byte = '<' then
+                writeString(&!out, "&lt;");
+            else if byte = '>' then
+                writeString(&!out, "&gt;");
+            else if byte = '"' then
+                writeString(&!out, "&quot;");
+            else if byte = 39 then
+                writeString(&!out, "&#39;");
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function markOf(byte: Nat8): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, byte);
+        return finalize(out);
+    end;
+
+    function clampLimit(limit: Int64): Int64 is
+        let least: Int64 := 1;
+        let most: Int64 := 100;
+        if limit < least then
+            return least;
+        end if;
+        if limit > most then
+            return most;
+        end if;
+        return limit;
+    end;
+
+    function clampOffset(offset: Int64): Int64 is
+        let zero: Int64 := 0;
+        if offset < zero then
+            return zero;
+        end if;
+        return offset;
+    end;
+
+    generic [R: Region, T: Region, B: Region, A: Region]
+    function search(db: &![Database[Writing], R], text: Span[Nat8, T], limit: Int64, offset: Int64,
+        before: Span[Nat8, B], after: Span[Nat8, A]): Either[SearchError, Buffer[SearchHit]] is
+        case searchQuery(text) of
+            when Some(value as query: String) do
+                let open: String := markOf(markOpen);
+                let close: String := markOf(markClose);
+                let values: Values := withInt64(withInt64(withText(withText(withText(noValues(), asSpan(&open)), asSpan(&close)), asSpan(&query)), clampLimit(limit)), clampOffset(offset));
+                destroyString(open);
+                destroyString(close);
+                destroyString(query);
+                var cursor: Cursor := start(&~db, "SELECT key, bm25(hilde_search, 0.0, 10.0, 1.0), snippet(hilde_search, 2, ?, ?, '...', 16) FROM hilde_search WHERE hilde_search MATCH ? ORDER BY 2 LIMIT ? OFFSET ?", values);
+                var hits: Buffer[SearchHit] := allocateEmpty();
+                while advance(&!cursor) do
+                    let key: String := fromSpan(columnText(&cursor, 0));
+                    let rank: Float64 := columnFloat64(&cursor, 1);
+                    let snippet: String := markedSnippet(columnText(&cursor, 2), before, after);
+                    insertBack(&!hits, SearchHit(key => key, rank => rank, snippet => snippet));
+                end while;
+                case finish(&~db, cursor) of
+                    when Some(value as error: DbError) do
+                        destroyHits(hits);
+                        let failed: Either[SearchError, Buffer[SearchHit]] := Left(left => stored(error));
+                        return failed;
+                    when None do
+                        let found: Either[SearchError, Buffer[SearchHit]] := Right(right => hits);
+                        return found;
+                end case;
+            when None do
+                let failed: Either[SearchError, Buffer[SearchHit]] := Left(left => NoWords());
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function countMatches(db: &![Database[Writing], R], text: Span[Nat8, T]): Either[SearchError, Int64] is
+        case searchQuery(text) of
+            when Some(value as query: String) do
+                var cursor: Cursor := start(&~db, "SELECT count(*) FROM hilde_search WHERE hilde_search MATCH ?", withText(noValues(), asSpan(&query)));
+                destroyString(query);
+                var count: Int64 := 0;
+                if advance(&!cursor) then
+                    count := columnInt64(&cursor, 0);
+                end if;
+                case finish(&~db, cursor) of
+                    when Some(value as error: DbError) do
+                        let failed: Either[SearchError, Int64] := Left(left => stored(error));
+                        return failed;
+                    when None do
+                        let counted: Either[SearchError, Int64] := Right(right => count);
+                        return counted;
+                end case;
+            when None do
+                let failed: Either[SearchError, Int64] := Left(left => NoWords());
+                return failed;
+        end case;
+    end;
+
+    function destroyHits(hits: Buffer[SearchHit]): Unit is
+        var rest: Buffer[SearchHit] := hits;
+        while lengthMut(&!rest) > 0 do
+            let { key: String, rank: Float64, snippet: String } := removeLast(&!rest);
+            destroyString(key);
+            destroyString(snippet);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+end module body.

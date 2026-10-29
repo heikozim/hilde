@@ -1,0 +1,167 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    readExactly,
+    readAll,
+    closeFile
+);
+import Standard.HttpClient (
+    Limits,
+    defaultLimits
+);
+import Standard.X509 (
+    PrivateKey,
+    EcP256,
+    generateKey
+);
+import Standard.Acme (
+    AcmeError,
+    Account,
+    destroyAcmeError,
+    openAccount
+);
+
+module body AcmeFake is
+    record Fake: Linear is
+        process: Process;
+        input: FileDescriptor;
+        output: FileDescriptor;
+        errors: FileDescriptor;
+        port: String;
+    end;
+
+    -- The path of rest in the tree the tests run in, from HILDE_TREE.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    function drain(file: FileDescriptor): Unit is
+        var open: FileDescriptor := file;
+        case readAll(&!open) of
+            when Some(value as text: String) do
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        let closed: Bool := closeFile(open);
+        return nil;
+    end;
+
+    function startFake(): Option[Fake] is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/acme/fake-ca.py");
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                var out: FileDescriptor := output;
+                case readExactly(&!out, 6) of
+                    when Some(value as port: String) do
+                        let fake: Option[Fake] := Some(value => Fake(process => process, input => input, output => out,
+                            errors => errors, port => port));
+                        return fake;
+                    when None do
+                        let closedInput: Bool := closeFile(input);
+                        drain(out);
+                        drain(errors);
+                        let status: ProcessStatus := waitProcess(process);
+                        let none: Option[Fake] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Fake] := None();
+                return none;
+        end case;
+    end;
+
+    function localLimits(): Limits is
+        let base: Limits := defaultLimits();
+        let local: Limits := Limits(connectMillis => base.connectMillis, totalMillis => base.totalMillis,
+            maximumBytes => base.maximumBytes, publicOnly => false);
+        return local;
+    end;
+
+    generic [R: Region]
+    function openFakeAccount(fake: &[Fake, R]): Option[Account] is
+        var url: StringBuilder := makeStringBuilder();
+        writeString(&!url, "https://localhost:");
+        writeString(&!url, substring(asSpan(&(fake->port)), 0, 5));
+        writeString(&!url, "/directory");
+        let directory: String := finalize(url);
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                case openAccount(asSpan(&directory), key, "", "server-cert.pem", localLimits()) of
+                    when Right(right as account: Account) do
+                        destroyString(directory);
+                        let some: Option[Account] := Some(value => account);
+                        return some;
+                    when Left(left as error: AcmeError) do
+                        destroyAcmeError(error);
+                        destroyString(directory);
+                        let none: Option[Account] := None();
+                        return none;
+                end case;
+            when None do
+                destroyString(directory);
+                let none: Option[Account] := None();
+                return none;
+        end case;
+    end;
+
+    function stopFake(fake: Fake): Unit is
+        let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor,
+            port: String } := fake;
+        let closedInput: Bool := closeFile(input);
+        drain(output);
+        drain(errors);
+        let status: ProcessStatus := waitProcess(process);
+        destroyString(port);
+        return nil;
+    end;
+end module body.

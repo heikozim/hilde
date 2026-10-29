@@ -1,0 +1,167 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module over Bindings.Watch.  A watcher keeps the kernel's number
+-- of each watch in the order the watches were added, and a wait turns the
+-- number the kernel names back into that place.
+import Standard.String (
+    String,
+    makeString,
+    storeNth,
+    destroyString
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length as bufferLength,
+    nth,
+    destroyFree
+);
+import Bindings.Watch (
+    watchAvailable as bindAvailable,
+    watchOpen,
+    watchAdd,
+    watchWait,
+    watchForget,
+    watchClose
+);
+
+module body Standard.Watch is
+    record Watcher: Linear is
+        number: Int32;
+        watches: Buffer[Int32];
+    end;
+
+    function watchAvailable(): Bool is
+        return bindAvailable();
+    end;
+
+    function makeWatcher(): Option[Watcher] is
+        let number: Int32 := watchOpen();
+        if number < 0 then
+            let none: Option[Watcher] := None();
+            return none;
+        end if;
+        let watches: Buffer[Int32] := allocateEmpty();
+        let some: Option[Watcher] := Some(value => Watcher(number => number, watches => watches));
+        return some;
+    end;
+
+    -- A copy of path with a zero byte after it, or None for a path that is
+    -- empty or holds a zero byte.
+    generic [R: Region]
+    function terminated(path: Span[Nat8, R]): Option[String] is
+        let size: Index := spanLength(path);
+        var holdsZero: Bool := size = 0;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if path[i] = 0 then
+                    holdsZero := true;
+                end if;
+            end for;
+        end if;
+        if holdsZero then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var copy: String := makeString(size + 1, 0);
+        for i from 0 to size - 1 do
+            storeNth(&!copy, i, path[i]);
+        end for;
+        let some: Option[String] := Some(value => copy);
+        return some;
+    end;
+
+    generic [R: Region]
+    function watchCount(watcher: &![Watcher, R]): Index is
+        return bufferLength(&(watcher->watches));
+    end;
+
+    generic [R: Region]
+    function keep(watcher: &![Watcher, R], number: Int32): Unit is
+        insertBack(&!(watcher->watches), number);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function add(watcher: &![Watcher, R], path: Span[Nat8, S], directory: Bool): Option[Index] is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let number: Int32 := watchAdd(watcher->number, &name, directory);
+                destroyString(name);
+                if number < 0 then
+                    let none: Option[Index] := None();
+                    return none;
+                end if;
+                let index: Index := watchCount(&~watcher);
+                keep(&~watcher, number);
+                let some: Option[Index] := Some(value => index);
+                return some;
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function watchDirectory(watcher: &![Watcher, R], path: Span[Nat8, S]): Option[Index] is
+        return add(watcher, path, true);
+    end;
+
+    generic [R: Region, S: Region]
+    function watchFile(watcher: &![Watcher, R], path: Span[Nat8, S]): Option[Index] is
+        return add(watcher, path, false);
+    end;
+
+    -- The place of the watch the kernel numbered number, or None.
+    generic [R: Region]
+    function placeOf(watches: &[Buffer[Int32], R], number: Int32): Option[Index] is
+        let count: Index := bufferLength(watches);
+        var i: Index := 0;
+        while i < count do
+            if nth(watches, i) = number then
+                let some: Option[Index] := Some(value => i);
+                return some;
+            end if;
+            i := i + 1;
+        end while;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function waitForChange(watcher: &![Watcher, R], milliseconds: Nat32): WatchResult is
+        let got: Int32 := watchWait(watcher->number, milliseconds);
+        if got = -2 then
+            return WaitedOut();
+        end if;
+        if got < 0 then
+            return WatchFailed();
+        end if;
+        case placeOf(&(watcher->watches), got) of
+            when Some(value as place: Index) do
+                return Changed(watch => place);
+            when None do
+                return WatchFailed();
+        end case;
+    end;
+
+    function destroyWatcher(watcher: Watcher): Unit is
+        let { number: Int32, watches: Buffer[Int32] } := watcher;
+        let count: Index := bufferLength(&watches);
+        var i: Index := 0;
+        while i < count do
+            let forgotten: Bool := watchForget(nth(&watches, i));
+            i := i + 1;
+        end while;
+        destroyFree(watches);
+        let closed: Bool := watchClose(number);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,721 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    isDigit,
+    hexDigitValue
+);
+
+module body Standard.Ip is
+    record IpAddress: Free is
+        isV6: Bool;
+        -- IPv4 lives in the low 32 bits of low; IPv6 uses both halves,
+        -- high first.  128 bits of address in two machine words, so
+        -- masking and comparing are arithmetic and not a loop over bytes.
+        high: Nat64;
+        low: Nat64;
+    end;
+
+    -- What a parse carries while it runs.  ok rather than an early
+    -- return, so that every path goes through the same end.
+    record Scan: Free is
+        high: Nat64;
+        low: Nat64;
+        ok: Bool;
+    end;
+
+    -- The longest run of zero groups in an IPv6 address: where it starts
+    -- and how long it is.
+    record Run: Free is
+        at: Index;
+        len: Index;
+    end;
+
+    constant byteDot: Nat8 := 46;
+    constant byteZero: Nat8 := 48;
+    constant byteColon: Nat8 := 58;
+    constant hexLetterGap: Nat8 := 87;
+
+    -- An integer literal is an Int32 unless a declaration says otherwise,
+    -- so every value an assignment uses is named.
+    constant zeroNat: Nat64 := 0;
+    -- Arithmetic and rem are typeclass methods: both operands share one
+    -- type parameter, so a bare literal beside a Nat64 leaves the binding
+    -- ambiguous.  Every operand of this module's arithmetic is named.
+    constant twoNat: Nat64 := 2;
+    constant tenNat: Nat64 := 10;
+    constant sixteenNat: Nat64 := 16;
+    constant hundredNat: Nat64 := 100;
+    constant maxByteValue: Nat64 := 255;
+    constant byteModulus: Nat64 := 256;
+    constant groupModulus: Nat64 := 65536;
+    constant tenByte: Nat8 := 10;
+    constant zeroIndex: Index := 0;
+    -- A literal on the left of an operator does not take the other
+    -- side's type, so 7 - position with an Index is an Int32 and the
+    -- call below it will not type.  These three are the left operands.
+    constant threeIndex: Index := 3;
+    constant sevenIndex: Index := 7;
+    constant fourIndex: Index := 4;
+    constant eightIndex: Index := 8;
+    constant sixteenIndex: Index := 16;
+    constant twoIndex: Index := 2;
+    constant bitsV4: Index := 32;
+    constant bitsV6: Index := 128;
+    constant halfBits: Index := 64;
+    constant anonymiseV4: Index := 24;
+    constant anonymiseV6: Index := 48;
+
+    ---
+    --- Arithmetic that stands in for the shifts the language has not got
+    ---
+
+    -- Hilde's BitwiseOperations has and, or, xor and not, and no shift.
+    -- A shift by n is a multiplication or a division by two to the n, and
+    -- that is what this is.  The exponent is never above 63 here, so the
+    -- trapping multiplication below cannot trap.
+    function powerOfTwo(exponent: Index): Nat64 is
+        var result: Nat64 := 1;
+        var i: Index := zeroIndex;
+        while i < exponent do
+            result := result * twoNat;
+            i := i + 1;
+        end while;
+        return result;
+    end;
+
+    -- The value with its lowest count bits cleared.
+    function clearLow(value: Nat64, count: Index): Nat64 is
+        if count = zeroIndex then
+            return value;
+        end if;
+        if count >= halfBits then
+            return zeroNat;
+        end if;
+        let step: Nat64 := powerOfTwo(count);
+        return (value / step) * step;
+    end;
+
+    function nat8Of(wide: Nat64): Nat8 is
+        case toNat8(wide) of
+            when Some(value: Nat8) do
+                return value;
+            when None do
+                abort("Standard.Ip: a byte value did not fit in a Nat8.");
+        end case;
+    end;
+
+    function natOfByte(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value: Nat64) do
+                return value;
+            when None do
+                abort("Standard.Ip: a Nat8 did not fit in a Nat64.");
+        end case;
+    end;
+
+    -- Byte position of a 64-bit half, counting 0 from the most
+    -- significant end.
+    function byteAt(value: Nat64, position: Index): Nat8 is
+        let step: Nat64 := powerOfTwo((sevenIndex - position) * 8);
+        return nat8Of(rem(value / step, byteModulus));
+    end;
+
+    -- Group g of an IPv6 address, 0 to 7, sixteen bits each.
+    function groupAt(address: IpAddress, g: Index): Nat64 is
+        var half: Nat64 := address.low;
+        var within: Index := g;
+        if g < 4 then
+            half := address.high;
+        else
+            within := g - 4;
+        end if;
+        let step: Nat64 := powerOfTwo((threeIndex - within) * 16);
+        return rem(half / step, groupModulus);
+    end;
+
+    function place(scan: Scan, g: Index, value: Nat64): Scan is
+        var within: Index := g;
+        if g >= 4 then
+            within := g - 4;
+        end if;
+        let added: Nat64 := value * powerOfTwo((threeIndex - within) * 16);
+        if g < 4 then
+            return Scan(high => scan.high + added, low => scan.low, ok => scan.ok);
+        end if;
+        return Scan(high => scan.high, low => scan.low + added, ok => scan.ok);
+    end;
+
+    function refuse(scan: Scan): Scan is
+        return Scan(high => scan.high, low => scan.low, ok => false);
+    end;
+
+    ---
+    --- Parsing
+    ---
+
+    generic [R: Region]
+    function parseIpv4(string: Span[Nat8, R]): Option[IpAddress] is
+        let size: Index := spanLength(string);
+        var packed: Nat64 := zeroNat;
+        var current: Nat64 := zeroNat;
+        var groups: Index := zeroIndex;
+        var digits: Index := zeroIndex;
+        var ok: Bool := size > 0;
+        var i: Index := zeroIndex;
+        while (i < size) and ok do
+            let byte: Nat8 := string[i];
+            if byte = byteDot then
+                if digits = zeroIndex then
+                    ok := false;
+                else
+                    if groups >= 3 then
+                        ok := false;
+                    else
+                        packed := (packed * byteModulus) + current;
+                        groups := groups + 1;
+                        current := zeroNat;
+                        digits := zeroIndex;
+                    end if;
+                end if;
+            else
+                if isDigit(byte) then
+                    if digits >= 3 then
+                        ok := false;
+                    else
+                        current := (current * tenNat) + natOfByte(byte - byteZero);
+                        digits := digits + 1;
+                        if current > maxByteValue then
+                            ok := false;
+                        end if;
+                    end if;
+                else
+                    ok := false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        if digits = zeroIndex then
+            ok := false;
+        end if;
+        if groups /= 3 then
+            ok := false;
+        end if;
+        let none: Option[IpAddress] := None();
+        if not ok then
+            return none;
+        end if;
+        packed := (packed * byteModulus) + current;
+        let some: Option[IpAddress] :=
+            Some(value => IpAddress(isV6 => false, high => zeroNat, low => packed));
+        return some;
+    end;
+
+    generic [R: Region]
+    function findDoubleColon(string: Span[Nat8, R]): Option[Index] is
+        let size: Index := spanLength(string);
+        var i: Index := zeroIndex;
+        var found: Bool := false;
+        var at: Index := zeroIndex;
+        while ((i + 1) < size) and (not found) do
+            if string[i] = byteColon then
+                if string[i + 1] = byteColon then
+                    found := true;
+                    at := i;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        if found then
+            let some: Option[Index] := Some(value => at);
+            return some;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function countGroups(string: Span[Nat8, R], startAt: Index, endAt: Index): Index is
+        if startAt >= endAt then
+            return zeroIndex;
+        end if;
+        var count: Index := 1;
+        var i: Index := startAt;
+        while i < endAt do
+            if string[i] = byteColon then
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    generic [R: Region]
+    function absorbGroups(string: Span[Nat8, R], startAt: Index, endAt: Index,
+        firstGroup: Index, incoming: Scan): Scan is
+        var scan: Scan := incoming;
+        var current: Nat64 := zeroNat;
+        var digits: Index := zeroIndex;
+        var group: Index := firstGroup;
+        var i: Index := startAt;
+        while (i < endAt) and scan.ok do
+            let byte: Nat8 := string[i];
+            if byte = byteColon then
+                if digits = zeroIndex then
+                    scan := refuse(scan);
+                else
+                    scan := place(scan, group, current);
+                    group := group + 1;
+                    current := zeroNat;
+                    digits := zeroIndex;
+                end if;
+            else
+                case hexDigitValue(byte) of
+                    when Some(value: Nat8) do
+                        if digits >= 4 then
+                            scan := refuse(scan);
+                        else
+                            current := (current * sixteenNat) + natOfByte(value);
+                            digits := digits + 1;
+                        end if;
+                    when None do
+                        scan := refuse(scan);
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        if scan.ok then
+            if digits = zeroIndex then
+                scan := refuse(scan);
+            else
+                scan := place(scan, group, current);
+            end if;
+        end if;
+        return scan;
+    end;
+
+    generic [R: Region]
+    function absorbAroundGap(string: Span[Nat8, R], gapAt: Index, incoming: Scan): Scan is
+        let size: Index := spanLength(string);
+        let beforeCount: Index := countGroups(string, zeroIndex, gapAt);
+        let afterCount: Index := countGroups(string, gapAt + 2, size);
+        var scan: Scan := incoming;
+        if (beforeCount + afterCount) > 7 then
+            return refuse(scan);
+        end if;
+        if beforeCount > zeroIndex then
+            scan := absorbGroups(string, zeroIndex, gapAt, zeroIndex, scan);
+        end if;
+        if afterCount > zeroIndex then
+            scan := absorbGroups(string, gapAt + 2, size,
+                eightIndex - afterCount, scan);
+        end if;
+        return scan;
+    end;
+
+    generic [R: Region]
+    function parseIpv6(string: Span[Nat8, R]): Option[IpAddress] is
+        let size: Index := spanLength(string);
+        let none: Option[IpAddress] := None();
+        if size = zeroIndex then
+            return none;
+        end if;
+        var scan: Scan := Scan(high => zeroNat, low => zeroNat, ok => true);
+        case findDoubleColon(string) of
+            when Some(value: Index) do
+                scan := absorbAroundGap(string, value, scan);
+            when None do
+                if countGroups(string, zeroIndex, size) /= 8 then
+                    return none;
+                end if;
+                scan := absorbGroups(string, zeroIndex, size, zeroIndex, scan);
+        end case;
+        if not scan.ok then
+            return none;
+        end if;
+        let some: Option[IpAddress] :=
+            Some(value => IpAddress(isV6 => true, high => scan.high, low => scan.low));
+        return some;
+    end;
+
+    generic [R: Region]
+    function holdsColon(string: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(string);
+        var i: Index := zeroIndex;
+        var found: Bool := false;
+        while i < size do
+            if string[i] = byteColon then
+                found := true;
+            end if;
+            i := i + 1;
+        end while;
+        return found;
+    end;
+
+    generic [R: Region]
+    function parseIp(string: Span[Nat8, R]): Option[IpAddress] is
+        if holdsColon(string) then
+            return parseIpv6(string);
+        end if;
+        return parseIpv4(string);
+    end;
+
+    -- The count bytes of bytes from first on, most significant first, as
+    -- one number.
+    generic [R: Region]
+    function bigEndian(bytes: Span[Nat8, R], first: Index, count: Index): Nat64 is
+        var value: Nat64 := zeroNat;
+        var i: Index := zeroIndex;
+        while i < count do
+            value := (value * byteModulus) + natOfByte(bytes[first + i]);
+            i := i + 1;
+        end while;
+        return value;
+    end;
+
+    generic [R: Region]
+    function ipFromBytes(bytes: Span[Nat8, R]): Option[IpAddress] is
+        let size: Index := spanLength(bytes);
+        if size = fourIndex then
+            let v4: IpAddress := IpAddress(isV6 => false, high => zeroNat, low => bigEndian(bytes, zeroIndex, fourIndex));
+            return Some(value => v4);
+        end if;
+        if size = sixteenIndex then
+            let v6: IpAddress := IpAddress(isV6 => true, high => bigEndian(bytes, zeroIndex, eightIndex), low => bigEndian(bytes, eightIndex, eightIndex));
+            return Some(value => v6);
+        end if;
+        let none: Option[IpAddress] := None();
+        return none;
+    end;
+
+    ---
+    --- Asking
+    ---
+
+    function isIpv6(address: IpAddress): Bool is
+        return address.isV6;
+    end;
+
+    function sameIp(left: IpAddress, right: IpAddress): Bool is
+        if left.isV6 /= right.isV6 then
+            return false;
+        end if;
+        return (left.high = right.high) and (left.low = right.low);
+    end;
+
+    ---
+    --- Rendering
+    ---
+
+    function digitByte(value: Nat64): Nat8 is
+        return byteZero + nat8Of(value);
+    end;
+
+    function hexByte(value: Nat64): Nat8 is
+        let digit: Nat8 := nat8Of(value);
+        if digit < tenByte then
+            return byteZero + digit;
+        end if;
+        return hexLetterGap + digit;
+    end;
+
+    -- Every writer takes the builder and gives it back.  A write reference
+    -- is linear, so a parameter of that type could be used exactly once;
+    -- an owned builder can be borrowed afresh for every byte.
+    function writeDecimal(builder: StringBuilder, value: Nat64): StringBuilder is
+        var b: StringBuilder := builder;
+        if value >= hundredNat then
+            writeByte(&!b, digitByte(value / hundredNat));
+        end if;
+        if value >= tenNat then
+            writeByte(&!b, digitByte(rem(value / tenNat, tenNat)));
+        end if;
+        writeByte(&!b, digitByte(rem(value, tenNat)));
+        return b;
+    end;
+
+    function writeHexGroup(builder: StringBuilder, value: Nat64): StringBuilder is
+        var b: StringBuilder := builder;
+        var started: Bool := false;
+        var k: Index := 4;
+        while k > zeroIndex do
+            k := k - 1;
+            let digit: Nat64 := rem(value / powerOfTwo(k * fourIndex), sixteenNat);
+            if (digit /= zeroNat) or started then
+                writeByte(&!b, hexByte(digit));
+                started := true;
+            end if;
+        end while;
+        if not started then
+            writeByte(&!b, byteZero);
+        end if;
+        return b;
+    end;
+
+    function writeV4(builder: StringBuilder, address: IpAddress): StringBuilder is
+        var b: StringBuilder := builder;
+        var i: Index := 4;
+        while i < 8 do
+            if i > 4 then
+                writeByte(&!b, byteDot);
+            end if;
+            b := writeDecimal(b, natOfByte(byteAt(address.low, i)));
+            i := i + 1;
+        end while;
+        return b;
+    end;
+
+    function longestZeroRun(address: IpAddress): Run is
+        var best: Run := Run(at => zeroIndex, len => zeroIndex);
+        var current: Index := zeroIndex;
+        var g: Index := zeroIndex;
+        while g < 8 do
+            if groupAt(address, g) = zeroNat then
+                current := current + 1;
+                -- Strictly greater, so the leftmost of two equally long
+                -- runs wins, which is what RFC 5952 asks for.
+                if current > best.len then
+                    best := Run(at => (g + 1) - current, len => current);
+                end if;
+            else
+                current := zeroIndex;
+            end if;
+            g := g + 1;
+        end while;
+        return best;
+    end;
+
+    function writeV6(builder: StringBuilder, address: IpAddress): StringBuilder is
+        let run: Run := longestZeroRun(address);
+        let useRun: Bool := run.len >= twoIndex;
+        var b: StringBuilder := builder;
+        var g: Index := zeroIndex;
+        while g < 8 do
+            if useRun and (g = run.at) then
+                writeByte(&!b, byteColon);
+                writeByte(&!b, byteColon);
+                g := run.at + run.len;
+            else
+                if g > zeroIndex then
+                    -- No separator right after the ::, which already
+                    -- carries both of them.
+                    if not (useRun and (g = (run.at + run.len))) then
+                        writeByte(&!b, byteColon);
+                    end if;
+                end if;
+                b := writeHexGroup(b, groupAt(address, g));
+                g := g + 1;
+            end if;
+        end while;
+        return b;
+    end;
+
+    function ipToString(address: IpAddress): String is
+        var builder: StringBuilder := makeStringBuilder();
+        if address.isV6 then
+            builder := writeV6(builder, address);
+        else
+            builder := writeV4(builder, address);
+        end if;
+        return finalize(builder);
+    end;
+
+    ---
+    --- Masks and matching
+    ---
+
+    function applyMask(address: IpAddress, bits: Index): Option[IpAddress] is
+        let none: Option[IpAddress] := None();
+        var limit: Index := bitsV4;
+        if address.isV6 then
+            limit := bitsV6;
+        end if;
+        if bits > limit then
+            return none;
+        end if;
+        if not address.isV6 then
+            let kept: Nat64 := clearLow(address.low, bitsV4 - bits);
+            let some: Option[IpAddress] :=
+                Some(value => IpAddress(isV6 => false, high => zeroNat, low => kept));
+            return some;
+        end if;
+        if bits >= halfBits then
+            let kept: Nat64 := clearLow(address.low, bitsV6 - bits);
+            let some: Option[IpAddress] :=
+                Some(value => IpAddress(isV6 => true, high => address.high, low => kept));
+            return some;
+        end if;
+        let kept: Nat64 := clearLow(address.high, halfBits - bits);
+        let some: Option[IpAddress] :=
+            Some(value => IpAddress(isV6 => true, high => kept, low => zeroNat));
+        return some;
+    end;
+
+    function maskedEqual(masked: IpAddress, subnet: IpAddress, bits: Index): Bool is
+        case applyMask(subnet, bits) of
+            when Some(value: IpAddress) do
+                return sameIp(masked, value);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function inSubnet(address: IpAddress, subnet: IpAddress, bits: Index): Bool is
+        if address.isV6 /= subnet.isV6 then
+            return false;
+        end if;
+        case applyMask(address, bits) of
+            when Some(value: IpAddress) do
+                return maskedEqual(value, subnet, bits);
+            when None do
+                return false;
+        end case;
+    end;
+
+    ---
+    --- Bytes, and the addresses a request must not go to
+    ---
+
+    function ipToBytes(address: IpAddress): String is
+        var out: StringBuilder := makeStringBuilder();
+        if address.isV6 then
+            var i: Index := zeroIndex;
+            while i < eightIndex do
+                writeByte(&!out, byteAt(address.high, i));
+                i := i + 1;
+            end while;
+            var j: Index := zeroIndex;
+            while j < eightIndex do
+                writeByte(&!out, byteAt(address.low, j));
+                j := j + 1;
+            end while;
+        else
+            -- IPv4 is the low 32 bits of low: bytes 4 to 7 of it.
+            var k: Index := fourIndex;
+            while k < eightIndex do
+                writeByte(&!out, byteAt(address.low, k));
+                k := k + 1;
+            end while;
+        end if;
+        return finalize(out);
+    end;
+
+    -- The IPv4 address a.b.c.d.
+    function dotted(a: Nat64, b: Nat64, c: Nat64, d: Nat64): IpAddress is
+        let low: Nat64 := (((((a * byteModulus) + b) * byteModulus) + c) * byteModulus) + d;
+        let address: IpAddress := IpAddress(isV6 => false, high => zeroNat, low => low);
+        return address;
+    end;
+
+    -- The IPv6 address whose first group is group and every other zero.
+    function v6Prefix(group: Nat64): IpAddress is
+        let address: IpAddress := IpAddress(isV6 => true, high => group * powerOfTwo(48), low => zeroNat);
+        return address;
+    end;
+
+    -- The IPv6 address whose first three groups are given, every other zero.
+    function v6Groups(first: Nat64, second: Nat64, third: Nat64): IpAddress is
+        let high: Nat64 := ((first * powerOfTwo(48)) + (second * powerOfTwo(32))) + (third * powerOfTwo(16));
+        let address: IpAddress := IpAddress(isV6 => true, high => high, low => zeroNat);
+        return address;
+    end;
+
+    -- The IPv4 ranges that are not public: this network, the three private
+    -- ones, carrier-grade NAT, loopback, link-local, the protocol
+    -- assignments of 192.0.0.0/24, the three ranges for documentation, the
+    -- range for benchmarks, multicast, and the reserved range with the
+    -- broadcast address in it.
+    function reservedV4(address: IpAddress): Bool is
+        return inSubnet(address, dotted(0, 0, 0, 0), 8)
+            or (inSubnet(address, dotted(10, 0, 0, 0), 8)
+            or (inSubnet(address, dotted(100, 64, 0, 0), 10)
+                or (inSubnet(address, dotted(127, 0, 0, 0), 8)
+                    or (inSubnet(address, dotted(169, 254, 0, 0), 16)
+                        or (inSubnet(address, dotted(172, 16, 0, 0), 12)
+                            or (inSubnet(address, dotted(192, 0, 0, 0), 24)
+                                or (inSubnet(address, dotted(192, 0, 2, 0), 24)
+                                    or (inSubnet(address, dotted(192, 168, 0, 0), 16)
+                                        or (inSubnet(address, dotted(198, 18, 0, 0), 15)
+                                            or (inSubnet(address, dotted(198, 51, 100, 0), 24)
+                                                or (inSubnet(address, dotted(203, 0, 113, 0), 24)
+                                                    or (inSubnet(address, dotted(224, 0, 0, 0), 4)
+                                                        or inSubnet(address, dotted(240, 0, 0, 0), 4)))))))))))));
+    end;
+
+    -- The IPv6 addresses that are not public: ::/96 with the unspecified
+    -- address and loopback in it, the local NAT64 prefix, the discard
+    -- prefix, the protocol assignments of 2001::/23, documentation, 6to4,
+    -- the second range for documentation, unique local, link-local, the
+    -- old site-local range, and multicast.
+    function reservedV6(address: IpAddress): Bool is
+        if (address.high = zeroNat) and (address.low < powerOfTwo(32)) then
+            return true;
+        end if;
+        return inSubnet(address, v6Groups(100, 65435, 1), 48)
+            or (inSubnet(address, v6Prefix(256), 64)
+            or (inSubnet(address, v6Prefix(8193), 23)
+                or (inSubnet(address, v6Groups(8193, 3512, 0), 32)
+                    or (inSubnet(address, v6Prefix(8194), 16)
+                        or (inSubnet(address, v6Prefix(16383), 20)
+                            or (inSubnet(address, v6Prefix(64512), 7)
+                                or (inSubnet(address, v6Prefix(65152), 10)
+                                    or (inSubnet(address, v6Prefix(65216), 10)
+                                        or inSubnet(address, v6Prefix(65280), 8)))))))));
+    end;
+
+    function isPrivateOrReserved(address: IpAddress): Bool is
+        if not address.isV6 then
+            return reservedV4(address);
+        end if;
+        -- ::ffff:a.b.c.d reaches the IPv4 address a.b.c.d, and is judged
+        -- as that address.
+        let mappedMark: Nat64 := 65535;
+        let v4Span: Nat64 := powerOfTwo(32);
+        if (address.high = zeroNat) and ((address.low / v4Span) = mappedMark) then
+            let inner: IpAddress := IpAddress(isV6 => false, high => zeroNat, low => rem(address.low, v4Span));
+            return reservedV4(inner);
+        end if;
+        -- 64:ff9b::a.b.c.d, the prefix of NAT64, reaches a.b.c.d through a
+        -- translator, and is judged as that address too.
+        let nat64: IpAddress := v6Groups(100, 65435, 0);
+        if (address.high = nat64.high) and ((address.low / v4Span) = zeroNat) then
+            let translated: IpAddress := IpAddress(isV6 => false, high => zeroNat, low => address.low);
+            return reservedV4(translated);
+        end if;
+        return reservedV6(address);
+    end;
+
+    ---
+    --- Anonymising
+    ---
+
+    function anonymise(address: IpAddress): IpAddress is
+        var bits: Index := anonymiseV4;
+        if address.isV6 then
+            bits := anonymiseV6;
+        end if;
+        case applyMask(address, bits) of
+            when Some(value: IpAddress) do
+                return value;
+            when None do
+                -- 24 fits in 32 and 48 fits in 128, so this cannot be
+                -- reached; a wrong address would be worse than a stop.
+                abort("Standard.Ip: the anonymising mask does not fit the address.");
+        end case;
+    end;
+end module body.

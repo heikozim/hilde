@@ -1,0 +1,1762 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- An archive that was read keeps its bytes (a tar compressed with gzip
+-- unpacked first), its names and link targets in one string, and an index
+-- of free records that point into both.  A zip entry stays compressed
+-- until its content is asked for.  Every number read from a header is
+-- checked against the bytes there are before it is used as a place.  The
+-- readers work on a collector the caller owns and report a code, so that
+-- a loop never has to give back a linear value to stop.
+import Standard.String (
+    String,
+    makeString,
+    fromSpan,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    storeNth,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length as bufferLength,
+    nth,
+    destroyFree
+);
+import Standard.Gzip (
+    GzipFailure,
+    crc32,
+    deflateRaw,
+    inflateRaw,
+    gzip,
+    gunzip
+);
+import Standard.Failure (
+    Failure,
+    FailureKind,
+    Unclassified,
+    Invalid,
+    makeFailure
+);
+import Standard.File (
+    FileDescriptor,
+    FileStatus,
+    FileFound,
+    FileMissing,
+    FileUnreadable,
+    kindDirectory,
+    kindSymlink,
+    sameKind,
+    statusOf,
+    createNewFile,
+    writeAll,
+    closeFile,
+    openRead,
+    setFileMode,
+    createDirectory,
+    createSymlink
+);
+
+module body Standard.Archive is
+    -- The kinds of the index: the three of EntryKind and two that are read
+    -- but never extracted.
+    constant kindFile: Nat8 := 0;
+    constant kindDir: Nat8 := 1;
+    constant kindLink: Nat8 := 2;
+    constant kindHard: Nat8 := 3;
+    constant kindOther: Nat8 := 4;
+
+    record Entry: Free is
+        kind: Nat8;
+        nameAt: Index;
+        nameCount: Index;
+        linkAt: Index;
+        linkCount: Index;
+        mode: Nat32;
+        size: Nat64;
+        dataAt: Index;
+        dataCount: Index;
+        compressed: Bool;
+        checksum: Nat32;
+    end;
+
+    record Archive: Linear is
+        data: String;
+        names: String;
+        entries: Buffer[Entry];
+        zip: Bool;
+    end;
+
+    -- What a reader fills in: the names, how many bytes of them there are,
+    -- and the index.
+    record Collector: Linear is
+        names: StringBuilder;
+        used: Index;
+        entries: Buffer[Entry];
+    end;
+
+    -- What a reader reports: 0 when the archive read, or a code and the
+    -- byte at which it stopped.
+    record Outcome: Free is
+        code: Nat8;
+        at: Index;
+    end;
+
+    record Place: Free is
+        at: Index;
+        count: Index;
+    end;
+
+    function defaultBudget(): Budget is
+        let entries: Nat32 := 65536;
+        let largest: Nat64 := 1073741824;
+        let total: Nat64 := 4294967296;
+        return Budget(entries => entries, largestEntry => largest, total => total);
+    end;
+
+    ---
+    --- Conversions of values that were checked
+    ---
+
+    function wide(value: Nat8): Index is
+        case toIndex(value) of
+            when Some(value as widened: Index) do
+                return widened;
+            when None do
+                abort("Standard.Archive: a byte did not fit an Index");
+        end case;
+    end;
+
+    function wide64(value: Nat8): Nat64 is
+        case toNat64(value) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.Archive: a byte did not fit a Nat64");
+        end case;
+    end;
+
+    function nat64(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.Archive: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function wide32(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.Archive: a Nat32 did not fit a Nat64");
+        end case;
+    end;
+
+    function narrow32(value: Nat64): Nat32 is
+        case toNat32(value) of
+            when Some(value as narrowed: Nat32) do
+                return narrowed;
+            when None do
+                abort("Standard.Archive: a checked value did not fit a Nat32");
+        end case;
+    end;
+
+    function byteOf(value: Nat64): Nat8 is
+        case toNat8(value) of
+            when Some(value as narrowed: Nat8) do
+                return narrowed;
+            when None do
+                abort("Standard.Archive: a checked value did not fit a byte");
+        end case;
+    end;
+
+    -- An Index for a Nat64 read from a header, or None when it does not
+    -- fit; the caller then refuses the archive.
+    function place64(value: Nat64): Option[Index] is
+        return toIndex(value);
+    end;
+
+    ---
+    --- Failures
+    ---
+
+    function fine(): Outcome is
+        return Outcome(code => 0, at => 0);
+    end;
+
+    function stop(code: Nat8, at: Index): Outcome is
+        return Outcome(code => code, at => at);
+    end;
+
+    function reason(code: Nat8): Span[Nat8, Static] is
+        let texts: Span[Nat8, Static] := "?";
+        if code = 1 then
+            return "the archive is cut short";
+        end if;
+        if code = 2 then
+            return "a header's checksum is wrong";
+        end if;
+        if code = 3 then
+            return "a number in a header does not read";
+        end if;
+        if code = 4 then
+            return "more entries than the budget allows";
+        end if;
+        if code = 5 then
+            return "an entry larger than the budget allows";
+        end if;
+        if code = 6 then
+            return "more bytes in all than the budget allows";
+        end if;
+        if code = 7 then
+            return "a pax header does not read";
+        end if;
+        if code = 8 then
+            return "no end of a central directory";
+        end if;
+        if code = 9 then
+            return "a zip of more than one disk or of 64 bits";
+        end if;
+        if code = 10 then
+            return "an entry of the central directory does not read";
+        end if;
+        if code = 11 then
+            return "an encrypted entry";
+        end if;
+        if code = 12 then
+            return "a compression other than stored and DEFLATE";
+        end if;
+        if code = 13 then
+            return "a local header does not read";
+        end if;
+        if code = 14 then
+            return "a link's target does not unpack";
+        end if;
+        if code = 15 then
+            return "the gzip data does not unpack within the budget";
+        end if;
+        return texts;
+    end;
+
+    generic [R: Region]
+    function writeNumber(out: &![StringBuilder, R], value: Nat64): Unit is
+        let ten: Nat64 := 10;
+        if value >= ten then
+            writeNumber(&~out, value / ten);
+        end if;
+        writeByte(out, (48 : Nat8) + byteOf(value - ((value / ten) * ten)));
+        return nil;
+    end;
+
+    function readFailure(outcome: Outcome): Failure is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, reason(outcome.code));
+        writeString(&!out, " at byte ");
+        writeNumber(&!out, nat64(outcome.at));
+        let message: String := finalize(out);
+        let made: Failure := makeFailure("readArchive", Invalid(), asSpan(&message));
+        destroyString(message);
+        return made;
+    end;
+
+    generic [R: Region]
+    function namedFailure(op: Span[Nat8, Static], kind: FailureKind, what: Span[Nat8, Static], name: Span[Nat8, R]): Failure is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, what);
+        writeString(&!out, ": ");
+        writeString(&!out, name);
+        let message: String := finalize(out);
+        let made: Failure := makeFailure(op, kind, asSpan(&message));
+        destroyString(message);
+        return made;
+    end;
+
+    ---
+    --- The collector
+    ---
+
+    generic [C: Region, R: Region]
+    function addPart(c: &![Collector, C], part: Span[Nat8, R]): Place is
+        let at: Index := c->used;
+        c->used := at + spanLength(part);
+        writeString(&!(c->names), part);
+        return Place(at => at, count => spanLength(part));
+    end;
+
+    generic [C: Region]
+    function addEntry(c: &![Collector, C], entry: Entry): Unit is
+        insertBack(&!(c->entries), entry);
+        return nil;
+    end;
+
+    function newCollector(): Collector is
+        let entries: Buffer[Entry] := allocateEmpty();
+        return Collector(names => makeStringBuilder(), used => 0, entries => entries);
+    end;
+
+    ---
+    --- Numbers in headers
+    ---
+
+    -- The little-endian number of count bytes at at.  Only called with
+    -- at + count within the bytes.
+    generic [R: Region]
+    function little(bytes: Span[Nat8, R], at: Index, count: Index): Nat64 is
+        var value: Nat64 := 0;
+        var i: Index := count;
+        while i > 0 do
+            i := i - 1;
+            value := (value * 256) + wide64(bytes[at + i]);
+        end while;
+        return value;
+    end;
+
+    -- The octal number of a tar field of count bytes at at, with spaces and
+    -- zero bytes around it.  None for any other byte, and for a value of 2
+    -- to the 60 or more, the base-256 form among them.
+    generic [R: Region]
+    function octal(bytes: Span[Nat8, R], at: Index, count: Index): Option[Nat64] is
+        var value: Nat64 := 0;
+        var started: Bool := false;
+        var ended: Bool := false;
+        var bad: Bool := false;
+        let limit: Nat64 := 144115188075855872;
+        for i from at to (at + count) - 1 do
+            let byte: Nat8 := bytes[i];
+            if (byte >= '0') and (byte <= '7') then
+                if ended or (value >= limit) then
+                    bad := true;
+                else
+                    value := (value * 8) + wide64(byte - '0');
+                    started := true;
+                end if;
+            else
+                if (byte = ' ') or (byte = 0) then
+                    if started then
+                        ended := true;
+                    end if;
+                else
+                    bad := true;
+                end if;
+            end if;
+        end for;
+        if bad then
+            let none: Option[Nat64] := None();
+            return none;
+        end if;
+        let some: Option[Nat64] := Some(value => value);
+        return some;
+    end;
+
+    -- Bytes of a field up to its first zero byte, at most count.
+    generic [R: Region]
+    function fieldLength(bytes: Span[Nat8, R], at: Index, count: Index): Index is
+        var n: Index := 0;
+        var going: Bool := true;
+        while going and (n < count) do
+            if bytes[at + n] = 0 then
+                going := false;
+            else
+                n := n + 1;
+            end if;
+        end while;
+        return n;
+    end;
+
+    -- size rounded up to a multiple of 512.
+    function blocks(size: Index): Index is
+        let whole: Index := size / 512;
+        if (whole * 512) = size then
+            return size;
+        end if;
+        return (whole + 1) * 512;
+    end;
+
+    ---
+    --- Reading a tar
+    ---
+
+    generic [R: Region]
+    function zeroBlock(bytes: Span[Nat8, R], at: Index): Bool is
+        var zero: Bool := true;
+        for i from at to at + 511 do
+            if bytes[i] /= 0 then
+                zero := false;
+            end if;
+        end for;
+        return zero;
+    end;
+
+    -- Whether the checksum of the header at at is the sum of its bytes, the
+    -- checksum field read as eight spaces.
+    generic [R: Region]
+    function checksumRight(bytes: Span[Nat8, R], at: Index): Bool is
+        var sum: Nat64 := 0;
+        for i from at to at + 511 do
+            if (i >= (at + 148)) and (i < (at + 156)) then
+                sum := sum + 32;
+            else
+                sum := sum + wide64(bytes[i]);
+            end if;
+        end for;
+        case octal(bytes, at + 148, 8) of
+            when Some(value as stored: Nat64) do
+                return stored = sum;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether bytes at at hold word, a literal of the same length.
+    generic [R: Region]
+    function holdsAt(bytes: Span[Nat8, R], at: Index, word: Span[Nat8, Static]): Bool is
+        let count: Index := spanLength(word);
+        if (at + count) > spanLength(bytes) then
+            return false;
+        end if;
+        var same: Bool := true;
+        for i from 0 to count - 1 do
+            if bytes[at + i] /= word[i] then
+                same := false;
+            end if;
+        end for;
+        return same;
+    end;
+
+    -- The path and linkpath records of a pax header of count bytes at at:
+    -- each record is its length in decimal, a space, key=value and a line
+    -- feed.  right is false for a record that does not read so.
+    record PaxNames: Free is
+        path: Place;
+        link: Place;
+        right: Bool;
+    end;
+
+    generic [R: Region]
+    function readPax(bytes: Span[Nat8, R], at: Index, count: Index): PaxNames is
+        let none: Place := Place(at => 0, count => 0);
+        var path: Place := none;
+        var link: Place := none;
+        var o: Index := at;
+        let last: Index := at + count;
+        while o < last do
+            var n: Index := 0;
+            var p: Index := o;
+            var digits: Bool := true;
+            while digits and (p < last) do
+                if (bytes[p] >= '0') and (bytes[p] <= '9') then
+                    if n > 1000000 then
+                        return PaxNames(path => none, link => none, right => false);
+                    end if;
+                    n := (n * 10) + wide(bytes[p] - '0');
+                    p := p + 1;
+                else
+                    digits := false;
+                end if;
+            end while;
+            if (n = 0) or ((o + n) > last) then
+                return PaxNames(path => none, link => none, right => false);
+            end if;
+            let recordEnd: Index := (o + n) - 1;
+            if (p >= recordEnd) or ((bytes[p] /= ' ') or (bytes[recordEnd] /= '\n')) then
+                return PaxNames(path => none, link => none, right => false);
+            end if;
+            let keyAt: Index := p + 1;
+            var eq: Index := keyAt;
+            while (eq < recordEnd) and (bytes[eq] /= '=') do
+                eq := eq + 1;
+            end while;
+            if eq >= recordEnd then
+                return PaxNames(path => none, link => none, right => false);
+            end if;
+            let value: Place := Place(at => eq + 1, count => recordEnd - (eq + 1));
+            if ((eq - keyAt) = 4) and holdsAt(bytes, keyAt, "path") then
+                path := value;
+            end if;
+            if ((eq - keyAt) = 8) and holdsAt(bytes, keyAt, "linkpath") then
+                link := value;
+            end if;
+            o := o + n;
+        end while;
+        return PaxNames(path => path, link => link, right => true);
+    end;
+
+    -- Reads the tar in bytes into c, within budget.
+    generic [R: Region, C: Region]
+    function readTar(bytes: Span[Nat8, R], budget: Budget, c: &![Collector, C]): Outcome is
+        let size: Index := spanLength(bytes);
+        let none: Place := Place(at => 0, count => 0);
+        var o: Index := 0;
+        var count: Nat32 := 0;
+        var total: Nat64 := 0;
+        var longName: Place := none;
+        var longLink: Place := none;
+        while true do
+            if (o + 512) > size then
+                return stop(1, o);
+            end if;
+            if zeroBlock(bytes, o) then
+                return fine();
+            end if;
+            if not checksumRight(bytes, o) then
+                return stop(2, o);
+            end if;
+            var sizeRead: Nat64 := 0;
+            case octal(bytes, o + 124, 12) of
+                when Some(value as read: Nat64) do
+                    sizeRead := read;
+                when None do
+                    return stop(3, o);
+            end case;
+            var mode: Nat32 := 0;
+            case octal(bytes, o + 100, 8) of
+                when Some(value as read: Nat64) do
+                    mode := narrow32(bitwiseAnd(read, (4095 : Nat64)));
+                when None do
+                    return stop(3, o);
+            end case;
+            let dataAt: Index := o + 512;
+            var dataCount: Index := 0;
+            case place64(sizeRead) of
+                when Some(value as n: Index) do
+                    dataCount := n;
+                when None do
+                    return stop(1, o);
+            end case;
+            if dataCount > (size - dataAt) then
+                return stop(1, o);
+            end if;
+            let next: Index := dataAt + blocks(dataCount);
+            let flag: Nat8 := bytes[o + 156];
+            if flag = 'L' then
+                longName := Place(at => dataAt, count => fieldLength(bytes, dataAt, dataCount));
+            else
+                if flag = 'K' then
+                    longLink := Place(at => dataAt, count => fieldLength(bytes, dataAt, dataCount));
+                else
+                    if flag = 'x' then
+                        let pax: PaxNames := readPax(bytes, dataAt, dataCount);
+                        if not pax.right then
+                            return stop(7, o);
+                        end if;
+                        if pax.path.count > 0 then
+                            longName := pax.path;
+                        end if;
+                        if pax.link.count > 0 then
+                            longLink := pax.link;
+                        end if;
+                    else
+                        if flag /= 'g' then
+                            count := count + 1;
+                            if count > budget.entries then
+                                return stop(4, o);
+                            end if;
+                            var kind: Nat8 := kindOther;
+                            if ((flag = '0') or (flag = 0)) or (flag = '7') then
+                                kind := kindFile;
+                            end if;
+                            if flag = '5' then
+                                kind := kindDir;
+                            end if;
+                            if flag = '2' then
+                                kind := kindLink;
+                            end if;
+                            if flag = '1' then
+                                kind := kindHard;
+                            end if;
+                            if kind = kindFile then
+                                if sizeRead > budget.largestEntry then
+                                    return stop(5, o);
+                                end if;
+                                total := total + sizeRead;
+                                if total > budget.total then
+                                    return stop(6, o);
+                                end if;
+                            else
+                                sizeRead := (0 : Nat64);
+                                dataCount := (0 : Index);
+                            end if;
+                            -- The name: a long one given before, or the ustar
+                            -- prefix, a slash and the name field.
+                            var name: Place := none;
+                            if longName.count > 0 then
+                                name := addPart(&~c, spanPart(bytes, longName.at, longName.count));
+                            else
+                                let field: Index := fieldLength(bytes, o, 100);
+                                let prefix: Index := fieldLength(bytes, o + 345, 155);
+                                if holdsAt(bytes, o + 257, "ustar") and (prefix > 0) then
+                                    let first: Place := addPart(&~c, spanPart(bytes, o + 345, prefix));
+                                    let slash: Place := addPart(&~c, "/");
+                                    let rest: Place := addPart(&~c, spanPart(bytes, o, field));
+                                    name := Place(at => first.at, count => (prefix + 1) + field);
+                                else
+                                    name := addPart(&~c, spanPart(bytes, o, field));
+                                end if;
+                            end if;
+                            -- A slash at the end of a directory's name is not part of it.
+                            if (name.count > 1) and (kind = kindDir) then
+                                if nameEndsInSlash(bytes, o, longName, name) then
+                                    name := Place(at => name.at, count => name.count - 1);
+                                end if;
+                            end if;
+                            var link: Place := none;
+                            if (kind = kindLink) or (kind = kindHard) then
+                                if longLink.count > 0 then
+                                    link := addPart(&~c, spanPart(bytes, longLink.at, longLink.count));
+                                else
+                                    link := addPart(&~c, spanPart(bytes, o + 157, fieldLength(bytes, o + 157, 100)));
+                                end if;
+                            end if;
+                            addEntry(&~c, Entry(
+                                kind => kind,
+                                nameAt => name.at,
+                                nameCount => name.count,
+                                linkAt => link.at,
+                                linkCount => link.count,
+                                mode => mode,
+                                size => sizeRead,
+                                dataAt => dataAt,
+                                dataCount => dataCount,
+                                compressed => false,
+                                checksum => 0
+                            ));
+                            longName := none;
+                            longLink := none;
+                        end if;
+                    end if;
+                end if;
+            end if;
+            o := next;
+        end while;
+        return fine();
+    end;
+
+    -- Whether the name just written ends in a slash: its last byte is that
+    -- of the long name, or of the name field.
+    generic [R: Region]
+    function nameEndsInSlash(bytes: Span[Nat8, R], header: Index, longName: Place, name: Place): Bool is
+        if longName.count > 0 then
+            return bytes[(longName.at + longName.count) - 1] = '/';
+        end if;
+        let field: Index := fieldLength(bytes, header, 100);
+        if field = 0 then
+            return false;
+        end if;
+        return bytes[(header + field) - 1] = '/';
+    end;
+
+    ---
+    --- Reading a zip
+    ---
+
+    -- Whether bytes at at hold the signature P K third fourth.
+    generic [R: Region]
+    function signature(bytes: Span[Nat8, R], at: Index, third: Nat8, fourth: Nat8): Bool is
+        if (at + 4) > spanLength(bytes) then
+            return false;
+        end if;
+        return ((bytes[at] = 'P') and (bytes[at + 1] = 'K')) and ((bytes[at + 2] = third) and (bytes[at + 3] = fourth));
+    end;
+
+    -- Where the end of the central directory starts, searched from the end
+    -- over the longest comment it may have; size when there is none.
+    generic [R: Region]
+    function endOfDirectory(bytes: Span[Nat8, R]): Index is
+        let size: Index := spanLength(bytes);
+        if size < 22 then
+            return size;
+        end if;
+        var o: Index := size - 22;
+        var searched: Index := 0;
+        while searched <= 65535 do
+            if signature(bytes, o, 5, 6) then
+                if ((nat64(o) + 22) + little(bytes, o + 20, 2)) = nat64(size) then
+                    return o;
+                end if;
+            end if;
+            if o = 0 then
+                return size;
+            end if;
+            o := o - 1;
+            searched := searched + 1;
+        end while;
+        return size;
+    end;
+
+    -- The kind and mode of a central directory entry: from the Unix mode
+    -- in the high half of its external attributes when it was made on
+    -- Unix, else a directory by the slash its name ends in.
+    record KindMode: Free is
+        kind: Nat8;
+        mode: Nat32;
+    end;
+
+    function kindMode(madeBy: Nat64, external: Nat64, slash: Bool): KindMode is
+        let unix: Nat64 := madeBy / 256;
+        if unix = 3 then
+            let full: Nat64 := external / 65536;
+            let bits: Nat64 := bitwiseAnd(full, (61440 : Nat64));
+            let mode: Nat32 := narrow32(bitwiseAnd(full, (4095 : Nat64)));
+            if bits = 16384 then
+                return KindMode(kind => kindDir, mode => mode);
+            end if;
+            if bits = 40960 then
+                return KindMode(kind => kindLink, mode => mode);
+            end if;
+            if (bits = 32768) or (bits = 0) then
+                if slash then
+                    return KindMode(kind => kindDir, mode => mode);
+                end if;
+                return KindMode(kind => kindFile, mode => mode);
+            end if;
+            return KindMode(kind => kindOther, mode => mode);
+        end if;
+        if slash then
+            return KindMode(kind => kindDir, mode => 493);
+        end if;
+        return KindMode(kind => kindFile, mode => 420);
+    end;
+
+    -- Reads the zip in bytes into c, within budget.  A link's target is
+    -- unpacked now, as a name.
+    generic [R: Region, C: Region]
+    function readZip(bytes: Span[Nat8, R], budget: Budget, c: &![Collector, C]): Outcome is
+        let size: Index := spanLength(bytes);
+        let eocd: Index := endOfDirectory(bytes);
+        if eocd = size then
+            return stop(8, size);
+        end if;
+        let disk: Nat64 := little(bytes, eocd + 4, 2);
+        let startDisk: Nat64 := little(bytes, eocd + 6, 2);
+        let onDisk: Nat64 := little(bytes, eocd + 8, 2);
+        let entries: Nat64 := little(bytes, eocd + 10, 2);
+        let directorySize: Nat64 := little(bytes, eocd + 12, 4);
+        let directoryAt: Nat64 := little(bytes, eocd + 16, 4);
+        if ((disk /= 0) or (startDisk /= 0)) or ((onDisk /= entries) or (entries = 65535)) then
+            return stop(9, eocd);
+        end if;
+        if (directorySize = 4294967295) or (directoryAt = 4294967295) then
+            return stop(9, eocd);
+        end if;
+        if (directoryAt + directorySize) > nat64(eocd) then
+            return stop(10, eocd);
+        end if;
+        if entries > wide32(budget.entries) then
+            return stop(4, eocd);
+        end if;
+        var o: Index := 0;
+        case place64(directoryAt) of
+            when Some(value as at: Index) do
+                o := at;
+            when None do
+                return stop(10, eocd);
+        end case;
+        var total: Nat64 := 0;
+        var i: Nat64 := 0;
+        let none: Place := Place(at => 0, count => 0);
+        while i < entries do
+            if ((o + 46) > eocd) or (not signature(bytes, o, 1, 2)) then
+                return stop(10, o);
+            end if;
+            let madeBy: Nat64 := little(bytes, o + 4, 2);
+            let flags: Nat64 := little(bytes, o + 8, 2);
+            let compression: Nat64 := little(bytes, o + 10, 2);
+            let checksum: Nat32 := narrow32(little(bytes, o + 16, 4));
+            let packed: Nat64 := little(bytes, o + 20, 4);
+            let unpacked: Nat64 := little(bytes, o + 24, 4);
+            let nameCount: Index := wide(bytes[o + 28]) + (wide(bytes[o + 29]) * 256);
+            let extraCount: Index := wide(bytes[o + 30]) + (wide(bytes[o + 31]) * 256);
+            let commentCount: Index := wide(bytes[o + 32]) + (wide(bytes[o + 33]) * 256);
+            let external: Nat64 := little(bytes, o + 38, 4);
+            let localAt: Nat64 := little(bytes, o + 42, 4);
+            let next: Index := ((o + 46) + nameCount) + (extraCount + commentCount);
+            if next > eocd then
+                return stop(10, o);
+            end if;
+            if bitwiseAnd(flags, (1 : Nat64)) /= 0 then
+                return stop(11, o);
+            end if;
+            if (compression /= 0) and (compression /= 8) then
+                return stop(12, o);
+            end if;
+            if (packed = 4294967295) or (unpacked = 4294967295) then
+                return stop(9, o);
+            end if;
+            if (nameCount = 0) or ((compression = 0) and (packed /= unpacked)) then
+                return stop(10, o);
+            end if;
+            let slash: Bool := bytes[((o + 46) + nameCount) - 1] = '/';
+            let km: KindMode := kindMode(madeBy, external, slash);
+            -- The local header: its signature, and where the data starts.
+            var local: Index := 0;
+            case place64(localAt) of
+                when Some(value as at: Index) do
+                    local := at;
+                when None do
+                    return stop(13, o);
+            end case;
+            if ((local + 30) > nat64Index(directoryAt)) or (not signature(bytes, local, 3, 4)) then
+                return stop(13, o);
+            end if;
+            let dataAt: Index := ((local + 30) + (wide(bytes[local + 26]) + (wide(bytes[local + 27]) * 256))) + (wide(bytes[local + 28]) + (wide(bytes[local + 29]) * 256));
+            var dataCount: Index := 0;
+            case place64(packed) of
+                when Some(value as n: Index) do
+                    dataCount := n;
+                when None do
+                    return stop(13, o);
+            end case;
+            if (dataAt > size) or (dataCount > (size - dataAt)) then
+                return stop(13, o);
+            end if;
+            var sizeRead: Nat64 := unpacked;
+            if km.kind = kindFile then
+                if unpacked > budget.largestEntry then
+                    return stop(5, o);
+                end if;
+                total := total + unpacked;
+                if total > budget.total then
+                    return stop(6, o);
+                end if;
+            else
+                sizeRead := (0 : Nat64);
+            end if;
+            var nameLength: Index := nameCount;
+            if slash and (nameCount > 1) then
+                nameLength := nameCount - 1;
+            end if;
+            let name: Place := addPart(&~c, spanPart(bytes, o + 46, nameLength));
+            var link: Place := none;
+            if km.kind = kindLink then
+                if unpacked > 4096 then
+                    return stop(14, o);
+                end if;
+                if compression = 0 then
+                    link := addPart(&~c, spanPart(bytes, dataAt, dataCount));
+                else
+                    case inflateRaw(spanPart(bytes, dataAt, dataCount), 4096) of
+                        when Right(right as target: String) do
+                            let unpackedRight: Bool := (nat64(stringLength(&target)) = unpacked) and (crc32(asSpan(&target)) = checksum);
+                            if unpackedRight then
+                                link := addPart(&~c, asSpan(&target));
+                            end if;
+                            destroyString(target);
+                            if not unpackedRight then
+                                return stop(14, o);
+                            end if;
+                        when Left(left: GzipFailure) do
+                            return stop(14, o);
+                    end case;
+                end if;
+            end if;
+            addEntry(&~c, Entry(
+                kind => km.kind,
+                nameAt => name.at,
+                nameCount => name.count,
+                linkAt => link.at,
+                linkCount => link.count,
+                mode => km.mode,
+                size => sizeRead,
+                dataAt => dataAt,
+                dataCount => dataCount,
+                compressed => compression = 8,
+                checksum => checksum
+            ));
+            o := next;
+            i := i + 1;
+        end while;
+        return fine();
+    end;
+
+    -- An Index for a Nat64 already checked to be below an Index.
+    function nat64Index(value: Nat64): Index is
+        case toIndex(value) of
+            when Some(value as n: Index) do
+                return n;
+            when None do
+                abort("Standard.Archive: a checked Nat64 did not fit an Index");
+        end case;
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    function archiveFailure(why: Failure): Either[Failure, Archive] is
+        let left: Either[Failure, Archive] := Left(left => why);
+        return left;
+    end;
+
+    -- Reads data, which the archive keeps, as tar or zip into an archive.
+    function readInto(data: String, zip: Bool, budget: Budget): Either[Failure, Archive] is
+        var c: Collector := newCollector();
+        var outcome: Outcome := fine();
+        if zip then
+            outcome := readZip(asSpan(&data), budget, &!c);
+        else
+            outcome := readTar(asSpan(&data), budget, &!c);
+        end if;
+        let { names: StringBuilder, used: Index, entries: Buffer[Entry] } := c;
+        let text: String := finalize(names);
+        if outcome.code /= 0 then
+            destroyString(text);
+            destroyFree(entries);
+            destroyString(data);
+            return archiveFailure(readFailure(outcome));
+        else
+            let right: Either[Failure, Archive] := Right(right => Archive(data => data, names => text, entries => entries, zip => zip));
+            return right;
+        end if;
+    end;
+
+    generic [R: Region]
+    function readArchive(archive: Span[Nat8, R], format: ArchiveFormat, budget: Budget): Either[Failure, Archive] is
+        case format of
+            when Tar do
+                return readInto(fromSpan(archive), false, budget);
+            when Zip do
+                return readInto(fromSpan(archive), true, budget);
+            when TarGz do
+                -- The tar may hold its entries' bytes and a header of 512
+                -- bytes each, and its end; beyond that the budget is spent.
+                let headers: Nat64 := wide32(budget.entries) * 1536;
+                -- A total so large that the sum would not fit is no limit,
+                -- as it is for Tar and Zip: gunzip is asked for the most an
+                -- Index holds.
+                var limit: Index := maximum_index;
+                if budget.total <= ((maximum_nat64 - headers) - 1024) then
+                    case toIndex((budget.total + headers) + 1024) of
+                        when Some(value as n: Index) do
+                            limit := n;
+                        when None do
+                            limit := maximum_index;
+                    end case;
+                end if;
+                case gunzip(archive, limit) of
+                    when Right(right as tar: String) do
+                        return readInto(tar, false, budget);
+                    when Left(left: GzipFailure) do
+                        return archiveFailure(readFailure(stop(15, 0)));
+                end case;
+        end case;
+    end;
+
+    ---
+    --- Asking about entries
+    ---
+
+    generic [R: Region]
+    function entryCount(archive: &[Archive, R]): Index is
+        return bufferLength(&(archive->entries));
+    end;
+
+    generic [R: Region]
+    function entryAt(archive: &[Archive, R], n: Index): Option[Entry] is
+        if n >= bufferLength(&(archive->entries)) then
+            let none: Option[Entry] := None();
+            return none;
+        end if;
+        let some: Option[Entry] := Some(value => nth(&(archive->entries), n));
+        return some;
+    end;
+
+    generic [R: Region]
+    function entryName(archive: &[Archive, R], n: Index): Span[Nat8, R] is
+        case entryAt(archive, n) of
+            when Some(value as e: Entry) do
+                return spanPart(asSpan(&(archive->names)), e.nameAt, e.nameCount);
+            when None do
+                return spanPart(asSpan(&(archive->names)), 0, 0);
+        end case;
+    end;
+
+    generic [R: Region]
+    function entryLinkTarget(archive: &[Archive, R], n: Index): Span[Nat8, R] is
+        case entryAt(archive, n) of
+            when Some(value as e: Entry) do
+                return spanPart(asSpan(&(archive->names)), e.linkAt, e.linkCount);
+            when None do
+                return spanPart(asSpan(&(archive->names)), 0, 0);
+        end case;
+    end;
+
+    generic [R: Region]
+    function entryKind(archive: &[Archive, R], n: Index): EntryKind is
+        case entryAt(archive, n) of
+            when Some(value as e: Entry) do
+                if e.kind = kindDir then
+                    return ArchivedDirectory();
+                end if;
+                if e.kind = kindLink then
+                    return ArchivedLink();
+                end if;
+                if e.kind = kindHard then
+                    return ArchivedHardLink();
+                end if;
+                if e.kind = kindOther then
+                    return ArchivedOther();
+                end if;
+                return ArchivedFile();
+            when None do
+                return ArchivedFile();
+        end case;
+    end;
+
+    generic [R: Region]
+    function entrySize(archive: &[Archive, R], n: Index): Nat64 is
+        case entryAt(archive, n) of
+            when Some(value as e: Entry) do
+                return e.size;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region]
+    function entryMode(archive: &[Archive, R], n: Index): Nat32 is
+        case entryAt(archive, n) of
+            when Some(value as e: Entry) do
+                return e.mode;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function contentFailure(what: Span[Nat8, Static]): Either[Failure, String] is
+        let left: Either[Failure, String] := Left(left => makeFailure("entryContent", Invalid(), what));
+        return left;
+    end;
+
+    generic [R: Region]
+    function entryContent(archive: &[Archive, R], n: Index): Either[Failure, String] is
+        case entryAt(archive, n) of
+            when Some(value as e: Entry) do
+                if e.kind /= kindFile then
+                    return contentFailure("not a file");
+                end if;
+                let packed: Span[Nat8, R] := spanPart(asSpan(&(archive->data)), e.dataAt, e.dataCount);
+                if not e.compressed then
+                    let copy: String := fromSpan(packed);
+                    if (archive->zip) and (crc32(asSpan(&copy)) /= e.checksum) then
+                        destroyString(copy);
+                        return contentFailure("the content does not match its checksum");
+                    else
+                        let right: Either[Failure, String] := Right(right => copy);
+                        return right;
+                    end if;
+                end if;
+                case inflateRaw(packed, nat64Index(e.size)) of
+                    when Right(right as unpacked: String) do
+                        if (nat64(stringLength(&unpacked)) /= e.size) or (crc32(asSpan(&unpacked)) /= e.checksum) then
+                            destroyString(unpacked);
+                            return contentFailure("the content does not unpack to its size and checksum");
+                        else
+                            let right: Either[Failure, String] := Right(right => unpacked);
+                            return right;
+                        end if;
+                    when Left(left: GzipFailure) do
+                        return contentFailure("the content does not unpack");
+                end case;
+            when None do
+                return contentFailure("no such entry");
+        end case;
+    end;
+
+    function destroyArchive(archive: Archive): Unit is
+        let { data: String, names: String, entries: Buffer[Entry], zip: Bool } := archive;
+        destroyString(data);
+        destroyString(names);
+        destroyFree(entries);
+        return nil;
+    end;
+
+    ---
+    --- Judging names
+    ---
+
+    -- Whether name is one extraction takes: not empty, not absolute, no
+    -- zero byte, and no part that is empty, . or .. .
+    generic [R: Region]
+    function safeName(name: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(name);
+        if size = 0 then
+            return false;
+        end if;
+        if name[0] = '/' then
+            return false;
+        end if;
+        var start: Index := 0;
+        var right: Bool := true;
+        for i from 0 to size do
+            if (i = size) or (name[i] = '/') then
+                let part: Index := i - start;
+                if part = 0 then
+                    right := false;
+                end if;
+                if (part = 1) and (name[start] = '.') then
+                    right := false;
+                end if;
+                if (part = 2) and ((name[start] = '.') and (name[start + 1] = '.')) then
+                    right := false;
+                end if;
+                start := i + 1;
+            else
+                if name[i] = 0 then
+                    right := false;
+                end if;
+            end if;
+        end for;
+        return right;
+    end;
+
+    -- Whether a link at name that points at target stays inside: the
+    -- target is not absolute, and walking its parts from the directory of
+    -- name never goes above the top.
+    generic [R: Region, S: Region]
+    function linkStaysInside(name: Span[Nat8, R], target: Span[Nat8, S]): Bool is
+        let count: Index := spanLength(target);
+        if count = 0 then
+            return false;
+        end if;
+        if target[0] = '/' then
+            return false;
+        end if;
+        -- The depth of the link's directory: the slashes of its name.
+        var depth: Index := 0;
+        for i from 0 to spanLength(name) - 1 do
+            if name[i] = '/' then
+                depth := depth + 1;
+            end if;
+        end for;
+        var start: Index := 0;
+        var inside: Bool := true;
+        for i from 0 to count do
+            if (i = count) or (target[i] = '/') then
+                let part: Index := i - start;
+                if (part = 2) and ((target[start] = '.') and (target[start + 1] = '.')) then
+                    if depth = 0 then
+                        inside := false;
+                    else
+                        depth := depth - 1;
+                    end if;
+                else
+                    if (part > 0) and (not ((part = 1) and (target[start] = '.'))) then
+                        depth := depth + 1;
+                    end if;
+                end if;
+                start := i + 1;
+            else
+                if target[i] = 0 then
+                    inside := false;
+                end if;
+            end if;
+        end for;
+        return inside;
+    end;
+
+    ---
+    --- Extracting
+    ---
+
+    function extractFailure(why: Failure): Either[Failure, Unit] is
+        let left: Either[Failure, Unit] := Left(left => why);
+        return left;
+    end;
+
+    function extracted(): Either[Failure, Unit] is
+        let right: Either[Failure, Unit] := Right(right => nil);
+        return right;
+    end;
+
+    -- 0 when the name is taken, 1 for a refused name, 2 for a link that
+    -- leaves the target, 3 for a hard link, 4 for another kind.
+    generic [R: Region]
+    function judge(archive: &[Archive, R], n: Index): Nat8 is
+        case entryAt(archive, n) of
+            when Some(value as e: Entry) do
+                if not safeName(entryName(archive, n)) then
+                    return 1;
+                end if;
+                if e.kind = kindLink then
+                    if not linkStaysInside(entryName(archive, n), entryLinkTarget(archive, n)) then
+                        return 2;
+                    end if;
+                end if;
+                if e.kind = kindHard then
+                    return 3;
+                end if;
+                if e.kind = kindOther then
+                    return 4;
+                end if;
+                return 0;
+            when None do
+                return 1;
+        end case;
+    end;
+
+    function judgement(verdict: Nat8): Span[Nat8, Static] is
+        if verdict = 1 then
+            return "a name that could leave the target";
+        end if;
+        if verdict = 2 then
+            return "a link whose target leaves the target";
+        end if;
+        if verdict = 3 then
+            return "a hard link";
+        end if;
+        return "an entry that is neither file, directory nor link";
+    end;
+
+    -- Makes the directories of path below target, each only when missing,
+    -- and refuses a part that is a symbolic link or not a directory.  path
+    -- is target, a slash and a name extraction took.  0 when all is well,
+    -- 1 for a link, 2 for something else, 3 when a directory could not be
+    -- made.
+    generic [R: Region]
+    function makeParents(path: &[String, R], start: Index): Nat8 is
+        let size: Index := stringLength(path);
+        var i: Index := start;
+        while i < size do
+            if nthByte(path, i) = '/' then
+                let part: Span[Nat8, R] := spanPart(asSpan(path), 0, i);
+                case statusOf(part) of
+                    when FileFound(status: FileStatus) do
+                        if sameKind(status.kind, kindSymlink) then
+                            return 1;
+                        end if;
+                        if not sameKind(status.kind, kindDirectory) then
+                            return 2;
+                        end if;
+                    when FileMissing do
+                        if not createDirectory(part) then
+                            return 3;
+                        end if;
+                    when FileUnreadable do
+                        return 2;
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        return 0;
+    end;
+
+    generic [R: Region]
+    function setDirectoryMode(path: Span[Nat8, R], mode: Nat32): Bool is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var directory: FileDescriptor := opened;
+                let set: Bool := setFileMode(&!directory, mode);
+                let closed: Bool := closeFile(directory);
+                return set and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Writes entry n to path.  None when it was written.
+    generic [R: Region, S: Region]
+    function writeEntry(archive: &[Archive, R], n: Index, path: &[String, S]): Option[Failure] is
+        let op: Span[Nat8, Static] := "extractArchive";
+        let e: Entry := nthEntry(archive, n);
+        let name: Span[Nat8, R] := entryName(archive, n);
+        if e.kind = kindDir then
+            case statusOf(asSpan(path)) of
+                when FileFound(status: FileStatus) do
+                    if sameKind(status.kind, kindDirectory) then
+                        return noFailure();
+                    end if;
+                    return someFailure(namedFailure(op, Invalid(), "something else is there", name));
+                when FileMissing do
+                    if not createDirectory(asSpan(path)) then
+                        return someFailure(namedFailure(op, Unclassified(), "could not make the directory", name));
+                    end if;
+                    if not setDirectoryMode(asSpan(path), bitwiseAnd(e.mode, (493 : Nat32))) then
+                        return someFailure(namedFailure(op, Unclassified(), "could not set the directory's mode", name));
+                    end if;
+                    return noFailure();
+                when FileUnreadable do
+                    return someFailure(namedFailure(op, Unclassified(), "could not look at", name));
+            end case;
+        end if;
+        if e.kind = kindLink then
+            if not createSymlink(entryLinkTarget(archive, n), asSpan(path)) then
+                return someFailure(namedFailure(op, Invalid(), "could not make the link, or something is there", name));
+            end if;
+            return noFailure();
+        end if;
+        case entryContent(archive, n) of
+            when Right(right as content: String) do
+                case createNewFile(asSpan(path), bitwiseAnd(e.mode, (420 : Nat32))) of
+                    when Some(value as made: FileDescriptor) do
+                        var file: FileDescriptor := made;
+                        let written: Bool := writeAll(&!file, asSpan(&content));
+                        let closed: Bool := closeFile(file);
+                        destroyString(content);
+                        if written and closed then
+                            return noFailure();
+                        end if;
+                        return someFailure(namedFailure(op, Unclassified(), "could not write", name));
+                    when None do
+                        destroyString(content);
+                        return someFailure(namedFailure(op, Invalid(), "could not make the file, or something is there", name));
+                end case;
+            when Left(left as why: Failure) do
+                return someFailure(why);
+        end case;
+    end;
+
+    generic [R: Region]
+    function nthEntry(archive: &[Archive, R], n: Index): Entry is
+        return nth(&(archive->entries), n);
+    end;
+
+    function noFailure(): Option[Failure] is
+        let none: Option[Failure] := None();
+        return none;
+    end;
+
+    function someFailure(why: Failure): Option[Failure] is
+        let some: Option[Failure] := Some(value => why);
+        return some;
+    end;
+
+    generic [R: Region, S: Region]
+    function extractArchive(archive: &[Archive, R], target: Span[Nat8, S]): Either[Failure, Unit] is
+        let op: Span[Nat8, Static] := "extractArchive";
+        let count: Index := bufferLength(&(archive->entries));
+        -- Every name is judged before the first is written.
+        var i: Index := 0;
+        while i < count do
+            let verdict: Nat8 := judge(archive, i);
+            if verdict /= 0 then
+                return extractFailure(namedFailure(op, Invalid(), judgement(verdict), entryName(archive, i)));
+            end if;
+            i := i + 1;
+        end while;
+        case statusOf(target) of
+            when FileFound(status: FileStatus) do
+                if not sameKind(status.kind, kindDirectory) then
+                    return extractFailure(namedFailure(op, Invalid(), "the target is not a directory", target));
+                end if;
+            when FileMissing do
+                return extractFailure(namedFailure(op, Invalid(), "no such directory", target));
+            when FileUnreadable do
+                return extractFailure(namedFailure(op, Unclassified(), "could not look at", target));
+        end case;
+        i := (0 : Index);
+        while i < count do
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, target);
+            writeByte(&!out, '/');
+            let prefix: Index := spanLength(target) + 1;
+            writeString(&!out, entryName(archive, i));
+            let path: String := finalize(out);
+            let parents: Nat8 := makeParents(&path, prefix);
+            if parents /= 0 then
+                destroyString(path);
+                if parents = 1 then
+                    return extractFailure(namedFailure(op, Invalid(), "a symbolic link lies in the way of", entryName(archive, i)));
+                end if;
+                return extractFailure(namedFailure(op, Invalid(), "something that is not a directory lies in the way of", entryName(archive, i)));
+            else
+                let written: Option[Failure] := writeEntry(archive, i, &path);
+                destroyString(path);
+                case written of
+                    when Some(value as why: Failure) do
+                        return extractFailure(why);
+                    when None do
+                        skip;
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        return extracted();
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    record ArchiveWriter: Linear is
+        zip: Bool;
+        gzipped: Bool;
+        compress: Bool;
+        -- The tar, or the local headers and data of a zip.
+        out: StringBuilder;
+        written: Index;
+        -- The central directory of a zip.
+        central: StringBuilder;
+        centralCount: Index;
+        entries: Nat64;
+    end;
+
+    function makeArchiveWriter(format: ArchiveFormat, compress: Bool): ArchiveWriter is
+        var zip: Bool := false;
+        var gzipped: Bool := false;
+        case format of
+            when Zip do
+                zip := true;
+            when Tar do
+                skip;
+            when TarGz do
+                gzipped := true;
+        end case;
+        return ArchiveWriter(zip => zip, gzipped => gzipped, compress => compress, out => makeStringBuilder(), written => 0, central => makeStringBuilder(), centralCount => 0, entries => 0);
+    end;
+
+    generic [W: Region, R: Region]
+    function putOut(w: &![ArchiveWriter, W], bytes: Span[Nat8, R]): Unit is
+        w->written := (w->written) + spanLength(bytes);
+        writeString(&!(w->out), bytes);
+        return nil;
+    end;
+
+    generic [W: Region, R: Region]
+    function putCentral(w: &![ArchiveWriter, W], bytes: Span[Nat8, R]): Unit is
+        w->centralCount := (w->centralCount) + spanLength(bytes);
+        writeString(&!(w->central), bytes);
+        return nil;
+    end;
+
+    -- Writes value as count little-endian bytes.
+    generic [R: Region]
+    function putLittle(out: &![StringBuilder, R], value: Nat64, count: Index): Unit is
+        var rest: Nat64 := value;
+        var i: Index := 0;
+        while i < count do
+            writeByte(&~out, byteOf(bitwiseAnd(rest, (255 : Nat64))));
+            rest := rest / 256;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Stores value in the tar header as count - 1 octal digits and a zero
+    -- byte, from at.
+    generic [R: Region]
+    function putOctal(header: &![String, R], at: Index, count: Index, value: Nat64): Unit is
+        var rest: Nat64 := value;
+        var i: Index := count - 1;
+        storeNth(&~header, (at + count) - 1, 0);
+        while i > 0 do
+            i := i - 1;
+            storeNth(&~header, at + i, (48 : Nat8) + byteOf(bitwiseAnd(rest, (7 : Nat64))));
+            rest := rest / 8;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function putText(header: &![String, R], at: Index, text: Span[Nat8, S]): Unit is
+        let count: Index := spanLength(text);
+        if count > 0 then
+            for i from 0 to count - 1 do
+                storeNth(&~header, at + i, text[i]);
+            end for;
+        end if;
+        return nil;
+    end;
+
+    -- Where a name longer than 100 bytes is cut into a ustar prefix and a
+    -- name: at the last slash that leaves at most 155 bytes before it and
+    -- at most 100 after it.  0 when the name fits whole; the name's length
+    -- when it cannot be cut.
+    generic [R: Region]
+    function tarCut(name: Span[Nat8, R]): Index is
+        let size: Index := spanLength(name);
+        if size <= 100 then
+            return 0;
+        end if;
+        var cut: Index := size;
+        for i from 0 to size - 1 do
+            if (name[i] = '/') and ((i <= 155) and (((size - i) - 1) <= 100)) then
+                if (i > 0) and (((size - i) - 1) > 0) then
+                    cut := i;
+                end if;
+            end if;
+        end for;
+        return cut;
+    end;
+
+    -- A ustar header for name, of type, with mode, size and link target.
+    -- None when the name or the link target is too long for it.
+    generic [R: Region, S: Region]
+    function tarHeader(name: Span[Nat8, R], flag: Nat8, mode: Nat32, size: Nat64, link: Span[Nat8, S]): Option[String] is
+        let cut: Index := tarCut(name);
+        let count: Index := spanLength(name);
+        if (cut = count) or (spanLength(link) > 100) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var header: String := makeString(512, 0);
+        if cut = 0 then
+            putText(&!header, 0, name);
+        else
+            putText(&!header, 345, spanPart(name, 0, cut));
+            putText(&!header, 0, spanPart(name, cut + 1, (count - cut) - 1));
+        end if;
+        case toNat64(mode) of
+            when Some(value as m: Nat64) do
+                putOctal(&!header, 100, 8, bitwiseAnd(m, (4095 : Nat64)));
+            when None do
+                skip;
+        end case;
+        putOctal(&!header, 108, 8, 0);
+        putOctal(&!header, 116, 8, 0);
+        putOctal(&!header, 124, 12, size);
+        putOctal(&!header, 136, 12, 0);
+        storeNth(&!header, 156, flag);
+        putText(&!header, 157, link);
+        putText(&!header, 257, "ustar");
+        putText(&!header, 263, "00");
+        -- The checksum: the sum of the bytes with the field as spaces,
+        -- written as six digits, a zero byte and a space.
+        putText(&!header, 148, "        ");
+        var sum: Nat64 := 0;
+        for i from 0 to 511 do
+            sum := sum + wide64(nthByte(&header, i));
+        end for;
+        putOctal(&!header, 148, 7, sum);
+        storeNth(&!header, 155, ' ');
+        let some: Option[String] := Some(value => header);
+        return some;
+    end;
+
+    -- Zero bytes up to the next multiple of 512 after count.
+    generic [W: Region]
+    function padTar(w: &![ArchiveWriter, W], count: Index): Unit is
+        let pad: Index := blocks(count) - count;
+        if pad > 0 then
+            let zeros: String := makeString(pad, 0);
+            putOut(&~w, asSpan(&zeros));
+            destroyString(zeros);
+        end if;
+        return nil;
+    end;
+
+    -- Adds an entry of kind with name, content and mode.  content is the
+    -- link target for a link and empty for a directory.
+    generic [W: Region, R: Region, S: Region]
+    function addEntryTo(w: &![ArchiveWriter, W], kind: Nat8, name: Span[Nat8, R], content: Span[Nat8, S], mode: Nat32): Bool is
+        if not safeName(name) then
+            return false;
+        end if;
+        if w->zip then
+            return addZipEntry(&~w, kind, name, content, mode);
+        end if;
+        var flag: Nat8 := '0';
+        var size: Nat64 := nat64(spanLength(content));
+        var link: Span[Nat8, S] := spanPart(content, 0, 0);
+        if kind = kindDir then
+            flag := ('5' : Nat8);
+            size := (0 : Nat64);
+        end if;
+        if kind = kindLink then
+            flag := ('2' : Nat8);
+            size := (0 : Nat64);
+            link := content;
+        end if;
+        let dirName: String := nameFor(kind, name);
+        case tarHeader(asSpan(&dirName), flag, mode, size, link) of
+            when Some(value as header: String) do
+                destroyString(dirName);
+                putOut(&~w, asSpan(&header));
+                destroyString(header);
+                if kind = kindFile then
+                    putOut(&~w, content);
+                    padTar(&~w, spanLength(content));
+                end if;
+                w->entries := (w->entries) + 1;
+                return true;
+            when None do
+                destroyString(dirName);
+                return false;
+        end case;
+    end;
+
+    -- The name an entry is written under: a directory's with a slash
+    -- after it.
+    generic [R: Region]
+    function nameFor(kind: Nat8, name: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, name);
+        if kind = kindDir then
+            writeByte(&!out, '/');
+        end if;
+        return finalize(out);
+    end;
+
+    -- The bytes a zip entry holds: its content compressed with DEFLATE
+    -- when it is a file and the writer compresses, else as it is.
+    generic [R: Region]
+    function packedFor(kind: Nat8, compress: Bool, content: Span[Nat8, R]): String is
+        if (kind = kindFile) and compress then
+            return deflateRaw(content);
+        end if;
+        return fromSpan(content);
+    end;
+
+    -- The Unix type bits of kind, for a zip's external attributes.
+    function unixType(kind: Nat8): Nat64 is
+        if kind = kindDir then
+            return 16384;
+        end if;
+        if kind = kindLink then
+            return 40960;
+        end if;
+        return 32768;
+    end;
+
+    generic [W: Region, R: Region, S: Region]
+    function addZipEntry(w: &![ArchiveWriter, W], kind: Nat8, name: Span[Nat8, R], content: Span[Nat8, S], mode: Nat32): Bool is
+        if (spanLength(name) >= 65535) or (nat64(spanLength(content)) >= 4294967295) then
+            return false;
+        end if;
+        let fullName: String := nameFor(kind, name);
+        let nameCount: Index := stringLength(&fullName);
+        let checksum: Nat64 := wideChecksum(crc32(content));
+        let unpacked: Nat64 := nat64(spanLength(content));
+        var compression: Nat64 := 0;
+        let compress: Bool := w->compress;
+        if (kind = kindFile) and compress then
+            compression := (8 : Nat64);
+        end if;
+        let packedBytes: String := packedFor(kind, compress, content);
+        let packed: Nat64 := nat64(stringLength(&packedBytes));
+        let at: Nat64 := nat64(w->written);
+        var modeBits: Nat64 := 0;
+        case toNat64(mode) of
+            when Some(value as m: Nat64) do
+                modeBits := bitwiseAnd(m, (4095 : Nat64));
+            when None do
+                skip;
+        end case;
+        let external: Nat64 := (unixType(kind) + modeBits) * 65536;
+        -- The local header.
+        var local: StringBuilder := makeStringBuilder();
+        writeString(&!local, "PK");
+        writeByte(&!local, 3);
+        writeByte(&!local, 4);
+        putLittle(&!local, 20, 2);
+        putLittle(&!local, 0, 2);
+        putLittle(&!local, compression, 2);
+        putLittle(&!local, 0, 2);
+        putLittle(&!local, 33, 2);
+        putLittle(&!local, checksum, 4);
+        putLittle(&!local, packed, 4);
+        putLittle(&!local, unpacked, 4);
+        putLittle(&!local, nat64(nameCount), 2);
+        putLittle(&!local, 0, 2);
+        writeString(&!local, asSpan(&fullName));
+        let localBytes: String := finalize(local);
+        putOut(&~w, asSpan(&localBytes));
+        destroyString(localBytes);
+        putOut(&~w, asSpan(&packedBytes));
+        destroyString(packedBytes);
+        -- The entry of the central directory.
+        var entry: StringBuilder := makeStringBuilder();
+        writeString(&!entry, "PK");
+        writeByte(&!entry, 1);
+        writeByte(&!entry, 2);
+        putLittle(&!entry, 788, 2);
+        putLittle(&!entry, 20, 2);
+        putLittle(&!entry, 0, 2);
+        putLittle(&!entry, compression, 2);
+        putLittle(&!entry, 0, 2);
+        putLittle(&!entry, 33, 2);
+        putLittle(&!entry, checksum, 4);
+        putLittle(&!entry, packed, 4);
+        putLittle(&!entry, unpacked, 4);
+        putLittle(&!entry, nat64(nameCount), 2);
+        putLittle(&!entry, 0, 2);
+        putLittle(&!entry, 0, 2);
+        putLittle(&!entry, 0, 2);
+        putLittle(&!entry, 0, 2);
+        putLittle(&!entry, external, 4);
+        putLittle(&!entry, at, 4);
+        writeString(&!entry, asSpan(&fullName));
+        destroyString(fullName);
+        let entryBytes: String := finalize(entry);
+        putCentral(&~w, asSpan(&entryBytes));
+        destroyString(entryBytes);
+        w->entries := (w->entries) + 1;
+        return true;
+    end;
+
+    function wideChecksum(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.Archive: a Nat32 did not fit a Nat64");
+        end case;
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function addFile(writer: &![ArchiveWriter, R], name: Span[Nat8, S], content: Span[Nat8, T], mode: Nat32): Bool is
+        return addEntryTo(writer, kindFile, name, content, mode);
+    end;
+
+    generic [R: Region, S: Region]
+    function addDirectory(writer: &![ArchiveWriter, R], name: Span[Nat8, S], mode: Nat32): Bool is
+        return addEntryTo(writer, kindDir, name, "", mode);
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function addLink(writer: &![ArchiveWriter, R], name: Span[Nat8, S], target: Span[Nat8, T]): Bool is
+        if spanLength(target) = 0 then
+            return false;
+        end if;
+        let mode: Nat32 := 511;
+        return addEntryTo(writer, kindLink, name, target, mode);
+    end;
+
+    function finishArchive(writer: ArchiveWriter): String is
+        let { zip: Bool, gzipped: Bool, compress: Bool, out: StringBuilder, written: Index, central: StringBuilder, centralCount: Index, entries: Nat64 } := writer;
+        let directory: String := finalize(central);
+        var all: StringBuilder := out;
+        if zip then
+            writeString(&!all, asSpan(&directory));
+            writeString(&!all, "PK");
+            writeByte(&!all, 5);
+            writeByte(&!all, 6);
+            putLittle(&!all, 0, 2);
+            putLittle(&!all, 0, 2);
+            putLittle(&!all, entries, 2);
+            putLittle(&!all, entries, 2);
+            putLittle(&!all, nat64(centralCount), 4);
+            putLittle(&!all, nat64(written), 4);
+            putLittle(&!all, 0, 2);
+        else
+            let trailer: String := makeString(1024, 0);
+            writeString(&!all, asSpan(&trailer));
+            destroyString(trailer);
+        end if;
+        destroyString(directory);
+        let bytes: String := finalize(all);
+        if gzipped then
+            let packed: String := gzip(asSpan(&bytes));
+            destroyString(bytes);
+            return packed;
+        else
+            return bytes;
+        end if;
+    end;
+end module body.

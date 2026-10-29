@@ -1,0 +1,1 @@
+A function pointer whose parameters have different types takes its arguments in the order of its type: Fn[Int32, Bool, Int64] is called with an Int32 and then a Bool.  Austral takes the parameter types in reverse order (docs/differences-from-austral.md, defect 18).

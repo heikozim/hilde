@@ -1,0 +1,314 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Structured concurrency: tasks that belong to a scope, and channels with two linear ends.
+
+- Tasks run on the threads of the process and may run at the same time.
+- spawn moves its argument into the task; it may not hold a reference or a span (H3002).
+- A lending scope lets its tasks read what one borrow lends them, checked at the call.
+- join is the only thing that consumes a task, and every task must be joined.
+- closeScope returns only when every task of the scope has ended.
+- A value left in a channel when its receiver closes ends the programme with a message.
+- A programme in which every task waits for another ends with a message.
+- abort in a task ends the process.
+
+    var scope: Scope := opened;
+    case spawn(&!scope, work, 21) of
+        when Right(right as task: Task[Int32]) do
+            printLn(join(task));
+        when Left(left as unused: Int32) do
+            printLn(-1);
+    end case;
+    closeScope(scope);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.File (
+    FileDescriptor
+);
+
+module Standard.Task is
+    """
+    Whether this build can start tasks at all.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function tasksAvailable(): Bool;
+
+    ---
+    --- Scopes
+    ---
+
+    """
+    Where tasks are started, and what they cannot outlive.  It is linear.
+    """
+    type Scope: Linear;
+
+    """
+    A new scope.  None when there is no memory for it, or when the task
+    runtime cannot be set up at its first use because the process has no
+    file descriptor left for its interrupt pipe.  A later call tries again.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    function openScope(): Option[Scope];
+
+    """
+    A new scope whose tasks each get stackBytes of stack instead of the
+    64 KiB of openScope, rounded up to a page: for tasks that call into
+    a C library with deep calls or large frames, as a database engine or
+    a parser.  Only the pages a task touches cost memory.  None as for
+    openScope.
+    """
+    function openScopeWithStack(stackBytes: Index): Option[Scope]
+        requires (stackBytes >= 65536) and (stackBytes <= 8388608);
+
+    """
+    Waits until every task started in the scope has ended, then gives the
+    scope back.  A task can still be joined after its scope has closed,
+    and must be.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeScope(scope: Scope): Unit;
+
+    ---
+    --- Tasks
+    ---
+
+    """
+    A task that will produce a T.  It is linear: it must be joined.
+    """
+    type Task[T: Type]: Linear;
+
+    """
+    Starts work applied to argument as a task in scope, and moves the
+    argument in.  Returns the task, or the argument back, untouched, when
+    no task could be started.  The argument may not hold a reference or a
+    span, at any depth; the compiler refuses one (H3002).
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [A: Type, T: Type, R: Region]
+    function spawn(scope: &![Scope, R], work: Fn[A, T], argument: A): Either[A, Task[T]];
+
+    """
+    Waits for the task to end and returns its result.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [T: Type]
+    function join(task: Task[T]): T;
+
+    """
+    True when the task has ended, so that a join of it returns at once.
+    No contract: the answer is the state of the runtime at the call.
+    """
+    generic [T: Type, R: Region]
+    function isDone(task: &[Task[T], R]): Bool;
+
+    """
+    Waits until fewer than count of the tasks started in scope are still
+    running, while other tasks run.  With count the number of tasks not
+    yet joined, it returns once one of them has ended, whichever it is.
+    Returns at once when no task of the scope runs.
+    No contract: what it waits for is the runtime's.
+    """
+    generic [R: Region]
+    function awaitFewer(scope: &![Scope, R], count: Index): Unit;
+
+    """
+    Lets the other runnable tasks run before this one continues.
+    No contract: its effect is on the system or on what it consumes, which a condition cannot read.
+    """
+    function yieldNow(): Unit;
+
+    """
+    Waits until the descriptor can be read from, or has hung up, while
+    other tasks run.  Returns false when the wait failed.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function waitReadable(file: &[FileDescriptor, R]): Bool;
+
+    """
+    Waits until the descriptor can be written to, while other tasks run.
+    Returns false when the wait failed.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function waitWritable(file: &[FileDescriptor, R]): Bool;
+
+    ---
+    --- Lending scopes
+    ---
+
+    """
+    A scope whose tasks may read what one borrow lends them.  It is
+    linear, and its type names the region R of the borrow, so it cannot
+    leave the borrow; closeLending waits for its tasks before the borrow
+    ends.
+    """
+    type Lending[R: Region]: Linear;
+
+    """
+    A lending scope for the borrow anchor comes from; only its region is
+    used.  None when there is no memory for it, or when the task runtime
+    cannot be set up, as for openScope.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [T: Type, R: Region]
+    function openLending(anchor: &[T, R]): Option[Lending[R]];
+
+    """
+    A lending scope as openLending gives, whose tasks each get stackBytes
+    of stack instead of 64 KiB, rounded up to a page, as openScopeWithStack
+    gives a scope.  None as for openLending.
+    """
+    generic [T: Type, R: Region]
+    function openLendingWithStack(anchor: &[T, R], stackBytes: Index): Option[Lending[R]]
+        requires (stackBytes >= 65536) and (stackBytes <= 8388608);
+
+    """
+    Waits until every task started in the scope has ended.  Its tasks can
+    still be joined afterwards, and must be, inside the borrow.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [R: Region]
+    function closeLending(scope: Lending[R]): Unit;
+
+    """
+    Starts a task in a lending scope, as spawn does.  The argument may
+    hold read references and spans of R or Static, and nothing that could
+    be written or outlive the borrow; the compiler checks it at the call
+    (H3066 to H3069).
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [A: Type, T: Type, R: Region, S: Region]
+    function spawnLending(scope: &![Lending[R], S], work: Fn[A, T], argument: A): Either[A, Task[T]];
+
+    ---
+    --- Channels
+    ---
+
+    """
+    The sending end of a channel of T.  It is linear.
+    """
+    type Sender[T: Type]: Linear;
+
+    """
+    The receiving end of a channel of T.  It is linear.
+    """
+    type Receiver[T: Type]: Linear;
+
+    """
+    Both ends of a new channel, to be taken apart with a let.
+    """
+    record Channel[T: Type]: Linear is
+        sender: Sender[T];
+        receiver: Receiver[T];
+    end;
+
+    """
+    A channel that holds at most capacity values; with 0, a send waits
+    until a receiver takes the value.  None when there is no memory.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [T: Type]
+    function openChannel(capacity: Index): Option[Channel[T]];
+
+    """
+    Sends a value, waiting while the channel is full.  None when it was
+    delivered; Some hands the value back when the receiving end is closed.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [T: Type, R: Region]
+    function send(sender: &![Sender[T], R], value: T): Option[T];
+
+    """
+    The next value, waiting while the channel is empty.  None when it is
+    empty and the sender has closed.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [T: Type, R: Region]
+    function receive(receiver: &![Receiver[T], R]): Option[T];
+
+    """
+    Closes the sending end.  A receiver still gets every value sent, then
+    None.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [T: Type]
+    function closeSender(sender: Sender[T]): Unit;
+
+    """
+    Closes the receiving end.  Every value sent must have been received:
+    one still in the channel would be lost, so the program ends with a
+    message instead.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [T: Type]
+    function closeReceiver(receiver: Receiver[T]): Unit;
+
+    """
+    What tryReceive found: a value, nothing yet, or nothing ever again.
+    """
+    union Polled[T: Type]: Type is
+        case Ready is
+            value: T;
+        case Empty;
+        case Closed;
+    end;
+
+    """
+    The next value if one is there, without waiting.  Empty when the
+    channel is empty and its sender may still send, Closed when it is
+    empty and the sender has closed.  On a channel of capacity 0 a sender
+    hands its value only to a receive that waits, so this finds none there.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [T: Type, R: Region]
+    function tryReceive(receiver: &![Receiver[T], R]): Polled[T];
+
+    """
+    The next value, waiting at most milliseconds for it while the other
+    tasks run: Ready with the value, Closed when the channel is empty and
+    its sender has closed, Empty when the time ran out first.  A value a
+    sender hands over after that waits for the next receive.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [T: Type, R: Region]
+    function receiveWithin(receiver: &![Receiver[T], R], milliseconds: Nat32): Polled[T];
+
+    """
+    The running task waits milliseconds while the other tasks run; 0 lets
+    them run once.  Outside a task, and where there are no tasks, the
+    programme waits.
+    No contract: its effect is on the system or on what it consumes, which a condition cannot read.
+    """
+    function sleepFor(milliseconds: Nat32): Unit;
+
+    """
+    What receiveEither took: a value from the first receiver, one from the
+    second, or none because both senders have closed and nothing is left.
+    """
+    union Selected[T: Type, U: Type]: Type is
+        case FromFirst is
+            value: T;
+        case FromSecond is
+            value: U;
+        case AllClosed;
+    end;
+
+    """
+    The next value of whichever of two channels has one first, waiting
+    while both are empty.  A channel whose sender has closed is waited on
+    no longer; AllClosed when both are empty and closed.  When both hold a
+    value the one taken alternates, so neither channel can starve the
+    other.  On a channel of capacity 0 the wait lets its sender hand over a
+    value, which the next receive gets if the other channel's value was
+    taken first.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [T: Type, U: Type, R: Region, S: Region]
+    function receiveEither(first: &![Receiver[T], R], second: &![Receiver[U], S]): Selected[T, U];
+end module.

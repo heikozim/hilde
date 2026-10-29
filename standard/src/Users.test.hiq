@@ -1,0 +1,231 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    length
+);
+import Standard.File (
+    removeFile
+);
+import Standard.Sqlite (
+    Connection,
+    Writing,
+    SqlError,
+    openWriter,
+    closeDatabase
+);
+import Standard.Users (
+    UserError,
+    BadName,
+    BadPassword,
+    BadClient,
+    BadTime,
+    HashFailed,
+    StorageFailed,
+    Verdict,
+    Accepted,
+    Rejected,
+    Locked,
+    Throttled,
+    AttemptLimits,
+    defaultAttemptLimits,
+    isUserName,
+    addUser,
+    deleteUser,
+    setPassword,
+    changePassword,
+    listUsers,
+    destroyUserNames,
+    verify,
+    lockUser,
+    unlockUser
+);
+import Standard.SqliteUsers (
+    SqliteUsers,
+    SqliteUsersFailed,
+    openSqliteUsers,
+    closeSqliteUsers
+);
+
+module body Standard.Users.Test is
+    function removeDatabase(name: Span[Nat8, Static]): Unit is
+        let path: String := fromLiteral(name);
+        let removed: Bool := removeFile(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+
+    -- A store in a fresh database, or an abort.
+    function fresh(name: Span[Nat8, Static]): SqliteUsers is
+        removeDatabase(name);
+        case openWriter(name) of
+            when Right(right as opened: Connection[Writing]) do
+                case openSqliteUsers(opened) of
+                    when Right(right as users: SqliteUsers) do
+                        return users;
+                    when Left(left as failed: SqliteUsersFailed) do
+                        let { db: Connection[Writing], error: UserError } := failed;
+                        closeDatabase(db);
+                        abort("openSqliteUsers failed");
+                end case;
+            when Left(left as error: SqlError) do
+                abort("the test database could not be opened");
+        end case;
+    end;
+
+    function closeAndRemove(users: SqliteUsers, name: Span[Nat8, Static]): Unit is
+        closeDatabase(closeSqliteUsers(users));
+        removeDatabase(name);
+        return nil;
+    end;
+
+    -- 1 Accepted, 2 Rejected, 3 Locked, 4 Throttled, 0 an error.
+    function code(answer: Either[UserError, Verdict]): Int32 is
+        case answer of
+            when Right(right as verdict: Verdict) do
+                case verdict of
+                    when Accepted do
+                        return 1;
+                    when Rejected do
+                        return 2;
+                    when Locked do
+                        return 3;
+                    when Throttled do
+                        return 4;
+                end case;
+            when Left(left as error: UserError) do
+                return 0;
+        end case;
+    end;
+
+    function yes(answer: Either[UserError, Bool]): Bool is
+        case answer of
+            when Right(right as done: Bool) do
+                return done;
+            when Left(left as error: UserError) do
+                return false;
+        end case;
+    end;
+
+    function no(answer: Either[UserError, Bool]): Bool is
+        case answer of
+            when Right(right as done: Bool) do
+                return not done;
+            when Left(left as error: UserError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function check(users: &![SqliteUsers, R], name: Span[Nat8, Static], password: Span[Nat8, Static], now: Int64): Int32 is
+        return code(verify(&~users, name, password, "192.0.2.1", defaultAttemptLimits(), now));
+    end;
+
+    function testNames(): Unit is
+        assertTrue(isUserName("alice"), "a plain name");
+        assertTrue(isUserName("a.b_c-9"), "dot, underscore and hyphen inside");
+        assertTrue(isUserName("7"), "one digit");
+        assertTrue(not isUserName(""), "empty");
+        assertTrue(not isUserName(".alice"), "a dot first");
+        assertTrue(not isUserName("al ice"), "a blank");
+        assertTrue(not isUserName("alice\u{e9}"), "a byte above ASCII");
+        assertTrue(isUserName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "64 bytes");
+        assertTrue(not isUserName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "65 bytes");
+        return nil;
+    end;
+
+    function testAccounts(): Unit is
+        var users: SqliteUsers := fresh("users-test-accounts.db");
+        assertTrue(yes(addUser(&!users, "alice", "first secret")), "alice added");
+        assertTrue(no(addUser(&!users, "alice", "other")), "a second alice is refused");
+        assertTrue(yes(addUser(&!users, "bob", "bobs secret")), "bob added");
+        assertTrue(check(&!users, "alice", "first secret", 100) = 1, "the right password");
+        assertTrue(check(&!users, "alice", "wrong", 100) = 2, "a wrong password");
+        assertTrue(check(&!users, "nobody", "first secret", 100) = 2, "an unknown name answers as a wrong password");
+        assertTrue(yes(lockUser(&!users, "alice")), "alice locked");
+        assertTrue(check(&!users, "alice", "first secret", 100) = 3, "locked, to the right password");
+        assertTrue(check(&!users, "alice", "wrong", 100) = 2, "locked, a wrong password says nothing of the lock");
+        assertTrue(yes(unlockUser(&!users, "alice")), "alice unlocked");
+        assertTrue(check(&!users, "alice", "first secret", 100) = 1, "unlocked again");
+        assertTrue(code(changePassword(&!users, "alice", "wrong", "second secret", "192.0.2.1", defaultAttemptLimits(), 100)) = 2, "a change with a wrong old password");
+        assertTrue(code(changePassword(&!users, "alice", "first secret", "second secret", "192.0.2.1", defaultAttemptLimits(), 100)) = 1, "a change");
+        assertTrue(check(&!users, "alice", "second secret", 100) = 1, "the new password");
+        assertTrue(check(&!users, "alice", "first secret", 100) = 2, "the old password no more");
+        assertTrue(yes(setPassword(&!users, "bob", "new bob")), "bob set by an administrator");
+        assertTrue(check(&!users, "bob", "new bob", 100) = 1, "bob's new password");
+        assertTrue(no(setPassword(&!users, "nobody", "x")), "no password for nobody");
+        case listUsers(&!users) of
+            when Right(right as names: Buffer[String]) do
+                assertTrue(length(&names) = 2, "two users listed");
+                destroyUserNames(names);
+            when Left(left as error: UserError) do
+                assertFailure("listUsers failed");
+        end case;
+        assertTrue(yes(deleteUser(&!users, "bob")), "bob deleted");
+        assertTrue(no(deleteUser(&!users, "bob")), "bob is gone");
+        assertTrue(check(&!users, "bob", "new bob", 100) = 2, "a deleted user is rejected");
+        closeAndRemove(users, "users-test-accounts.db");
+        return nil;
+    end;
+
+    function testThrottle(): Unit is
+        var users: SqliteUsers := fresh("users-test-throttle.db");
+        let limits: AttemptLimits := AttemptLimits(attempts => 3, windowSeconds => 60);
+        assertTrue(yes(addUser(&!users, "carol", "carols secret")), "carol added");
+        assertTrue(code(verify(&!users, "carol", "wrong", "198.51.100.7", limits, 1000)) = 2, "first failure");
+        assertTrue(code(verify(&!users, "carol", "wrong", "198.51.100.7", limits, 1001)) = 2, "second failure");
+        assertTrue(code(verify(&!users, "carol", "carols secret", "198.51.100.7", limits, 1002)) = 1, "the right one forgets them");
+        assertTrue(code(verify(&!users, "carol", "wrong", "198.51.100.7", limits, 1003)) = 2, "failure one again");
+        assertTrue(code(verify(&!users, "nobody", "wrong", "198.51.100.7", limits, 1004)) = 2, "failure two, an unknown name");
+        assertTrue(code(verify(&!users, "-bad", "wrong", "198.51.100.7", limits, 1005)) = 2, "failure three, a name not valid");
+        assertTrue(code(verify(&!users, "carol", "carols secret", "198.51.100.7", limits, 1006)) = 4, "throttled, the right password not looked at");
+        assertTrue(code(verify(&!users, "carol", "carols secret", "203.0.113.9", limits, 1006)) = 1, "another client is not throttled");
+        assertTrue(code(verify(&!users, "carol", "carols secret", "198.51.100.7", limits, 1062)) = 4, "inside the window of the last three failures");
+        assertTrue(code(verify(&!users, "carol", "carols secret", "198.51.100.7", limits, 1065)) = 1, "after the window");
+        closeAndRemove(users, "users-test-throttle.db");
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        var users: SqliteUsers := fresh("users-test-refusals.db");
+        case addUser(&!users, "-dash", "secret") of
+            when Left(left as error: UserError) do
+                case error of
+                    when BadName do
+                        assertTrue(true, "a name not valid");
+                    when BadPassword do
+                        assertFailure("a name not valid");
+                    when BadClient do
+                        assertFailure("a name not valid");
+                    when BadTime do
+                        assertFailure("a name not valid");
+                    when HashFailed do
+                        assertFailure("a name not valid");
+                    when StorageFailed do
+                        assertFailure("a name not valid");
+                end case;
+            when Right(right as done: Bool) do
+                assertFailure("a name not valid was added");
+        end case;
+        assertTrue(not yes(addUser(&!users, "dave", "")), "an empty password");
+        assertTrue(code(verify(&!users, "dave", "x", "192.0.2.1", defaultAttemptLimits(), -1)) = 0, "a time below 0");
+        assertTrue(code(verify(&!users, "dave", "x", "", defaultAttemptLimits(), 5)) = 0, "an empty client");
+        closeAndRemove(users, "users-test-refusals.db");
+        return nil;
+    end;
+end module body.

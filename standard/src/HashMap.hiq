@@ -1,0 +1,426 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The entries are three buffers side by side, keys, values and their
+-- hashes, one entry after another.  The table is open addressing with
+-- linear probing over a power of two of slots: a slot holds 0 when empty,
+-- the largest Index when an entry left it (a tombstone, so that a probe
+-- goes on past it), else the entry's position plus one.  The table is
+-- rebuilt, twice as large when needed, before live entries and tombstones
+-- fill half of it, so that a probe always meets an empty slot.
+import Standard.Tuples (
+    Pair
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    destroyEmpty as destroyEmptyBuffer,
+    destroyFree as destroyFreeBuffer,
+    length as bufferLength,
+    nth,
+    nthRef,
+    storeNth,
+    swapNth,
+    swapIndex,
+    insertBack,
+    removeLast
+);
+import Standard.Order (
+    TotalOrder,
+    equal
+);
+import Standard.Hash (
+    Hashable,
+    hashOf
+);
+import Bindings.Entropy (
+    entropyWord
+);
+import Bindings.Serial (
+    nextSerial
+);
+
+module body Standard.HashMap is
+    record HashMap[K: Type, V: Type]: Linear is
+        key0: Nat64;
+        key1: Nat64;
+        keys: Buffer[K];
+        values: Buffer[V];
+        hashes: Buffer[Nat64];
+        table: Buffer[Index];
+        tombstones: Index;
+        invariant bufferLength(&keys) = bufferLength(&values);
+        invariant bufferLength(&keys) = bufferLength(&hashes);
+    end;
+
+    constant emptySlot: Index := 0;
+    constant tombstone: Index := maximum_index;
+    constant firstCapacity: Index := 8;
+    constant notFound: Index := maximum_index;
+
+    -- The keys of the fallback when the system gives no random bytes.
+    constant fallback0: Nat64 := 7816392313619706465;
+    constant fallback1: Nat64 := 8387220255154660723;
+
+    record Probe: Free is
+        found: Bool;
+        slot: Index;
+        entry: Index;
+    end;
+
+    ---
+    --- The buffers, through the kind of reference the map is held by
+    ---
+
+    generic [K: Type, V: Type, R: Region]
+    function keysRead(map: &[HashMap[K, V], R]): &[Buffer[K], R] is
+        return &(map->keys);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function valuesRead(map: &[HashMap[K, V], R]): &[Buffer[V], R] is
+        return &(map->values);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function hashesRead(map: &[HashMap[K, V], R]): &[Buffer[Nat64], R] is
+        return &(map->hashes);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function tableRead(map: &[HashMap[K, V], R]): &[Buffer[Index], R] is
+        return &(map->table);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function keysMut(map: &![HashMap[K, V], R]): &![Buffer[K], R] is
+        return &!(map->keys);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function valuesMut(map: &![HashMap[K, V], R]): &![Buffer[V], R] is
+        return &!(map->values);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function hashesMut(map: &![HashMap[K, V], R]): &![Buffer[Nat64], R] is
+        return &!(map->hashes);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function tableMut(map: &![HashMap[K, V], R]): &![Buffer[Index], R] is
+        return &!(map->table);
+    end;
+
+    ---
+    --- Lifecycle
+    ---
+
+    generic [K: Type, V: Type]
+    function makeHashMapKeyed(key0: Nat64, key1: Nat64): HashMap[K, V] is
+        let keys: Buffer[K] := allocateEmpty();
+        let values: Buffer[V] := allocateEmpty();
+        let hashes: Buffer[Nat64] := allocateEmpty();
+        let table: Buffer[Index] := initialize(firstCapacity, emptySlot);
+        let none: Index := 0;
+        return HashMap(key0 => key0, key1 => key1, keys => keys, values => values, hashes => hashes,
+            table => table, tombstones => none);
+    end;
+
+    generic [K: Type, V: Type]
+    function makeHashMap(): HashMap[K, V] is
+        var key0: Nat64 := entropyWord();
+        var key1: Nat64 := entropyWord();
+        let zero: Nat64 := 0;
+        if (key0 = zero) and (key1 = zero) then
+            let serial: Nat64 := nextSerial();
+            key0 := hashOf(&serial, fallback0, fallback1);
+            key1 := hashOf(&serial, fallback1, fallback0);
+        end if;
+        return makeHashMapKeyed(key0, key1);
+    end;
+
+    generic [K: Type, V: Type]
+    function destroyEmpty(map: HashMap[K, V]): Unit is
+        let { key0: Nat64, key1: Nat64, keys: Buffer[K], values: Buffer[V], hashes: Buffer[Nat64],
+            table: Buffer[Index], tombstones: Index } := map;
+        destroyEmptyBuffer(keys);
+        destroyEmptyBuffer(values);
+        destroyFreeBuffer(hashes);
+        destroyFreeBuffer(table);
+        return nil;
+    end;
+
+    generic [K: Free, V: Free]
+    function destroyFree(map: HashMap[K, V]): Unit is
+        let { key0: Nat64, key1: Nat64, keys: Buffer[K], values: Buffer[V], hashes: Buffer[Nat64],
+            table: Buffer[Index], tombstones: Index } := map;
+        destroyFreeBuffer(keys);
+        destroyFreeBuffer(values);
+        destroyFreeBuffer(hashes);
+        destroyFreeBuffer(table);
+        return nil;
+    end;
+
+    ---
+    --- Finding
+    ---
+
+    -- The first slot of hash in a table of capacity slots.
+    function slotOf(hash: Nat64, capacity: Index): Index is
+        case toNat64(capacity) of
+            when Some(value as c: Nat64) do
+                case toIndex(rem(hash, c)) of
+                    when Some(value as s: Index) do
+                        return s;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function nextSlot(slot: Index, capacity: Index): Index is
+        if (slot + 1) = capacity then
+            return 0;
+        else
+            return slot + 1;
+        end if;
+    end;
+
+    -- Where key is: found, its slot and its entry; or not found, with the
+    -- slot a new entry of this hash would take.
+    generic [K: Type(TotalOrder, Hashable), V: Type, R: Region, S: Region]
+    function probe(map: &[HashMap[K, V], R], key: &[K, S], hash: Nat64): Probe is
+        let table: &[Buffer[Index], R] := tableRead(map);
+        let capacity: Index := bufferLength(table);
+        var slot: Index := slotOf(hash, capacity);
+        var free: Index := notFound;
+        var steps: Index := 0;
+        while steps < capacity do
+            let t: Index := nth(table, slot);
+            if t = emptySlot then
+                if free = notFound then
+                    free := slot;
+                end if;
+                return Probe(found => false, slot => free, entry => notFound);
+            else if t = tombstone then
+                if free = notFound then
+                    free := slot;
+                end if;
+            else
+                let entry: Index := t - 1;
+                if nth(hashesRead(map), entry) = hash then
+                    if equal(nthRef(keysRead(map), entry), key) then
+                        return Probe(found => true, slot => slot, entry => entry);
+                    end if;
+                end if;
+            end if;
+            slot := nextSlot(slot, capacity);
+            steps := steps + 1;
+        end while;
+        return Probe(found => false, slot => free, entry => notFound);
+    end;
+
+    -- The slot that points at entry, whose hash is hash.
+    generic [K: Type, V: Type, R: Region]
+    function slotOfEntry(map: &[HashMap[K, V], R], entry: Index, hash: Nat64): Index is
+        let table: &[Buffer[Index], R] := tableRead(map);
+        let capacity: Index := bufferLength(table);
+        var slot: Index := slotOf(hash, capacity);
+        var steps: Index := 0;
+        while steps < capacity do
+            if nth(table, slot) = (entry + 1) then
+                return slot;
+            end if;
+            slot := nextSlot(slot, capacity);
+            steps := steps + 1;
+        end while;
+        abort("HashMap: an entry that no slot points at");
+    end;
+
+    ---
+    --- Asking
+    ---
+
+    generic [K: Type, V: Type, R: Region]
+    function size(map: &[HashMap[K, V], R]): Index is
+        return bufferLength(keysRead(map));
+    end;
+
+    generic [K: Type(TotalOrder, Hashable), V: Type, R: Region, S: Region]
+    function contains(map: &[HashMap[K, V], R], key: &[K, S]): Bool is
+        let p: Probe := probe(map, key, hashOf(key, map->key0, map->key1));
+        return p.found;
+    end;
+
+    generic [K: Type(TotalOrder, Hashable), V: Free, R: Region, S: Region]
+    function get(map: &[HashMap[K, V], R], key: &[K, S]): Option[V] is
+        let p: Probe := probe(map, key, hashOf(key, map->key0, map->key1));
+        if p.found then
+            return Some(value => nth(valuesRead(map), p.entry));
+        else
+            let none: Option[V] := None();
+            return none;
+        end if;
+    end;
+
+    generic [K: Type(TotalOrder, Hashable), V: Type, R: Region, S: Region]
+    function getRef(map: &[HashMap[K, V], R], key: &[K, S]): Option[&[V, R]] is
+        let p: Probe := probe(map, key, hashOf(key, map->key0, map->key1));
+        if p.found then
+            return Some(value => nthRef(valuesRead(map), p.entry));
+        else
+            let none: Option[&[V, R]] := None();
+            return none;
+        end if;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function keyAt(map: &[HashMap[K, V], R], pos: Index): Option[&[K, R]] is
+        if pos < size(map) then
+            return Some(value => nthRef(keysRead(map), pos));
+        else
+            let none: Option[&[K, R]] := None();
+            return none;
+        end if;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function valueAt(map: &[HashMap[K, V], R], pos: Index): Option[&[V, R]] is
+        if pos < size(map) then
+            return Some(value => nthRef(valuesRead(map), pos));
+        else
+            let none: Option[&[V, R]] := None();
+            return none;
+        end if;
+    end;
+
+    ---
+    --- Changing
+    ---
+
+    -- Every slot of table taken out, then capacity empty ones put in.
+    generic [R: Region]
+    function resetTable(table: &![Buffer[Index], R], capacity: Index): Unit is
+        while bufferLength(&table) > 0 do
+            let dropped: Index := removeLast(&~table);
+        end while;
+        var i: Index := 0;
+        while i < capacity do
+            insertBack(&~table, emptySlot);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The table built anew with capacity slots and no tombstones.
+    generic [K: Type, V: Type, R: Region]
+    function rebuild(map: &![HashMap[K, V], R], capacity: Index): Unit is
+        let count: Index := size(&map);
+        resetTable(tableMut(&~map), capacity);
+        var entry: Index := 0;
+        while entry < count do
+            let hash: Nat64 := nth(hashesRead(&map), entry);
+            var slot: Index := slotOf(hash, capacity);
+            while nth(tableRead(&map), slot) /= emptySlot do
+                slot := nextSlot(slot, capacity);
+            end while;
+            storeNth(tableMut(&~map), slot, entry + 1);
+            entry := entry + 1;
+        end while;
+        map->tombstones := emptySlot;
+        return nil;
+    end;
+
+    -- Makes room for one more entry: the table rebuilt, larger when the
+    -- live entries need it, before half of it is used.
+    generic [K: Type, V: Type, R: Region]
+    function makeRoom(map: &![HashMap[K, V], R]): Unit is
+        let count: Index := size(&map);
+        let capacity: Index := bufferLength(tableRead(&map));
+        if (((count + map->tombstones) + 1) * 2) > capacity then
+            var larger: Index := capacity;
+            while ((count + 1) * 2) > larger do
+                larger := larger * 2;
+            end while;
+            rebuild(&~map, larger);
+        end if;
+        return nil;
+    end;
+
+    generic [K: Type(TotalOrder, Hashable), V: Type, R: Region]
+    function put(map: &![HashMap[K, V], R], key: K, value: V): Option[Pair[K, V]] is
+        let hash: Nat64 := hashOf(&key, map->key0, map->key1);
+        let found: Probe := probe(&map, &key, hash);
+        if found.found then
+            let oldKey: K := swapNth(keysMut(&~map), found.entry, key);
+            let oldValue: V := swapNth(valuesMut(&~map), found.entry, value);
+            return Some(value => Pair(first => oldKey, second => oldValue));
+        else
+            makeRoom(&~map);
+            let p: Probe := probe(&map, &key, hash);
+            let entry: Index := size(&map);
+            if nth(tableRead(&map), p.slot) = tombstone then
+                map->tombstones := map->tombstones - 1;
+            end if;
+            insertBack(keysMut(&~map), key);
+            insertBack(valuesMut(&~map), value);
+            insertBack(hashesMut(&~map), hash);
+            storeNth(tableMut(&~map), p.slot, entry + 1);
+            let none: Option[Pair[K, V]] := None();
+            return none;
+        end if;
+    end;
+
+    -- The entry at entry taken out: its slot is a tombstone already; the
+    -- last entry moves into its place and its slot is pointed there.
+    generic [K: Type, V: Type, R: Region]
+    function takeEntry(map: &![HashMap[K, V], R], entry: Index): Pair[K, V] is
+        let last: Index := size(&map) - 1;
+        if entry /= last then
+            let lastHash: Nat64 := nth(hashesRead(&map), last);
+            let moved: Index := slotOfEntry(&map, last, lastHash);
+            storeNth(tableMut(&~map), moved, entry + 1);
+            swapIndex(keysMut(&~map), entry, last);
+            swapIndex(valuesMut(&~map), entry, last);
+            swapIndex(hashesMut(&~map), entry, last);
+        end if;
+        let key: K := removeLast(keysMut(&~map));
+        let value: V := removeLast(valuesMut(&~map));
+        let hash: Nat64 := removeLast(hashesMut(&~map));
+        return Pair(first => key, second => value);
+    end;
+
+    generic [K: Type(TotalOrder, Hashable), V: Type, R: Region, S: Region]
+    function remove(map: &![HashMap[K, V], R], key: &[K, S]): Option[Pair[K, V]] is
+        let p: Probe := probe(&map, key, hashOf(key, map->key0, map->key1));
+        if p.found then
+            storeNth(tableMut(&~map), p.slot, tombstone);
+            map->tombstones := map->tombstones + 1;
+            return Some(value => takeEntry(&~map, p.entry));
+        else
+            let none: Option[Pair[K, V]] := None();
+            return none;
+        end if;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function removeAt(map: &![HashMap[K, V], R], pos: Index): Option[Pair[K, V]] is
+        if pos < size(&map) then
+            let slot: Index := slotOfEntry(&map, pos, nth(hashesRead(&map), pos));
+            storeNth(tableMut(&~map), slot, tombstone);
+            map->tombstones := map->tombstones + 1;
+            return Some(value => takeEntry(&~map, pos));
+        else
+            let none: Option[Pair[K, V]] := None();
+            return none;
+        end if;
+    end;
+end module body.

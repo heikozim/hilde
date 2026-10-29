@@ -1,0 +1,483 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.SperliCollective: the payload of a collective frame in bytes
+-- and read back with every field wrong in turn, and combine for every
+-- reduce operation on every element type it fits, with the edges of
+-- wrapping, signed order and float order, and the calls it refuses.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    startsWith
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile
+);
+import Standard.Bits (
+    float32Bits,
+    float64Bits
+);
+import Standard.SperliError (
+    collectiveMismatch,
+    badCollective
+);
+import Standard.SperliCollective (
+    collectiveKind,
+    collectiveTag,
+    barrierOperation,
+    bcastOperation,
+    reduceOperation,
+    allreduceOperation,
+    gatherOperation,
+    scatterOperation,
+    bytesType,
+    int32Type,
+    int64Type,
+    uint32Type,
+    uint64Type,
+    float32Type,
+    float64Type,
+    noReduction,
+    sumReduction,
+    minReduction,
+    maxReduction,
+    prodReduction,
+    landReduction,
+    lorReduction,
+    lxorReduction,
+    bandReduction,
+    borReduction,
+    bxorReduction,
+    contributionPhase,
+    resultPhase,
+    elementWidth,
+    reductionFits,
+    collectivePayload,
+    checkCollective,
+    collectiveData,
+    combine
+);
+
+module body Standard.SperliCollective.Test is
+    constant allOnes: Nat64 := 18446744073709551615;
+
+    function byteOf(value: Nat64): Nat8 is
+        case toNat8(bitwiseAnd(value, 255)) of
+            when Some(value as at: Nat8) do
+                return at;
+            when None do
+                abort("a byte");
+        end case;
+    end;
+
+    -- value in width bytes, least significant first.
+    function le(value: Nat64, width: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var rest: Nat64 := value;
+        var i: Index := 0;
+        while i < width do
+            writeByte(&!out, byteOf(rest));
+            rest := rest / 256;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function widen(value: Nat8): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("a number");
+        end case;
+    end;
+
+    -- The one element that combine makes of the elements x and y of a
+    -- type, or the stop of the programme when it refuses.
+    function pair(elementType: Nat8, reduction: Nat8, x: Nat64, y: Nat64): Nat64 is
+        let width: Index := elementWidth(elementType);
+        let a: String := le(x, width);
+        let b: String := le(y, width);
+        case combine(elementType, reduction, asSpan(&a), asSpan(&b)) of
+            when Left(left as code: Int32) do
+                destroyString(a);
+                destroyString(b);
+                abort("combine refused");
+            when Right(right as out: String) do
+                var value: Nat64 := 0;
+                var i: Index := width;
+                while i > 0 do
+                    i := i - 1;
+                    value := (value * 256) + widen(nthByte(&out, i));
+                end while;
+                destroyString(out);
+                destroyString(a);
+                destroyString(b);
+                return value;
+        end case;
+    end;
+
+    function refused(elementType: Nat8, reduction: Nat8, first: Span[Nat8, Static], second: Span[Nat8, Static]): Bool is
+        case combine(elementType, reduction, first, second) of
+            when Left(left as code: Int32) do
+                return code = badCollective();
+            when Right(right as out: String) do
+                destroyString(out);
+                return false;
+        end case;
+    end;
+
+    function testCodes(): Unit is
+        assertTrue(collectiveKind() = 3, "collective is type 3");
+        assertTrue(collectiveTag() = 2147483648, "the waiting tag is the first reserved one");
+        assertTrue((barrierOperation() = 1) and (bcastOperation() = 2), "operations 1 and 2");
+        assertTrue((reduceOperation() = 3) and (allreduceOperation() = 4), "operations 3 and 4");
+        assertTrue((gatherOperation() = 5) and (scatterOperation() = 6), "operations 5 and 6");
+        assertTrue((bytesType() = 0) and (int32Type() = 1), "types 0 and 1");
+        assertTrue((int64Type() = 2) and (uint32Type() = 3), "types 2 and 3");
+        assertTrue((uint64Type() = 4) and (float32Type() = 5), "types 4 and 5");
+        assertTrue(float64Type() = 6, "type 6");
+        assertTrue((noReduction() = 0) and (sumReduction() = 1), "reductions 0 and 1");
+        assertTrue((minReduction() = 2) and (maxReduction() = 3), "reductions 2 and 3");
+        assertTrue((prodReduction() = 4) and (landReduction() = 5), "reductions 4 and 5");
+        assertTrue((lorReduction() = 6) and (lxorReduction() = 7), "reductions 6 and 7");
+        assertTrue((bandReduction() = 8) and (borReduction() = 9), "reductions 8 and 9");
+        assertTrue(bxorReduction() = 10, "reduction 10");
+        assertTrue((contributionPhase() = 0) and (resultPhase() = 1), "phases");
+        assertTrue((elementWidth(0) = 1) and (elementWidth(1) = 4), "widths of bytes and int32");
+        assertTrue((elementWidth(2) = 8) and (elementWidth(3) = 4), "widths of int64 and uint32");
+        assertTrue((elementWidth(4) = 8) and (elementWidth(5) = 4), "widths of uint64 and float32");
+        assertTrue(elementWidth(6) = 8, "width of float64");
+        return nil;
+    end;
+
+    function testFits(): Unit is
+        assertTrue(not reductionFits(1, 0), "no reduction fits nothing");
+        assertTrue(not reductionFits(1, 11), "reduction 11 does not exist");
+        assertTrue(not reductionFits(7, 1), "type 7 does not exist");
+        assertTrue(reductionFits(0, 8) and reductionFits(0, 10), "bitwise on bytes");
+        assertTrue((not reductionFits(0, 1)) and (not reductionFits(0, 5)), "no sum or logical on bytes");
+        assertTrue(reductionFits(1, 1) and reductionFits(4, 10), "every operation on whole numbers");
+        assertTrue(reductionFits(5, 4) and reductionFits(6, 2), "sum, min, max, product on floats");
+        assertTrue((not reductionFits(5, 5)) and (not reductionFits(6, 8)), "no logical or bitwise on floats");
+        return nil;
+    end;
+
+    -- The vector of docs/sperli-vectors.txt: allreduce, int64, sum, result
+    -- phase, root 0, call 9, the number 42.
+    function testPayload(): Unit is
+        let number: String := le(42, 8);
+        let payload: String := collectivePayload(4, 2, 1, 1, 0, 9, asSpan(&number));
+        assertTrue(length(&payload) = 24, "16 bytes of header and 8 of data");
+        assertTrue((nthByte(&payload, 0) = 4) and (nthByte(&payload, 1) = 2), "operation and type");
+        assertTrue((nthByte(&payload, 2) = 1) and (nthByte(&payload, 3) = 1), "reduction and phase");
+        assertTrue((nthByte(&payload, 8) = 9) and (nthByte(&payload, 9) = 0), "sequence 9, least significant first");
+        assertTrue(nthByte(&payload, 16) = 42, "the data");
+        assertTrue(checkCollective(asSpan(&payload), 4, 2, 1, 1, 0, 9) = 0, "the payload matches its call");
+        assertTrue(checkCollective(asSpan(&payload), 3, 2, 1, 1, 0, 9) = collectiveMismatch(), "another operation");
+        assertTrue(checkCollective(asSpan(&payload), 4, 3, 1, 1, 0, 9) = collectiveMismatch(), "another type");
+        assertTrue(checkCollective(asSpan(&payload), 4, 2, 2, 1, 0, 9) = collectiveMismatch(), "another reduction");
+        assertTrue(checkCollective(asSpan(&payload), 4, 2, 1, 0, 0, 9) = collectiveMismatch(), "another phase");
+        assertTrue(checkCollective(asSpan(&payload), 4, 2, 1, 1, 1, 9) = collectiveMismatch(), "another root");
+        assertTrue(checkCollective(asSpan(&payload), 4, 2, 1, 1, 0, 10) = collectiveMismatch(), "another call");
+        assertTrue(checkCollective(asSpan(&payload), 4, 2, 1, 1, 0, 8) = collectiveMismatch(), "an earlier call");
+        let data: String := collectiveData(asSpan(&payload));
+        assertTrue(equal(asSpan(&data), asSpan(&number)), "the data comes back");
+        destroyString(data);
+        destroyString(payload);
+        destroyString(number);
+        let cut: String := le(1, 15);
+        assertTrue(checkCollective(asSpan(&cut), 1, 0, 0, 0, 0, 1) = collectiveMismatch(), "a cut header");
+        destroyString(cut);
+        let empty: String := collectivePayload(1, 0, 0, 0, 0, 1, "");
+        assertTrue(length(&empty) = 16, "an empty barrier payload");
+        let none: String := collectiveData(asSpan(&empty));
+        assertTrue(length(&none) = 0, "no data");
+        destroyString(none);
+        destroyString(empty);
+        return nil;
+    end;
+
+    function testWholeNumbers(): Unit is
+        assertTrue(pair(3, 1, 4000000000, 500000000) = 205032704, "uint32 sum wraps");
+        assertTrue(pair(3, 4, 65536, 65536) = 0, "uint32 product wraps");
+        assertTrue(pair(4, 1, allOnes, 2) = 1, "uint64 sum wraps");
+        assertTrue(pair(4, 2, allOnes, 2) = 2, "uint64 min");
+        assertTrue(pair(4, 3, allOnes, 2) = allOnes, "uint64 max");
+        assertTrue(pair(3, 3, 4294967295, 2) = 4294967295, "uint32 max");
+        assertTrue(pair(1, 1, 4294967295, 1) = 0, "int32 -1 + 1");
+        assertTrue(pair(1, 2, 4294967295, 1) = 4294967295, "int32 min is -1 below 1");
+        assertTrue(pair(1, 3, 4294967295, 1) = 1, "int32 max is 1 above -1");
+        assertTrue(pair(1, 2, 2147483648, 2147483647) = 2147483648, "int32 smallest below largest");
+        assertTrue(pair(1, 4, 4294967293, 4) = 4294967284, "int32 -3 * 4");
+        assertTrue(pair(2, 2, allOnes, 2) = allOnes, "int64 min is -1 below 2");
+        assertTrue(pair(2, 3, allOnes, 2) = 2, "int64 max is 2 above -1");
+        assertTrue(pair(2, 3, 9223372036854775808, 9223372036854775807) = 9223372036854775807, "int64 largest above smallest");
+        assertTrue(pair(2, 4, 18446744073709551613, 4) = 18446744073709551604, "int64 -3 * 4");
+        assertTrue(pair(2, 1, 9223372036854775807, 1) = 9223372036854775808, "int64 sum wraps to the smallest");
+        assertTrue(pair(2, 1, 5, 7) = 12, "int64 sum");
+        assertTrue(pair(2, 4, 5, 7) = 35, "int64 product");
+        return nil;
+    end;
+
+    function testLogicalAndBitwise(): Unit is
+        assertTrue(pair(3, 5, 5, 0) = 0, "5 and 0");
+        assertTrue(pair(3, 5, 5, 3) = 1, "5 and 3");
+        assertTrue(pair(3, 6, 0, 0) = 0, "0 or 0");
+        assertTrue(pair(3, 6, 0, 7) = 1, "0 or 7");
+        assertTrue(pair(3, 7, 5, 3) = 0, "5 xor 3 as truth");
+        assertTrue(pair(3, 7, 5, 0) = 1, "5 xor 0 as truth");
+        assertTrue(pair(4, 5, 4294967296, 1) = 1, "a high bit is true");
+        assertTrue(pair(2, 8, 12, 10) = 8, "bitwise and");
+        assertTrue(pair(2, 9, 12, 10) = 14, "bitwise or");
+        assertTrue(pair(2, 10, 12, 10) = 6, "bitwise xor");
+        assertTrue(pair(1, 10, 4294967295, 1) = 4294967294, "int32 bitwise xor");
+        assertTrue(pair(0, 8, 255, 15) = 15, "byte and");
+        assertTrue(pair(0, 9, 240, 15) = 255, "byte or");
+        assertTrue(pair(0, 10, 255, 15) = 240, "byte xor");
+        return nil;
+    end;
+
+    function testFloats(): Unit is
+        assertTrue(pair(6, 1, float64Bits(1.5), float64Bits(2.25)) = float64Bits(3.75), "float64 sum");
+        assertTrue(pair(6, 4, float64Bits(1.5), float64Bits(4.0)) = float64Bits(6.0), "float64 product");
+        assertTrue(pair(6, 2, float64Bits(1.5), float64Bits(-2.0)) = float64Bits(-2.0), "float64 min");
+        assertTrue(pair(6, 3, float64Bits(1.5), float64Bits(-2.0)) = float64Bits(1.5), "float64 max");
+        let a: Float32 := 1.5;
+        let b: Float32 := 2.25;
+        let c: Float32 := 3.75;
+        let d: Float32 := -2.0;
+        let e: Float32 := 3.375;
+        assertTrue(pair(5, 1, widen32(float32Bits(a)), widen32(float32Bits(b))) = widen32(float32Bits(c)), "float32 sum");
+        assertTrue(pair(5, 4, widen32(float32Bits(a)), widen32(float32Bits(b))) = widen32(float32Bits(e)), "float32 product");
+        assertTrue(pair(5, 2, widen32(float32Bits(a)), widen32(float32Bits(d))) = widen32(float32Bits(d)), "float32 min");
+        assertTrue(pair(5, 3, widen32(float32Bits(a)), widen32(float32Bits(d))) = widen32(float32Bits(a)), "float32 max");
+        return nil;
+    end;
+
+    function widen32(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("a number");
+        end case;
+    end;
+
+    function testManyElements(): Unit is
+        var first: StringBuilder := makeStringBuilder();
+        var second: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 4 do
+            let x: String := le(10, 4);
+            let y: String := le(3, 4);
+            writeString(&!first, asSpan(&x));
+            writeString(&!second, asSpan(&y));
+            destroyString(x);
+            destroyString(y);
+            i := i + 1;
+        end while;
+        let a: String := finalize(first);
+        let b: String := finalize(second);
+        case combine(3, 1, asSpan(&a), asSpan(&b)) of
+            when Left(left as code: Int32) do
+                assertTrue(false, "four elements combine");
+            when Right(right as out: String) do
+                assertTrue(length(&out) = 16, "four elements out");
+                assertTrue((nthByte(&out, 0) = 13) and (nthByte(&out, 12) = 13), "each element 10 + 3");
+                destroyString(out);
+        end case;
+        destroyString(a);
+        destroyString(b);
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        assertTrue(refused(0, 1, "ab", "cd"), "bytes have no sum");
+        assertTrue(refused(6, 8, "abcdefgh", "abcdefgh"), "floats have no bitwise and");
+        assertTrue(refused(1, 0, "abcd", "abcd"), "no reduction");
+        assertTrue(refused(7, 1, "abcd", "abcd"), "a type that does not exist");
+        assertTrue(refused(1, 1, "abcd", "abcdefgh"), "lengths differ");
+        assertTrue(refused(1, 1, "abc", "abc"), "no whole element");
+        assertTrue(refused(2, 1, "abcdefghi", "abcdefghi"), "no whole element of eight bytes");
+        return nil;
+    end;
+    function hexDigit(byte: Nat8): Nat8 is
+        if (byte >= 48) and (byte <= 57) then
+            return byte - 48;
+        end if;
+        return (byte - 97) + 10;
+    end;
+
+    function digitValue(byte: Nat8): Index is
+        case toIndex(byte - 48) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("a digit did not fit an Index");
+        end case;
+    end;
+
+    -- The bytes a line of the vector file spells: pairs of digits behind
+    -- blanks, and hh*n for n times the byte.
+    generic [R: Region]
+    function decodeHex(text: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] = 32 then
+                i := i + 1;
+            else
+                let byte: Nat8 := (hexDigit(text[i]) * 16) + hexDigit(text[i + 1]);
+                i := i + 2;
+                var times: Index := 1;
+                if (i < spanLength(text)) and (text[i] = 42) then
+                    i := i + 1;
+                    times := 0;
+                    while (i < spanLength(text)) and (text[i] /= 32) do
+                        times := (times * 10) + digitValue(text[i]);
+                        i := i + 1;
+                    end while;
+                end if;
+                var k: Index := 0;
+                while k < times do
+                    writeByte(&!out, byte);
+                    k := k + 1;
+                end while;
+            end if;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function decimal(text: Span[Nat8, R]): Nat8 is
+        var value: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            value := (value * 10) + digitValue(text[i]);
+            i := i + 1;
+        end while;
+        case toNat8(value) of
+            when Some(value as at: Nat8) do
+                return at;
+            when None do
+                abort("a number did not fit a Nat8");
+        end case;
+    end;
+
+    function readVectors(): String is
+        case openRead("docs/sperli-vectors.txt") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var text: String := fromLiteral("");
+                case readAll(&!file) of
+                    when Some(value as read: String) do
+                        destroyString(text);
+                        text := read;
+                    when None do
+                        skip;
+                end case;
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return fromLiteral("");
+        end case;
+    end;
+
+    generic [R: Region]
+    function lineHas(text: &[String, R], start: Index, final: Index, prefix: Span[Nat8, Static]): Bool is
+        return startsWith(getSpan(text, start, final), prefix);
+    end;
+
+    function testVectorFile(): Unit is
+        let text: String := readVectors();
+        assertTrue(length(&text) > 0, "the vector file was read");
+        var reduceRecord: Bool := false;
+        var accepted: Bool := false;
+        var elementType: Nat8 := 0;
+        var reduction: Nat8 := 0;
+        var firstBytes: String := fromLiteral("");
+        var secondBytes: String := fromLiteral("");
+        var checked: Index := 0;
+        var lineStart: Index := 0;
+        while lineStart < length(&text) do
+            var lineEnd: Index := lineStart;
+            while (lineEnd < length(&text)) and (nthByte(&text, lineEnd) /= 10) do
+                lineEnd := lineEnd + 1;
+            end while;
+            if lineEnd > lineStart then
+                let last: Index := lineEnd - 1;
+                if lineHas(&text, lineStart, last, "name: ") then
+                    reduceRecord := false;
+                end if;
+                if lineHas(&text, lineStart, last, "kind: reduce") then
+                    reduceRecord := true;
+                end if;
+                if lineHas(&text, lineStart, last, "expect: ") then
+                    accepted := lineHas(&text, lineStart, last, "expect: ok");
+                end if;
+                if lineHas(&text, lineStart, last, "type: ") then
+                    elementType := decimal(getSpan(&text, lineStart + 6, last));
+                end if;
+                if lineHas(&text, lineStart, last, "reduction: ") then
+                    reduction := decimal(getSpan(&text, lineStart + 11, last));
+                end if;
+                if lineHas(&text, lineStart, last, "first: ") then
+                    destroyString(firstBytes);
+                    firstBytes := decodeHex(getSpan(&text, lineStart + 7, last));
+                end if;
+                if lineHas(&text, lineStart, last, "second: ") then
+                    destroyString(secondBytes);
+                    secondBytes := decodeHex(getSpan(&text, lineStart + 8, last));
+                end if;
+                if lineHas(&text, lineStart, last, "hex:") and reduceRecord then
+                    var wanted: String := fromLiteral("");
+                    if last >= (lineStart + 5) then
+                        destroyString(wanted);
+                        wanted := decodeHex(getSpan(&text, lineStart + 5, last));
+                    end if;
+                    case combine(elementType, reduction, asSpan(&firstBytes), asSpan(&secondBytes)) of
+                        when Left(left as code: Int32) do
+                            assertTrue((not accepted) and (code = badCollective()), "a refused record is refused with H1618");
+                        when Right(right as out: String) do
+                            assertTrue(accepted and equal(asSpan(&out), asSpan(&wanted)), "an accepted record gives the result of the file");
+                            destroyString(out);
+                    end case;
+                    destroyString(wanted);
+                    checked := checked + 1;
+                end if;
+            end if;
+            lineStart := lineEnd + 1;
+        end while;
+        assertTrue(checked = 23, "twenty-three reduce records of the file were checked");
+        destroyString(firstBytes);
+        destroyString(secondBytes);
+        destroyString(text);
+        return nil;
+    end;
+end module body.

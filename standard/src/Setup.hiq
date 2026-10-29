@@ -1,0 +1,527 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: the words are declared with Standard.Arguments and run
+-- on Standard.Vault and Standard.Users, a secret read with Standard.Secret.
+import Standard.Buffer (
+    Buffer,
+    destroyEmpty as destroyEmptyBuffer,
+    length as bufferLength,
+    removeFirst
+);
+import Standard.String (
+    String,
+    destroyString,
+    destroyWiped,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    formatNat
+);
+import Standard.Arguments (
+    Command,
+    Matches,
+    FlagKey,
+    PathKey,
+    PositionalKey,
+    SubcommandKey,
+    Shell,
+    Bash,
+    Zsh,
+    Fish,
+    makeCommand,
+    option,
+    addFlag,
+    addPositional,
+    addPositionalPath,
+    addSubcommand,
+    requireSubcommand,
+    flagCount,
+    positionalOf,
+    pathOf,
+    chosen,
+    manPage,
+    completionScript
+);
+import Standard.Vault (
+    Vault,
+    VaultError,
+    describeVaultError,
+    createPepper,
+    createKey,
+    openVault,
+    closeVault,
+    setSecret,
+    getSecret,
+    deleteSecret,
+    secretNames,
+    rotateKey,
+    rotatePepper
+);
+import Standard.Secret (
+    Secret,
+    SecretError,
+    NoTerminal,
+    TooLong,
+    Empty,
+    Mismatch,
+    Failed,
+    readSecret,
+    readNewSecret,
+    readSecretFromInput,
+    secretBytes,
+    destroySecret
+);
+import Standard.Users (
+    UserStore,
+    UserError,
+    BadName,
+    BadPassword,
+    BadClient,
+    BadTime,
+    HashFailed,
+    StorageFailed,
+    addUser,
+    deleteUser,
+    setPassword,
+    listUsers,
+    destroyUserNames
+);
+
+import Standard.Doctor (
+    Checkup,
+    addResult,
+    expectFile
+);
+
+module body Standard.Setup is
+    -- prefix, then each part in turn.
+    generic [X: Region, N: Region]
+    function joined(prefix: Span[Nat8, X], middle: Span[Nat8, Static], name: Span[Nat8, N], ending: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, prefix);
+        writeString(&!out, middle);
+        writeString(&!out, name);
+        writeString(&!out, ending);
+        return finalize(out);
+    end;
+
+    generic [R: Region, C: Region, N: Region, D: Region, S: Region, X: Region]
+    function addInstallFiles(checkup: &![Checkup, R], command: &[Command, C], name: Span[Nat8, N], date: Span[Nat8, D], system: Span[Nat8, S], prefix: Span[Nat8, X]): Unit is
+        let bash: String := joined(prefix, "/share/bash-completion/completions/", name, "");
+        expectFile(&~checkup, asSpan(&bash), completionScript(command, Bash()), 420);
+        destroyString(bash);
+        let zsh: String := joined(prefix, "/share/zsh/site-functions/_", name, "");
+        expectFile(&~checkup, asSpan(&zsh), completionScript(command, Zsh()), 420);
+        destroyString(zsh);
+        let fish: String := joined(prefix, "/share/fish/vendor_completions.d/", name, ".fish");
+        expectFile(&~checkup, asSpan(&fish), completionScript(command, Fish()), 420);
+        destroyString(fish);
+        var manual: String := joined(prefix, "/share/man/man1/", name, ".1");
+        if equal(system, "openbsd") or equal(system, "freebsd") then
+            destroyString(manual);
+            manual := joined(prefix, "/man/man1/", name, ".1");
+        end if;
+        expectFile(&~checkup, asSpan(&manual), manPage(command, date), 420);
+        destroyString(manual);
+        return nil;
+    end;
+
+    generic [R: Region, E: Region, P: Region, K: Region, F: Region]
+    function checkVault(checkup: &![Checkup, R], envPath: Span[Nat8, E], pepperPath: Span[Nat8, P], keyName: Span[Nat8, K], fix: Span[Nat8, F]): Unit is
+        case openVault(envPath, pepperPath, keyName) of
+            when Right(right as opened: Vault) do
+                closeVault(opened);
+                addResult(&~checkup, "vault", envPath, true, "", "");
+            when Left(left as error: VaultError) do
+                let reason: String := describeVaultError(error);
+                addResult(&~checkup, "vault", envPath, false, asSpan(&reason), fix);
+                destroyString(reason);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function addSetup(root: &![Command, R]): SetupKeys is
+        var setup: Command := makeCommand("setup", "Set up the vault of secrets, the completion and the manual");
+        var initVault: Command := makeCommand("init", "Make the pepper and the key of the vault");
+        var set: Command := makeCommand("set", "Store a secret, read without echo");
+        let setName: PositionalKey := addPositional(&!set, "name", "The name of the secret", true, false);
+        let fromInput: FlagKey := addFlag(&!set, option("password-stdin", 0, "Read the secret from standard input"));
+        var get: Command := makeCommand("get", "Print a secret");
+        let getName: PositionalKey := addPositional(&!get, "name", "The name of the secret", true, false);
+        var delete: Command := makeCommand("delete", "Remove a secret");
+        let deleteName: PositionalKey := addPositional(&!delete, "name", "The name of the secret", true, false);
+        let list: Command := makeCommand("list", "Print the names of the secrets");
+        let rotateKey: Command := makeCommand("rotate-key", "Seal every secret under a new key");
+        var rotatePepper: Command := makeCommand("rotate-pepper", "Seal every secret under a new pepper");
+        let newPepper: PathKey := addPositionalPath(&!rotatePepper, "pepper", "Where the new pepper goes, the old path when not given", false, false);
+        var completion: Command := makeCommand("completion", "Print the completion script of bash, zsh or fish");
+        let shell: PositionalKey := addPositional(&!completion, "shell", "bash, zsh or fish", true, false);
+        let manual: Command := makeCommand("manual", "Print the manual page");
+        let initKey: SubcommandKey := addSubcommand(&!setup, initVault);
+        let setKey: SubcommandKey := addSubcommand(&!setup, set);
+        let getKey: SubcommandKey := addSubcommand(&!setup, get);
+        let deleteKey: SubcommandKey := addSubcommand(&!setup, delete);
+        let listKey: SubcommandKey := addSubcommand(&!setup, list);
+        let rotateKeyKey: SubcommandKey := addSubcommand(&!setup, rotateKey);
+        let rotatePepperKey: SubcommandKey := addSubcommand(&!setup, rotatePepper);
+        let completionKey: SubcommandKey := addSubcommand(&!setup, completion);
+        let manualKey: SubcommandKey := addSubcommand(&!setup, manual);
+        requireSubcommand(&!setup);
+        let setupKey: SubcommandKey := addSubcommand(&~root, setup);
+        return SetupKeys(setup => setupKey, initVault => initKey, set => setKey, get => getKey, delete => deleteKey,
+            list => listKey, rotateKey => rotateKeyKey, rotatePepper => rotatePepperKey, completion => completionKey,
+            manual => manualKey, setName => setName, getName => getName, deleteName => deleteName,
+            newPepper => newPepper, shell => shell, fromInput => fromInput);
+    end;
+
+    generic [R: Region]
+    function addUserCommands(root: &![Command, R]): UserKeys is
+        var user: Command := makeCommand("user", "Manage the users");
+        var add: Command := makeCommand("add", "Add a user, the password read without echo");
+        let addName: PositionalKey := addPositional(&!add, "name", "The name of the user", true, false);
+        let fromInput: FlagKey := addFlag(&!add, option("password-stdin", 0, "Read the password from standard input"));
+        var del: Command := makeCommand("del", "Remove a user");
+        let delName: PositionalKey := addPositional(&!del, "name", "The name of the user", true, false);
+        var passwd: Command := makeCommand("passwd", "Set the password of a user");
+        let passwdName: PositionalKey := addPositional(&!passwd, "name", "The name of the user", true, false);
+        let passwdInput: FlagKey := addFlag(&!passwd, option("password-stdin", 0, "Read the password from standard input"));
+        let list: Command := makeCommand("list", "Print the names of the users");
+        let addKey: SubcommandKey := addSubcommand(&!user, add);
+        let delKey: SubcommandKey := addSubcommand(&!user, del);
+        let passwdKey: SubcommandKey := addSubcommand(&!user, passwd);
+        let listKey: SubcommandKey := addSubcommand(&!user, list);
+        requireSubcommand(&!user);
+        let userKey: SubcommandKey := addSubcommand(&~root, user);
+        return UserKeys(user => userKey, add => addKey, del => delKey, passwd => passwdKey, list => listKey,
+            addName => addName, delName => delName, passwdName => passwdName, fromInput => fromInput,
+            passwdInput => passwdInput);
+    end;
+
+    function secretErrorText(error: SecretError): Span[Nat8, Static] is
+        case error of
+            when NoTerminal do
+                return "there is no terminal to ask; give --password-stdin";
+            when TooLong do
+                return "the line is longer than 1024 bytes";
+            when Empty do
+                return "the line is empty";
+            when Mismatch do
+                return "the two lines differ";
+            when Failed do
+                return "reading failed";
+        end case;
+    end;
+
+    function userErrorText(error: UserError): Span[Nat8, Static] is
+        case error of
+            when BadName do
+                return "not a valid user name";
+            when BadPassword do
+                return "not a valid password";
+            when BadClient do
+                return "not a valid client";
+            when BadTime do
+                return "not a valid time";
+            when HashFailed do
+                return "the password could not be hashed";
+            when StorageFailed do
+                return "the store of users failed";
+        end case;
+    end;
+
+    -- A new secret: one line of standard input with fromInput, else asked
+    -- twice on the terminal.
+    function readNew(fromInput: Bool): Either[SecretError, Secret] is
+        if fromInput then
+            return readSecretFromInput();
+        end if;
+        return readNewSecret("New value: ", "Again: ");
+    end;
+
+    generic [U: Region]
+    function failWith(errors: &![StringBuilder, U], text: Span[Nat8, Static]): Int32 is
+        writeString(&~errors, text);
+        writeByte(&~errors, '\n');
+        return 1;
+    end;
+
+    generic [U: Region]
+    function failVault(errors: &![StringBuilder, U], error: VaultError): Int32 is
+        let text: String := describeVaultError(error);
+        writeString(&~errors, asSpan(&text));
+        writeByte(&~errors, '\n');
+        destroyString(text);
+        return 1;
+    end;
+
+    -- Each name on a line of its own; the names are given back.
+    generic [T: Region]
+    function writeLines(out: &![StringBuilder, T], names: Buffer[String]): Unit is
+        var rest: Buffer[String] := names;
+        while bufferLength(&rest) > 0 do
+            let name: String := removeFirst(&!rest);
+            writeString(&~out, asSpan(&name));
+            writeByte(&~out, '\n');
+            destroyString(name);
+        end while;
+        destroyEmptyBuffer(rest);
+        return nil;
+    end;
+
+    generic [R: Region, M: Region, E: Region, P: Region, K: Region, D: Region, T: Region, U: Region]
+    function runSetup(command: &[Command, R], matches: &[Matches, M], keys: SetupKeys, envPath: Span[Nat8, E], pepperPath: Span[Nat8, P], keyName: Span[Nat8, K], date: Span[Nat8, D], out: &![StringBuilder, T], errors: &![StringBuilder, U]): Int32 is
+        if chosen(matches, keys.completion) then
+            case positionalOf(matches, keys.shell) of
+                when Some(value as shell: &[String, M]) do
+                    if equal(asSpan(shell), "bash") then
+                        return writeScript(command, Bash(), &~out);
+                    else if equal(asSpan(shell), "zsh") then
+                        return writeScript(command, Zsh(), &~out);
+                    else if equal(asSpan(shell), "fish") then
+                        return writeScript(command, Fish(), &~out);
+                    end if;
+                    return failWith(&~errors, "the shell is bash, zsh or fish");
+                when None do
+                    return failWith(&~errors, "the shell is bash, zsh or fish");
+            end case;
+        end if;
+        if chosen(matches, keys.manual) then
+            let page: String := manPage(command, date);
+            writeString(&~out, asSpan(&page));
+            destroyString(page);
+            return 0;
+        end if;
+        if chosen(matches, keys.initVault) then
+            case createPepper(pepperPath) of
+                when Left(left as error: VaultError) do
+                    return failVault(&~errors, error);
+                when Right(right as done: Unit) do
+                    skip;
+            end case;
+            case createKey(envPath, pepperPath, keyName) of
+                when Left(left as error: VaultError) do
+                    return failVault(&~errors, error);
+                when Right(right as done: Unit) do
+                    return 0;
+            end case;
+        end if;
+        case openVault(envPath, pepperPath, keyName) of
+            when Left(left as error: VaultError) do
+                return failVault(&~errors, error);
+            when Right(right as opened: Vault) do
+                var vault: Vault := opened;
+                let status: Int32 := onVault(matches, keys, pepperPath, &!vault, &~out, &~errors);
+                closeVault(vault);
+                return status;
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function writeScript(command: &[Command, R], shell: Shell, out: &![StringBuilder, T]): Int32 is
+        let script: String := completionScript(command, shell);
+        writeString(&~out, asSpan(&script));
+        destroyString(script);
+        return 0;
+    end;
+
+    -- The words of setup that need the open vault.
+    generic [M: Region, P: Region, V: Region, T: Region, U: Region]
+    function onVault(matches: &[Matches, M], keys: SetupKeys, pepperPath: Span[Nat8, P], vault: &![Vault, V], out: &![StringBuilder, T], errors: &![StringBuilder, U]): Int32 is
+        if chosen(matches, keys.set) then
+            case positionalOf(matches, keys.setName) of
+                when Some(value as name: &[String, M]) do
+                    case readNew(flagCount(matches, keys.fromInput) > 0) of
+                        when Left(left as error: SecretError) do
+                            return failWith(&~errors, secretErrorText(error));
+                        when Right(right as secret: Secret) do
+                            let stored: Either[VaultError, Unit] := setSecret(&~vault, asSpan(name), secretBytes(&secret));
+                            destroySecret(secret);
+                            case stored of
+                                when Left(left as error: VaultError) do
+                                    return failVault(&~errors, error);
+                                when Right(right as done: Unit) do
+                                    return 0;
+                            end case;
+                    end case;
+                when None do
+                    return failWith(&~errors, "set needs the name of the secret");
+            end case;
+        else if chosen(matches, keys.get) then
+            case positionalOf(matches, keys.getName) of
+                when Some(value as name: &[String, M]) do
+                    case getSecret(&vault, asSpan(name)) of
+                        when Left(left as error: VaultError) do
+                            return failVault(&~errors, error);
+                        when Right(right as text: String) do
+                            writeString(&~out, asSpan(&text));
+                            writeByte(&~out, '\n');
+                            destroyWiped(text);
+                            return 0;
+                    end case;
+                when None do
+                    return failWith(&~errors, "get needs the name of the secret");
+            end case;
+        else if chosen(matches, keys.delete) then
+            case positionalOf(matches, keys.deleteName) of
+                when Some(value as name: &[String, M]) do
+                    case deleteSecret(&~vault, asSpan(name)) of
+                        when Left(left as error: VaultError) do
+                            return failVault(&~errors, error);
+                        when Right(right as found: Bool) do
+                            if not found then
+                                return failWith(&~errors, "there is no secret of that name");
+                            end if;
+                            return 0;
+                    end case;
+                when None do
+                    return failWith(&~errors, "delete needs the name of the secret");
+            end case;
+        else if chosen(matches, keys.list) then
+            case secretNames(&vault) of
+                when Left(left as error: VaultError) do
+                    return failVault(&~errors, error);
+                when Right(right as names: Buffer[String]) do
+                    writeLines(&~out, names);
+                    return 0;
+            end case;
+        else if chosen(matches, keys.rotateKey) then
+            case rotateKey(&~vault) of
+                when Left(left as error: VaultError) do
+                    return failVault(&~errors, error);
+                when Right(right as count: Index) do
+                    return writeCount(&~out, "secrets sealed under the new key: ", count);
+            end case;
+        else if chosen(matches, keys.rotatePepper) then
+            return rotateTo(matches, keys, pepperPath, &~vault, &~out, &~errors);
+        end if;
+        return failWith(&~errors, "setup needs a word");
+    end;
+
+    generic [T: Region]
+    function writeCount(out: &![StringBuilder, T], text: Span[Nat8, Static], count: Index): Int32 is
+        var wide: Nat64 := 0;
+        case toNat64(count) of
+            when Some(value as w: Nat64) do
+                wide := w;
+            when None do
+                skip;
+        end case;
+        let number: String := formatNat(wide);
+        writeString(&~out, text);
+        writeString(&~out, asSpan(&number));
+        writeByte(&~out, '\n');
+        destroyString(number);
+        return 0;
+    end;
+
+    -- rotate-pepper: to the path given, or to the pepper's own path.
+    generic [M: Region, P: Region, V: Region, T: Region, U: Region]
+    function rotateTo(matches: &[Matches, M], keys: SetupKeys, pepperPath: Span[Nat8, P], vault: &![Vault, V], out: &![StringBuilder, T], errors: &![StringBuilder, U]): Int32 is
+        var result: Either[VaultError, Index] := Right(right => 0);
+        case pathOf(matches, keys.newPepper) of
+            when Some(value as path: &[String, M]) do
+                result := rotatePepper(&~vault, asSpan(path));
+            when None do
+                result := rotatePepper(&~vault, pepperPath);
+        end case;
+        case result of
+            when Left(left as error: VaultError) do
+                return failVault(&~errors, error);
+            when Right(right as count: Index) do
+                return writeCount(&~out, "secrets sealed under the new pepper: ", count);
+        end case;
+    end;
+
+    -- A new password: one line of standard input with fromInput, else
+    -- asked twice on the terminal.
+    function readPassword(fromInput: Bool): Either[SecretError, Secret] is
+        if fromInput then
+            return readSecretFromInput();
+        end if;
+        return readNewSecret("New password: ", "Again: ");
+    end;
+
+    generic [U: Region]
+    function failUser(errors: &![StringBuilder, U], error: UserError): Int32 is
+        return failWith(&~errors, userErrorText(error));
+    end;
+
+    -- The answer of a store that says false when the user was not there,
+    -- or when the name is taken for add.
+    generic [U: Region]
+    function answer(result: Either[UserError, Bool], errors: &![StringBuilder, U], refused: Span[Nat8, Static]): Int32 is
+        case result of
+            when Left(left as error: UserError) do
+                return failUser(&~errors, error);
+            when Right(right as done: Bool) do
+                if not done then
+                    return failWith(&~errors, refused);
+                end if;
+                return 0;
+        end case;
+    end;
+
+    generic [S: Type(UserStore), R: Region, M: Region, T: Region, U: Region]
+    function runUser(matches: &[Matches, M], keys: UserKeys, store: &![S, R], out: &![StringBuilder, T], errors: &![StringBuilder, U]): Int32 is
+        if chosen(matches, keys.list) then
+            case listUsers(&~store) of
+                when Left(left as error: UserError) do
+                    return failUser(&~errors, error);
+                when Right(right as names: Buffer[String]) do
+                    writeLines(&~out, names);
+                    return 0;
+            end case;
+        else if chosen(matches, keys.del) then
+            case positionalOf(matches, keys.delName) of
+                when Some(value as name: &[String, M]) do
+                    return answer(deleteUser(&~store, asSpan(name)), &~errors, "there is no user of that name");
+                when None do
+                    return failWith(&~errors, "del needs the name of the user");
+            end case;
+        else if chosen(matches, keys.add) then
+            case positionalOf(matches, keys.addName) of
+                when Some(value as name: &[String, M]) do
+                    case readPassword(flagCount(matches, keys.fromInput) > 0) of
+                        when Left(left as error: SecretError) do
+                            return failWith(&~errors, secretErrorText(error));
+                        when Right(right as secret: Secret) do
+                            let added: Either[UserError, Bool] := addUser(&~store, asSpan(name), secretBytes(&secret));
+                            destroySecret(secret);
+                            return answer(added, &~errors, "the name is taken");
+                    end case;
+                when None do
+                    return failWith(&~errors, "add needs the name of the user");
+            end case;
+        else if chosen(matches, keys.passwd) then
+            case positionalOf(matches, keys.passwdName) of
+                when Some(value as name: &[String, M]) do
+                    case readPassword(flagCount(matches, keys.passwdInput) > 0) of
+                        when Left(left as error: SecretError) do
+                            return failWith(&~errors, secretErrorText(error));
+                        when Right(right as secret: Secret) do
+                            let changed: Either[UserError, Bool] := setPassword(&~store, asSpan(name), secretBytes(&secret));
+                            destroySecret(secret);
+                            return answer(changed, &~errors, "there is no user of that name");
+                    end case;
+                when None do
+                    return failWith(&~errors, "passwd needs the name of the user");
+            end case;
+        end if;
+        return failWith(&~errors, "user needs a word");
+    end;
+end module body.

@@ -1,0 +1,238 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    length as bufferLength,
+    nth,
+    nthRef,
+    insertBack,
+    storeNth,
+    removeLast,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    substring,
+    split,
+    lines,
+    formatNat
+);
+import Standard.Semver (
+    Version,
+    parseVersion,
+    formatVersion
+);
+import Pkg.Report (
+    Problem,
+    problemOf
+);
+import Pkg.Manifest (
+    isPrefix
+);
+
+module body Pkg.Sum is
+    generic [P: Region, S: Region, K: Region]
+    function makeEntry(prefix: Span[Nat8, P], version: Version, sum: Span[Nat8, S], key: Span[Nat8, K]): SumEntry is
+        return SumEntry(prefix => fromSpan(prefix), version => version, sum => fromSpan(sum), key => fromSpan(key));
+    end;
+
+    function destroyEntry(entry: SumEntry): Unit is
+        let { prefix: String, version: Version, sum: String, key: String } := entry;
+        destroyString(prefix);
+        destroyString(sum);
+        destroyString(key);
+        return nil;
+    end;
+
+    function destroyEntries(entries: Buffer[SumEntry]): Unit is
+        var rest: Buffer[SumEntry] := entries;
+        while bufferLength(&rest) > 0 do
+            destroyEntry(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function prefixOfEntry(entry: &[SumEntry, R]): Span[Nat8, R] is
+        return asSpan(&(entry->prefix));
+    end;
+
+    -- Whether a comes before b, byte by byte, a prefix before the longer.
+    generic [A: Region, B: Region]
+    function before(a: Span[Nat8, A], b: Span[Nat8, B]): Bool is
+        var i: Index := 0;
+        while (i < spanLength(a)) and (i < spanLength(b)) do
+            if a[i] /= b[i] then
+                return a[i] < b[i];
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(a) < spanLength(b);
+    end;
+
+    function lineProblem(line: Index, what: Span[Nat8, Static]): Problem is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "hilde.sum, line ");
+        case toNat64(line) of
+            when Some(value as n: Nat64) do
+                let digits: String := formatNat(n);
+                writeString(&!out, asSpan(&digits));
+                destroyString(digits);
+            when None do
+                abort("Pkg.Sum: a line number did not fit a Nat64");
+        end case;
+        writeString(&!out, ": ");
+        writeString(&!out, what);
+        return problemOf(1514, finalize(out), fromLiteral("hilde get writes hilde.sum; run it again rather than editing the file"));
+    end;
+
+    -- The key of a field key:..., the empty text for a dash.
+    generic [K: Region]
+    function keyOf(field: Span[Nat8, K]): Span[Nat8, K] is
+        let rest: Span[Nat8, K] := substring(field, 4, spanLength(field));
+        if equal(rest, "-") then
+            return substring(field, 0, 0);
+        end if;
+        return rest;
+    end;
+
+    -- The entry of one line, or None when it is not of the form.
+    generic [L: Region]
+    function entryOf(line: Span[Nat8, L]): Option[SumEntry] is
+        let fields: Buffer[Span[Nat8, L]] := split(line, " ");
+        if bufferLength(&fields) /= 4 then
+            destroyFree(fields);
+            return None();
+        end if;
+        let prefix: Span[Nat8, L] := nth(&fields, 0);
+        let version: Span[Nat8, L] := nth(&fields, 1);
+        let sum: Span[Nat8, L] := nth(&fields, 2);
+        let key: Span[Nat8, L] := nth(&fields, 3);
+        destroyFree(fields);
+        if not isPrefix(prefix) then
+            return None();
+        end if;
+        if (not startsWith(sum, "h1:")) or (spanLength(sum) <= 3) then
+            return None();
+        end if;
+        if (not startsWith(key, "key:")) or (spanLength(key) <= 4) then
+            return None();
+        end if;
+        case parseVersion(version) of
+            when Some(value as v: Version) do
+                return Some(value => makeEntry(prefix, v, sum, keyOf(key)));
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region]
+    function readSum(text: Span[Nat8, R]): Either[Problem, Buffer[SumEntry]] is
+        let all: Buffer[Span[Nat8, R]] := lines(text);
+        var out: Buffer[SumEntry] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let line: Span[Nat8, R] := nth(&all, i);
+            if spanLength(line) > 0 then
+                case entryOf(line) of
+                    when Some(value as entry: SumEntry) do
+                        let n: Index := bufferLength(&out);
+                        if (n > 0) and (not before(prefixOfEntry(nthRef(&out, n - 1)), prefixOfEntry(&entry))) then
+                            destroyEntry(entry);
+                            destroyEntries(out);
+                            destroyFree(all);
+                            return Left(left => lineProblem(i + 1, "the prefix is not after the one before it; the lines are sorted and each prefix stands once"));
+                        end if;
+                        insertBack(&!out, entry);
+                    when None do
+                        destroyEntries(out);
+                        destroyFree(all);
+                        return Left(left => lineProblem(i + 1, "the line is not prefix, version, h1: checksum and key: with a key or a dash"));
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return Right(right => out);
+    end;
+
+    generic [R: Region]
+    function formatSum(entries: &[Buffer[SumEntry], R]): String is
+        let n: Index := bufferLength(entries);
+        var done: Buffer[Bool] := initialize(n, false);
+        var out: StringBuilder := makeStringBuilder();
+        var written: Index := 0;
+        while written < n do
+            -- The first of the entries not yet written, by prefix.
+            var best: Index := n;
+            var i: Index := 0;
+            while i < n do
+                if not nth(&done, i) then
+                    if best = n then
+                        best := i;
+                    else if before(prefixOfEntry(nthRef(entries, i)), prefixOfEntry(nthRef(entries, best))) then
+                        best := i;
+                    end if;
+                end if;
+                i := i + 1;
+            end while;
+            storeNth(&!done, best, true);
+            let e: &[SumEntry, R] := nthRef(entries, best);
+            writeString(&!out, asSpan(&(e->prefix)));
+            writeByte(&!out, ' ');
+            let v: String := formatVersion(e->version);
+            writeString(&!out, asSpan(&v));
+            destroyString(v);
+            writeByte(&!out, ' ');
+            writeString(&!out, asSpan(&(e->sum)));
+            writeString(&!out, " key:");
+            if length(&(e->key)) > 0 then
+                writeString(&!out, asSpan(&(e->key)));
+            else
+                writeByte(&!out, '-');
+            end if;
+            writeByte(&!out, '\n');
+            written := written + 1;
+        end while;
+        destroyFree(done);
+        return finalize(out);
+    end;
+
+    generic [R: Region, P: Region]
+    function findEntry(entries: &[Buffer[SumEntry], R], prefix: Span[Nat8, P]): Option[Index] is
+        var i: Index := 0;
+        while i < bufferLength(entries) do
+            if equal(prefixOfEntry(nthRef(entries, i)), prefix) then
+                return Some(value => i);
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+end module body.

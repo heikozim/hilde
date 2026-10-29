@@ -1,0 +1,1017 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Binds libmariadb through the declarations of Bindings.C.Mariadb.  Every
+-- statement is a prepared statement of the binary protocol: the values go
+-- in MYSQL_BIND structures apart from the text, never into it.  The
+-- structures and the option calls of the connection are C, written here
+-- with @embed against mysql.h, which the generated module includes.  It is
+-- an unsafe module for that; Standard.MariaDB is the safe module built on
+-- it.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullPointer,
+    nullCheck,
+    allocateBuffer
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    insertBack,
+    remove,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    storeNth,
+    getSpan,
+    length as stringLength
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    civilAt,
+    instantOf
+);
+import Bindings.C.Mariadb (
+    mysql_get_client_info,
+    MYSQL_NO_DATA,
+    MYSQL_DATA_TRUNCATED,
+    CLIENT_MULTI_STATEMENTS,
+    mysql_next_result,
+    mysql_store_result,
+    mysql_free_result,
+    mysql_errno,
+    mysql_error,
+    mysql_init,
+    mysql_get_ssl_cipher,
+    mysql_real_connect,
+    mysql_close,
+    mysql_real_query,
+    mysql_stmt_init,
+    mysql_stmt_prepare,
+    mysql_stmt_execute,
+    mysql_stmt_fetch,
+    mysql_stmt_fetch_column,
+    mysql_stmt_store_result,
+    mysql_stmt_bind_param,
+    mysql_stmt_bind_result,
+    mysql_stmt_close,
+    mysql_stmt_free_result,
+    mysql_stmt_errno,
+    mysql_stmt_affected_rows,
+    mysql_stmt_field_count
+);
+
+module body Bindings.MariaDB is
+    record Connection: Linear is
+        handle: Address[Unit];
+    end;
+
+    record Transaction: Linear is
+        handle: Address[Unit];
+    end;
+
+    union Value: Linear is
+        case IntValue is
+            value: Int64;
+        case FloatValue is
+            value: Float64;
+        case BoolValue is
+            value: Bool;
+        case TimeValue is
+            value: Int64;
+        case TextValue is
+            value: String;
+        case BytesValue is
+            value: String;
+        case NullValue;
+    end;
+
+    record Values: Linear is
+        items: Buffer[Value];
+    end;
+
+    -- A statement that was run.  statement is null when it could not be
+    -- made; columns is 0 for a statement without rows.  binds, lengths and
+    -- nulls are C arrays of one entry per column, which the fetch fills;
+    -- cells holds, per column, a copy of the bytes of the current row,
+    -- taken at advance, so that a span into it lasts while the row is
+    -- lent; scratch is one MYSQL_BIND and room for one value, for the
+    -- readers of numbers and times.
+    record Cursor: Linear is
+        handle: Address[Unit];
+        statement: Address[Unit];
+        columns: Int32;
+        binds: Address[Unit];
+        lengths: Address[Unit];
+        nulls: Address[Unit];
+        cells: Address[Address[Nat8]];
+        scratch: Address[Unit];
+        row: Bool;
+        failure: Int32;
+        invariant columns >= 0;
+    end;
+
+    constant connectionFailed: Int32 := -1;
+    constant newerDatabase: Int32 := -2;
+    constant tooLarge: Int32 := -3;
+    constant connectionLost: Int32 := -4;
+    constant alreadyInTransaction: Int32 := -5;
+
+    -- 1180 is ER_ERROR_DURING_COMMIT; it stands for a commit refused after
+    -- a statement of the transaction failed, which this module reports.
+    constant failedTransaction: Int32 := 1180;
+
+    ---
+    --- C memory
+    ---
+
+    function isNull(address: Address[Unit]): Bool is
+        return @embed(Bool, "($1 == NULL)", address);
+    end;
+
+    function isNullBytes(address: Address[Nat8]): Bool is
+        return @embed(Bool, "($1 == NULL)", address);
+    end;
+
+    function sameHandle(a: Address[Unit], b: Address[Unit]): Bool is
+        return @embed(Bool, "($1 == $2)", a, b);
+    end;
+
+    generic [R: Region]
+    function containsZero(value: Span[Nat8, R]): Bool is
+        var i: Index := 0;
+        while i < spanLength(value) do
+            if value[i] = 0 then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    function checkMemory(address: Address[Unit]): Unit is
+        if isNull(address) then
+            abort("Standard.MariaDB: out of memory");
+        end if;
+        return nil;
+    end;
+
+    -- size bytes of zeroed C memory, which release frees.
+    function zeroed(size: Index): Address[Unit] is
+        let address: Address[Unit] := @embed(Address[Unit], "hilde_calloc(1, (size_t)$1 + 1)", size);
+        checkMemory(address);
+        return address;
+    end;
+
+    function release(address: Address[Unit]): Unit is
+        @embed(Unit, "hilde_free($1)", address);
+        return nil;
+    end;
+
+    -- A copy of the span with a zero byte after it; freed with wipeAndFree.
+    generic [R: Region]
+    function cCopy(value: Span[Nat8, R]): Address[Nat8] is
+        let size: Index := spanLength(value);
+        let address: Address[Nat8] := @embed(Address[Nat8], "(hilde_nat8_t*)hilde_calloc(1, (size_t)$1 + 1)", size);
+        checkMemory(@embed(Address[Unit], "(void*)$1", address));
+        if size > 0 then
+            @embed(Unit, "memcpy($1, (void*)($2).data, $3)", address, value, size);
+        end if;
+        return address;
+    end;
+
+    function wipeAndFree(address: Address[Nat8]): Unit is
+        @embed(Unit, "hilde_wipe($1, strlen((const char*)$1))", address);
+        @embed(Unit, "hilde_free($1)", address);
+        return nil;
+    end;
+
+    function staticSpan(text: Address[Nat8]): Span[Nat8, Static] is
+        if isNullBytes(text) then
+            return "";
+        end if;
+        return @embed(Span[Nat8, Static], "hilde_make_span((void*)$1, strlen((const char*)$1))", text);
+    end;
+
+    function errnoOf(handle: Address[Unit]): Int32 is
+        return @embed(Int32, "(int32_t)$1", mysql_errno(handle));
+    end;
+
+    function statementErrno(statement: Address[Unit]): Int32 is
+        return @embed(Int32, "(int32_t)$1", mysql_stmt_errno(statement));
+    end;
+
+    ---
+    --- Connecting
+    ---
+
+    -- Run sql, which may hold several statements, to its end, every result
+    -- read and freed.  0, or the error number of the first failure.
+    function runSimple(handle: Address[Unit], text: Address[Nat8]): Int32 is
+        let size: Nat64 := @embed(Nat64, "(uint64_t)strlen((const char*)$1)", text);
+        if mysql_real_query(handle, text, size) /= 0 then
+            return errnoOf(handle);
+        end if;
+        var more: Bool := true;
+        while more do
+            let result: Address[Unit] := mysql_store_result(handle);
+            if not isNull(result) then
+                mysql_free_result(result);
+            else
+                -- No result is a statement without rows only when no error
+                -- is set; otherwise reading the rows failed.
+                let stored: Int32 := errnoOf(handle);
+                if stored /= 0 then
+                    return stored;
+                end if;
+            end if;
+            let next: Int32 := mysql_next_result(handle);
+            if next > 0 then
+                return errnoOf(handle);
+            end if;
+            more := next = 0;
+        end while;
+        return 0;
+    end;
+
+    function runStatic(handle: Address[Unit], sql: Span[Nat8, Static]): Int32 is
+        let text: Address[Nat8] := cCopy(sql);
+        let failure: Int32 := runSimple(handle, text);
+        @embed(Unit, "hilde_free($1)", text);
+        return failure;
+    end;
+
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function connect(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F], readOnly: Bool): Either[MariaError, Connection] is
+        -- libmariadb ends each value at a zero byte, so a value holding one
+        -- would be cut short without a word.  It is refused here.
+        let zeros: Bool := (containsZero(host) or containsZero(database)) or (containsZero(user) or containsZero(password));
+        if zeros or containsZero(caFile) then
+            return Left(left => MariaError(code => connectionFailed));
+        end if;
+        let none: Address[Unit] := nullPointer();
+        let handle: Address[Unit] := mysql_init(none);
+        checkMemory(handle);
+        let ca: Address[Nat8] := cCopy(caFile);
+        -- TLS is required, the certificate verified against the CA file,
+        -- its name included, and a connection gives up after ten seconds.
+        -- Each answer is held to 0 or 1 before it is counted, so that no two
+        -- failures can add up to success.
+        var options: Int32 := @embed(Int32, "(mysql_options((MYSQL*)$1, MYSQL_OPT_SSL_CA, (const void*)$2) != 0)", handle, ca);
+        options := options + @embed(Int32, "(mysql_options((MYSQL*)$1, MYSQL_OPT_SSL_ENFORCE, &(my_bool){1}) != 0)", handle);
+        options := options + @embed(Int32, "(mysql_options((MYSQL*)$1, MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &(my_bool){1}) != 0)", handle);
+        options := options + @embed(Int32, "(mysql_options((MYSQL*)$1, MYSQL_OPT_CONNECT_TIMEOUT, &(unsigned int){10}) != 0)", handle);
+        let hostText: Address[Nat8] := cCopy(host);
+        let userText: Address[Nat8] := cCopy(user);
+        let secret: Address[Nat8] := cCopy(password);
+        let base: Address[Nat8] := cCopy(database);
+        let noSocket: Address[Nat8] := nullPointer();
+        let portNumber: Nat32 := @embed(Nat32, "(uint32_t)$1", port);
+        let connected: Address[Unit] := mysql_real_connect(handle, hostText, userText, secret, base, portNumber, noSocket, CLIENT_MULTI_STATEMENTS);
+        wipeAndFree(secret);
+        wipeAndFree(hostText);
+        wipeAndFree(userText);
+        wipeAndFree(base);
+        wipeAndFree(ca);
+        if (options /= 0) or isNull(connected) then
+            mysql_close(handle);
+            return Left(left => MariaError(code => connectionFailed));
+        end if;
+        var failure: Int32 := runStatic(handle, "SET time_zone = '+00:00'");
+        if (failure = 0) and readOnly then
+            failure := runStatic(handle, "SET SESSION TRANSACTION READ ONLY");
+        end if;
+        if failure /= 0 then
+            mysql_close(handle);
+            return Left(left => MariaError(code => failure));
+        end if;
+        return Right(right => Connection(handle => handle));
+    end;
+
+    function closeDatabase(db: Connection): Unit is
+        let { handle: Address[Unit] } := db;
+        mysql_close(handle);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function lastMessage(db: &[Connection, R]): String is
+        return copyText(staticSpan(mysql_error(db->handle)));
+    end;
+
+    generic [R: Region]
+    function usesTls(db: &[Connection, R]): Bool is
+        return not isNullBytes(mysql_get_ssl_cipher(db->handle));
+    end;
+
+    ---
+    --- Values
+    ---
+
+    function noValues(): Values is
+        let items: Buffer[Value] := allocateEmpty();
+        return Values(items => items);
+    end;
+
+    function withValue(values: Values, value: Value): Values is
+        let { items: Buffer[Value] } := values;
+        var list: Buffer[Value] := items;
+        insertBack(&!list, value);
+        return Values(items => list);
+    end;
+
+    function withInt64(values: Values, value: Int64): Values is
+        return withValue(values, IntValue(value => value));
+    end;
+
+    function withFloat64(values: Values, value: Float64): Values is
+        return withValue(values, FloatValue(value => value));
+    end;
+
+    function withBool(values: Values, value: Bool): Values is
+        return withValue(values, BoolValue(value => value));
+    end;
+
+    function withTimestamp(values: Values, value: Int64): Values is
+        return withValue(values, TimeValue(value => value));
+    end;
+
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values is
+        return withValue(values, TextValue(value => copyText(value)));
+    end;
+
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values is
+        return withValue(values, BytesValue(value => copyText(value)));
+    end;
+
+    function withNull(values: Values): Values is
+        return withValue(values, NullValue());
+    end;
+
+    function dropValues(values: Values): Unit is
+        let { items: Buffer[Value] } := values;
+        var list: Buffer[Value] := items;
+        while bufferLength(&list) > 0 do
+            dropValue(remove(&!list, 0));
+        end while;
+        destroyEmpty(list);
+        return nil;
+    end;
+
+    function dropValue(item: Value): Unit is
+        case item of
+            when TextValue(value as s: String) do
+                destroyString(s);
+            when BytesValue(value as s: String) do
+                destroyString(s);
+            when IntValue(value as v: Int64) do
+                skip;
+            when FloatValue(value as v: Float64) do
+                skip;
+            when BoolValue(value as v: Bool) do
+                skip;
+            when TimeValue(value as v: Int64) do
+                skip;
+            when NullValue do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index is
+        return bufferLength(&(values->items));
+    end;
+
+    -- The UTC date and time of microseconds since 1970 into the MYSQL_TIME
+    -- at target; false when it lies outside the years 0 to 9999.
+    function putTime(target: Address[Unit], micros: Int64): Bool is
+        let million: Int64 := 1000000;
+        var seconds: Int64 := micros / million;
+        var rest: Int64 := micros - (seconds * million);
+        if rest < 0 then
+            seconds := seconds - 1;
+            rest := rest + million;
+        end if;
+        let thousand: Int64 := 1000;
+        let nanos: Nat32 := @embed(Nat32, "(uint32_t)($1 * $2)", rest, thousand);
+        case civilAt(Instant(seconds => seconds, nanos => nanos), 0) of
+            when Some(value as civil: Civil) do
+                @embed(Unit, "(*(MYSQL_TIME*)$1 = (MYSQL_TIME){ .year = (unsigned)$2, .month = $3, .day = $4, .hour = $5, .minute = $6, .second = $7, .second_part = (unsigned long)$8, .neg = 0, .time_type = MYSQL_TIMESTAMP_DATETIME })",
+                    target, civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second, rest);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The MYSQL_TIME at source as microseconds since 1970, read as UTC.
+    function takeTime(source: Address[Unit]): Int64 is
+        let civil: Civil := Civil(
+            year => @embed(Int32, "(int32_t)((MYSQL_TIME*)$1)->year", source),
+            month => @embed(Nat8, "(hilde_nat8_t)((MYSQL_TIME*)$1)->month", source),
+            day => @embed(Nat8, "(hilde_nat8_t)((MYSQL_TIME*)$1)->day", source),
+            hour => @embed(Nat8, "(hilde_nat8_t)((MYSQL_TIME*)$1)->hour", source),
+            minute => @embed(Nat8, "(hilde_nat8_t)((MYSQL_TIME*)$1)->minute", source),
+            second => @embed(Nat8, "(hilde_nat8_t)((MYSQL_TIME*)$1)->second", source),
+            nanos => 0
+        );
+        let micros: Int64 := @embed(Int64, "(int64_t)((MYSQL_TIME*)$1)->second_part", source);
+        case instantOf(civil, 0) of
+            when Some(value as instant: Instant) do
+                let million: Int64 := 1000000;
+                return (instant.seconds * million) + micros;
+            when None do
+                abort("Standard.MariaDB: the server sent a date that does not exist");
+        end case;
+    end;
+
+    ---
+    --- Running a statement
+    ---
+
+    -- The parameters as MYSQL_BIND structures, each value in C memory of
+    -- its own listed in memory, which the caller frees after the execute.
+    -- 0, or tooLarge for a value of 2 GiB or more.
+    generic [R: Region]
+    function bindAll(binds: Address[Unit], values: Values, memory: &![Buffer[Address[Unit]], R]): Int32 is
+        let { items: Buffer[Value] } := values;
+        var list: Buffer[Value] := items;
+        var failure: Int32 := 0;
+        var i: Index := 0;
+        while bufferLength(&list) > 0 do
+            case remove(&!list, 0) of
+                when IntValue(value as v: Int64) do
+                    let cell: Address[Unit] := zeroed(8);
+                    @embed(Unit, "(*(int64_t*)$1 = $2)", cell, v);
+                    setBind(binds, i, @embed(Int32, "MYSQL_TYPE_LONGLONG"), cell, 8);
+                    insertBack(&~memory, cell);
+                when FloatValue(value as v: Float64) do
+                    let cell: Address[Unit] := zeroed(8);
+                    @embed(Unit, "(*(double*)(void*)$1 = $2)", cell, v);
+                    setBind(binds, i, @embed(Int32, "MYSQL_TYPE_DOUBLE"), cell, 8);
+                    insertBack(&~memory, cell);
+                when BoolValue(value as v: Bool) do
+                    let cell: Address[Unit] := zeroed(1);
+                    @embed(Unit, "(*(signed char*)$1 = ($2) ? 1 : 0)", cell, v);
+                    setBind(binds, i, @embed(Int32, "MYSQL_TYPE_TINY"), cell, 1);
+                    insertBack(&~memory, cell);
+                when TimeValue(value as v: Int64) do
+                    let cell: Address[Unit] := zeroed(@embed(Index, "sizeof(MYSQL_TIME)"));
+                    if not putTime(cell, v) then
+                        abort("Standard.MariaDB: a timestamp outside the years 0 to 9999");
+                    end if;
+                    setBind(binds, i, @embed(Int32, "MYSQL_TYPE_DATETIME"), cell, @embed(Index, "sizeof(MYSQL_TIME)"));
+                    insertBack(&~memory, cell);
+                when TextValue(value as s: String) do
+                    failure := bindBytes(binds, i, @embed(Int32, "MYSQL_TYPE_STRING"), s, &~memory, failure);
+                when BytesValue(value as s: String) do
+                    failure := bindBytes(binds, i, @embed(Int32, "MYSQL_TYPE_BLOB"), s, &~memory, failure);
+                when NullValue do
+                    let none: Address[Unit] := nullPointer();
+                    setBind(binds, i, @embed(Int32, "MYSQL_TYPE_NULL"), none, 0);
+            end case;
+            i := i + 1;
+        end while;
+        destroyEmpty(list);
+        return failure;
+    end;
+
+    generic [R: Region]
+    function bindBytes(binds: Address[Unit], i: Index, kind: Int32, text: String, memory: &![Buffer[Address[Unit]], R], failure: Int32): Int32 is
+        let size: Index := stringLength(&text);
+        let cell: Address[Unit] := zeroed(size);
+        if size > 0 then
+            @embed(Unit, "memcpy($1, (void*)($2).data, $3)", cell, bytesOf(&text), size);
+        end if;
+        destroyString(text);
+        setBind(binds, i, kind, cell, size);
+        insertBack(&~memory, cell);
+        if size >= 2147483648 then
+            return tooLarge;
+        end if;
+        return failure;
+    end;
+
+    generic [R: Region]
+    function bytesOf(text: &[String, R]): Span[Nat8, R] is
+        let size: Index := stringLength(text);
+        if size = 0 then
+            return @embed(Span[Nat8, R], "hilde_make_span((void*)\"\", 0)");
+        end if;
+        return getSpan(text, 0, size - 1);
+    end;
+
+    function setBind(binds: Address[Unit], i: Index, kind: Int32, buffer: Address[Unit], size: Index): Unit is
+        @embed(Unit, "(((MYSQL_BIND*)$1)[$2].buffer_type = (enum enum_field_types)$3)", binds, i, kind);
+        @embed(Unit, "(((MYSQL_BIND*)$1)[$2].buffer = $3)", binds, i, buffer);
+        @embed(Unit, "(((MYSQL_BIND*)$1)[$2].buffer_length = (unsigned long)$3)", binds, i, size);
+        return nil;
+    end;
+
+    function freeAll(memory: Buffer[Address[Unit]]): Unit is
+        var list: Buffer[Address[Unit]] := memory;
+        while bufferLength(&list) > 0 do
+            release(remove(&!list, 0));
+        end while;
+        destroyEmpty(list);
+        return nil;
+    end;
+
+    function failedCursor(handle: Address[Unit], statement: Address[Unit], failure: Int32): Cursor is
+        let none: Address[Unit] := nullPointer();
+        let noCells: Address[Address[Nat8]] := nullPointer();
+        let zero: Int32 := 0;
+        return Cursor(handle => handle, statement => statement, columns => zero, binds => none, lengths => none, nulls => none,
+            cells => noCells, scratch => none, row => false, failure => failure);
+    end;
+
+    -- Prepare sql on statement; 0 or the error number of the statement.
+    generic [S: Region]
+    function prepare(statement: Address[Unit], sql: Span[Nat8, S]): Int32 is
+        let text: Address[Nat8] := cCopy(sql);
+        let size: Nat64 := @embed(Nat64, "(uint64_t)$1", spanLength(sql));
+        let prepared: Int32 := mysql_stmt_prepare(statement, text, size);
+        @embed(Unit, "hilde_free($1)", text);
+        if prepared /= 0 then
+            return statementErrno(statement);
+        end if;
+        return 0;
+    end;
+
+    -- Bind values to the prepared statement and execute it; 0 or the error
+    -- number.  The values are consumed in every case.
+    function bindAndExecute(statement: Address[Unit], values: Values): Int32 is
+        let count: Index := valueCount(&values);
+        let binds: Address[Unit] := zeroed(@embed(Index, "(sizeof(MYSQL_BIND) * ((size_t)$1 + 1))", count));
+        var memory: Buffer[Address[Unit]] := allocateEmpty();
+        var failure: Int32 := bindAll(binds, values, &!memory);
+        if (failure = 0) and (count > 0) then
+            if mysql_stmt_bind_param(statement, binds) /= 0 then
+                failure := statementErrno(statement);
+            end if;
+        end if;
+        if failure = 0 then
+            if mysql_stmt_execute(statement) /= 0 then
+                failure := statementErrno(statement);
+            end if;
+        end if;
+        freeAll(memory);
+        release(binds);
+        return failure;
+    end;
+
+    generic [S: Region]
+    function run(handle: Address[Unit], sql: Span[Nat8, S], values: Values): Cursor is
+        let statement: Address[Unit] := mysql_stmt_init(handle);
+        var failure: Int32 := 0;
+        if isNull(statement) then
+            failure := errnoOf(handle);
+        else
+            failure := prepare(statement, sql);
+        end if;
+        if failure /= 0 then
+            dropValues(values);
+        else
+            failure := bindAndExecute(statement, values);
+        end if;
+        if failure /= 0 then
+            return failedCursor(handle, statement, failure);
+        end if;
+        let columns: Int32 := @embed(Int32, "(int32_t)$1", mysql_stmt_field_count(statement));
+        if columns = 0 then
+            return failedCursor(handle, statement, 0);
+        end if;
+        if mysql_stmt_store_result(statement) /= 0 then
+            return failedCursor(handle, statement, statementErrno(statement));
+        end if;
+        let columnCountIndex: Index := @embed(Index, "(size_t)$1", columns);
+        let results: Address[Unit] := zeroed(@embed(Index, "(sizeof(MYSQL_BIND) * (size_t)$1)", columnCountIndex));
+        let lengths: Address[Unit] := zeroed(@embed(Index, "(sizeof(unsigned long) * (size_t)$1)", columnCountIndex));
+        let nulls: Address[Unit] := zeroed(@embed(Index, "(sizeof(my_bool) * (size_t)$1)", columnCountIndex));
+        let cells: Address[Address[Nat8]] := @embed(Address[Address[Nat8]], "(hilde_nat8_t**)hilde_calloc((size_t)$1, sizeof(hilde_nat8_t*))", columnCountIndex);
+        checkMemory(@embed(Address[Unit], "(void*)$1", cells));
+        let scratch: Address[Unit] := zeroed(@embed(Index, "(sizeof(MYSQL_BIND) + 64)"));
+        var i: Index := 0;
+        while i < columnCountIndex do
+            @embed(Unit, "(((MYSQL_BIND*)$1)[$2].length = &((unsigned long*)$3)[$2])", results, i, lengths);
+            @embed(Unit, "(((MYSQL_BIND*)$1)[$2].is_null = &((my_bool*)$3)[$2])", results, i, nulls);
+            i := i + 1;
+        end while;
+        var bindFailure: Int32 := 0;
+        if mysql_stmt_bind_result(statement, results) /= 0 then
+            bindFailure := statementErrno(statement);
+        end if;
+        return Cursor(handle => handle, statement => statement, columns => columns, binds => results, lengths => lengths,
+            nulls => nulls, cells => cells, scratch => scratch, row => false, failure => bindFailure);
+    end;
+
+    generic [R: Region, S: Region]
+    function start(db: &![Connection, R], sql: Span[Nat8, S], values: Values): Cursor is
+        return run(db->handle, sql, values);
+    end;
+
+    generic [R: Region]
+    function failureOf(cursor: &[Cursor, R]): Int32 is
+        return cursor->failure;
+    end;
+
+    generic [R: Region]
+    function statementOf(cursor: &[Cursor, R]): Address[Unit] is
+        return cursor->statement;
+    end;
+
+    generic [R: Region, S: Region]
+    function execute(db: &![Connection, R], sql: Span[Nat8, S], values: Values): Either[MariaError, Nat64] is
+        let cursor: Cursor := run(db->handle, sql, values);
+        var count: Nat64 := 0;
+        if failureOf(&cursor) = 0 then
+            count := mysql_stmt_affected_rows(statementOf(&cursor));
+        end if;
+        case finish(db, cursor) of
+            when Some(value as error: MariaError) do
+                return Left(left => error);
+            when None do
+                return Right(right => count);
+        end case;
+    end;
+
+    -- Fetch the next row and copy the bytes of every column that is not
+    -- null into cells, so that a span lasts while the row is lent.
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool is
+        if (cursor->failure /= 0) or (cursor->columns = 0) then
+            return false;
+        end if;
+        let rc: Int32 := mysql_stmt_fetch(cursor->statement);
+        if (rc /= 0) and (rc /= MYSQL_DATA_TRUNCATED) then
+            if rc /= MYSQL_NO_DATA then
+                cursor->failure := statementErrno(cursor->statement);
+            end if;
+            cursor->row := false;
+            return false;
+        end if;
+        var i: Index := 0;
+        let count: Index := @embed(Index, "(size_t)$1", cursor->columns);
+        while i < count do
+            let cellIsNull: Bool := @embed(Bool, "(((my_bool*)$1)[$2] != 0)", cursor->nulls, i);
+            let size: Index := @embed(Index, "(size_t)((unsigned long*)$1)[$2]", cursor->lengths, i);
+            @embed(Unit, "hilde_free(((hilde_nat8_t**)$1)[$2])", cursor->cells, i);
+            @embed(Unit, "(((hilde_nat8_t**)$1)[$2] = NULL)", cursor->cells, i);
+            if not cellIsNull then
+                let cell: Address[Unit] := zeroed(size);
+                @embed(Unit, "(((hilde_nat8_t**)$1)[$2] = (hilde_nat8_t*)$3)", cursor->cells, i, cell);
+                @embed(Unit, "memset($1, 0, sizeof(MYSQL_BIND))", cursor->scratch);
+                @embed(Unit, "(((MYSQL_BIND*)$1)->buffer_type = MYSQL_TYPE_LONG_BLOB)", cursor->scratch);
+                @embed(Unit, "(((MYSQL_BIND*)$1)->buffer = $2)", cursor->scratch, cell);
+                @embed(Unit, "(((MYSQL_BIND*)$1)->buffer_length = (unsigned long)$2)", cursor->scratch, size);
+                let column: Nat32 := @embed(Nat32, "(uint32_t)$1", i);
+                let zero: Nat64 := 0;
+                if mysql_stmt_fetch_column(cursor->statement, cursor->scratch, column, zero) /= 0 then
+                    cursor->failure := statementErrno(cursor->statement);
+                    cursor->row := false;
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        cursor->row := true;
+        return true;
+    end;
+
+    generic [R: Region]
+    function columnCount(cursor: &[Cursor, R]): Int32 is
+        if cursor->failure /= 0 then
+            return 0;
+        end if;
+        return cursor->columns;
+    end;
+
+    generic [R: Region]
+    function checkCell(cursor: &[Cursor, R], index: Int32): Unit is
+        if (cursor->failure /= 0) or (not cursor->row) then
+            abort("Standard.MariaDB: a column was read without a current row");
+        end if;
+        if index >= cursor->columns then
+            abort("Standard.MariaDB: a column past the last one was read");
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool is
+        checkCell(cursor, index);
+        return @embed(Bool, "(((my_bool*)$1)[$2] != 0)", cursor->nulls, index);
+    end;
+
+    generic [R: Region]
+    function notNull(cursor: &[Cursor, R], index: Int32): Unit is
+        if isNullColumn(cursor, index) then
+            abort("Standard.MariaDB: a null column was read as a value; read it as an Option");
+        end if;
+        return nil;
+    end;
+
+    -- Fetch the column again into the scratch room, converted by
+    -- libmariadb to kind; the room's address.
+    generic [R: Region]
+    function fetchAs(cursor: &[Cursor, R], index: Int32, kind: Int32): Address[Unit] is
+        notNull(cursor, index);
+        let room: Address[Unit] := @embed(Address[Unit], "((char*)$1 + sizeof(MYSQL_BIND))", cursor->scratch);
+        @embed(Unit, "memset($1, 0, sizeof(MYSQL_BIND) + 64)", cursor->scratch);
+        @embed(Unit, "(((MYSQL_BIND*)$1)->buffer_type = (enum enum_field_types)$2)", cursor->scratch, kind);
+        @embed(Unit, "(((MYSQL_BIND*)$1)->buffer = $2)", cursor->scratch, room);
+        @embed(Unit, "(((MYSQL_BIND*)$1)->buffer_length = 64)", cursor->scratch);
+        let column: Nat32 := @embed(Nat32, "(uint32_t)$1", index);
+        let zero: Nat64 := 0;
+        if mysql_stmt_fetch_column(cursor->statement, cursor->scratch, column, zero) /= 0 then
+            abort("Standard.MariaDB: a column could not be read as the type asked for");
+        end if;
+        return room;
+    end;
+
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64 is
+        return @embed(Int64, "(*(int64_t*)$1)", fetchAs(cursor, index, @embed(Int32, "MYSQL_TYPE_LONGLONG")));
+    end;
+
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64 is
+        return @embed(Float64, "(*(double*)(void*)$1)", fetchAs(cursor, index, @embed(Int32, "MYSQL_TYPE_DOUBLE")));
+    end;
+
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool is
+        return @embed(Bool, "(*(signed char*)$1 != 0)", fetchAs(cursor, index, @embed(Int32, "MYSQL_TYPE_TINY")));
+    end;
+
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64 is
+        return takeTime(fetchAs(cursor, index, @embed(Int32, "MYSQL_TYPE_DATETIME")));
+    end;
+
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        notNull(cursor, index);
+        let size: Index := @embed(Index, "(size_t)((unsigned long*)$1)[$2]", cursor->lengths, index);
+        return @embed(Span[Nat8, R], "hilde_make_span((void*)((hilde_nat8_t**)$1)[$2], $3)", cursor->cells, index, size);
+    end;
+
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        return columnText(cursor, index);
+    end;
+
+    generic [R: Region]
+    function finish(db: &![Connection, R], cursor: Cursor): Option[MariaError] is
+        let { handle: Address[Unit], statement: Address[Unit], columns: Int32, binds: Address[Unit], lengths: Address[Unit],
+            nulls: Address[Unit], cells: Address[Address[Nat8]], scratch: Address[Unit], row: Bool, failure: Int32 } := cursor;
+        if not sameHandle(handle, db->handle) then
+            abort("Standard.MariaDB: a statement was finished on another connection than it was started on");
+        end if;
+        var i: Index := 0;
+        let count: Index := @embed(Index, "(size_t)$1", columns);
+        if not isNullBytes(@embed(Address[Nat8], "(hilde_nat8_t*)$1", cells)) then
+            while i < count do
+                @embed(Unit, "hilde_free(((hilde_nat8_t**)$1)[$2])", cells, i);
+                i := i + 1;
+            end while;
+        end if;
+        @embed(Unit, "hilde_free($1)", cells);
+        release(binds);
+        release(lengths);
+        release(nulls);
+        release(scratch);
+        if not isNull(statement) then
+            let freed: Nat8 := mysql_stmt_free_result(statement);
+            let closed: Nat8 := mysql_stmt_close(statement);
+        end if;
+        if failure /= 0 then
+            return Some(value => MariaError(code => failure));
+        end if;
+        return None();
+    end;
+
+    ---
+    --- Transactions
+    ---
+
+    -- Starting a transaction inside one commits the open one without a
+    -- word, so the flag the server sends with every answer is read first.
+    generic [R: Region]
+    function begin(db: &![Connection, R]): Either[MariaError, Transaction] is
+        let handle: Address[Unit] := db->handle;
+        let open: Int32 := @embed(Int32, "((((MYSQL*)$1)->server_status & SERVER_STATUS_IN_TRANS) != 0)", handle);
+        if open /= 0 then
+            return Left(left => MariaError(code => alreadyInTransaction));
+        end if;
+        let failure: Int32 := runStatic(db->handle, "START TRANSACTION");
+        if failure /= 0 then
+            return Left(left => MariaError(code => failure));
+        end if;
+        return Right(right => Transaction(handle => db->handle));
+    end;
+
+    generic [R: Region]
+    function commit(db: &![Connection, R], transaction: Transaction): Either[MariaError, Unit] is
+        let { handle: Address[Unit] } := transaction;
+        if not sameHandle(handle, db->handle) then
+            abort("Standard.MariaDB: a transaction was committed on another connection than it was begun on");
+        end if;
+        let failure: Int32 := runStatic(handle, "COMMIT");
+        if failure /= 0 then
+            let back: Int32 := runStatic(handle, "ROLLBACK");
+            return Left(left => MariaError(code => failure));
+        end if;
+        return Right(right => nil);
+    end;
+
+    generic [R: Region]
+    function rollback(db: &![Connection, R], transaction: Transaction): Unit is
+        let { handle: Address[Unit] } := transaction;
+        if not sameHandle(handle, db->handle) then
+            abort("Standard.MariaDB: a transaction was rolled back on another connection than it was begun on");
+        end if;
+        let back: Int32 := runStatic(handle, "ROLLBACK");
+        return nil;
+    end;
+
+    ---
+    --- Migrations
+    ---
+
+    -- The highest version in the ledger, read through a statement.
+    function ledgerVersion(handle: Address[Unit]): Either[MariaError, Index] is
+        var cursor: Cursor := run(handle, "SELECT CAST(COALESCE(MAX(version), 0) AS SIGNED) FROM hilde_migrations", noValues());
+        var version: Index := 0;
+        if advance(&!cursor) then
+            case toIndex(columnInt64(&cursor, 0)) of
+                when Some(value as v: Index) do
+                    version := v;
+                when None do
+                    skip;
+            end case;
+        end if;
+        let failure: Int32 := close(cursor);
+        if failure /= 0 then
+            return Left(left => MariaError(code => failure));
+        end if;
+        return Right(right => version);
+    end;
+
+    -- Take the lock hilde_migrations, waiting at most 60 seconds.  GET_LOCK
+    -- answers 1 when it holds the lock, 0 when the wait ran out and null on
+    -- an error; anything but 1 is the failure 1205, a lock wait timeout.
+    function takeLock(handle: Address[Unit]): Int32 is
+        var cursor: Cursor := run(handle, "SELECT CAST(GET_LOCK('hilde_migrations', 60) AS SIGNED)", noValues());
+        var held: Bool := false;
+        if advance(&!cursor) then
+            if not isNullColumn(&cursor, 0) then
+                let answer: Int64 := columnInt64(&cursor, 0);
+                held := answer = 1;
+            end if;
+        end if;
+        let failure: Int32 := close(cursor);
+        if failure /= 0 then
+            return failure;
+        end if;
+        if not held then
+            return 1205;
+        end if;
+        return 0;
+    end;
+
+    -- End a cursor of this module's own; its failure code.
+    function close(cursor: Cursor): Int32 is
+        let { handle: Address[Unit], statement: Address[Unit], columns: Int32, binds: Address[Unit], lengths: Address[Unit],
+            nulls: Address[Unit], cells: Address[Address[Nat8]], scratch: Address[Unit], row: Bool, failure: Int32 } := cursor;
+        var db: Connection := Connection(handle => handle);
+        let rebuilt: Cursor := Cursor(handle => handle, statement => statement, columns => columns, binds => binds, lengths => lengths,
+            nulls => nulls, cells => cells, scratch => scratch, row => row, failure => failure);
+        let result: Option[MariaError] := finish(&!db, rebuilt);
+        let { handle as kept: Address[Unit] } := db;
+        case result of
+            when Some(value as error: MariaError) do
+                return error.code;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function indexInt64(value: Index): Int64 is
+        case toInt64(value) of
+            when Some(value as v: Int64) do
+                return v;
+            when None do
+                abort("Standard.MariaDB: a migration number past Int64");
+        end case;
+    end;
+
+    -- MariaDB commits a statement that changes a table's form at once, so
+    -- a migration is not undone when it fails half way; the ledger row is
+    -- written only after the whole migration ran.  The lock
+    -- hilde_migrations keeps two programmes from migrating at once.
+    generic [R: Region]
+    function migrate(db: &![Connection, R], migrations: Span[Nat8, Static]): Either[MariaError, Index] is
+        let handle: Address[Unit] := db->handle;
+        var failure: Int32 := runStatic(handle, "CREATE TABLE IF NOT EXISTS hilde_migrations (version BIGINT PRIMARY KEY, applied_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6))");
+        if failure = 0 then
+            failure := takeLock(handle);
+        end if;
+        if failure /= 0 then
+            return Left(left => MariaError(code => failure));
+        end if;
+        var have: Index := 0;
+        case ledgerVersion(handle) of
+            when Left(left as error: MariaError) do
+                failure := error.code;
+            when Right(right as v: Index) do
+                have := v;
+        end case;
+        var at: Index := 0;
+        var number: Index := 0;
+        var applied: Index := 0;
+        let total: Index := spanLength(migrations);
+        while (failure = 0) and (at < total) do
+            var size: Index := 0;
+            while digitAt(migrations, at) do
+                size := ((size * 10) + byteIndex(migrations[at])) - 48;
+                at := at + 1;
+            end while;
+            at := at + 1;
+            number := number + 1;
+            if number > have then
+                let script: Address[Nat8] := cCopy(spanPart(migrations, at, size));
+                failure := runSimple(handle, script);
+                @embed(Unit, "hilde_free($1)", script);
+                if failure = 0 then
+                    failure := close(run(handle, "INSERT INTO hilde_migrations (version) VALUES (?)", withInt64(noValues(), indexInt64(number))));
+                end if;
+                if failure = 0 then
+                    applied := applied + 1;
+                end if;
+            end if;
+            at := at + size;
+        end while;
+        let unlocked: Int32 := runStatic(handle, "DO RELEASE_LOCK('hilde_migrations')");
+        if failure /= 0 then
+            return Left(left => MariaError(code => failure));
+        end if;
+        if have > number then
+            return Left(left => MariaError(code => newerDatabase));
+        end if;
+        return Right(right => applied);
+    end;
+
+    function digitAt(migrations: Span[Nat8, Static], at: Index): Bool is
+        if at >= spanLength(migrations) then
+            return false;
+        end if;
+        let b: Nat8 := migrations[at];
+        return (b >= '0') and (b <= '9');
+    end;
+
+    function byteIndex(b: Nat8): Index is
+        case toIndex(b) of
+            when Some(value as v: Index) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    ---
+    --- Text
+    ---
+
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): String is
+        let size: Index := spanLength(text);
+        var copy: String := makeString(size, '0');
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!copy, i, text[i]);
+            i := i + 1;
+        end while;
+        return copy;
+    end;
+
+    function libraryVersion(): Span[Nat8, Static] is
+        return staticSpan(mysql_get_client_info());
+    end;
+end module body.

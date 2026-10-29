@@ -1,0 +1,675 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    nthByte,
+    length,
+    fromLiteral,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Ip (
+    IpAddress,
+    parseIp,
+    parseIpv4,
+    parseIpv6,
+    isIpv6,
+    sameIp,
+    ipToString,
+    ipFromBytes,
+    ipToBytes,
+    isPrivateOrReserved,
+    applyMask,
+    inSubnet,
+    anonymise
+);
+
+module body Standard.Ip.Test is
+    ---
+    --- Parsing
+    ---
+
+    -- parseIpv4.
+    function testIpv4Parse(): Unit is
+        assertRoundTrip("0.0.0.0", "the all-zero address");
+        assertRoundTrip("198.51.100.1", "a documentation address");
+        assertRoundTrip("255.255.255.255", "the broadcast address");
+        assertRoundTrip("8.8.8.8", "eight all round");
+        assertNoParse("1.2.3", "three groups");
+        assertNoParse("1.2.3.4.5", "five groups");
+        assertNoParse("256.0.0.1", "a group above 255");
+        assertNoParse("1.2.3.", "a trailing dot");
+        assertNoParse(".1.2.3", "a leading dot");
+        assertNoParse("1.2..3", "an empty group");
+        assertNoParse("1.2.3.a", "a letter");
+        assertNoParse("", "the empty string");
+        assertNoParse("1.2.3.4444", "four digits in a group");
+        -- parseIpv4 is not parseIp: it refuses an IPv6 address outright,
+        -- and parseIpv6 refuses a dotted quad.
+        assertNoV4("::1", "parseIpv4 refuses an IPv6 address");
+        assertNoV6("1.2.3.4", "parseIpv6 refuses a dotted quad");
+        assertFamily("1.2.3.4", false, "1.2.3.4 is IPv4");
+        assertFamily("::1", true, "::1 is IPv6");
+        return nil;
+    end;
+
+    -- parseIpv6.
+    function testIpv6Parse(): Unit is
+        assertRoundTrip("::", "the all-zero address");
+        assertRoundTrip("::1", "the loopback");
+        assertRoundTrip("1::", "a trailing gap");
+        assertRoundTrip("2001:db8::1", "a documentation address");
+        assertRoundTrip("1:2:3:4:5:6:7:8", "eight full groups");
+        assertNoParse("1::2::3", "two gaps");
+        assertNoParse("1:2:3:4:5:6:7:8:9", "nine groups");
+        assertNoParse("1:2:3:4:5:6:7", "seven groups and no gap");
+        assertNoParse("gg::", "not hexadecimal");
+        assertNoParse("12345::", "five digits in a group");
+        assertNoParse(":", "a lone colon");
+        assertNoParse("1:", "a trailing colon");
+        -- Not accepted on purpose, as the docstring of parseIpv6 says.
+        assertNoParse("::ffff:1.2.3.4", "the IPv4-mapped text form");
+        return nil;
+    end;
+
+    ---
+    --- Rendering
+    ---
+
+    -- ipToString.
+    function testRender(): Unit is
+        -- The canonical form, which is the point: the input is legal and
+        -- the output is the one RFC 5952 asks for.
+        assertRender("2001:0db8:0000:0000:0000:0000:0000:0001", "2001:db8::1",
+            "leading zeros and a long run of zero groups");
+        assertRender("0:0:0:0:0:0:0:0", "::", "all zeros");
+        assertRender("1:0:0:0:0:0:0:8", "1::8", "one long run");
+        -- Two runs of the same length: the leftmost is the one compressed.
+        assertRender("1:0:0:2:0:0:3:4", "1::2:0:0:3:4", "leftmost of two equal runs");
+        -- A single zero group is not compressed: :: for one group is
+        -- longer than the group it replaces.
+        assertRender("1:2:3:4:5:6:0:8", "1:2:3:4:5:6:0:8", "a lone zero group");
+        assertRender("00ab:00CD::", "ab:cd::", "upper case in, lower case out");
+        return nil;
+    end;
+
+    ---
+    --- From bytes
+    ---
+
+    -- The address the bytes make, rendered, against its text.
+    function bytesRender(bytes: String, expected: Span[Nat8, Static]): Bool is
+        var same: Bool := false;
+        case ipFromBytes(asSpan(&bytes)) of
+            when Some(value: IpAddress) do
+                let text: String := ipToString(value);
+                same := textIs(text, expected);
+            when None do
+                skip;
+        end case;
+        destroyString(bytes);
+        return same;
+    end;
+
+    function textIs(text: String, expected: Span[Nat8, Static]): Bool is
+        var same: Bool := length(&text) = spanLength(expected);
+        if same then
+            var i: Index := 0;
+            while i < spanLength(expected) do
+                if nthByte(&text, i) /= expected[i] then
+                    same := false;
+                end if;
+                i := i + 1;
+            end while;
+        end if;
+        destroyString(text);
+        return same;
+    end;
+
+    -- count bytes, each its position times step, plus first.
+    function counting(count: Index, first: Nat8, step: Nat8): String is
+        var bytes: StringBuilder := makeStringBuilder();
+        var value: Nat8 := first;
+        var i: Index := 0;
+        while i < count do
+            writeByte(&!bytes, value);
+            value := value + step;
+            i := i + 1;
+        end while;
+        return finalize(bytes);
+    end;
+
+    -- ipFromBytes.
+    function testFromBytes(): Unit is
+        assertTrue(bytesRender(counting(4, 192, 0), "192.192.192.192"), "four bytes are IPv4");
+        assertTrue(bytesRender(counting(4, 1, 1), "1.2.3.4"), "in network byte order");
+        assertTrue(bytesRender(counting(16, 0, 0), "::"), "sixteen zero bytes are IPv6");
+        assertTrue(bytesRender(counting(16, 1, 1), "102:304:506:708:90a:b0c:d0e:f10"), "sixteen bytes, the most significant first");
+        let three: String := counting(3, 1, 1);
+        case ipFromBytes(asSpan(&three)) of
+            when Some(value: IpAddress) do
+                assertFailure("three bytes are no address");
+            when None do
+                assertSuccess("three bytes are no address");
+        end case;
+        destroyString(three);
+        let five: String := counting(5, 1, 1);
+        case ipFromBytes(asSpan(&five)) of
+            when Some(value: IpAddress) do
+                assertFailure("five bytes are no address");
+            when None do
+                assertSuccess("five bytes are no address");
+        end case;
+        destroyString(five);
+        let v6: String := counting(16, 0, 0);
+        case ipFromBytes(asSpan(&v6)) of
+            when Some(value: IpAddress) do
+                assertTrue(isIpv6(value), "sixteen bytes say IPv6");
+            when None do
+                assertFailure("sixteen bytes say IPv6");
+        end case;
+        destroyString(v6);
+        return nil;
+    end;
+
+    ---
+    --- Bytes, and the addresses a request must not go to
+    ---
+
+    -- Whether text parses, ipToBytes gives size bytes and ipFromBytes
+    -- reads them back as the same address.
+    function bytesRoundTrip(text: Span[Nat8, Static], size: Index): Bool is
+        case parseIp(text) of
+            when Some(value as address: IpAddress) do
+                let bytes: String := ipToBytes(address);
+                let sized: Bool := length(&bytes) = size;
+                var back: Bool := false;
+                case ipFromBytes(asSpan(&bytes)) of
+                    when Some(value as again: IpAddress) do
+                        back := sameIp(address, again);
+                    when None do
+                        skip;
+                end case;
+                destroyString(bytes);
+                return sized and back;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The first byte ipToBytes gives for text, 0 when text does not parse.
+    function firstByte(text: Span[Nat8, Static]): Nat8 is
+        case parseIp(text) of
+            when Some(value as address: IpAddress) do
+                let bytes: String := ipToBytes(address);
+                let first: Nat8 := nthByte(&bytes, 0);
+                destroyString(bytes);
+                return first;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- ipToBytes.
+    function testToBytes(): Unit is
+        assertTrue(bytesRoundTrip("192.0.2.1", 4), "IPv4 is four bytes and back");
+        assertTrue(bytesRoundTrip("2001:db8::1", 16), "IPv6 is sixteen bytes and back");
+        assertTrue(bytesRoundTrip("255.255.255.255", 4), "every bit of IPv4 set");
+        assertTrue(bytesRoundTrip("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 16), "every bit of IPv6 set");
+        assertTrue(firstByte("192.0.2.1") = 192, "IPv4, the most significant byte first");
+        assertTrue(firstByte("2001:db8::1") = 32, "IPv6, the most significant byte first");
+        return nil;
+    end;
+
+    -- 1 when text is not public, 0 when it is, -1 when it does not parse.
+    function reservedCode(text: Span[Nat8, Static]): Int32 is
+        case parseIp(text) of
+            when Some(value as address: IpAddress) do
+                if isPrivateOrReserved(address) then
+                    return 1;
+                end if;
+                return 0;
+            when None do
+                return -1;
+        end case;
+    end;
+
+    -- The bytes of the IPv4 address a.b.c.d.
+    function ipv4Bytes(a: Nat8, b: Nat8, c: Nat8, d: Nat8): String is
+        var bytes: StringBuilder := makeStringBuilder();
+        writeByte(&!bytes, a);
+        writeByte(&!bytes, b);
+        writeByte(&!bytes, c);
+        writeByte(&!bytes, d);
+        return finalize(bytes);
+    end;
+
+    -- The bytes of an IPv6 address: first, second, third and fourth make
+    -- the first two groups, the groups after them are zero and the last
+    -- group is 1.
+    function ipv6Bytes(first: Nat8, second: Nat8, third: Nat8, fourth: Nat8): String is
+        var bytes: StringBuilder := makeStringBuilder();
+        writeByte(&!bytes, first);
+        writeByte(&!bytes, second);
+        writeByte(&!bytes, third);
+        writeByte(&!bytes, fourth);
+        var i: Index := 0;
+        while i < 11 do
+            writeByte(&!bytes, 0);
+            i := i + 1;
+        end while;
+        writeByte(&!bytes, 1);
+        return finalize(bytes);
+    end;
+
+    -- The bytes of the IPv6 address that maps the IPv4 address a.b.c.d:
+    -- ten zero bytes, two bytes 255, then the four of the IPv4 address.
+    function mappedBytes(a: Nat8, b: Nat8, c: Nat8, d: Nat8): String is
+        var bytes: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 10 do
+            writeByte(&!bytes, 0);
+            i := i + 1;
+        end while;
+        writeByte(&!bytes, 255);
+        writeByte(&!bytes, 255);
+        writeByte(&!bytes, a);
+        writeByte(&!bytes, b);
+        writeByte(&!bytes, c);
+        writeByte(&!bytes, d);
+        return finalize(bytes);
+    end;
+
+    -- 1 when the address the bytes make is not public, 0 when it is, -1
+    -- when the bytes are no address.  The private ranges are given as
+    -- bytes, so that no private address stands in the text of the tests.
+    function bytesCode(bytes: String): Int32 is
+        var code: Int32 := -1;
+        case ipFromBytes(asSpan(&bytes)) of
+            when Some(value as address: IpAddress) do
+                code := 0;
+                if isPrivateOrReserved(address) then
+                    code := 1;
+                end if;
+            when None do
+                skip;
+        end case;
+        destroyString(bytes);
+        return code;
+    end;
+
+    -- isPrivateOrReserved over public, loopback, private, link-local,
+    -- shared and unique local addresses of both families.  9.9.9.9 is the
+    -- public example, since 203.0.113.10 is an address for documentation.
+    function testPrivateOrReservedCommon(): Unit is
+        assertTrue(reservedCode("8.8.8.8") = 0, "8.8.8.8 is public");
+        assertTrue(reservedCode("1.1.1.1") = 0, "1.1.1.1 is public");
+        assertTrue(reservedCode("9.9.9.9") = 0, "9.9.9.9 is public");
+        assertTrue(reservedCode("2606:4700:4700::1111") = 0, "2606:4700:4700::1111 is public");
+        assertTrue(reservedCode("127.0.0.1") = 1, "127.0.0.1 is loopback");
+        assertTrue(reservedCode("::1") = 1, "::1 is loopback");
+        assertTrue(bytesCode(ipv4Bytes(10, 0, 0, 1)) = 1, "the first private network is private");
+        assertTrue(bytesCode(ipv4Bytes(172, 16, 5, 4)) = 1, "the second private network is private");
+        assertTrue(bytesCode(ipv4Bytes(192, 168, 1, 1)) = 1, "the third private network is private");
+        assertTrue(bytesCode(ipv4Bytes(169, 254, 169, 254)) = 1, "the metadata address of cloud hosts is link-local");
+        assertTrue(bytesCode(ipv4Bytes(100, 64, 0, 1)) = 1, "the first address of carrier-grade NAT");
+        assertTrue(reservedCode("0.0.0.0") = 1, "0.0.0.0 is unspecified");
+        assertTrue(reservedCode("::") = 1, ":: is unspecified");
+        assertTrue(bytesCode(ipv6Bytes(254, 128, 0, 0)) = 1, "IPv6 link-local");
+        assertTrue(bytesCode(ipv6Bytes(252, 0, 0, 0)) = 1, "IPv6 unique local");
+        return nil;
+    end;
+
+    -- isPrivateOrReserved over the whole of each reserved range, multicast
+    -- included, and at the edges of every range.
+    function testPrivateOrReservedEdges(): Unit is
+        assertTrue(reservedCode("0.1.2.3") = 1, "0.0.0.0/8 whole");
+        assertTrue(reservedCode("224.0.0.251") = 1, "multicast");
+        assertTrue(reservedCode("239.255.255.250") = 1, "multicast to its end");
+        assertTrue(reservedCode("240.0.0.1") = 1, "the reserved range");
+        assertTrue(reservedCode("255.255.255.255") = 1, "the broadcast address");
+        assertTrue(reservedCode("ff05::1") = 1, "IPv6 multicast beyond link-local");
+        assertTrue(bytesCode(ipv6Bytes(253, 255, 255, 255)) = 1, "unique local to its end");
+        assertTrue(bytesCode(ipv6Bytes(254, 191, 0, 0)) = 1, "link-local to its end");
+        assertTrue(reservedCode("::ffff:7f00:1") = 1, "a mapped IPv4 loopback address");
+        assertTrue(bytesCode(mappedBytes(10, 0, 0, 1)) = 1, "a mapped private address");
+        assertTrue(reservedCode("::ffff:808:808") = 0, "a mapped public address");
+        assertTrue(reservedCode("1.0.0.0") = 0, "just above this network");
+        assertTrue(reservedCode("9.255.255.255") = 0, "just below the first private network");
+        assertTrue(reservedCode("11.0.0.0") = 0, "just above the first private network");
+        assertTrue(reservedCode("100.63.255.255") = 0, "just below carrier-grade NAT");
+        assertTrue(reservedCode("100.128.0.0") = 0, "just above carrier-grade NAT");
+        assertTrue(reservedCode("126.255.255.255") = 0, "just below loopback");
+        assertTrue(reservedCode("128.0.0.0") = 0, "just above loopback");
+        assertTrue(reservedCode("169.253.255.255") = 0, "just below link-local");
+        assertTrue(reservedCode("169.255.0.0") = 0, "just above link-local");
+        assertTrue(reservedCode("172.15.255.255") = 0, "just below the second private network");
+        assertTrue(reservedCode("172.32.0.0") = 0, "just above the second private network");
+        assertTrue(reservedCode("192.167.255.255") = 0, "just below the third private network");
+        assertTrue(reservedCode("192.169.0.0") = 0, "just above the third private network");
+        assertTrue(reservedCode("223.255.255.255") = 0, "just below multicast");
+        assertTrue(reservedCode("::2") = 1, "::/96 whole, not only unspecified and loopback");
+        assertTrue(reservedCode("fbff:ffff::1") = 0, "just below unique local");
+        assertTrue(reservedCode("fe00::1") = 0, "between unique local and link-local");
+        assertTrue(reservedCode("fec0::1") = 1, "the old site-local range, just above link-local");
+        assertTrue(reservedCode("feff::1") = 1, "site-local to its end, just below multicast");
+        return nil;
+    end;
+
+    -- isPrivateOrReserved on the special ranges of IANA's registers that
+    -- no public server has, at both edges of each.
+    function testPrivateOrReservedSpecial(): Unit is
+        assertTrue(reservedCode("192.0.0.1") = 1, "192.0.0.0/24, protocol assignments");
+        assertTrue(reservedCode("192.0.0.9") = 1, "192.0.0.0/24 whole, its anycast addresses too");
+        assertTrue(reservedCode("191.255.255.255") = 0, "just below 192.0.0.0/24");
+        assertTrue(reservedCode("192.0.1.0") = 0, "just above 192.0.0.0/24");
+        assertTrue(reservedCode("192.0.2.1") = 1, "192.0.2.0/24, documentation");
+        assertTrue(reservedCode("192.0.3.0") = 0, "just above 192.0.2.0/24");
+        assertTrue(reservedCode("198.17.255.255") = 0, "just below 198.18.0.0/15");
+        assertTrue(reservedCode("198.18.0.1") = 1, "198.18.0.0/15, benchmarks");
+        assertTrue(reservedCode("198.19.255.255") = 1, "198.18.0.0/15 to its end");
+        assertTrue(reservedCode("198.20.0.0") = 0, "just above 198.18.0.0/15");
+        assertTrue(reservedCode("198.51.99.255") = 0, "just below 198.51.100.0/24");
+        assertTrue(reservedCode("198.51.100.7") = 1, "198.51.100.0/24, documentation");
+        assertTrue(reservedCode("198.51.101.0") = 0, "just above 198.51.100.0/24");
+        assertTrue(reservedCode("203.0.112.255") = 0, "just below 203.0.113.0/24");
+        assertTrue(reservedCode("203.0.113.10") = 1, "203.0.113.0/24, documentation");
+        assertTrue(reservedCode("203.0.114.0") = 0, "just above 203.0.113.0/24");
+        assertTrue(reservedCode("::7f00:1") = 1, "an address in ::/96");
+        assertTrue(reservedCode("::1:0:0") = 0, "just above ::/96");
+        assertTrue(reservedCode("64:ff9b::7f00:1") = 1, "loopback through NAT64");
+        assertTrue(reservedCode("64:ff9b::a00:1") = 1, "a private address through NAT64");
+        assertTrue(reservedCode("64:ff9b::808:808") = 0, "a public address through NAT64");
+        assertTrue(reservedCode("64:ff9b:0:1::1") = 0, "beside NAT64's /96, not in it");
+        assertTrue(reservedCode("64:ff9b:1::1") = 1, "64:ff9b:1::/48, local NAT64");
+        assertTrue(reservedCode("64:ff9b:2::1") = 0, "just above 64:ff9b:1::/48");
+        assertTrue(reservedCode("100::1") = 1, "100::/64, discard only");
+        assertTrue(reservedCode("100:0:0:1::1") = 0, "just above 100::/64");
+        assertTrue(reservedCode("2001::1") = 1, "2001::/23, Teredo and protocol assignments");
+        assertTrue(reservedCode("2001:1ff:ffff::1") = 1, "2001::/23 to its end");
+        assertTrue(reservedCode("2001:200::1") = 0, "just above 2001::/23");
+        assertTrue(reservedCode("2001:db8::1") = 1, "2001:db8::/32, documentation");
+        assertTrue(reservedCode("2001:db7:ffff::1") = 0, "just below 2001:db8::/32");
+        assertTrue(reservedCode("2001:db9::1") = 0, "just above 2001:db8::/32");
+        assertTrue(reservedCode("2002:7f00:1::1") = 1, "2002::/16, 6to4");
+        assertTrue(reservedCode("2003::1") = 0, "just above 2002::/16");
+        assertTrue(reservedCode("3fff::1") = 1, "3fff::/20, documentation");
+        assertTrue(reservedCode("3fff:fff:ffff::1") = 1, "3fff::/20 to its end");
+        assertTrue(reservedCode("3fff:1000::1") = 0, "just above 3fff::/20");
+        assertTrue(reservedCode("3ffe:ffff::1") = 0, "just below 3fff::/20");
+        return nil;
+    end;
+
+    ---
+    --- Masks
+    ---
+
+    -- applyMask.
+    function testMask(): Unit is
+        assertMasked("198.51.100.55", 24, "198.51.100.0", "a /24");
+        assertMasked("198.51.100.55", 16, "198.51.0.0", "a /16");
+        assertMasked("198.51.100.55", 32, "198.51.100.55", "a /32 keeps everything");
+        assertMasked("198.51.100.55", 0, "0.0.0.0", "a /0 keeps nothing");
+        assertNoMask("198.51.100.55", 33, "a /33 on an IPv4 address");
+        assertMasked("2001:db8:1:2:3:4:5:6", 48, "2001:db8:1::", "a /48");
+        assertMasked("2001:db8:1:2:3:4:5:6", 64, "2001:db8:1:2::", "a /64 on the seam");
+        assertMasked("2001:db8:1:2:3:4:5:6", 32, "2001:db8::", "a /32 below the seam");
+        assertMasked("2001:db8:1:2:3:4:5:6", 128, "2001:db8:1:2:3:4:5:6",
+            "a /128 keeps everything");
+        assertNoMask("2001:db8::1", 129, "a /129");
+        return nil;
+    end;
+
+    ---
+    --- Subnets
+    ---
+
+    -- inSubnet.
+    function testSubnet(): Unit is
+        assertSubnet("198.51.100.3", "198.0.0.0", 8, true, "inside a /8");
+        assertSubnet("198.51.100.3", "198.51.0.0", 16, true, "inside a /16");
+        assertSubnet("198.51.100.3", "198.52.0.0", 16, false, "outside a /16");
+        assertSubnet("198.51.100.3", "198.0.0.0", 32, false, "a /32 that differs");
+        assertSubnet("198.51.100.3", "198.51.100.3", 32, true, "a /32 that matches");
+        -- The subnet is masked too, so a caller who wrote a host address
+        -- with a prefix gets the answer for the network.
+        assertSubnet("198.51.100.3", "198.51.9.9", 16, true, "an unmasked subnet still works");
+        assertSubnet("198.51.100.3", "198.0.0.0", 33, false, "a prefix that is too long");
+        assertSubnet("2001:db8:1::5", "2001:db8:1::", 48, true, "inside an IPv6 /48");
+        assertSubnet("2001:db8:2::5", "2001:db8:1::", 48, false, "outside an IPv6 /48");
+        -- Different families are never in each other's subnets.
+        assertSubnet("198.51.100.3", "2001:db8::", 8, false, "IPv4 against an IPv6 subnet");
+        assertSubnet("2001:db8::1", "198.0.0.0", 8, false, "IPv6 against an IPv4 subnet");
+        return nil;
+    end;
+
+    ---
+    --- Anonymising
+    ---
+
+    -- anonymise.
+    function testAnonymise(): Unit is
+        assertAnonymised("198.51.100.55", "198.51.100.0", "IPv4 keeps the /24");
+        assertAnonymised("8.8.8.8", "8.8.8.0", "and so does a public one");
+        assertAnonymised("2001:db8:1:2:3:4:5:6", "2001:db8:1::", "IPv6 keeps the /48");
+        -- A reduction and not a hash: two addresses in one /24 become one
+        -- value, which is what makes it anonymous and also what makes it
+        -- lossy.
+        assertSameAnonymous("198.51.100.55", "198.51.100.200",
+            "two addresses in one /24 become one");
+        return nil;
+    end;
+
+    ---
+    --- Utilities
+    ---
+
+    function assertNoV4(text: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        let input: String := fromLiteral(text);
+        case parseIpv4(asSpan(&input)) of
+            when Some(value: IpAddress) do
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        destroyString(input);
+        return nil;
+    end;
+
+    function assertNoV6(text: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        let input: String := fromLiteral(text);
+        case parseIpv6(asSpan(&input)) of
+            when Some(value: IpAddress) do
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        destroyString(input);
+        return nil;
+    end;
+
+    function assertFamily(text: Span[Nat8, Static], want: Bool,
+        message: Span[Nat8, Static]): Unit is
+        case parseLiteral(text) of
+            when Some(value: IpAddress) do
+                assertTrue(isIpv6(value) = want, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(left: &[String, R], right: &[String, S]): Bool is
+        let size: Index := length(left);
+        if size /= length(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        var same: Bool := true;
+        while i < size do
+            if nthByte(left, i) /= nthByte(right, i) then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    function assertText(produced: String, expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        var made: String := produced;
+        let want: String := fromLiteral(expected);
+        assertTrue(sameBytes(&made, &want), message);
+        destroyString(want);
+        destroyString(made);
+        return nil;
+    end;
+
+    function assertAddress(got: Option[IpAddress], expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case got of
+            when Some(value: IpAddress) do
+                assertText(ipToString(value), expected, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function parseLiteral(text: Span[Nat8, Static]): Option[IpAddress] is
+        let input: String := fromLiteral(text);
+        let answer: Option[IpAddress] := parseIp(asSpan(&input));
+        destroyString(input);
+        return answer;
+    end;
+
+    function assertRoundTrip(text: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        assertAddress(parseLiteral(text), text, message);
+        return nil;
+    end;
+
+    function assertRender(text: Span[Nat8, Static], expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        assertAddress(parseLiteral(text), expected, message);
+        return nil;
+    end;
+
+    function assertNoParse(text: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case parseLiteral(text) of
+            when Some(value: IpAddress) do
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    function maskLiteral(text: Span[Nat8, Static], bits: Index): Option[IpAddress] is
+        case parseLiteral(text) of
+            when Some(value: IpAddress) do
+                return applyMask(value, bits);
+            when None do
+                let none: Option[IpAddress] := None();
+                return none;
+        end case;
+    end;
+
+    function assertMasked(text: Span[Nat8, Static], bits: Index,
+        expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        assertAddress(maskLiteral(text, bits), expected, message);
+        return nil;
+    end;
+
+    function assertNoMask(text: Span[Nat8, Static], bits: Index,
+        message: Span[Nat8, Static]): Unit is
+        case maskLiteral(text, bits) of
+            when Some(value: IpAddress) do
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    function subnetOf(address: IpAddress, subnetText: Span[Nat8, Static],
+        bits: Index): Bool is
+        case parseLiteral(subnetText) of
+            when Some(value: IpAddress) do
+                return inSubnet(address, value, bits);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function assertSubnet(text: Span[Nat8, Static], subnetText: Span[Nat8, Static],
+        bits: Index, want: Bool,
+        message: Span[Nat8, Static]): Unit is
+        case parseLiteral(text) of
+            when Some(value: IpAddress) do
+                assertTrue(subnetOf(value, subnetText, bits) = want, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function anonymiseLiteral(text: Span[Nat8, Static]): Option[IpAddress] is
+        case parseLiteral(text) of
+            when Some(value: IpAddress) do
+                let some: Option[IpAddress] := Some(value => anonymise(value));
+                return some;
+            when None do
+                let none: Option[IpAddress] := None();
+                return none;
+        end case;
+    end;
+
+    function assertAnonymised(text: Span[Nat8, Static], expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        assertAddress(anonymiseLiteral(text), expected, message);
+        return nil;
+    end;
+
+    function bothAnonymous(left: IpAddress, rightText: Span[Nat8, Static]): Bool is
+        case anonymiseLiteral(rightText) of
+            when Some(value: IpAddress) do
+                return sameIp(left, value);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function assertSameAnonymous(leftText: Span[Nat8, Static],
+        rightText: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case anonymiseLiteral(leftText) of
+            when Some(value: IpAddress) do
+                assertTrue(bothAnonymous(value, rightText), message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,301 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The tables are held by digests that scripts/unicode/make-normalization-
+-- tables.py computes from Python's unicodedata: one per form over every
+-- code point alone, and one per form over texts of a base and two
+-- accents, where ordering and composition are at work.  The texts are
+-- written as the hexadecimal of their UTF-8, since the source is ASCII.
+import Standard.String (
+    String,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    finalize
+);
+import Standard.Text (
+    hexToBytes,
+    bytesToHex
+);
+import Standard.Utf8 (
+    CodePoint,
+    makeCodePoint,
+    appendCodePoint
+);
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Normalization (
+    toNfd,
+    toNfc,
+    toNfkd,
+    toNfkc,
+    combiningClass
+);
+
+module body Standard.Normalization.Test is
+    -- The form numbered form of text: 0 NFD, 1 NFC, 2 NFKD, 3 NFKC.
+    generic [R: Region]
+    function normalized(form: Index, text: Span[Nat8, R]): Option[String] is
+        if form = 0 then
+            return toNfd(text);
+        else if form = 1 then
+            return toNfc(text);
+        else if form = 2 then
+            return toNfkd(text);
+        else
+            return toNfkc(text);
+        end if;
+    end;
+
+    generic [R: Region]
+    function sameAs(text: &[String, R], want: Span[Nat8, Static]): Bool is
+        if stringLength(text) /= spanLength(want) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(want) do
+            if nthByte(text, i) /= want[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether the form of the text given in hexadecimal is the text given
+    -- in hexadecimal.
+    function becomes(form: Index, input: Span[Nat8, Static], want: Span[Nat8, Static]): Bool is
+        case hexToBytes(input) of
+            when Some(value as text: String) do
+                case normalized(form, asSpan(&text)) of
+                    when Some(value as got: String) do
+                        let hex: String := bytesToHex(asSpan(&got));
+                        let same: Bool := sameAs(&hex, want);
+                        destroyString(hex);
+                        destroyString(got);
+                        destroyString(text);
+                        return same;
+                    when None do
+                        destroyString(text);
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function testExamples(): Unit is
+        assertTrue(becomes(1, "65cc81", "c3a9"), "e and an acute compose to e acute");
+        assertTrue(becomes(0, "c3a9", "65cc81"), "e acute decomposes");
+        assertTrue(becomes(0, "61cc81cca3", "61cca3cc81"), "the dot below goes before the acute");
+        assertTrue(becomes(1, "61cc81cca3", "e1baa1cc81"), "a with dot below, then the acute");
+        assertTrue(becomes(1, "e18480e185a1e186a8", "eab081"), "three jamo compose to one syllable");
+        assertTrue(becomes(0, "eab081", "e18480e185a1e186a8"), "a syllable decomposes to its jamo");
+        assertTrue(becomes(3, "efac81", "6669"), "the ligature fi folds to f and i in KC");
+        assertTrue(becomes(1, "efac81", "efac81"), "and stays in C");
+        assertTrue(becomes(1, "e284ab", "c385"), "the angstrom sign is a singleton");
+        assertTrue(becomes(1, "cc81", "cc81"), "an accent with nothing before it stays");
+        assertTrue(becomes(3, "e1ba9bcca3", "e1b9a9"), "long s with dot above and dot below, KC");
+        assertTrue(becomes(1, "", ""), "the empty text");
+        return nil;
+    end;
+
+    function testRefusal(): Unit is
+        case hexToBytes("61ff") of
+            when Some(value as text: String) do
+                case toNfc(asSpan(&text)) of
+                    when Some(value as got: String) do
+                        destroyString(got);
+                        assertTrue(false, "a byte that is not UTF-8 is refused");
+                    when None do
+                        assertTrue(true, "a byte that is not UTF-8 is refused");
+                end case;
+                destroyString(text);
+            when None do
+                assertTrue(false, "the hexadecimal of the test is well formed");
+        end case;
+        return nil;
+    end;
+
+    function testClasses(): Unit is
+        assertTrue(combiningClass(769) = 230, "the acute is above, 230");
+        assertTrue(combiningClass(803) = 220, "the dot below is below, 220");
+        assertTrue(combiningClass(97) = 0, "a is a starter");
+        return nil;
+    end;
+
+    ---
+    --- Digests
+    ---
+
+    generic [R: Region]
+    function hashString(hash: Nat32, text: &[String, R]): Nat32 is
+        let prime: Nat32 := 16777619;
+        var h: Nat32 := hash;
+        var i: Index := 0;
+        while i < stringLength(text) do
+            case toNat32(nthByte(text, i)) of
+                when Some(value as byte: Nat32) do
+                    h := modularMultiply(bitwiseXor(h, byte), prime);
+                when None do
+                    abort("Standard.Normalization.Test: a byte did not fit a Nat32");
+            end case;
+            i := i + 1;
+        end while;
+        return h;
+    end;
+
+    generic [B: Region]
+    function append(builder: &![StringBuilder, B], scalar: Index): Unit is
+        case toNat32(scalar) of
+            when Some(value as wide: Nat32) do
+                case makeCodePoint(wide) of
+                    when Some(value as point: CodePoint) do
+                        appendCodePoint(&~builder, point);
+                    when None do
+                        abort("Standard.Normalization.Test: not a code point");
+                end case;
+            when None do
+                abort("Standard.Normalization.Test: not a Nat32");
+        end case;
+        return nil;
+    end;
+
+    -- The hash after text in the form, or after nothing when it is refused.
+    generic [R: Region]
+    function hashForm(hash: Nat32, form: Index, text: &[String, R]): Nat32 is
+        case normalized(form, asSpan(text)) of
+            when Some(value as got: String) do
+                let h: Nat32 := hashString(hash, &got);
+                destroyString(got);
+                return h;
+            when None do
+                abort("Standard.Normalization.Test: a text of the digest was refused");
+        end case;
+    end;
+
+    -- The FNV-1a hash of the form of every code point alone, the
+    -- surrogates left out, as --digests computes it.
+    function digestSingle(form: Index): Nat32 is
+        var hash: Nat32 := 2166136261;
+        let limit: Index := #x110000;
+        var point: Index := 0;
+        while point < limit do
+            if (point < #xD800) or (point > #xDFFF) then
+                var builder: StringBuilder := makeStringBuilder();
+                append(&!builder, point);
+                let text: String := finalize(builder);
+                hash := hashForm(hash, form, &text);
+                destroyString(text);
+            end if;
+            point := point + 1;
+        end while;
+        return hash;
+    end;
+
+    -- The code points of the lists of --sequences, six hexadecimal digits
+    -- each.
+    function bases(): Span[Nat8, Static] is
+        return "00004100006100004500006500004F00006F0000530000730000C5001100\
+            \00AC000003910003B10004150004350005D0000915";
+    end;
+
+    function marks(): Span[Nat8, Static] is
+        return "00030000030100030200030800030A00032300032700032800034500\
+            \05B000093C00094D0011610011A8";
+    end;
+
+    function pointAt(list: Span[Nat8, Static], k: Index): Index is
+        var total: Index := 0;
+        var i: Index := 0;
+        while i < 6 do
+            let byte: Nat8 := list[(k * 6) + i];
+            var digit: Nat8 := byte - '0';
+            if byte >= 'A' then
+                digit := (byte - 'A') + 10;
+            end if;
+            case toIndex(digit) of
+                when Some(value as d: Index) do
+                    total := (total * 16) + d;
+                when None do
+                    abort("Standard.Normalization.Test: a digit did not fit an Index");
+            end case;
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    -- The hash of the form of every text of a base and two accents, as
+    -- --sequences computes it.
+    function digestSequences(form: Index): Nat32 is
+        var hash: Nat32 := 2166136261;
+        let baseCount: Index := spanLength(bases()) / 6;
+        let markCount: Index := spanLength(marks()) / 6;
+        var b: Index := 0;
+        while b < baseCount do
+            var m1: Index := 0;
+            while m1 < markCount do
+                var m2: Index := 0;
+                while m2 < markCount do
+                    var builder: StringBuilder := makeStringBuilder();
+                    append(&!builder, pointAt(bases(), b));
+                    append(&!builder, pointAt(marks(), m1));
+                    append(&!builder, pointAt(marks(), m2));
+                    let text: String := finalize(builder);
+                    hash := hashForm(hash, form, &text);
+                    destroyString(text);
+                    m2 := m2 + 1;
+                end while;
+                m1 := m1 + 1;
+            end while;
+            b := b + 1;
+        end while;
+        return hash;
+    end;
+
+    -- One test for each form, so that each stays within the time hilde
+    -- test gives a test under valgrind.
+    function testDigestOfSingleCodePointsNfd(): Unit is
+        let nfd: Nat32 := 2063517005;
+        assertTrue(digestSingle(0) = nfd, "D of every code point");
+        return nil;
+    end;
+
+    function testDigestOfSingleCodePointsNfc(): Unit is
+        let nfc: Nat32 := 1962371257;
+        assertTrue(digestSingle(1) = nfc, "C of every code point");
+        return nil;
+    end;
+
+    function testDigestOfSingleCodePointsNfkd(): Unit is
+        let nfkd: Nat32 := 1128185800;
+        assertTrue(digestSingle(2) = nfkd, "KD of every code point");
+        return nil;
+    end;
+
+    function testDigestOfSingleCodePointsNfkc(): Unit is
+        let nfkc: Nat32 := 865914293;
+        assertTrue(digestSingle(3) = nfkc, "KC of every code point");
+        return nil;
+    end;
+
+    function testDigestsOfSequences(): Unit is
+        let decomposed: Nat32 := 2645203547;
+        let composed: Nat32 := 2829801506;
+        assertTrue(digestSequences(0) = decomposed, "D of 3332 texts of a base and two accents");
+        assertTrue(digestSequences(1) = composed, "C of the same texts");
+        assertTrue(digestSequences(2) = decomposed, "KD of the same texts");
+        assertTrue(digestSequences(3) = composed, "KC of the same texts");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,1393 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  A connection is read record by record with
+-- Standard.Fcgi, from a non-blocking socket and against one deadline per
+-- request, so that a web server that sends one byte at a time cannot hold
+-- a worker longer than the limit says.  The loop keeps the tasks of the
+-- connections it serves in a queue and, when the queue is full, waits for
+-- one of them to end and joins it, so a slow connection holds up only
+-- itself.
+import Standard.String (
+    String,
+    makeEmpty,
+    makeString,
+    storeNth,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    insert,
+    insertFront,
+    insertBack,
+    remove,
+    removeFirst,
+    lengthMut as bufferLengthMut
+);
+import Standard.File (
+    FileDescriptor,
+    Listener,
+    TcpListener,
+    WaitFailure,
+    WaitTimedOut,
+    WaitFailed,
+    acceptWithin,
+    acceptTcpWithin,
+    makeNonblocking,
+    readWithin,
+    writeWithin,
+    closeFile
+);
+import Standard.Fcgi (
+    RecordHeader,
+    typeBeginRequest,
+    typeAbortRequest,
+    typeEndRequest,
+    typeParams,
+    typeStdin,
+    typeStdout,
+    typeGetValues,
+    typeGetValuesResult,
+    typeUnknown,
+    roleResponder,
+    statusRequestComplete,
+    statusCantMultiplex,
+    statusUnknownRole,
+    readHeader,
+    headerKind,
+    headerRequestId,
+    headerContentLength,
+    bytesAfterHeader,
+    readContent,
+    beginRequestRole,
+    beginRequestKeepConnection,
+    pairCount,
+    nthPairName,
+    nthPairValue,
+    makeRecord,
+    makeEndRequest,
+    makePair
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScopeWithStack,
+    closeScope,
+    spawn,
+    join,
+    isDone as taskIsDone,
+    awaitFewer
+);
+import Standard.Signal (
+    Signals,
+    shutdownRequested
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Context (
+    Context,
+    isDone,
+    remainingMilliseconds
+);
+
+module body Standard.FcgiServer is
+    constant zeroIndex: Index := 0;
+    constant oneIndex: Index := 1;
+    constant headerLength: Index := 8;
+    -- A record carries at most 65535 bytes; 32768 is a multiple of eight,
+    -- so no record of a long answer needs padding.
+    constant chunkLength: Index := 32768;
+    -- How long one wait for a connection lasts before the loop looks at
+    -- its limits and signals again.
+    constant acceptMilliseconds: Nat32 := 200;
+    -- The stack of a task that serves a connection.  A handler calls into
+    -- C libraries with deep calls, a database engine parsing its schema
+    -- among them, which overran the 64 KiB of a plain task.
+    constant handlerStack: Index := 524288;
+    constant nanosPerMilli: Nat64 := 1000000;
+    constant largestWait: Nat32 := 2147483647;
+    constant ten: Index := 10;
+    constant digitZero: Nat8 := 48;
+
+    record Limits: Free is
+        workers: Index;
+        connections: Index;
+        paramsBytes: Index;
+        bodyBytes: Index;
+        requestMilliseconds: Nat32;
+        writeMilliseconds: Nat32;
+    end;
+
+    function defaultLimits(): Limits is
+        let limits: Limits := Limits(
+            workers => 8,
+            connections => 0,
+            paramsBytes => 65536,
+            bodyBytes => 1048576,
+            requestMilliseconds => 30000,
+            writeMilliseconds => 30000
+        );
+        return limits;
+    end;
+
+    ---
+    --- Requests and answers
+    ---
+
+    record Request: Linear is
+        params: String;
+        input: String;
+    end;
+
+    function makeRequest(params: String, input: String): Request is
+        return Request(params => params, input => input);
+    end;
+
+    record Turn[T: Type]: Type is
+        state: T;
+        request: Request;
+    end;
+
+    record Served[T: Type]: Type is
+        state: T;
+        answer: String;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(left: Span[Nat8, R], right: Span[Nat8, S]): Bool is
+        let size: Index := spanLength(left);
+        if size /= spanLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if left[i] /= right[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The value of the first pair called name in block.
+    generic [R: Region, S: Region]
+    function pairValue(block: Span[Nat8, R], name: Span[Nat8, S]): Option[String] is
+        let count: Index := pairCount(block);
+        var i: Index := 0;
+        while i < count do
+            case nthPairName(block, i) of
+                when Some(value as found: String) do
+                    let same: Bool := sameBytes(asSpan(&found), name);
+                    destroyString(found);
+                    if same then
+                        return nthPairValue(block, i);
+                    end if;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    generic [R: Region, S: Region]
+    function requestParam(request: &[Request, R], name: Span[Nat8, S]): Option[String] is
+        return pairValue(asSpan(&(request->params)), name);
+    end;
+
+    generic [R: Region]
+    function requestParams(request: &[Request, R]): Span[Nat8, R] is
+        return asSpan(&(request->params));
+    end;
+
+    generic [R: Region]
+    function requestBody(request: &[Request, R]): Span[Nat8, R] is
+        return asSpan(&(request->input));
+    end;
+
+    function destroyRequest(request: Request): Unit is
+        let { params: String, input: String } := request;
+        destroyString(params);
+        destroyString(input);
+        return nil;
+    end;
+
+    function reasonPhrase(status: Nat16): Span[Nat8, Static] is
+        if status = 200 then return "OK"; end if;
+        if status = 201 then return "Created"; end if;
+        if status = 204 then return "No Content"; end if;
+        if status = 301 then return "Moved Permanently"; end if;
+        if status = 302 then return "Found"; end if;
+        if status = 303 then return "See Other"; end if;
+        if status = 304 then return "Not Modified"; end if;
+        if status = 307 then return "Temporary Redirect"; end if;
+        if status = 308 then return "Permanent Redirect"; end if;
+        if status = 400 then return "Bad Request"; end if;
+        if status = 401 then return "Unauthorized"; end if;
+        if status = 403 then return "Forbidden"; end if;
+        if status = 404 then return "Not Found"; end if;
+        if status = 405 then return "Method Not Allowed"; end if;
+        if status = 409 then return "Conflict"; end if;
+        if status = 413 then return "Content Too Large"; end if;
+        if status = 415 then return "Unsupported Media Type"; end if;
+        if status = 422 then return "Unprocessable Content"; end if;
+        if status = 429 then return "Too Many Requests"; end if;
+        if status = 431 then return "Request Header Fields Too Large"; end if;
+        if status = 500 then return "Internal Server Error"; end if;
+        if status = 502 then return "Bad Gateway"; end if;
+        if status = 503 then return "Service Unavailable"; end if;
+        return "Unknown";
+    end;
+
+    -- The decimal digits of number.
+    generic [B: Region]
+    function writeDecimal(out: &![StringBuilder, B], number: Index): Unit is
+        if number >= ten then
+            writeDecimal(&~out, number / ten);
+        end if;
+        let digit: Index := number - ((number / ten) * ten);
+        case toNat8(digit) of
+            when Some(value as small: Nat8) do
+                writeByte(&~out, digitZero + small);
+            when None do
+                abort("Standard.FcgiServer: a digit did not fit a Nat8");
+        end case;
+        return nil;
+    end;
+
+    function widenStatus(status: Nat16): Index is
+        case toIndex(status) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                abort("Standard.FcgiServer: a Nat16 did not fit an Index");
+        end case;
+    end;
+
+    -- A byte of a field value: a tab, printable ASCII or 128 and above.
+    function isFieldByte(byte: Nat8): Bool is
+        if byte = 9 then
+            return true;
+        end if;
+        return (byte >= 32) and (byte /= 127);
+    end;
+
+    -- A byte of a token, the name of a header (RFC 9110, section 5.6.2).
+    function isTokenByte(byte: Nat8): Bool is
+        if (byte >= '0') and (byte <= '9') then return true; end if;
+        if (byte >= 'A') and (byte <= 'Z') then return true; end if;
+        if (byte >= 'a') and (byte <= 'z') then return true; end if;
+        -- The fifteen marks: ! # $ % & ' * + - . ^ _ and the grave accent,
+        -- the vertical bar and the tilde.
+        if byte = 33 then return true; end if;
+        if (byte >= 35) and (byte <= 39) then return true; end if;
+        if (byte = 42) or (byte = 43) then return true; end if;
+        if (byte = 45) or (byte = 46) then return true; end if;
+        if (byte >= 94) and (byte <= 96) then return true; end if;
+        if (byte = 124) or (byte = 126) then return true; end if;
+        return false;
+    end;
+
+    generic [R: Region]
+    function isFieldValue(value: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(value);
+        var i: Index := 0;
+        while i < size do
+            if not isFieldByte(value[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function isHeaderBlock(block: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(block);
+        var i: Index := 0;
+        while i < size do
+            -- The name, up to the colon; every index is checked before it
+            -- is read, so no condition relies on the order of evaluation.
+            let nameStart: Index := i;
+            var inName: Bool := true;
+            while inName do
+                if i >= size then
+                    return false;
+                end if;
+                if isTokenByte(block[i]) then
+                    i := i + 1;
+                else
+                    inName := false;
+                end if;
+            end while;
+            if i = nameStart then
+                return false;
+            end if;
+            if (i + 1) >= size then
+                return false;
+            end if;
+            if block[i] /= ':' then
+                return false;
+            end if;
+            if block[i + 1] /= ' ' then
+                return false;
+            end if;
+            i := i + 2;
+            -- The value, up to the carriage return.
+            var inValue: Bool := true;
+            while inValue do
+                if i >= size then
+                    return false;
+                end if;
+                if block[i] = '\r' then
+                    inValue := false;
+                else
+                    if not isFieldByte(block[i]) then
+                        return false;
+                    end if;
+                    i := i + 1;
+                end if;
+            end while;
+            if (i + 1) >= size then
+                return false;
+            end if;
+            if block[i + 1] /= '\n' then
+                return false;
+            end if;
+            i := i + 2;
+        end while;
+        return true;
+    end;
+
+    generic [C: Region, B: Region]
+    function cgiResponse(status: Nat16, contentType: Span[Nat8, C], input: Span[Nat8, B]): String is
+        return cgiResponseWith(status, contentType, "", input);
+    end;
+
+    generic [C: Region, H: Region, B: Region]
+    function cgiResponseWith(status: Nat16, contentType: Span[Nat8, C], headers: Span[Nat8, H], input: Span[Nat8, B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "Status: ");
+        writeDecimal(&!out, widenStatus(status));
+        writeByte(&!out, ' ');
+        writeString(&!out, reasonPhrase(status));
+        writeString(&!out, "\r\nContent-Type: ");
+        writeString(&!out, contentType);
+        writeString(&!out, "\r\n");
+        writeString(&!out, headers);
+        writeString(&!out, "\r\n");
+        writeString(&!out, input);
+        return finalize(out);
+    end;
+
+    ---
+    --- Time
+    ---
+
+    -- The moment a request or an answer must be done by.  Where there is
+    -- no monotonic clock each wait gets the whole time instead.
+    record Deadline: Free is
+        clocked: Bool;
+        at: Nat64;
+        milliseconds: Nat32;
+    end;
+
+    function deadlineIn(milliseconds: Nat32): Deadline is
+        var bounded: Nat32 := milliseconds;
+        if bounded > largestWait then
+            bounded := largestWait;
+        end if;
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                case toNat64(bounded) of
+                    when Some(value as wide: Nat64) do
+                        let deadline: Deadline := Deadline(clocked => true, at => now + (wide * nanosPerMilli), milliseconds => bounded);
+                        return deadline;
+                    when None do
+                        abort("Standard.FcgiServer: a Nat32 did not fit a Nat64");
+                end case;
+            when None do
+                let unclocked: Deadline := Deadline(clocked => false, at => 0, milliseconds => bounded);
+                return unclocked;
+        end case;
+    end;
+
+    -- The milliseconds the next wait may take, rounded up; None when the
+    -- time is up.
+    function remaining(deadline: Deadline): Option[Nat32] is
+        if not deadline.clocked then
+            let whole: Option[Nat32] := Some(value => deadline.milliseconds);
+            return whole;
+        end if;
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                if now >= deadline.at then
+                    let none: Option[Nat32] := None();
+                    return none;
+                end if;
+                let left: Nat64 := ((deadline.at - now) + (nanosPerMilli - 1)) / nanosPerMilli;
+                case toNat32(left) of
+                    when Some(value as ms: Nat32) do
+                        let some: Option[Nat32] := Some(value => ms);
+                        return some;
+                    when None do
+                        let whole: Option[Nat32] := Some(value => deadline.milliseconds);
+                        return whole;
+                end case;
+            when None do
+                let whole: Option[Nat32] := Some(value => deadline.milliseconds);
+                return whole;
+        end case;
+    end;
+
+    ---
+    --- Reading records
+    ---
+
+    -- What one read of a record brought.
+    union Read: Linear is
+        case Got is
+            bytes: String;
+        -- The stream ended before the first byte of the record.
+        case Ended;
+        -- The stream ended inside the record, or the record does not parse.
+        case Broken;
+        case Late;
+    end;
+
+    -- How reading a number of bytes ended.
+    union Step: Free is
+        case Done;
+        case StreamEnded;
+        case StreamBroken;
+        case StreamLate;
+    end;
+
+    -- Exactly count bytes appended to out.  StreamEnded when the stream
+    -- ended before any of them, StreamBroken when it ended after some.
+    generic [R: Region, B: Region]
+    function readInto(socket: &![FileDescriptor, R], count: Index, deadline: Deadline, out: &![StringBuilder, B]): Step is
+        var have: Index := 0;
+        var step: Step := Done();
+        var going: Bool := count > 0;
+        while going do
+            case remaining(deadline) of
+                when Some(value as ms: Nat32) do
+                    case readWithin(&~socket, count - have, ms) of
+                        when Right(right as got: String) do
+                            let size: Index := length(&got);
+                            if size = 0 then
+                                if have = 0 then
+                                    step := StreamEnded();
+                                else
+                                    step := StreamBroken();
+                                end if;
+                                going := false;
+                            else
+                                writeString(&~out, asSpan(&got));
+                                have := have + size;
+                                going := have < count;
+                            end if;
+                            destroyString(got);
+                        when Left(left as failure: WaitFailure) do
+                            case failure of
+                                when WaitTimedOut do
+                                    step := StreamLate();
+                                when WaitFailed do
+                                    step := StreamBroken();
+                            end case;
+                            going := false;
+                    end case;
+                when None do
+                    step := StreamLate();
+                    going := false;
+            end case;
+        end while;
+        return step;
+    end;
+
+    -- One whole record: the header, then as many bytes as it says follow.
+    generic [R: Region]
+    function readRecord(socket: &![FileDescriptor, R], deadline: Deadline): Read is
+        var out: StringBuilder := makeStringBuilder();
+        let first: Step := readInto(&~socket, headerLength, deadline, &!out);
+        let header: String := finalize(out);
+        case first of
+            when Done do
+                case bytesAfterHeader(asSpan(&header)) of
+                    when Some(value as rest: Index) do
+                        var whole: StringBuilder := makeStringBuilder();
+                        writeString(&!whole, asSpan(&header));
+                        destroyString(header);
+                        let second: Step := readInto(&~socket, rest, deadline, &!whole);
+                        let bytes: String := finalize(whole);
+                        case second of
+                            when Done do
+                                return Got(bytes => bytes);
+                            when StreamEnded do
+                                destroyString(bytes);
+                                return Broken();
+                            when StreamBroken do
+                                destroyString(bytes);
+                                return Broken();
+                            when StreamLate do
+                                destroyString(bytes);
+                                return Late();
+                        end case;
+                    when None do
+                        destroyString(header);
+                        return Broken();
+                end case;
+            when StreamEnded do
+                destroyString(header);
+                return Ended();
+            when StreamBroken do
+                destroyString(header);
+                return Broken();
+            when StreamLate do
+                destroyString(header);
+                return Late();
+        end case;
+    end;
+
+    ---
+    --- Writing records
+    ---
+
+    generic [R: Region, S: Region]
+    function writeBytes(socket: &![FileDescriptor, R], bytes: Span[Nat8, S], deadline: Deadline): Bool is
+        case remaining(deadline) of
+            when Some(value as ms: Nat32) do
+                case writeWithin(&~socket, bytes, ms) of
+                    when Right(right as done: Unit) do
+                        return true;
+                    when Left(left as failure: WaitFailure) do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeRecord(socket: &![FileDescriptor, R], kind: Nat8, requestId: Nat64, content: Span[Nat8, S], deadline: Deadline): Bool is
+        case makeRecord(kind, requestId, content) of
+            when Some(value as bytes: String) do
+                let written: Bool := writeBytes(&~socket, asSpan(&bytes), deadline);
+                destroyString(bytes);
+                return written;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function writeEnd(socket: &![FileDescriptor, R], requestId: Nat64, status: Nat8, deadline: Deadline): Bool is
+        let ending: String := makeEndRequest(requestId, 0, status);
+        let written: Bool := writeBytes(&~socket, asSpan(&ending), deadline);
+        destroyString(ending);
+        return written;
+    end;
+
+    -- The whole output as stdout records, the empty one that ends the
+    -- stream, and FCGI_END_REQUEST.
+    generic [R: Region, S: Region]
+    function writeAnswer(socket: &![FileDescriptor, R], requestId: Nat64, output: &[String, S], deadline: Deadline): Bool is
+        let size: Index := length(output);
+        var at: Index := 0;
+        while at < size do
+            var stop: Index := at + chunkLength;
+            if stop > size then
+                stop := size;
+            end if;
+            if not writeRecord(&~socket, typeStdout, requestId, getSpan(output, at, stop - 1), deadline) then
+                return false;
+            end if;
+            at := stop;
+        end while;
+        let empty: String := makeEmpty();
+        let closed: Bool := writeRecord(&~socket, typeStdout, requestId, asSpan(&empty), deadline);
+        destroyString(empty);
+        if not closed then
+            return false;
+        end if;
+        return writeEnd(&~socket, requestId, statusRequestComplete, deadline);
+    end;
+
+    -- The answer to FCGI_GET_VALUES: the three variables the protocol
+    -- names, those of them that were asked for.
+    generic [R: Region, S: Region]
+    function answerValues(socket: &![FileDescriptor, R], asked: Span[Nat8, S], limits: Limits, deadline: Deadline): Bool is
+        var out: StringBuilder := makeStringBuilder();
+        let count: Index := pairCount(asked);
+        var i: Index := 0;
+        while i < count do
+            case nthPairName(asked, i) of
+                when Some(value as name: String) do
+                    var number: StringBuilder := makeStringBuilder();
+                    var known: Bool := true;
+                    if sameBytes(asSpan(&name), "FCGI_MAX_CONNS") or sameBytes(asSpan(&name), "FCGI_MAX_REQS") then
+                        writeDecimal(&!number, limits.workers);
+                    else if sameBytes(asSpan(&name), "FCGI_MPXS_CONNS") then
+                        writeByte(&!number, '0');
+                    else
+                        known := false;
+                    end if;
+                    let text: String := finalize(number);
+                    if known then
+                        case makePair(asSpan(&name), asSpan(&text)) of
+                            when Some(value as pair: String) do
+                                writeString(&!out, asSpan(&pair));
+                                destroyString(pair);
+                            when None do
+                                skip;
+                        end case;
+                    end if;
+                    destroyString(text);
+                    destroyString(name);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        let content: String := finalize(out);
+        let zero: Nat64 := 0;
+        let written: Bool := writeRecord(&~socket, typeGetValuesResult, zero, asSpan(&content), deadline);
+        destroyString(content);
+        return written;
+    end;
+
+    -- FCGI_UNKNOWN_TYPE for a management record this responder does not
+    -- know.
+    generic [R: Region]
+    function answerUnknown(socket: &![FileDescriptor, R], kind: Nat8, deadline: Deadline): Bool is
+        var content: String := makeString(8, 0);
+        storeNth(&!content, 0, kind);
+        let zero: Nat64 := 0;
+        let written: Bool := writeRecord(&~socket, typeUnknown, zero, asSpan(&content), deadline);
+        destroyString(content);
+        return written;
+    end;
+
+    ---
+    --- One request
+    ---
+
+    -- How reading one request ended.
+    union Outcome: Free is
+        -- A request is complete and waits for the handler.
+        case Complete;
+        -- A request was answered without the handler: aborted, or refused
+        -- for its role.  keep says whether the web server keeps the
+        -- connection.
+        case Answered is
+            keep: Bool;
+        case Closed;
+        case Stopped is
+            ending: Ending;
+    end;
+
+    -- The state of a request while its records arrive.
+    record Progress: Free is
+        begun: Bool;
+        requestId: Nat64;
+        keep: Bool;
+        paramsDone: Bool;
+        paramsSize: Index;
+        bodySize: Index;
+        outcome: Outcome;
+        going: Bool;
+    end;
+
+    function stopWith(progress: Progress, outcome: Outcome): Progress is
+        let next: Progress := Progress(
+            begun => progress.begun,
+            requestId => progress.requestId,
+            keep => progress.keep,
+            paramsDone => progress.paramsDone,
+            paramsSize => progress.paramsSize,
+            bodySize => progress.bodySize,
+            outcome => outcome,
+            going => false
+        );
+        return next;
+    end;
+
+    -- One record of the request in progress: the bytes go to params or
+    -- body, and the progress says what comes next.
+    generic [R: Region, S: Region, P: Region, B: Region]
+    function takeRecord(socket: &![FileDescriptor, R], bytes: &[String, S], progress: Progress, limits: Limits,
+        deadline: Deadline, params: &![StringBuilder, P], input: &![StringBuilder, B]): Progress is
+        var next: Progress := progress;
+        case readHeader(asSpan(bytes), 0) of
+            when Some(value as header: RecordHeader) do
+                let kind: Nat8 := headerKind(header);
+                let id: Nat64 := headerRequestId(header);
+                var content: String := makeEmpty();
+                case readContent(asSpan(bytes), 0, header) of
+                    when Some(value as read: String) do
+                        destroyString(content);
+                        content := read;
+                    when None do
+                        skip;
+                end case;
+                let size: Index := length(&content);
+                if id = 0 then
+                    var written: Bool := true;
+                    if kind = typeGetValues then
+                        written := answerValues(&~socket, asSpan(&content), limits, deadline);
+                    else
+                        written := answerUnknown(&~socket, kind, deadline);
+                    end if;
+                    if not written then
+                        next := stopWith(next, Stopped(ending => WriteFailed()));
+                    end if;
+                else if kind = typeBeginRequest then
+                    if next.begun then
+                        -- One request at a time: another one is refused,
+                        -- and the same one twice does not parse.
+                        if id = next.requestId then
+                            next := stopWith(next, Stopped(ending => Malformed()));
+                        else if not writeEnd(&~socket, id, statusCantMultiplex, deadline) then
+                            next := stopWith(next, Stopped(ending => WriteFailed()));
+                        end if;
+                    else
+                        var responder: Bool := false;
+                        case beginRequestRole(asSpan(&content)) of
+                            when Some(value as role: Nat64) do
+                                responder := role = roleResponder;
+                            when None do
+                                skip;
+                        end case;
+                        var keep: Bool := false;
+                        case beginRequestKeepConnection(asSpan(&content)) of
+                            when Some(value as flag: Bool) do
+                                keep := flag;
+                            when None do
+                                skip;
+                        end case;
+                        if size /= 8 then
+                            next := stopWith(next, Stopped(ending => Malformed()));
+                        else if not responder then
+                            if writeEnd(&~socket, id, statusUnknownRole, deadline) then
+                                next := stopWith(next, Answered(keep => keep));
+                            else
+                                next := stopWith(next, Stopped(ending => WriteFailed()));
+                            end if;
+                        else
+                            next := Progress(
+                                begun => true,
+                                requestId => id,
+                                keep => keep,
+                                paramsDone => false,
+                                paramsSize => 0,
+                                bodySize => 0,
+                                outcome => Complete(),
+                                going => true
+                            );
+                        end if;
+                    end if;
+                else if (not next.begun) or (id /= next.requestId) then
+                    -- A record of a request this responder refused or never
+                    -- had: there is nothing to give it to.
+                    skip;
+                else if kind = typeAbortRequest then
+                    if writeEnd(&~socket, id, statusRequestComplete, deadline) then
+                        next := stopWith(next, Answered(keep => next.keep));
+                    else
+                        next := stopWith(next, Stopped(ending => WriteFailed()));
+                    end if;
+                else if kind = typeParams then
+                    if next.paramsDone then
+                        next := stopWith(next, Stopped(ending => Malformed()));
+                    else if size = 0 then
+                        next := Progress(
+                            begun => true,
+                            requestId => next.requestId,
+                            keep => next.keep,
+                            paramsDone => true,
+                            paramsSize => next.paramsSize,
+                            bodySize => 0,
+                            outcome => Complete(),
+                            going => true
+                        );
+                    else if size > (limits.paramsBytes - next.paramsSize) then
+                        next := stopWith(next, Stopped(ending => TooLarge()));
+                        refuse(&~socket, id, 431, deadline);
+                    else
+                        writeString(&~params, asSpan(&content));
+                        next := Progress(
+                            begun => true,
+                            requestId => next.requestId,
+                            keep => next.keep,
+                            paramsDone => false,
+                            paramsSize => next.paramsSize + size,
+                            bodySize => 0,
+                            outcome => Complete(),
+                            going => true
+                        );
+                    end if;
+                else if kind = typeStdin then
+                    if not next.paramsDone then
+                        next := stopWith(next, Stopped(ending => Malformed()));
+                    else if size = 0 then
+                        next := stopWith(next, Complete());
+                    else if size > (limits.bodyBytes - next.bodySize) then
+                        next := stopWith(next, Stopped(ending => TooLarge()));
+                        refuse(&~socket, id, 413, deadline);
+                    else
+                        writeString(&~input, asSpan(&content));
+                        next := Progress(
+                            begun => true,
+                            requestId => next.requestId,
+                            keep => next.keep,
+                            paramsDone => true,
+                            paramsSize => next.paramsSize,
+                            bodySize => next.bodySize + size,
+                            outcome => Complete(),
+                            going => true
+                        );
+                    end if;
+                end if;
+                destroyString(content);
+            when None do
+                next := stopWith(next, Stopped(ending => Malformed()));
+        end case;
+        return next;
+    end;
+
+    -- The answer to a request over a limit; whether it was written does
+    -- not change that the connection closes.
+    generic [R: Region]
+    function refuse(socket: &![FileDescriptor, R], requestId: Nat64, status: Nat16, deadline: Deadline): Unit is
+        let empty: String := makeEmpty();
+        let output: String := cgiResponse(status, "text/plain", asSpan(&empty));
+        let written: Bool := writeAnswer(&~socket, requestId, &output, deadline);
+        destroyString(output);
+        destroyString(empty);
+        return nil;
+    end;
+
+    function isTooLarge(ending: Ending): Bool is
+        case ending of
+            when TooLarge do
+                return true;
+            when Finished do
+                return false;
+            when TimedOut do
+                return false;
+            when Malformed do
+                return false;
+            when WriteFailed do
+                return false;
+        end case;
+    end;
+
+    -- After a refusal the rest of the request is read and dropped, up to
+    -- its empty stdin record or the deadline.  A socket closed with bytes
+    -- it has not read is reset, and the web server could lose the answer
+    -- that was written before.
+    generic [R: Region]
+    function drain(socket: &![FileDescriptor, R], requestId: Nat64, deadline: Deadline): Unit is
+        var going: Bool := true;
+        while going do
+            case readRecord(&~socket, deadline) of
+                when Got(bytes: String) do
+                    case readHeader(asSpan(&bytes), 0) of
+                        when Some(value as header: RecordHeader) do
+                            if ((headerKind(header) = typeStdin) and (headerRequestId(header) = requestId))
+                                and (headerContentLength(header) = 0) then
+                                going := false;
+                            end if;
+                        when None do
+                            going := false;
+                    end case;
+                    destroyString(bytes);
+                when Ended do
+                    going := false;
+                when Broken do
+                    going := false;
+                when Late do
+                    going := false;
+            end case;
+        end while;
+        return nil;
+    end;
+
+    -- What reading one request came to: a request for the handler, with
+    -- the id and the keep flag its answer needs, or how the connection
+    -- goes on when there is nothing for the handler.
+    union Reading: Linear is
+        case Ready is
+            request: Request;
+            requestId: Nat64;
+            keep: Bool;
+        case Over is
+            next: Option[Ending];
+    end;
+
+    -- Reads one request.  What has to be answered without the handler is
+    -- answered here.
+    generic [R: Region]
+    function readRequest(socket: &![FileDescriptor, R], limits: Limits): Reading is
+        let deadline: Deadline := deadlineIn(limits.requestMilliseconds);
+        var params: StringBuilder := makeStringBuilder();
+        var input: StringBuilder := makeStringBuilder();
+        var progress: Progress := Progress(
+            begun => false,
+            requestId => 0,
+            keep => false,
+            paramsDone => false,
+            paramsSize => 0,
+            bodySize => 0,
+            outcome => Closed(),
+            going => true
+        );
+        while progress.going do
+            case readRecord(&~socket, deadline) of
+                when Got(bytes: String) do
+                    progress := takeRecord(&~socket, &bytes, progress, limits, deadline, &!params, &!input);
+                    destroyString(bytes);
+                when Ended do
+                    if progress.begun then
+                        progress := stopWith(progress, Stopped(ending => Malformed()));
+                    else
+                        progress := stopWith(progress, Closed());
+                    end if;
+                when Broken do
+                    progress := stopWith(progress, Stopped(ending => Malformed()));
+                when Late do
+                    progress := stopWith(progress, Stopped(ending => TimedOut()));
+            end case;
+        end while;
+        let paramBlock: String := finalize(params);
+        let bodyText: String := finalize(input);
+        case progress.outcome of
+            when Complete do
+                return Ready(
+                    request => Request(params => paramBlock, input => bodyText),
+                    requestId => progress.requestId,
+                    keep => progress.keep
+                );
+            when Answered(keep: Bool) do
+                destroyString(paramBlock);
+                destroyString(bodyText);
+                if keep then
+                    let more: Option[Ending] := None();
+                    return Over(next => more);
+                end if;
+                let finished: Option[Ending] := Some(value => Finished());
+                return Over(next => finished);
+            when Closed do
+                destroyString(paramBlock);
+                destroyString(bodyText);
+                let finished: Option[Ending] := Some(value => Finished());
+                return Over(next => finished);
+            when Stopped(ending: Ending) do
+                destroyString(paramBlock);
+                destroyString(bodyText);
+                if isTooLarge(ending) then
+                    drain(&~socket, progress.requestId, deadline);
+                end if;
+                let stopped: Option[Ending] := Some(value => ending);
+                return Over(next => stopped);
+        end case;
+    end;
+
+    -- Writes the handler's output as the answer to requestId and says
+    -- whether the connection goes on: None when it does, the ending when
+    -- it does not.
+    generic [R: Region]
+    function writeOutput(socket: &![FileDescriptor, R], requestId: Nat64, keep: Bool, output: String, limits: Limits): Option[Ending] is
+        let written: Bool := writeAnswer(&~socket, requestId, &output, deadlineIn(limits.writeMilliseconds));
+        destroyString(output);
+        if not written then
+            let failed: Option[Ending] := Some(value => WriteFailed());
+            return failed;
+        end if;
+        if keep then
+            let more: Option[Ending] := None();
+            return more;
+        end if;
+        let finished: Option[Ending] := Some(value => Finished());
+        return finished;
+    end;
+
+    -- Reads one request, answers it, and says whether the connection goes
+    -- on: None when it does, the ending when it does not.
+    generic [R: Region]
+    function serveRequest(socket: &![FileDescriptor, R], handler: Fn[Request, String], limits: Limits): Option[Ending] is
+        case readRequest(&~socket, limits) of
+            when Ready(request: Request, requestId: Nat64, keep: Bool) do
+                return writeOutput(&~socket, requestId, keep, handler(request), limits);
+            when Over(next: Option[Ending]) do
+                return next;
+        end case;
+    end;
+
+    -- A handler's state and how the connection goes on after one request.
+    record Stepped[T: Type]: Type is
+        state: T;
+        next: Option[Ending];
+    end;
+
+    -- As serveRequest, with the state handed to the handler and taken back.
+    generic [T: Type, R: Region]
+    function serveRequestWith(socket: &![FileDescriptor, R], state: T, handler: Fn[Turn[T], Served[T]],
+        limits: Limits): Stepped[T] is
+        case readRequest(&~socket, limits) of
+            when Ready(request: Request, requestId: Nat64, keep: Bool) do
+                let { state as after: T, answer as output: String } := handler(Turn(state => state, request => request));
+                let next: Option[Ending] := writeOutput(&~socket, requestId, keep, output, limits);
+                return Stepped(state => after, next => next);
+            when Over(next: Option[Ending]) do
+                return Stepped(state => state, next => next);
+        end case;
+    end;
+
+    function serveConnection(socket: FileDescriptor, handler: Fn[Request, String], limits: Limits): Ending is
+        var connection: FileDescriptor := socket;
+        var ending: Ending := Finished();
+        var going: Bool := true;
+        if not makeNonblocking(&!connection) then
+            ending := Malformed();
+            going := false;
+        end if;
+        while going do
+            case serveRequest(&!connection, handler, limits) of
+                when Some(value as last: Ending) do
+                    ending := last;
+                    going := false;
+                when None do
+                    skip;
+            end case;
+        end while;
+        let closed: Bool := closeFile(connection);
+        return ending;
+    end;
+
+    generic [T: Type]
+    function serveConnectionWith(socket: FileDescriptor, state: T, handler: Fn[Turn[T], Served[T]],
+        limits: Limits): T is
+        var connection: FileDescriptor := socket;
+        var held: T := state;
+        var going: Bool := makeNonblocking(&!connection);
+        while going do
+            let { state as after: T, next: Option[Ending] } := serveRequestWith(&!connection, held, handler, limits);
+            held := after;
+            case next of
+                when Some(value as last: Ending) do
+                    going := false;
+                when None do
+                    skip;
+            end case;
+        end while;
+        let closed: Bool := closeFile(connection);
+        return held;
+    end;
+
+    ---
+    --- The loops
+    ---
+
+    -- What a task of the loop is given: one connection and how to serve it.
+    record Job: Linear is
+        socket: FileDescriptor;
+        handler: Fn[Request, String];
+        limits: Limits;
+    end;
+
+    function runJob(job: Job): Ending is
+        let { socket: FileDescriptor, handler: Fn[Request, String], limits: Limits } := job;
+        return serveConnection(socket, handler, limits);
+    end;
+
+    -- Starts a task for the connection, after joining one that has ended
+    -- when workers are busy already.  When no task starts, the connection
+    -- is served here.
+    generic [R: Region, Q: Region]
+    function start(scope: &![Scope, R], running: &![Buffer[Task[Ending]], Q], socket: FileDescriptor,
+        handler: Fn[Request, String], limits: Limits): Unit is
+        var workers: Index := limits.workers;
+        if workers = 0 then
+            workers := oneIndex;
+        end if;
+        if lengthOf(&~running) >= workers then
+            let ended: Ending := joinEnded(&~scope, &~running);
+        end if;
+        let run: Fn[Job, Ending] := runJob;
+        let job: Job := Job(socket => socket, handler => handler, limits => limits);
+        case spawn(&~scope, run, job) of
+            when Right(right as task: Task[Ending]) do
+                insertBack(&~running, task);
+            when Left(left as back: Job) do
+                let served: Ending := runJob(back);
+        end case;
+        return nil;
+    end;
+
+    -- Joins a task of running that has ended, the first one found, after
+    -- waiting until one has.  Joining the oldest instead let one slow
+    -- connection hold up the next while the others were done.
+    generic [T: Type, R: Region, Q: Region]
+    function joinEnded(scope: &![Scope, R], running: &![Buffer[Task[T]], Q]): T is
+        awaitFewer(&~scope, bufferLengthMut(&~running));
+        var i: Index := 0;
+        while i < bufferLengthMut(&~running) do
+            let task: Task[T] := remove(&~running, i);
+            if taskIsDone(&task) then
+                return join(task);
+            end if;
+            insert(&~running, i, task);
+            i := i + 1;
+        end while;
+        return join(removeFirst(&~running));
+    end;
+
+    generic [Q: Region]
+    function lengthOf(
+        running: &![Buffer[Task[Ending]], Q]): Index is
+        return bufferLengthMut(&~running);
+    end;
+
+    -- Joins every task still running, then closes the scope.
+    function finish(scope: Scope, running: Buffer[Task[Ending]]): Unit is
+        var queue: Buffer[Task[Ending]] := running;
+        while lengthOf(&!queue) > 0 do
+            let ended: Ending := join(removeFirst(&!queue));
+        end while;
+        destroyEmpty(queue);
+        closeScope(scope);
+        return nil;
+    end;
+
+    -- Whether the loop takes another connection.
+    generic [S: Region]
+    function goOn(accepted: Index, limits: Limits, signals: &![Signals, S]): Bool is
+        if (limits.connections > 0) and (accepted >= limits.connections) then
+            return false;
+        end if;
+        return not shutdownRequested(&~signals);
+    end;
+
+    generic [R: Region, S: Region]
+    function serveUnix(listener: &[Listener, R], handler: Fn[Request, String], limits: Limits,
+        signals: &![Signals, S]): Option[Index] is
+        case openScopeWithStack(handlerStack) of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                var running: Buffer[Task[Ending]] := allocateEmpty();
+                var accepted: Index := 0;
+                while goOn(accepted, limits, &~signals) do
+                    case acceptWithin(listener, acceptMilliseconds) of
+                        when Some(value as socket: FileDescriptor) do
+                            accepted := accepted + 1;
+                            start(&!scope, &!running, socket, handler, limits);
+                        when None do
+                            skip;
+                    end case;
+                end while;
+                finish(scope, running);
+                let some: Option[Index] := Some(value => accepted);
+                return some;
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function serveTcp(listener: &[TcpListener, R], handler: Fn[Request, String], limits: Limits,
+        signals: &![Signals, S]): Option[Index] is
+        case openScopeWithStack(handlerStack) of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                var running: Buffer[Task[Ending]] := allocateEmpty();
+                var accepted: Index := 0;
+                while goOn(accepted, limits, &~signals) do
+                    case acceptTcpWithin(listener, acceptMilliseconds) of
+                        when Some(value as socket: FileDescriptor) do
+                            accepted := accepted + 1;
+                            start(&!scope, &!running, socket, handler, limits);
+                        when None do
+                            skip;
+                    end case;
+                end while;
+                finish(scope, running);
+                let some: Option[Index] := Some(value => accepted);
+                return some;
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    -- Whether the loop takes another connection while context lasts.
+    generic [S: Region]
+    function goOnWithin(accepted: Index, limits: Limits, context: &[Context, S]): Bool is
+        if (limits.connections > 0) and (accepted >= limits.connections) then
+            return false;
+        end if;
+        return not isDone(context);
+    end;
+
+    generic [R: Region, S: Region]
+    function serveUnixUntil(listener: &[Listener, R], handler: Fn[Request, String], limits: Limits,
+        context: &[Context, S]): Option[Index] is
+        case openScopeWithStack(handlerStack) of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                var running: Buffer[Task[Ending]] := allocateEmpty();
+                var accepted: Index := 0;
+                while goOnWithin(accepted, limits, context) do
+                    case acceptWithin(listener, remainingMilliseconds(context, acceptMilliseconds)) of
+                        when Some(value as socket: FileDescriptor) do
+                            accepted := accepted + 1;
+                            start(&!scope, &!running, socket, handler, limits);
+                        when None do
+                            skip;
+                    end case;
+                end while;
+                finish(scope, running);
+                let some: Option[Index] := Some(value => accepted);
+                return some;
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function serveTcpUntil(listener: &[TcpListener, R], handler: Fn[Request, String], limits: Limits,
+        context: &[Context, S]): Option[Index] is
+        case openScopeWithStack(handlerStack) of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                var running: Buffer[Task[Ending]] := allocateEmpty();
+                var accepted: Index := 0;
+                while goOnWithin(accepted, limits, context) do
+                    case acceptTcpWithin(listener, remainingMilliseconds(context, acceptMilliseconds)) of
+                        when Some(value as socket: FileDescriptor) do
+                            accepted := accepted + 1;
+                            start(&!scope, &!running, socket, handler, limits);
+                        when None do
+                            skip;
+                    end case;
+                end while;
+                finish(scope, running);
+                let some: Option[Index] := Some(value => accepted);
+                return some;
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    ---
+    --- The loop with a state for each task
+    ---
+
+    -- What a task of the loop with states is given: one connection, the
+    -- state its handler works with, and how to serve it.
+    record JobWith[T: Type]: Type is
+        socket: FileDescriptor;
+        state: T;
+        handler: Fn[Turn[T], Served[T]];
+        limits: Limits;
+    end;
+
+    generic [T: Type]
+    function runJobWith(job: JobWith[T]): T is
+        let { socket: FileDescriptor, state: T, handler: Fn[Turn[T], Served[T]], limits: Limits } := job;
+        return serveConnectionWith(socket, state, handler, limits);
+    end;
+
+    -- Starts a task for the connection with a free state, the one given
+    -- back last: at one connection at a time the same state serves every
+    -- request, with its caches warm, as a database connection whose pages
+    -- no other connection changed in between.  When no state
+    -- is free or workers tasks run already, a task that has ended is
+    -- joined first and its state is free again.  A state is either in states or
+    -- with a running task, so one of the two is never empty.  When no
+    -- task starts, the connection is served here.
+    generic [T: Type, R: Region, Q: Region, B: Region]
+    function startWith(scope: &![Scope, R], running: &![Buffer[Task[T]], Q], states: &![Buffer[T], B],
+        socket: FileDescriptor, handler: Fn[Turn[T], Served[T]], limits: Limits): Unit is
+        var workers: Index := limits.workers;
+        if workers = 0 then
+            workers := oneIndex;
+        end if;
+        if (bufferLengthMut(&~states) = 0) or (bufferLengthMut(&~running) >= workers) then
+            insertFront(&~states, joinEnded(&~scope, &~running));
+        end if;
+        let run: Fn[JobWith[T], T] := runJobWith;
+        let job: JobWith[T] := JobWith(socket => socket, state => removeFirst(&~states), handler => handler, limits => limits);
+        case spawn(&~scope, run, job) of
+            when Right(right as task: Task[T]) do
+                insertBack(&~running, task);
+            when Left(left as back: JobWith[T]) do
+                insertFront(&~states, runJobWith(back));
+        end case;
+        return nil;
+    end;
+
+    -- Joins every task still running, gives its state back to states, then
+    -- closes the scope.
+    generic [T: Type, B: Region]
+    function finishWith(scope: Scope, running: Buffer[Task[T]], states: &![Buffer[T], B]): Unit is
+        var queue: Buffer[Task[T]] := running;
+        while bufferLengthMut(&!queue) > 0 do
+            insertBack(&~states, join(removeFirst(&!queue)));
+        end while;
+        destroyEmpty(queue);
+        closeScope(scope);
+        return nil;
+    end;
+
+    generic [T: Type, R: Region, B: Region, S: Region]
+    function serveUnixWith(listener: &[Listener, R], states: &![Buffer[T], B], handler: Fn[Turn[T], Served[T]],
+        limits: Limits, signals: &![Signals, S]): Option[Index] is
+        case openScopeWithStack(handlerStack) of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                var running: Buffer[Task[T]] := allocateEmpty();
+                var accepted: Index := 0;
+                while goOn(accepted, limits, &~signals) do
+                    case acceptWithin(listener, acceptMilliseconds) of
+                        when Some(value as socket: FileDescriptor) do
+                            accepted := accepted + 1;
+                            startWith(&!scope, &!running, &~states, socket, handler, limits);
+                        when None do
+                            skip;
+                    end case;
+                end while;
+                finishWith(scope, running, &~states);
+                let some: Option[Index] := Some(value => accepted);
+                return some;
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+end module body.

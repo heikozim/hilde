@@ -1,0 +1,1 @@
+Three options that name an environment variable, set by env.txt: with nothing on the line their values come from the environment, a flag's from a Bool word; a value on the line wins over the environment's.

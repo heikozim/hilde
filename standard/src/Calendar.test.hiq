@@ -1,0 +1,699 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The expected answers of the zone tests were computed by Python's
+-- zoneinfo, another reader of the same format, from the same bytes and
+-- rules.
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    storeNth,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    hexToBytes
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFile,
+    seekFile,
+    seekFromStart
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    validCivil,
+    weekday,
+    civilAt,
+    instantOf,
+    Zone,
+    ZoneFailure,
+    NotAZoneName,
+    ZoneMissing,
+    ZoneMalformed,
+    loadZone,
+    loadZoneFile,
+    readZone,
+    zoneOfRule,
+    utcZone,
+    localZone,
+    destroyZone,
+    Offset,
+    offsetAt,
+    abbreviationAt,
+    localAt,
+    Resolved,
+    Exactly,
+    Twice,
+    Skipped,
+    NotACivil,
+    resolveLocal,
+    formatRfc3339,
+    Stamp,
+    parseRfc3339
+);
+
+module body Standard.Calendar.Test is
+    ---
+    --- Helpers
+    ---
+
+    function civil(year: Int32, month: Nat8, day: Nat8, hour: Nat8, minute: Nat8, second: Nat8): Civil is
+        let nanos: Nat32 := 0;
+        let made: Civil := Civil(year => year, month => month, day => day, hour => hour, minute => minute, second => second, nanos => nanos);
+        return made;
+    end;
+
+    function makeInstant(seconds: Int64, nanos: Nat32): Instant is
+        let made: Instant := Instant(seconds => seconds, nanos => nanos);
+        return made;
+    end;
+
+    function sameBool(left: Bool, right: Bool): Bool is
+        return (left and right) or ((not left) and (not right));
+    end;
+
+    generic [R: Region]
+    function sameText(text: &[String, R], other: Span[Nat8, Static]): Bool is
+        let size: Index := stringLength(text);
+        if size /= spanLength(other) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= other[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether instant written in UTC is expected.
+    function utcIs(instant: Instant, expected: Span[Nat8, Static]): Bool is
+        let zero: Int32 := 0;
+        case formatRfc3339(instant, zero) of
+            when Some(value as text: String) do
+                let same: Bool := sameText(&text, expected);
+                destroyString(text);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether instant written at offset is expected.
+    function textIs(instant: Instant, offset: Int32, expected: Span[Nat8, Static]): Bool is
+        case formatRfc3339(instant, offset) of
+            when Some(value as text: String) do
+                let same: Bool := sameText(&text, expected);
+                destroyString(text);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The instant of RFC 3339 text that must parse.
+    function instantOfText(text: Span[Nat8, Static]): Instant is
+        case parseRfc3339(text) of
+            when Some(value as stamp: Stamp) do
+                return stamp.instant;
+            when None do
+                abort("Standard.Calendar.Test: a test instant did not parse");
+        end case;
+    end;
+
+    function parses(text: Span[Nat8, Static]): Bool is
+        case parseRfc3339(text) of
+            when Some(value as stamp: Stamp) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The bytes of the test zone: Europe/Berlin's rule with the two
+    -- changes of 2026 as transitions, written by a script from that
+    -- rule.
+    function fixtureBytes(): String is
+        var hex: StringBuilder := makeStringBuilder();
+        writeString(&!hex, "545a696632000000000000000000000000000000000000000000000000000000");
+        writeString(&!hex, "00000000000000010000000400000000000055544300545a6966320000000000");
+        writeString(&!hex, "0000000000000000000000000000000000000000000000000002000000020000");
+        writeString(&!hex, "00090000000069c87990000000006add5490010000000e10000000001c200104");
+        writeString(&!hex, "4345540043455354000a4345542d31434553542c4d332e352e302c4d31302e35");
+        writeString(&!hex, "2e302f330a");
+        let text: String := finalize(hex);
+        case hexToBytes(asSpan(&text)) of
+            when Some(value as bytes: String) do
+                destroyString(text);
+                return bytes;
+            when None do
+                destroyString(text);
+                abort("Standard.Calendar.Test: the fixture is not hexadecimal");
+        end case;
+    end;
+
+    function fixture(): Zone is
+        let bytes: String := fixtureBytes();
+        let read: Either[ZoneFailure, Zone] := readZone(asSpan(&bytes));
+        destroyString(bytes);
+        case read of
+            when Right(right as zone: Zone) do
+                return zone;
+            when Left(left as why: ZoneFailure) do
+                abort("Standard.Calendar.Test: the fixture was refused");
+        end case;
+    end;
+
+    function ruleZone(rule: Span[Nat8, Static]): Zone is
+        case zoneOfRule(rule) of
+            when Right(right as zone: Zone) do
+                return zone;
+            when Left(left as why: ZoneFailure) do
+                abort("Standard.Calendar.Test: a test rule was refused");
+        end case;
+    end;
+
+    function failureCode(why: ZoneFailure): Int32 is
+        case why of
+            when NotAZoneName do
+                return 1;
+            when ZoneMissing do
+                return 2;
+            when ZoneMalformed do
+                return 3;
+        end case;
+    end;
+
+    -- 0 when bytes are read as a zone, else the failure's code.
+    generic [R: Region]
+    function readCode(bytes: &[String, R]): Int32 is
+        case readZone(asSpan(bytes)) of
+            when Right(right as zone: Zone) do
+                destroyZone(zone);
+                return 0;
+            when Left(left as why: ZoneFailure) do
+                return failureCode(why);
+        end case;
+    end;
+
+    -- The fixture with byte at changed to value, read; -1 when the byte
+    -- holds value already, so that a change that changes nothing cannot
+    -- pass for a refusal.
+    function mutatedCode(at: Index, value: Nat8): Int32 is
+        var bytes: String := fixtureBytes();
+        if nthByte(&bytes, at) = value then
+            destroyString(bytes);
+            return -1;
+        else
+            storeNth(&!bytes, at, value);
+            let code: Int32 := readCode(&bytes);
+            destroyString(bytes);
+            return code;
+        end if;
+    end;
+
+    function ruleCode(rule: Span[Nat8, Static]): Int32 is
+        case zoneOfRule(rule) of
+            when Right(right as zone: Zone) do
+                destroyZone(zone);
+                return 0;
+            when Left(left as why: ZoneFailure) do
+                return failureCode(why);
+        end case;
+    end;
+
+    function loadCode(name: Span[Nat8, Static]): Int32 is
+        case loadZone(name) of
+            when Right(right as zone: Zone) do
+                destroyZone(zone);
+                return 0;
+            when Left(left as why: ZoneFailure) do
+                return failureCode(why);
+        end case;
+    end;
+
+    function fileCode(path: Span[Nat8, Static]): Int32 is
+        case loadZoneFile(path) of
+            when Right(right as zone: Zone) do
+                destroyZone(zone);
+                return 0;
+            when Left(left as why: ZoneFailure) do
+                return failureCode(why);
+        end case;
+    end;
+
+    -- Whether the zone's offset at the instant of text is seconds, with the
+    -- daylight flag and the abbreviation expected.
+    generic [R: Region]
+    function offsetIs(zone: &[Zone, R], text: Span[Nat8, Static], seconds: Int32, daylight: Bool, name: Span[Nat8, Static]): Bool is
+        let instant: Instant := instantOfText(text);
+        let offset: Offset := offsetAt(zone, instant);
+        let abbreviation: String := abbreviationAt(zone, instant);
+        let named: Bool := sameText(&abbreviation, name);
+        destroyString(abbreviation);
+        return (offset.seconds = seconds) and (sameBool(offset.daylight, daylight) and named);
+    end;
+
+    -- Whether civil resolves exactly once, to the instant written in UTC.
+    generic [R: Region]
+    function exactlyAt(zone: &[Zone, R], local: Civil, expected: Span[Nat8, Static]): Bool is
+        case resolveLocal(zone, local) of
+            when Exactly(instant as found: Instant) do
+                return utcIs(found, expected);
+            when Twice(earlier as first: Instant, later as second: Instant) do
+                return false;
+            when Skipped(before as first: Instant, after as second: Instant) do
+                return false;
+            when NotACivil do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function twiceAt(zone: &[Zone, R], local: Civil, earlier: Span[Nat8, Static], later: Span[Nat8, Static]): Bool is
+        case resolveLocal(zone, local) of
+            when Twice(earlier as first: Instant, later as second: Instant) do
+                return utcIs(first, earlier) and utcIs(second, later);
+            when Exactly(instant as found: Instant) do
+                return false;
+            when Skipped(before as first: Instant, after as second: Instant) do
+                return false;
+            when NotACivil do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function skippedAt(zone: &[Zone, R], local: Civil, before: Span[Nat8, Static], after: Span[Nat8, Static]): Bool is
+        case resolveLocal(zone, local) of
+            when Skipped(before as first: Instant, after as second: Instant) do
+                return utcIs(first, before) and utcIs(second, after);
+            when Exactly(instant as found: Instant) do
+                return false;
+            when Twice(earlier as first: Instant, later as second: Instant) do
+                return false;
+            when NotACivil do
+                return false;
+        end case;
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    function testCivilAndInstant(): Unit is
+        let zero: Int32 := 0;
+        case instantOf(civil(1970, 1, 1, 0, 0, 0), zero) of
+            when Some(value as epoch: Instant) do
+                let origin: Int64 := 0;
+                assertTrue(epoch.seconds = origin, "1970-01-01 is second 0");
+            when None do
+                assertFailure("1970-01-01 is second 0");
+        end case;
+        case instantOf(civil(2000, 2, 29, 12, 0, 0), zero) of
+            when Some(value as leap: Instant) do
+                let expected: Int64 := 951825600;
+                assertTrue(leap.seconds = expected, "2000-02-29 12:00 is second 951825600");
+            when None do
+                assertFailure("2000-02-29 12:00 is second 951825600");
+        end case;
+        case instantOf(civil(0, 1, 1, 0, 0, 0), zero) of
+            when Some(value as first: Instant) do
+                let expected: Int64 := -62167219200;
+                assertTrue(first.seconds = expected, "the first second of the year 0");
+            when None do
+                assertFailure("the first second of the year 0");
+        end case;
+        case instantOf(civil(9999, 12, 31, 23, 59, 59), zero) of
+            when Some(value as last: Instant) do
+                let expected: Int64 := 253402300799;
+                assertTrue(last.seconds = expected, "the last second of the year 9999");
+            when None do
+                assertFailure("the last second of the year 9999");
+        end case;
+        assertTrue(utcIs(instantOfText("1969-12-31T23:59:59Z"), "1969-12-31T23:59:59Z"), "a second before the epoch");
+        let beyond: Instant := makeInstant(253402300800, 0);
+        case civilAt(beyond, zero) of
+            when Some(value as late: Civil) do
+                assertFailure("the year 10000 is refused");
+            when None do
+                assertSuccess("the year 10000 is refused");
+        end case;
+        return nil;
+    end;
+
+    -- Every 97th day from the year 0 to 9999 read back to the same date,
+    -- at noon and at a quarter to midnight.
+    function testDaysRoundTrip(): Unit is
+        let first: Int64 := -719528;
+        let last: Int64 := 2932896;
+        let step: Int64 := 97;
+        let perDay: Int64 := 86400;
+        let noon: Int64 := 43200;
+        let late: Int64 := 85500;
+        let zero: Int32 := 0;
+        var day: Int64 := first;
+        var good: Bool := true;
+        var count: Int64 := 0;
+        while day <= last do
+            let moment: Instant := makeInstant((day * perDay) + noon, 0);
+            case civilAt(moment, zero) of
+                when Some(value as shown: Civil) do
+                    case instantOf(shown, zero) of
+                        when Some(value as back: Instant) do
+                            if back.seconds /= moment.seconds then
+                                good := false;
+                            end if;
+                        when None do
+                            good := false;
+                    end case;
+                when None do
+                    good := false;
+            end case;
+            let evening: Instant := makeInstant((day * perDay) + late, 0);
+            case civilAt(evening, zero) of
+                when Some(value as shown: Civil) do
+                    if (shown.hour /= 23) or (shown.minute /= 45) then
+                        good := false;
+                    end if;
+                when None do
+                    good := false;
+            end case;
+            day := day + step;
+            count := count + 1;
+        end while;
+        let expected: Int64 := 37654;
+        assertTrue(count = expected, "37654 days were read");
+        assertTrue(good, "every day came back as itself");
+        return nil;
+    end;
+
+    function testValidCivil(): Unit is
+        assertTrue(validCivil(civil(2024, 2, 29, 0, 0, 0)), "2024-02-29 exists");
+        assertTrue(validCivil(civil(2000, 2, 29, 0, 0, 0)), "2000-02-29 exists");
+        assertFalse(validCivil(civil(1900, 2, 29, 0, 0, 0)), "1900-02-29 does not");
+        assertFalse(validCivil(civil(2025, 2, 29, 0, 0, 0)), "2025-02-29 does not");
+        assertFalse(validCivil(civil(2026, 4, 31, 0, 0, 0)), "April has 30 days");
+        assertFalse(validCivil(civil(2026, 13, 1, 0, 0, 0)), "month 13");
+        assertFalse(validCivil(civil(2026, 0, 1, 0, 0, 0)), "month 0");
+        assertFalse(validCivil(civil(2026, 1, 0, 0, 0, 0)), "day 0");
+        assertFalse(validCivil(civil(2026, 1, 1, 24, 0, 0)), "hour 24");
+        assertFalse(validCivil(civil(2026, 1, 1, 0, 60, 0)), "minute 60");
+        assertFalse(validCivil(civil(2026, 1, 1, 0, 0, 60)), "second 60");
+        assertFalse(validCivil(civil(10000, 1, 1, 0, 0, 0)), "the year 10000");
+        assertFalse(validCivil(civil(-1, 1, 1, 0, 0, 0)), "the year -1");
+        let year: Int32 := 2026;
+        let one: Nat8 := 1;
+        let nought: Nat8 := 0;
+        let whole: Nat32 := 1000000000;
+        let tooMany: Civil := Civil(year => year, month => one, day => one, hour => nought, minute => nought, second => nought, nanos => whole);
+        assertFalse(validCivil(tooMany), "a whole second of nanoseconds");
+        return nil;
+    end;
+
+    function testWeekday(): Unit is
+        assertTrue(weekday(civil(1970, 1, 1, 0, 0, 0)) = 4, "1970-01-01 was a Thursday");
+        assertTrue(weekday(civil(2000, 1, 1, 0, 0, 0)) = 6, "2000-01-01 was a Saturday");
+        assertTrue(weekday(civil(2026, 9, 27, 0, 0, 0)) = 7, "2026-09-27 is a Sunday");
+        assertTrue(weekday(civil(1, 1, 1, 0, 0, 0)) = 1, "0001-01-01 was a Monday");
+        assertTrue(weekday(civil(2026, 2, 30, 0, 0, 0)) = 0, "no weekday for a date that does not exist");
+        return nil;
+    end;
+
+    function testFormat(): Unit is
+        let zero: Int32 := 0;
+        let epoch: Instant := makeInstant(0, 0);
+        assertTrue(utcIs(epoch, "1970-01-01T00:00:00Z"), "the epoch");
+        let half: Instant := makeInstant(0, 500000000);
+        assertTrue(utcIs(half, "1970-01-01T00:00:00.5Z"), "a fraction without trailing zeros");
+        let fine: Instant := makeInstant(0, 123456789);
+        assertTrue(utcIs(fine, "1970-01-01T00:00:00.123456789Z"), "nine digits of fraction");
+        assertTrue(textIs(epoch, 7200, "1970-01-01T02:00:00+02:00"), "an offset east");
+        assertTrue(textIs(epoch, -19800, "1969-12-31T18:30:00-05:30"), "an offset west, half an hour");
+        case formatRfc3339(epoch, 90) of
+            when Some(value as text: String) do
+                destroyString(text);
+                assertFailure("an offset that is not whole minutes is refused");
+            when None do
+                assertSuccess("an offset that is not whole minutes is refused");
+        end case;
+        case formatRfc3339(epoch, 86400) of
+            when Some(value as text: String) do
+                destroyString(text);
+                assertFailure("an offset of a day is refused");
+            when None do
+                assertSuccess("an offset of a day is refused");
+        end case;
+        return nil;
+    end;
+
+    function testParse(): Unit is
+        assertTrue(utcIs(instantOfText("2026-09-27T01:10:00Z"), "2026-09-27T01:10:00Z"), "UTC read back");
+        assertTrue(utcIs(instantOfText("2026-09-27t03:10:00.25+02:00"), "2026-09-27T01:10:00.25Z"), "an offset and a fraction, t in lower case");
+        assertTrue(utcIs(instantOfText("0000-01-01T00:00:00Z"), "0000-01-01T00:00:00Z"), "the year 0");
+        assertFalse(parses("2026-02-29T00:00:00Z"), "2026-02-29 does not exist");
+        assertFalse(parses("2026-09-27T24:00:00Z"), "hour 24");
+        assertFalse(parses("2026-09-27T23:59:60Z"), "a leap second");
+        assertFalse(parses("2026-09-27 01:10:00Z"), "a space for the T");
+        assertFalse(parses("2026-09-27T01:10:00"), "no offset");
+        assertFalse(parses("2026-09-27T01:10:00.Z"), "a point without digits");
+        assertFalse(parses("2026-09-27T01:10:00.1234567890Z"), "ten digits of fraction");
+        assertFalse(parses("2026-09-27T01:10:00+24:00"), "an offset of 24 hours");
+        assertFalse(parses("2026-09-27T01:10:00+0200"), "an offset without its colon");
+        assertFalse(parses("2026-9-27T01:10:00Z"), "a month of one digit");
+        assertFalse(parses("2026-09-27T01:10:00Zx"), "a byte after the Z");
+        assertFalse(parses("+2026-09-27T01:10:00Z"), "a sign before the year");
+        return nil;
+    end;
+
+    function testZoneFile(): Unit is
+        var zone: Zone := fixture();
+        assertTrue(offsetIs(&zone, "2026-03-29T00:59:59Z", 3600, false, "CET"), "a second before the spring change");
+        assertTrue(offsetIs(&zone, "2026-03-29T01:00:00Z", 7200, true, "CEST"), "the spring change");
+        assertTrue(offsetIs(&zone, "2026-10-25T00:59:59Z", 7200, true, "CEST"), "a second before the autumn change");
+        assertTrue(offsetIs(&zone, "2026-10-25T01:00:00Z", 3600, false, "CET"), "the autumn change");
+        assertTrue(offsetIs(&zone, "2000-07-01T00:00:00Z", 3600, false, "CET"), "before the first transition, the first type");
+        assertTrue(offsetIs(&zone, "2050-07-01T00:00:00Z", 7200, true, "CEST"), "after the last transition, the footer's rule in summer");
+        assertTrue(offsetIs(&zone, "2050-12-01T00:00:00Z", 3600, false, "CET"), "and in winter");
+        case localAt(&zone, instantOfText("2026-07-01T10:00:00Z")) of
+            when Some(value as shown: Civil) do
+                assertTrue((shown.hour = 12) and (shown.day = 1), "10:00 UTC in July is 12:00 in the zone");
+            when None do
+                assertFailure("10:00 UTC in July is 12:00 in the zone");
+        end case;
+        destroyZone(zone);
+        return nil;
+    end;
+
+    -- The order's test: 02:30 on the days of the change.
+    function testTheChangeOfTime(): Unit is
+        var zone: Zone := fixture();
+        assertTrue(skippedAt(&zone, civil(2026, 3, 29, 2, 30, 0), "2026-03-29T00:30:00Z", "2026-03-29T01:30:00Z"), "02:30 in spring is skipped");
+        assertTrue(twiceAt(&zone, civil(2026, 10, 25, 2, 30, 0), "2026-10-25T00:30:00Z", "2026-10-25T01:30:00Z"), "02:30 in autumn comes twice");
+        assertTrue(skippedAt(&zone, civil(2030, 3, 31, 2, 30, 0), "2030-03-31T00:30:00Z", "2030-03-31T01:30:00Z"), "and by the footer's rule in 2030");
+        assertTrue(twiceAt(&zone, civil(2030, 10, 27, 2, 30, 0), "2030-10-27T00:30:00Z", "2030-10-27T01:30:00Z"), "twice by the rule in 2030");
+        assertTrue(exactlyAt(&zone, civil(2026, 7, 1, 12, 0, 0), "2026-07-01T10:00:00Z"), "noon in summer, once");
+        assertTrue(exactlyAt(&zone, civil(2025, 7, 1, 12, 0, 0), "2025-07-01T11:00:00Z"), "noon before the first transition, once");
+        assertTrue(exactlyAt(&zone, civil(2026, 3, 29, 1, 59, 59), "2026-03-29T00:59:59Z"), "the last second before the gap");
+        assertTrue(exactlyAt(&zone, civil(2026, 3, 29, 3, 0, 0), "2026-03-29T01:00:00Z"), "the first second after it");
+        case resolveLocal(&zone, civil(2026, 2, 30, 2, 30, 0)) of
+            when NotACivil do
+                assertSuccess("a date that does not exist");
+            when Exactly(instant as found: Instant) do
+                assertFailure("a date that does not exist");
+            when Twice(earlier as first: Instant, later as second: Instant) do
+                assertFailure("a date that does not exist");
+            when Skipped(before as first: Instant, after as second: Instant) do
+                assertFailure("a date that does not exist");
+        end case;
+        destroyZone(zone);
+        return nil;
+    end;
+
+    -- Rules alone, the footers of America/New_York, Australia/Lord_Howe and
+    -- Asia/Kolkata as the zone files of both systems carry them.
+    function testRules(): Unit is
+        var york: Zone := ruleZone("EST5EDT,M3.2.0,M11.1.0");
+        assertTrue(skippedAt(&york, civil(2026, 3, 8, 2, 30, 0), "2026-03-08T06:30:00Z", "2026-03-08T07:30:00Z"), "New York, 02:30 in March is skipped");
+        assertTrue(twiceAt(&york, civil(2026, 11, 1, 1, 30, 0), "2026-11-01T05:30:00Z", "2026-11-01T06:30:00Z"), "New York, 01:30 in November comes twice");
+        assertTrue(offsetIs(&york, "2026-07-01T00:00:00Z", -14400, true, "EDT"), "New York in summer");
+        assertTrue(offsetIs(&york, "2040-01-01T00:00:00Z", -18000, false, "EST"), "New York in winter");
+        destroyZone(york);
+        var howe: Zone := ruleZone("<+1030>-10:30<+11>-11,M10.1.0,M4.1.0");
+        assertTrue(skippedAt(&howe, civil(2026, 10, 4, 2, 15, 0), "2026-10-03T15:15:00Z", "2026-10-03T15:45:00Z"), "Lord Howe, half an hour skipped in October");
+        assertTrue(twiceAt(&howe, civil(2026, 4, 5, 1, 45, 0), "2026-04-04T14:45:00Z", "2026-04-04T15:15:00Z"), "Lord Howe, half an hour twice in April");
+        assertTrue(offsetIs(&howe, "2026-07-01T00:00:00Z", 37800, false, "+1030"), "Lord Howe in its winter");
+        assertTrue(offsetIs(&howe, "2040-01-01T00:00:00Z", 39600, true, "+11"), "Lord Howe in its summer");
+        destroyZone(howe);
+        var india: Zone := ruleZone("IST-5:30");
+        assertTrue(offsetIs(&india, "2026-07-01T00:00:00Z", 19800, false, "IST"), "Kolkata, no daylight saving time");
+        assertTrue(exactlyAt(&india, civil(2026, 3, 8, 2, 30, 0), "2026-03-07T21:00:00Z"), "Kolkata, once");
+        destroyZone(india);
+        var utc: Zone := utcZone();
+        assertTrue(offsetIs(&utc, "2026-07-01T00:00:00Z", 0, false, "UTC"), "UTC");
+        destroyZone(utc);
+        return nil;
+    end;
+
+    function testRulesRefused(): Unit is
+        assertTrue(ruleCode("CET-1CEST,M3.5.0,M10.5.0/3") = 0, "Berlin's rule is read");
+        assertTrue(ruleCode("") = 3, "an empty rule");
+        assertTrue(ruleCode("CE-1") = 3, "a name of two letters");
+        assertTrue(ruleCode("CET") = 3, "no offset");
+        assertTrue(ruleCode("CET-1CEST") = 3, "a daylight name without its changes");
+        assertTrue(ruleCode("CET-25") = 3, "an offset of 25 hours");
+        assertTrue(ruleCode("CET-1CEST,M13.1.0,M10.5.0") = 3, "month 13");
+        assertTrue(ruleCode("CET-1CEST,M3.6.0,M10.5.0") = 3, "week 6");
+        assertTrue(ruleCode("CET-1CEST,M3.5.7,M10.5.0") = 3, "weekday 7");
+        assertTrue(ruleCode("CET-1CEST,J366,J10") = 3, "Julian day 366");
+        assertTrue(ruleCode("CET-1CEST,M3.5.0") = 3, "one change only");
+        assertTrue(ruleCode("CET-1CEST,M3.5.0,M10.5.0/3x") = 3, "a byte after the rule");
+        assertTrue(ruleCode("<+10>-10") = 0, "a name in angle brackets");
+        assertTrue(ruleCode("<+1>-1") = 3, "a name in angle brackets too short");
+        return nil;
+    end;
+
+    -- The fixture changed in one byte, each a rule of RFC 8536.  The
+    -- positions follow from the fixture's layout: the version 1 header
+    -- and block take 54 bytes, the second header 44, the two transitions
+    -- 16, their types 2, then the two types of 6 bytes each.
+    function testZoneRefused(): Unit is
+        let whole: String := fixtureBytes();
+        assertTrue(readCode(&whole) = 0, "the fixture itself is read");
+        destroyString(whole);
+        assertTrue(mutatedCode(0, 'X') = 3, "not TZif");
+        assertTrue(mutatedCode(4, '1') = 3, "version 1");
+        assertTrue(mutatedCode(110, 0) = 3, "transitions not ascending");
+        assertTrue(mutatedCode(114, 5) = 3, "a type that does not exist");
+        assertTrue(mutatedCode(116, 127) = 3, "an offset beyond 25 hours");
+        assertTrue(mutatedCode(120, 2) = 3, "a daylight flag of 2");
+        assertTrue(mutatedCode(121, 200) = 3, "an abbreviation outside the names");
+        assertTrue(mutatedCode(164, 'x') = 3, "a footer without its last line feed");
+        assertTrue(mutatedCode(147, ';') = 3, "a footer rule that does not read");
+        assertTrue(loadCode("../etc/passwd") = 1, "a name with dots");
+        assertTrue(loadCode("Europe//Berlin") = 1, "an empty part");
+        assertTrue(loadCode("/Europe/Berlin") = 1, "a leading slash");
+        assertTrue(loadCode("Europe/Berlin/") = 1, "a trailing slash");
+        assertTrue(loadCode("Euro pe") = 1, "a space");
+        assertTrue(loadCode("No/Such_Zone") = 2, "a zone that does not exist");
+        assertTrue(fileCode("/") = 2, "a directory is no zone file");
+        assertTrue(fileCode("/dev/null") = 2, "a device is no zone file");
+        return nil;
+    end;
+
+    -- The fixture written to a file and loaded from it, then removed.
+    function testLoadFile(): Unit is
+        let path: Span[Nat8, Static] := "calendar-test-zone.tzif";
+        let bytes: String := fixtureBytes();
+        case openWrite(path) of
+            when Some(value as file: FileDescriptor) do
+                var opened: FileDescriptor := file;
+                let written: Bool := writeAll(&!opened, asSpan(&bytes));
+                let closed: Bool := closeFile(opened);
+                assertTrue(written and closed, "the fixture was written");
+            when None do
+                assertFailure("the fixture was written");
+        end case;
+        destroyString(bytes);
+        case loadZoneFile(path) of
+            when Right(right as zone: Zone) do
+                var loaded: Zone := zone;
+                assertTrue(offsetIs(&loaded, "2026-07-01T00:00:00Z", 7200, true, "CEST"), "the loaded zone answers");
+                destroyZone(loaded);
+            when Left(left as why: ZoneFailure) do
+                assertFailure("the loaded zone answers");
+        end case;
+        assertTrue(removeFile(path), "the file was removed");
+        return nil;
+    end;
+
+    -- A zone file of 64 GiB, sparse, with one byte written at its end: it
+    -- is refused as malformed by its size before a byte is read, so that a
+    -- path from TZ cannot make the load ask for more memory than there is.
+    function testLoadFileTooLarge(): Unit is
+        let path: Span[Nat8, Static] := "calendar-test-sparse.tzif";
+        var made: Bool := false;
+        case openWrite(path) of
+            when Some(value as file: FileDescriptor) do
+                var opened: FileDescriptor := file;
+                let last: Int64 := 68719476735;
+                case seekFile(&!opened, last, seekFromStart) of
+                    when Some(value as at: Int64) do
+                        made := writeAll(&!opened, "x");
+                    when None do
+                        made := false;
+                end case;
+                let closed: Bool := closeFile(opened);
+                made := made and closed;
+            when None do
+                made := false;
+        end case;
+        assertTrue(made, "a sparse file of 64 GiB was made");
+        assertTrue(fileCode(path) = 3, "a zone file of 64 GiB is malformed, and nothing of it was read");
+        assertTrue(removeFile(path), "the file was removed");
+        return nil;
+    end;
+
+    -- The system's zone files, which the gate's image and the OpenBSD
+    -- guest both carry (tzdata 2026c, measured): the same changes of time
+    -- as the fixture and the rules give.
+    function testSystemZones(): Unit is
+        case loadZone("Europe/Berlin") of
+            when Right(right as zone: Zone) do
+                var berlin: Zone := zone;
+                assertTrue(skippedAt(&berlin, civil(2026, 3, 29, 2, 30, 0), "2026-03-29T00:30:00Z", "2026-03-29T01:30:00Z"), "Berlin, 02:30 in spring is skipped");
+                assertTrue(twiceAt(&berlin, civil(2026, 10, 25, 2, 30, 0), "2026-10-25T00:30:00Z", "2026-10-25T01:30:00Z"), "Berlin, 02:30 in autumn comes twice");
+                assertTrue(offsetIs(&berlin, "2040-01-01T00:00:00Z", 3600, false, "CET"), "Berlin after 2037, by the footer");
+                destroyZone(berlin);
+            when Left(left as why: ZoneFailure) do
+                assertFailure("Berlin, 02:30 in spring is skipped");
+        end case;
+        case loadZone("America/New_York") of
+            when Right(right as zone: Zone) do
+                var york: Zone := zone;
+                assertTrue(skippedAt(&york, civil(2026, 3, 8, 2, 30, 0), "2026-03-08T06:30:00Z", "2026-03-08T07:30:00Z"), "New York, 02:30 in March is skipped");
+                assertTrue(offsetIs(&york, "2026-07-01T00:00:00Z", -14400, true, "EDT"), "New York in summer");
+                destroyZone(york);
+            when Left(left as why: ZoneFailure) do
+                assertFailure("New York, 02:30 in March is skipped");
+        end case;
+        return nil;
+    end;
+
+    -- The system's own zone: whatever TZ and /etc/localtime say, an answer
+    -- and no abort.  What it is depends on the machine and is not asserted.
+    function testLocalZone(): Unit is
+        case localZone() of
+            when Right(right as zone: Zone) do
+                destroyZone(zone);
+                assertSuccess("the local zone answers");
+            when Left(left as why: ZoneFailure) do
+                assertSuccess("the local zone answers");
+        end case;
+        return nil;
+    end;
+end module body.

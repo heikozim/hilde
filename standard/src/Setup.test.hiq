@@ -1,0 +1,366 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Setup.  The vault and the database are made in the working
+-- directory and removed again.  Nothing here reads standard input or the
+-- terminal: a secret is stored with Standard.Vault itself.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    contains,
+    startsWith
+);
+import Standard.File (
+    removeFileIfThere,
+    removeDirectory
+);
+import Standard.Arguments (
+    Command,
+    Matches,
+    ArgumentError,
+    Outcome,
+    Run,
+    Help,
+    Version,
+    makeCommand,
+    destroyCommand,
+    destroyArguments,
+    parse,
+    destroyMatches,
+    destroyError
+);
+import Standard.Vault (
+    Vault,
+    VaultError,
+    openVault,
+    closeVault,
+    setSecret
+);
+import Standard.Sqlite (
+    Connection,
+    Writing,
+    SqlError,
+    openWriter,
+    closeDatabase
+);
+import Standard.Users (
+    UserError,
+    addUser
+);
+import Standard.SqliteUsers (
+    SqliteUsers,
+    SqliteUsersFailed,
+    openSqliteUsers,
+    closeSqliteUsers
+);
+import Standard.Paths (
+    UserTool
+);
+import Standard.Doctor (
+    Checkup,
+    makeCheckup,
+    destroyCheckup,
+    runCheckupOn,
+    runInitOn
+);
+import Standard.Setup (
+    SetupKeys,
+    UserKeys,
+    addSetup,
+    addUserCommands,
+    runSetup,
+    runUser,
+    checkVault,
+    addInstallFiles
+);
+
+module body Standard.Setup.Test is
+    function words(a: Span[Nat8, Static], b: Span[Nat8, Static], c: Span[Nat8, Static]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        insertBack(&!out, fromLiteral(a));
+        if not equal(b, "") then
+            insertBack(&!out, fromLiteral(b));
+        end if;
+        if not equal(c, "") then
+            insertBack(&!out, fromLiteral(c));
+        end if;
+        return out;
+    end;
+
+    -- setup with the words a b c on the vault of the test: the exit
+    -- status, and the output and errors joined.
+    generic [R: Region]
+    function setupRun(command: &[Command, R], keys: SetupKeys, a: Span[Nat8, Static], b: Span[Nat8, Static], c: Span[Nat8, Static], status: Int32): String is
+        let line: Buffer[String] := words(a, b, c);
+        let result: Either[ArgumentError, Outcome] := parse(command, &line);
+        destroyArguments(line);
+        var out: StringBuilder := makeStringBuilder();
+        var errors: StringBuilder := makeStringBuilder();
+        case result of
+            when Right(right as outcome: Outcome) do
+                case outcome of
+                    when Run(matches as m: Matches) do
+                        let got: Int32 := runSetup(command, &m, keys, "setup-test.env", "setup-test.pepper", "SETUP_KEY", "October 17, 2026", &!out, &!errors);
+                        assertTrue(got = status, "the exit status");
+                        destroyMatches(m);
+                    when Help(text as t: String) do
+                        destroyString(t);
+                        assertTrue(false, "a run, not help");
+                    when Version(text as t: String) do
+                        destroyString(t);
+                        assertTrue(false, "a run, not a version");
+                end case;
+            when Left(left as e: ArgumentError) do
+                destroyError(e);
+                assertTrue(false, "the line parses");
+        end case;
+        let errorText: String := finalize(errors);
+        var all: StringBuilder := makeStringBuilder();
+        let outText: String := finalize(out);
+        writeBoth(&!all, outText, errorText);
+        return finalize(all);
+    end;
+
+    generic [R: Region]
+    function writeBoth(all: &![StringBuilder, R], first: String, second: String): Unit is
+        writeText(&~all, first);
+        writeText(&~all, second);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function writeText(all: &![StringBuilder, R], text: String): Unit is
+        writeString(&~all, asSpan(&text));
+        destroyString(text);
+        return nil;
+    end;
+
+    function clean(): Unit is
+        let env: Bool := removeFileIfThere("setup-test.env");
+        let pepper: Bool := removeFileIfThere("setup-test.pepper");
+        let moved: Bool := removeFileIfThere("setup-test-2.pepper");
+        return nil;
+    end;
+
+    function testSetup(): Unit is
+        clean();
+        var command: Command := makeCommand("tool", "A tool.");
+        let keys: SetupKeys := addSetup(&!command);
+        var before: Checkup := makeCheckup("tool", UserTool());
+        checkVault(&!before, "setup-test.env", "setup-test.pepper", "SETUP_KEY", "tool setup init");
+        var out: StringBuilder := makeStringBuilder();
+        let notOpen: Index := runCheckupOn("linux", false, &before, false, &!out);
+        let lines: String := finalize(out);
+        assertTrue(notOpen = 1, "no vault yet: one missing");
+        assertTrue(startsWith(asSpan(&lines), "missing  vault    setup-test.env: "), "doctor says the vault does not open");
+        assertTrue(contains(asSpan(&lines), "; fix: tool setup init\n"), "and how to make it");
+        destroyString(lines);
+        destroyCheckup(before);
+        let made: String := setupRun(&command, keys, "setup", "init", "", 0);
+        var after: Checkup := makeCheckup("tool", UserTool());
+        checkVault(&!after, "setup-test.env", "setup-test.pepper", "SETUP_KEY", "tool setup init");
+        var good: StringBuilder := makeStringBuilder();
+        let none: Index := runCheckupOn("linux", false, &after, false, &!good);
+        let goodLines: String := finalize(good);
+        assertTrue(none = 0, "after init: nothing missing");
+        assertTrue(equal(asSpan(&goodLines), "ok       vault    setup-test.env\n"), "doctor says the vault opens");
+        destroyString(goodLines);
+        destroyCheckup(after);
+        assertTrue(equal(asSpan(&made), ""), "init says nothing");
+        destroyString(made);
+        let again: String := setupRun(&command, keys, "setup", "init", "", 1);
+        assertTrue(contains(asSpan(&again), "\n"), "a second init fails with the reason");
+        destroyString(again);
+        case openVault("setup-test.env", "setup-test.pepper", "SETUP_KEY") of
+            when Right(right as opened: Vault) do
+                var vault: Vault := opened;
+                let stored: Either[VaultError, Unit] := setSecret(&!vault, "DB_PASSWORD", "s3cret");
+                closeVault(vault);
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the vault of init opens");
+        end case;
+        let got: String := setupRun(&command, keys, "setup", "get", "DB_PASSWORD", 0);
+        assertTrue(equal(asSpan(&got), "s3cret\n"), "get prints the value");
+        destroyString(got);
+        let listed: String := setupRun(&command, keys, "setup", "list", "", 0);
+        assertTrue(equal(asSpan(&listed), "DB_PASSWORD\n"), "list prints the names, not the key");
+        destroyString(listed);
+        let rotated: String := setupRun(&command, keys, "setup", "rotate-key", "", 0);
+        assertTrue(equal(asSpan(&rotated), "secrets sealed under the new key: 1\n"), "rotate-key counts");
+        destroyString(rotated);
+        let still: String := setupRun(&command, keys, "setup", "get", "DB_PASSWORD", 0);
+        assertTrue(equal(asSpan(&still), "s3cret\n"), "the value under the new key");
+        destroyString(still);
+        let pepper: String := setupRun(&command, keys, "setup", "rotate-pepper", "", 0);
+        assertTrue(equal(asSpan(&pepper), "secrets sealed under the new pepper: 1\n"), "rotate-pepper in place");
+        destroyString(pepper);
+        let deleted: String := setupRun(&command, keys, "setup", "delete", "DB_PASSWORD", 0);
+        destroyString(deleted);
+        let gone: String := setupRun(&command, keys, "setup", "delete", "DB_PASSWORD", 1);
+        assertTrue(equal(asSpan(&gone), "there is no secret of that name\n"), "a second delete fails");
+        destroyString(gone);
+        let missing: String := setupRun(&command, keys, "setup", "get", "DB_PASSWORD", 1);
+        assertTrue(contains(asSpan(&missing), "\n"), "get of a removed one fails");
+        destroyString(missing);
+        let script: String := setupRun(&command, keys, "setup", "completion", "bash", 0);
+        assertTrue(contains(asSpan(&script), "complete -F _tool tool\n"), "completion bash");
+        destroyString(script);
+        let ksh: String := setupRun(&command, keys, "setup", "completion", "ksh", 1);
+        assertTrue(equal(asSpan(&ksh), "the shell is bash, zsh or fish\n"), "a shell not known");
+        destroyString(ksh);
+        let page: String := setupRun(&command, keys, "setup", "manual", "", 0);
+        assertTrue(startsWith(asSpan(&page), ".Dd October 17, 2026\n.Dt TOOL 1\n"), "manual");
+        destroyString(page);
+        destroyCommand(command);
+        clean();
+        return nil;
+    end;
+
+    function removeTree(): Unit is
+        let a: Bool := removeFileIfThere("setup-prefix/share/bash-completion/completions/tool");
+        let b: Bool := removeFileIfThere("setup-prefix/share/zsh/site-functions/_tool");
+        let c: Bool := removeFileIfThere("setup-prefix/share/fish/vendor_completions.d/tool.fish");
+        let d: Bool := removeFileIfThere("setup-prefix/man/man1/tool.1");
+        let e: Bool := removeDirectory("setup-prefix/share/bash-completion/completions");
+        let f: Bool := removeDirectory("setup-prefix/share/bash-completion");
+        let g: Bool := removeDirectory("setup-prefix/share/zsh/site-functions");
+        let h: Bool := removeDirectory("setup-prefix/share/zsh");
+        let i: Bool := removeDirectory("setup-prefix/share/fish/vendor_completions.d");
+        let j: Bool := removeDirectory("setup-prefix/share/fish");
+        let k: Bool := removeDirectory("setup-prefix/share");
+        let l: Bool := removeDirectory("setup-prefix/man/man1");
+        let m: Bool := removeDirectory("setup-prefix/man");
+        let n: Bool := removeDirectory("setup-prefix");
+        return nil;
+    end;
+
+    function testInstallFiles(): Unit is
+        removeTree();
+        var command: Command := makeCommand("tool", "A tool.");
+        var checkup: Checkup := makeCheckup("tool", UserTool());
+        addInstallFiles(&!checkup, &command, "tool", "October 17, 2026", "openbsd", "setup-prefix");
+        var before: StringBuilder := makeStringBuilder();
+        let missing: Index := runCheckupOn("openbsd", false, &checkup, false, &!before);
+        let beforeText: String := finalize(before);
+        assertTrue(missing = 4, "four files not there");
+        assertTrue(contains(asSpan(&beforeText), "missing  file     setup-prefix/man/man1/tool.1: not there; init writes it\n"), "the manual where OpenBSD looks");
+        destroyString(beforeText);
+        var made: StringBuilder := makeStringBuilder();
+        let left: Index := runInitOn("openbsd", false, &checkup, "/usr/local/bin/tool", false, &!made);
+        let madeText: String := finalize(made);
+        assertTrue(left = 0, "init writes them all");
+        assertTrue(contains(asSpan(&madeText), "made     directory /usr/bin/install -d -m 0755 setup-prefix/share/bash-completion/completions\nmade     file     write setup-prefix/share/bash-completion/completions/tool mode 0644\n"), "the directory first, then the file");
+        destroyString(madeText);
+        var after: StringBuilder := makeStringBuilder();
+        let none: Index := runCheckupOn("openbsd", false, &checkup, false, &!after);
+        let afterText: String := finalize(after);
+        assertTrue(none = 0, "doctor finds them");
+        destroyString(afterText);
+        var again: StringBuilder := makeStringBuilder();
+        let nothing: Index := runInitOn("openbsd", false, &checkup, "/usr/local/bin/tool", false, &!again);
+        let againText: String := finalize(again);
+        assertTrue(equal(asSpan(&againText), "nothing to do\n"), "a second init writes nothing");
+        destroyString(againText);
+        destroyCheckup(checkup);
+        destroyCommand(command);
+        removeTree();
+        return nil;
+    end;
+
+    function freshUsers(): SqliteUsers is
+        let removed: Bool := removeFileIfThere("setup-test.db");
+        case openWriter("setup-test.db") of
+            when Right(right as opened: Connection[Writing]) do
+                case openSqliteUsers(opened) of
+                    when Right(right as users: SqliteUsers) do
+                        return users;
+                    when Left(left as failed: SqliteUsersFailed) do
+                        let { db: Connection[Writing], error: UserError } := failed;
+                        closeDatabase(db);
+                        abort("openSqliteUsers failed");
+                end case;
+            when Left(left as error: SqlError) do
+                abort("the test database could not be opened");
+        end case;
+    end;
+
+    -- user with the words a b c on store: the exit status, and the output
+    -- and errors joined.
+    generic [R: Region, S: Region]
+    function userRun(command: &[Command, R], keys: UserKeys, store: &![SqliteUsers, S], a: Span[Nat8, Static], b: Span[Nat8, Static], c: Span[Nat8, Static], status: Int32): String is
+        let line: Buffer[String] := words(a, b, c);
+        let result: Either[ArgumentError, Outcome] := parse(command, &line);
+        destroyArguments(line);
+        var out: StringBuilder := makeStringBuilder();
+        var errors: StringBuilder := makeStringBuilder();
+        case result of
+            when Right(right as outcome: Outcome) do
+                case outcome of
+                    when Run(matches as m: Matches) do
+                        let got: Int32 := runUser(&m, keys, &~store, &!out, &!errors);
+                        assertTrue(got = status, "the exit status");
+                        destroyMatches(m);
+                    when Help(text as t: String) do
+                        destroyString(t);
+                        assertTrue(false, "a run, not help");
+                    when Version(text as t: String) do
+                        destroyString(t);
+                        assertTrue(false, "a run, not a version");
+                end case;
+            when Left(left as e: ArgumentError) do
+                destroyError(e);
+                assertTrue(false, "the line parses");
+        end case;
+        let errorText: String := finalize(errors);
+        var all: StringBuilder := makeStringBuilder();
+        let outText: String := finalize(out);
+        writeBoth(&!all, outText, errorText);
+        return finalize(all);
+    end;
+
+    function testUser(): Unit is
+        var command: Command := makeCommand("tool", "A tool.");
+        let keys: UserKeys := addUserCommands(&!command);
+        var users: SqliteUsers := freshUsers();
+        let added: Either[UserError, Bool] := addUser(&!users, "anna", "correct horse battery staple");
+        let none: String := userRun(&command, keys, &!users, "user", "list", "", 0);
+        assertTrue(equal(asSpan(&none), "anna\n"), "list");
+        destroyString(none);
+        let removed: String := userRun(&command, keys, &!users, "user", "del", "anna", 0);
+        assertTrue(equal(asSpan(&removed), ""), "del");
+        destroyString(removed);
+        let twice: String := userRun(&command, keys, &!users, "user", "del", "anna", 1);
+        assertTrue(equal(asSpan(&twice), "there is no user of that name\n"), "del of one not there");
+        destroyString(twice);
+        let empty: String := userRun(&command, keys, &!users, "user", "list", "", 0);
+        assertTrue(equal(asSpan(&empty), ""), "list of none");
+        destroyString(empty);
+        closeDatabase(closeSqliteUsers(users));
+        let gone: Bool := removeFileIfThere("setup-test.db");
+        destroyCommand(command);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,1 @@
+The deviations that compile: |upper, |lower and |trim touch ASCII only. The expected output is this implementation's own, reviewed; Jinja2 changes the case of every letter and trims every white space of Unicode.

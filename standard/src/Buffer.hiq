@@ -1,0 +1,306 @@
+--
+-- Part of the Hilde project, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Hilde is derived from the Austral project and extends it substantially.
+-- Modified by Heiko Zimmermann, 2026.
+--
+-- A buffer is an array of the compiler, Hilde.Array, and every operation
+-- here is one of its operations.  The array checks every index and every
+-- span; this module holds no pointer and is safe.
+
+import Hilde.Array (
+    Array,
+    allocateArray,
+    arrayLength,
+    arrayNth,
+    arrayNthRef,
+    arrayStore,
+    arraySwap,
+    arraySwapIndex,
+    arrayApply,
+    arrayInsert,
+    arrayRemove,
+    arraySpan,
+    arraySpanMut,
+    arrayWholeSpan,
+    destroyEmptyArray,
+    destroyFreeArray,
+    destroyWipedArray
+);
+
+module body Standard.Buffer is
+    """
+    The room a new buffer starts with.  The array doubles it when an insert
+    needs more.
+    """
+    constant minimum_capacity: Index := 16;
+
+    record Buffer[T: Type]: Linear is
+        items: Array[T];
+    end;
+
+    -- The items, through the write reference the buffer is held by.  A function
+    -- passes &~buf, so that it keeps buf for the contract it states.
+    generic [T: Type, R: Region]
+    function itemsMut(buf: &![Buffer[T], R]): &![Array[T], R] is
+        return &!(buf->items);
+    end;
+
+    ---
+    --- Lifecycle
+    ---
+
+    generic [T: Type]
+    function allocateEmpty(): Buffer[T] is
+        let opt: Option[Buffer[T]] := safeAllocateEmpty();
+        case opt of
+            when Some(value: Buffer[T]) do
+                return value;
+            when None do
+                abort("allocateEmpty: allocation failed");
+        end case;
+    end;
+
+    generic [T: Type]
+    function safeAllocateEmpty(): Option[Buffer[T]] is
+        let opt: Option[Array[T]] := allocateArray(minimum_capacity);
+        let items: Array[T] := opt?;
+        return Some(value => Buffer(items => items));
+    end;
+
+    generic [T: Free]
+    function initialize(size: Index, initialElement: T): Buffer[T] is
+        let opt: Option[Buffer[T]] := safeInitialize(size, initialElement);
+        case opt of
+            when Some(value: Buffer[T]) do
+                return value;
+            when None do
+                abort("initialize: allocation failed");
+        end case;
+    end;
+
+    generic [T: Free]
+    function safeInitialize(size: Index, initialElement: T): Option[Buffer[T]] is
+        var capacity: Index := size;
+        if capacity < minimum_capacity then
+            capacity := minimum_capacity;
+        end if;
+        let opt: Option[Array[T]] := allocateArray(capacity);
+        let items: Array[T] := opt?;
+        var filled: Array[T] := items;
+        var i: Index := 0;
+        while i < size do
+            arrayInsert(&!filled, i, initialElement);
+            i := i + 1;
+        end while;
+        return Some(value => Buffer(items => filled));
+    end;
+
+    generic [T: Free]
+    function destroyFree(buffer: Buffer[T]): Unit is
+        let { items: Array[T] } := buffer;
+        destroyFreeArray(items);
+        return nil;
+    end;
+
+    generic [T: Free]
+    function destroyWiped(buffer: Buffer[T]): Unit is
+        let { items: Array[T] } := buffer;
+        destroyWipedArray(items);
+        return nil;
+    end;
+
+    generic [T: Type]
+    function destroyEmpty(buffer: Buffer[T]): Unit is
+        let { items: Array[T] } := buffer;
+        destroyEmptyArray(items);
+        return nil;
+    end;
+
+    ---
+    --- Retrieve
+    ---
+
+    generic [T: Type, R: Region]
+    function length(buf: &[Buffer[T], R]): Index is
+        return arrayLength(&(buf->items));
+    end;
+
+    generic [T: Free, R: Region]
+    function nth(buf: &[Buffer[T], R], pos: Index): T is
+        return arrayNth(&(buf->items), pos);
+    end;
+
+    generic [T: Type, R: Region]
+    function lengthMut(buf: &![Buffer[T], R]): Index is
+        return length(&buf);
+    end;
+
+    generic [T: Free, R: Region]
+    function nthMut(buf: &![Buffer[T], R], pos: Index): T is
+        return nth(&buf, pos);
+    end;
+
+    generic [T: Type, R: Region]
+    function nthRef(buf: &[Buffer[T], R], pos: Index): &[T, R] is
+        return arrayNthRef(&(buf->items), pos);
+    end;
+
+    ---
+    --- Update
+    ---
+
+    generic [T: Free, R: Region]
+    function storeNth(buf: &![Buffer[T], R], pos: Index, element: T): Unit is
+        arrayStore(itemsMut(&~buf), pos, element);
+        return nil;
+    end;
+
+    generic [T: Type, R: Region]
+    function swapNth(buf: &![Buffer[T], R], pos: Index, element: T): T is
+        return arraySwap(itemsMut(&~buf), pos, element);
+    end;
+
+    generic [T: Type, R: Region]
+    function swapIndex(buf: &![Buffer[T], R], a: Index, b: Index): Unit is
+        arraySwapIndex(itemsMut(&~buf), a, b);
+        return nil;
+    end;
+
+    generic [T: Type, R: Region]
+    function swapTransform(buf: &![Buffer[T], R], pos: Index, fn: Fn[T, T]): Unit is
+        arrayApply(itemsMut(&~buf), pos, fn);
+        return nil;
+    end;
+
+    generic [T: Free, R: Region]
+    function fill(buf: &![Buffer[T], R], element: T): Unit is
+        let size: Index := length(&buf);
+        var i: Index := 0;
+        while i < size do
+            storeNth(&~buf, i, element);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Insertion
+    ---
+
+    generic [T: Type, R: Region]
+    function insert(buf: &![Buffer[T], R], pos: Index, element: T): Unit is
+        arrayInsert(itemsMut(&~buf), pos, element);
+        return nil;
+    end;
+
+    -- Inserting at place 0 moves every element one place up.
+    generic [T: Type, R: Region]
+    function insertFront(buf: &![Buffer[T], R], element: T): Unit is
+        return insert(&~buf, 0, element);
+    end;
+
+    generic [T: Type, R: Region]
+    function insertBack(buf: &![Buffer[T], R], element: T): Unit is
+        let size: Index := length(&buf);
+        return insert(&~buf, size, element);
+    end;
+
+    ---
+    --- Removal
+    ---
+
+    generic [T: Type, R: Region]
+    function remove(buf: &![Buffer[T], R], pos: Index): T is
+        return arrayRemove(itemsMut(&~buf), pos);
+    end;
+
+    generic [T: Type, R: Region]
+    function removeFirst(buf: &![Buffer[T], R]): T is
+        return remove(&~buf, 0);
+    end;
+
+    -- An empty buffer has no last element; its length minus one would trap
+    -- before the array could say so, so the array is asked with its length.
+    generic [T: Type, R: Region]
+    function removeLast(buf: &![Buffer[T], R]): T is
+        let size: Index := length(&buf);
+        if size = 0 then
+            return remove(&~buf, 0);
+        else
+            return remove(&~buf, size - 1);
+        end if;
+    end;
+
+    ---
+    --- Reversal
+    ---
+
+    generic [T: Type, R: Region]
+    function reverse(buf: &![Buffer[T], R]): Unit is
+        let size: Index := length(&buf);
+        if size > 1 then
+            for i from 0 to (size / 2) - 1 do
+                let j: Index := (size - i) - 1;
+                swapIndex(&~buf, i, j);
+            end for;
+        end if;
+        return nil;
+    end;
+
+    ---
+    --- Map
+    ---
+
+    generic [T: Type, R: Region]
+    function inPlaceMap(buf: &![Buffer[T], R], fn: Fn[T, T]): Unit is
+        let size: Index := length(&buf);
+        var i: Index := 0;
+        while i < size do
+            swapTransform(&~buf, i, fn);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The elements are taken out from the last, transformed and appended to
+    -- the new buffer, which is then reversed: no element is moved twice, and
+    -- the old array is empty when it is given back.
+    generic [T: Type, U: Type]
+    function map(buf: Buffer[T], fn: Fn[T, U]): Buffer[U] is
+        let { items: Array[T] } := buf;
+        var old: Array[T] := items;
+        var newbuf: Buffer[U] := allocateEmpty();
+        while arrayLength(&old) > 0 do
+            let last: Index := arrayLength(&old) - 1;
+            let element: T := arrayRemove(&!old, last);
+            let changed: U := fn(element);
+            insertBack(&!newbuf, changed);
+        end while;
+        destroyEmptyArray(old);
+        reverse(&!newbuf);
+        return newbuf;
+    end;
+
+    ---
+    --- Spans
+    ---
+
+    generic [T: Type, R: Region]
+    function getSpan(buf: &[Buffer[T], R], start: Index, final: Index): Span[T, R] is
+        return arraySpan(&(buf->items), start, final);
+    end;
+
+    generic [T: Type, R: Region]
+    function getSpanMut(buf: &![Buffer[T], R], start: Index, final: Index): Span![T, R] is
+        return arraySpanMut(&!(buf->items), start, final);
+    end;
+
+    generic [T: Type, R: Region]
+    function wholeSpan(buf: &[Buffer[T], R]): Span[T, R] is
+        return arrayWholeSpan(&(buf->items));
+    end;
+end module body.

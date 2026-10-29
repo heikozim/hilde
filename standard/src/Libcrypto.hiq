@@ -1,0 +1,316 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: every call goes to Bindings.Libcrypto, which holds the
+-- work with addresses.
+import Standard.String (
+    String,
+    makeString,
+    storeNth as storeNthByte,
+    asSpan,
+    destroyString,
+    destroyWiped as destroyWipedString
+);
+import Standard.Buffer (
+    Buffer,
+    initialize,
+    nth,
+    nthMut,
+    storeNth,
+    destroyWiped as destroyWipedWords
+);
+import Bindings.Libcrypto (
+    libraryVersion as bindLibraryVersion,
+    sealAes256Gcm as bindSealAes256Gcm,
+    openAes256Gcm as bindOpenAes256Gcm,
+    sealChaCha20Poly1305 as bindSealChaCha20Poly1305,
+    openChaCha20Poly1305 as bindOpenChaCha20Poly1305,
+    x25519PublicKey as bindX25519PublicKey,
+    x25519SharedSecret as bindX25519SharedSecret,
+    ed25519PublicKey as bindEd25519PublicKey,
+    ed25519Sign as bindEd25519Sign,
+    ed25519Verify as bindEd25519Verify,
+    randomBytes as bindRandomBytes,
+    sha256 as bindSha256,
+    hmacSha256 as bindHmacSha256,
+    sha384 as bindSha384,
+    sha512 as bindSha512,
+    sha3_256 as bindSha3_256,
+    sha3_512 as bindSha3_512,
+    hmacSha384 as bindHmacSha384,
+    hmacSha512 as bindHmacSha512,
+    hmacSha3_512 as bindHmacSha3_512,
+    hmacSha1 as bindHmacSha1
+);
+
+module body Standard.Libcrypto is
+    generic [K: Region, N: Region, P: Region, A: Region]
+    function sealAes256Gcm(key: Span[Nat8, K], nonce: Span[Nat8, N], plaintext: Span[Nat8, P], aad: Span[Nat8, A]): Option[String] is
+        return bindSealAes256Gcm(key, nonce, plaintext, aad);
+    end;
+
+    generic [K: Region, N: Region, S: Region, A: Region]
+    function openAes256Gcm(key: Span[Nat8, K], nonce: Span[Nat8, N], sealed: Span[Nat8, S], aad: Span[Nat8, A]): Option[String] is
+        return bindOpenAes256Gcm(key, nonce, sealed, aad);
+    end;
+
+    generic [K: Region, N: Region, P: Region, A: Region]
+    function sealChaCha20Poly1305(key: Span[Nat8, K], nonce: Span[Nat8, N], plaintext: Span[Nat8, P], aad: Span[Nat8, A]): Option[String] is
+        return bindSealChaCha20Poly1305(key, nonce, plaintext, aad);
+    end;
+
+    generic [K: Region, N: Region, S: Region, A: Region]
+    function openChaCha20Poly1305(key: Span[Nat8, K], nonce: Span[Nat8, N], sealed: Span[Nat8, S], aad: Span[Nat8, A]): Option[String] is
+        return bindOpenChaCha20Poly1305(key, nonce, sealed, aad);
+    end;
+
+    -- A byte as a word.
+    function wordOf(byte: Nat8): Nat32 is
+        case toNat32(byte) of
+            when Some(value as word: Nat32) do
+                return word;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The lowest byte of a word.
+    function lowByte(word: Nat32): Nat8 is
+        case toNat8(bitwiseAnd(word, 255)) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The word of four bytes from at, the lowest first.
+    generic [R: Region]
+    function littleWord(bytes: Span[Nat8, R], at: Index): Nat32 is
+        let a: Nat32 := wordOf(bytes[at]);
+        let b: Nat32 := modularMultiply(wordOf(bytes[at + 1]), 256);
+        let c: Nat32 := modularMultiply(wordOf(bytes[at + 2]), 65536);
+        let d: Nat32 := modularMultiply(wordOf(bytes[at + 3]), 16777216);
+        return bitwiseOr(bitwiseOr(a, b), bitwiseOr(c, d));
+    end;
+
+    -- x turned left by n bits; up is 2 to the n, down 2 to the 32 - n.
+    function turned(x: Nat32, up: Nat32, down: Nat32): Nat32 is
+        return bitwiseOr(modularMultiply(x, up), x / down);
+    end;
+
+    -- The quarter round of ChaCha20 over the words a, b, c, d of the state.
+    generic [R: Region]
+    function quarter(state: &![Buffer[Nat32], R], a: Index, b: Index, c: Index, d: Index): Unit is
+        var wa: Nat32 := nthMut(&~state, a);
+        var wb: Nat32 := nthMut(&~state, b);
+        var wc: Nat32 := nthMut(&~state, c);
+        var wd: Nat32 := nthMut(&~state, d);
+        wa := modularAdd(wa, wb);
+        wd := turned(bitwiseXor(wd, wa), 65536, 65536);
+        wc := modularAdd(wc, wd);
+        wb := turned(bitwiseXor(wb, wc), 4096, 1048576);
+        wa := modularAdd(wa, wb);
+        wd := turned(bitwiseXor(wd, wa), 256, 16777216);
+        wc := modularAdd(wc, wd);
+        wb := turned(bitwiseXor(wb, wc), 128, 33554432);
+        storeNth(&~state, a, wa);
+        storeNth(&~state, b, wb);
+        storeNth(&~state, c, wc);
+        storeNth(&~state, d, wd);
+        return nil;
+    end;
+
+    generic [K: Region, N: Region]
+    function hchacha20(key: Span[Nat8, K], nonce: Span[Nat8, N]): Option[String] is
+        if (spanLength(key) /= 32) or (spanLength(nonce) /= 16) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var state: Buffer[Nat32] := initialize(16, 0);
+        storeNth(&!state, 0, 1634760805);
+        storeNth(&!state, 1, 857760878);
+        storeNth(&!state, 2, 2036477234);
+        storeNth(&!state, 3, 1797285236);
+        var i: Index := 0;
+        while i < 8 do
+            storeNth(&!state, 4 + i, littleWord(key, 4 * i));
+            i := i + 1;
+        end while;
+        i := 0;
+        while i < 4 do
+            storeNth(&!state, 12 + i, littleWord(nonce, 4 * i));
+            i := i + 1;
+        end while;
+        var round: Index := 0;
+        while round < 10 do
+            quarter(&!state, 0, 4, 8, 12);
+            quarter(&!state, 1, 5, 9, 13);
+            quarter(&!state, 2, 6, 10, 14);
+            quarter(&!state, 3, 7, 11, 15);
+            quarter(&!state, 0, 5, 10, 15);
+            quarter(&!state, 1, 6, 11, 12);
+            quarter(&!state, 2, 7, 8, 13);
+            quarter(&!state, 3, 4, 9, 14);
+            round := round + 1;
+        end while;
+        -- The subkey, made at its size so that wiping it wipes it all.
+        var out: String := makeString(32, 0);
+        var w: Index := 0;
+        while w < 8 do
+            var word: Nat32 := nth(&state, w);
+            if w >= 4 then
+                word := nth(&state, 8 + w);
+            end if;
+            var k: Index := 0;
+            while k < 4 do
+                storeNthByte(&!out, (4 * w) + k, lowByte(word));
+                word := word / 256;
+                k := k + 1;
+            end while;
+            w := w + 1;
+        end while;
+        destroyWipedWords(state);
+        let some: Option[String] := Some(value => out);
+        return some;
+    end;
+
+    -- The nonce of ChaCha20-Poly1305 under the subkey: four zero bytes
+    -- and the last eight of the long nonce.
+    generic [N: Region]
+    function shortNonce(nonce: Span[Nat8, N]): String is
+        var out: String := makeString(12, 0);
+        var i: Index := 0;
+        while i < 8 do
+            storeNthByte(&!out, 4 + i, nonce[16 + i]);
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [K: Region, N: Region, P: Region, A: Region]
+    function sealXChaCha20Poly1305(key: Span[Nat8, K], nonce: Span[Nat8, N], plaintext: Span[Nat8, P], aad: Span[Nat8, A]): Option[String] is
+        if spanLength(nonce) /= 24 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case hchacha20(key, spanPart(nonce, 0, 16)) of
+            when Some(value as subkey: String) do
+                let short: String := shortNonce(nonce);
+                let sealed: Option[String] := bindSealChaCha20Poly1305(asSpan(&subkey), asSpan(&short), plaintext, aad);
+                destroyString(short);
+                destroyWipedString(subkey);
+                return sealed;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [K: Region, N: Region, S: Region, A: Region]
+    function openXChaCha20Poly1305(key: Span[Nat8, K], nonce: Span[Nat8, N], sealed: Span[Nat8, S], aad: Span[Nat8, A]): Option[String] is
+        if spanLength(nonce) /= 24 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case hchacha20(key, spanPart(nonce, 0, 16)) of
+            when Some(value as subkey: String) do
+                let short: String := shortNonce(nonce);
+                let opened: Option[String] := bindOpenChaCha20Poly1305(asSpan(&subkey), asSpan(&short), sealed, aad);
+                destroyString(short);
+                destroyWipedString(subkey);
+                return opened;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [K: Region]
+    function x25519PublicKey(privateKey: Span[Nat8, K]): Option[String] is
+        return bindX25519PublicKey(privateKey);
+    end;
+
+    generic [K: Region, P: Region]
+    function x25519SharedSecret(privateKey: Span[Nat8, K], peerPublicKey: Span[Nat8, P]): Option[String] is
+        return bindX25519SharedSecret(privateKey, peerPublicKey);
+    end;
+
+    generic [S: Region]
+    function ed25519PublicKey(seed: Span[Nat8, S]): Option[String] is
+        return bindEd25519PublicKey(seed);
+    end;
+
+    generic [S: Region, M: Region]
+    function ed25519Sign(seed: Span[Nat8, S], message: Span[Nat8, M]): Option[String] is
+        return bindEd25519Sign(seed, message);
+    end;
+
+    generic [P: Region, M: Region, G: Region]
+    function ed25519Verify(publicKey: Span[Nat8, P], message: Span[Nat8, M], signature: Span[Nat8, G]): Bool is
+        return bindEd25519Verify(publicKey, message, signature);
+    end;
+
+    function randomBytes(count: Index): Option[String] is
+        return bindRandomBytes(count);
+    end;
+
+    generic [M: Region]
+    function sha256(message: Span[Nat8, M]): Option[String] is
+        return bindSha256(message);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha256(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        return bindHmacSha256(key, message);
+    end;
+
+    generic [M: Region]
+    function sha384(message: Span[Nat8, M]): Option[String] is
+        return bindSha384(message);
+    end;
+
+    generic [M: Region]
+    function sha512(message: Span[Nat8, M]): Option[String] is
+        return bindSha512(message);
+    end;
+
+    generic [M: Region]
+    function sha3_256(message: Span[Nat8, M]): Option[String] is
+        return bindSha3_256(message);
+    end;
+
+    generic [M: Region]
+    function sha3_512(message: Span[Nat8, M]): Option[String] is
+        return bindSha3_512(message);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha384(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        return bindHmacSha384(key, message);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha512(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        return bindHmacSha512(key, message);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha3_512(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        return bindHmacSha3_512(key, message);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha1(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        return bindHmacSha1(key, message);
+    end;
+
+    function libraryVersion(): Span[Nat8, Static] is
+        return bindLibraryVersion();
+    end;
+end module body.

@@ -1,0 +1,160 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    Command,
+    makeCommand,
+    addArgument,
+    discardCommand
+);
+import Standard.Ssh (
+    SshError,
+    CommandResult,
+    sshCommand,
+    addRemoteWord,
+    shellQuote,
+    runCommand,
+    destroyResult
+);
+
+module body Standard.Ssh.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function outputIs(result: &[CommandResult, R], expected: Span[Nat8, Static]): Bool is
+        return same(&(result->output), expected);
+    end;
+
+    generic [R: Region]
+    function errorsIs(result: &[CommandResult, R], expected: Span[Nat8, Static]): Bool is
+        return same(&(result->errors), expected);
+    end;
+
+    function errorNumber(error: SshError): Int32 is
+        case error of
+            when BadTarget do
+                return 1;
+            when NotStarted do
+                return 2;
+            when CommandTimedOut do
+                return 3;
+            when OutputTooLarge do
+                return 4;
+            when PipeFailed do
+                return 5;
+        end case;
+    end;
+
+    function shell(script: Span[Nat8, Static]): Command is
+        return addArgument(addArgument(makeCommand("/bin/sh"), "-c"), script);
+    end;
+
+    function fails(command: Command, milliseconds: Nat32, most: Index, expected: Int32, message: Span[Nat8, Static]): Unit is
+        case runCommand(command, milliseconds, most) of
+            when Right(right as result: CommandResult) do
+                destroyResult(result);
+                assertFailure(message);
+            when Left(left as error: SshError) do
+                assertTrue(errorNumber(error) = expected, message);
+        end case;
+        return nil;
+    end;
+
+    function testQuote(): Unit is
+        let quoted: String := shellQuote("it's $HOME; rm");
+        assertTrue(same(&quoted, "'it'\\''s $HOME; rm'"), "a quote inside, a dollar and a semicolon kept as text");
+        destroyString(quoted);
+        return nil;
+    end;
+
+    -- /bin/echo in place of ssh prints the command line ssh would get.
+    function testCommandLine(): Unit is
+        case sshCommand("/bin/echo", "host.example.org", "deploy", 2222, 10) of
+            when Right(right as built: Command) do
+                var command: Command := addRemoteWord(built, "ls");
+                command := addRemoteWord(command, "-la");
+                command := addRemoteWord(command, "a b; rm -rf /");
+                case runCommand(command, 5000, 4096) of
+                    when Right(right as result: CommandResult) do
+                        assertTrue(result.code = 0, "echo ends 0");
+                        assertTrue(outputIs(&result, "-T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -p 2222 -l deploy -- host.example.org 'ls' '-la' 'a b; rm -rf /'\n"),
+                            "batch mode, a known host key, the time, the port, the user, the end of the options, the host and the quoted words");
+                        destroyResult(result);
+                    when Left(left as error: SshError) do
+                        assertFailure("echo ran");
+                end case;
+            when Left(left as error: SshError) do
+                assertFailure("a good target");
+        end case;
+        return nil;
+    end;
+
+    function refusedTarget(host: Span[Nat8, Static], user: Span[Nat8, Static], port: Index, seconds: Index, message: Span[Nat8, Static]): Unit is
+        case sshCommand("/usr/bin/ssh", host, user, port, seconds) of
+            when Right(right as built: Command) do
+                discardCommand(built);
+                assertFailure(message);
+            when Left(left as error: SshError) do
+                assertTrue(errorNumber(error) = 1, message);
+        end case;
+        return nil;
+    end;
+
+    function testTargets(): Unit is
+        refusedTarget("-oProxyCommand=sh", "", 22, 10, "a host that is an option");
+        refusedTarget("-example.org", "", 22, 10, "a host of good characters that begins with a hyphen");
+        refusedTarget("a b", "", 22, 10, "a host with a space");
+        refusedTarget("", "", 22, 10, "no host");
+        refusedTarget("host", "-l", 22, 10, "a user that is an option");
+        refusedTarget("host", "a;b", 22, 10, "a user with a semicolon");
+        refusedTarget("host", "", 0, 10, "port 0");
+        refusedTarget("host", "", 65536, 10, "a port above 65535");
+        refusedTarget("host", "", 22, 0, "no time to connect");
+        return nil;
+    end;
+
+    function testRun(): Unit is
+        case runCommand(shell("cat; echo out; echo err >&2; exit 3"), 5000, 4096) of
+            when Right(right as result: CommandResult) do
+                assertTrue(result.code = 3, "the exit code");
+                assertTrue(outputIs(&result, "out\n"), "the input was closed, so cat ended at once");
+                assertTrue(errorsIs(&result, "err\n"), "the errors apart");
+                destroyResult(result);
+            when Left(left as error: SshError) do
+                assertFailure("a shell ran");
+        end case;
+        fails(shell("sleep 5"), 300, 4096, 3, "a child that takes too long is ended");
+        fails(shell("while true; do echo 0123456789; done"), 5000, 1000, 4, "a child that writes too much is ended");
+        fails(makeCommand("/nonexistent/ssh"), 1000, 4096, 2, "a programme that is not there");
+        return nil;
+    end;
+end module body.

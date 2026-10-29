@@ -1,0 +1,227 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- One order in three formats, and its sum in decimals.  Standard.Csv
+-- reads the lines of the order, Standard.Decimal adds their prices
+-- without the errors of binary floats, Standard.Json writes the order and
+-- reads a field back by its pointer, and Standard.Ini reads the settings
+-- of the shop.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Csv (
+    CsvTable,
+    CsvError,
+    readCsv,
+    destroyCsv,
+    rowCount,
+    fieldAt
+);
+import Standard.Decimal (
+    Decimal,
+    parseDecimal,
+    makeDecimal,
+    addDecimal,
+    multiplyDecimal,
+    roundDecimal,
+    decimalToString
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    JsonWriter,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    beginArray,
+    endArray,
+    writeName,
+    writeString,
+    writeInteger,
+    writeNumber,
+    finishJson,
+    readJson,
+    destroyJson,
+    stringAt,
+    countAt
+);
+import Standard.Ini (
+    IniFile,
+    readIni,
+    destroyIni,
+    iniValue,
+    iniSwitch
+);
+
+module body Example.LearnData is
+    -- A price of the table as a decimal, 0 when it is not one.
+    generic [R: Region]
+    function priceAt(table: &[CsvTable, R], row: Index): Decimal is
+        case fieldAt(table, row, 2) of
+            when Some(value as text: Span[Nat8, R]) do
+                case parseDecimal(text) of
+                    when Some(value as d: Decimal) do
+                        return d;
+                    when None do
+                        skip;
+                end case;
+            when None do
+                skip;
+        end case;
+        return zeroDecimal();
+    end;
+
+    function zeroDecimal(): Decimal is
+        let zero: Int64 := 0;
+        let noScale: Nat8 := 0;
+        case makeDecimal(zero, noScale) of
+            when Some(value as d: Decimal) do
+                return d;
+            when None do
+                abort("a zero that is not a decimal");
+        end case;
+    end;
+
+    -- The order as JSON: its lines with their names and prices, and the sum.
+    generic [R: Region]
+    function orderAsJson(table: &[CsvTable, R], sum: Decimal): Option[String] is
+        var w: JsonWriter := makeJsonWriter();
+        beginObject(&!w);
+        writeName(&!w, "lines");
+        beginArray(&!w);
+        var row: Index := 1;
+        while row < rowCount(table) do
+            beginObject(&!w);
+            case fieldAt(table, row, 0) of
+                when Some(value as name: Span[Nat8, R]) do
+                    writeName(&!w, "name");
+                    writeString(&!w, name);
+                when None do
+                    skip;
+            end case;
+            case fieldAt(table, row, 2) of
+                when Some(value as price: Span[Nat8, R]) do
+                    writeName(&!w, "price");
+                    writeNumber(&!w, price);
+                when None do
+                    skip;
+            end case;
+            endObject(&!w);
+            row := row + 1;
+        end while;
+        endArray(&!w);
+        let total: String := decimalToString(sum);
+        writeName(&!w, "total");
+        writeNumber(&!w, asSpan(&total));
+        destroyString(total);
+        let count: Int64 := 2;
+        writeName(&!w, "items");
+        writeInteger(&!w, count);
+        endObject(&!w);
+        return finishJson(w);
+    end;
+
+    generic [R: Region]
+    function printSetting(settings: &[IniFile, R], section: Span[Nat8, Static], name: Span[Nat8, Static]): Unit is
+        print(name);
+        print(": ");
+        case iniValue(settings, section, name) of
+            when Some(value as v: Span[Nat8, R]) do
+                printLn(v);
+            when None do
+                printLn("none");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        let order: Span[Nat8, Static] := "name,count,price\ncoffee,1,4.20\n\"tea, green\",1,3.10\n";
+        case readCsv(order) of
+            when Right(right as table: CsvTable) do
+                print("lines of the order: ");
+                printLn(rowCount(&table) - 1);
+                -- The sum of 4.20 and 3.10, exactly, then with 19 per cent.
+                var sum: Decimal := zeroDecimal();
+                var row: Index := 1;
+                while row < rowCount(&table) do
+                    case addDecimal(sum, priceAt(&table, row)) of
+                        when Some(value as s: Decimal) do
+                            sum := s;
+                        when None do
+                            skip;
+                    end case;
+                    row := row + 1;
+                end while;
+                let sumText: String := decimalToString(sum);
+                print("sum: ");
+                printLn(asSpan(&sumText));
+                destroyString(sumText);
+                case parseDecimal("1.19") of
+                    when Some(value as tax: Decimal) do
+                        case multiplyDecimal(sum, tax) of
+                            when Some(value as gross: Decimal) do
+                                let two: Nat8 := 2;
+                                case roundDecimal(gross, two) of
+                                    when Some(value as rounded: Decimal) do
+                                        let text: String := decimalToString(rounded);
+                                        print("with tax, rounded: ");
+                                        printLn(asSpan(&text));
+                                        destroyString(text);
+                                    when None do
+                                        printLn("with tax: none");
+                                end case;
+                            when None do
+                                printLn("with tax: none");
+                        end case;
+                    when None do
+                        printLn("1.19 is no decimal");
+                end case;
+                -- The order as JSON, and a field of it read back.
+                case orderAsJson(&table, sum) of
+                    when Some(value as json: String) do
+                        print("as JSON: ");
+                        printLn(asSpan(&json));
+                        case readJson(asSpan(&json)) of
+                            when Right(right as document: Json) do
+                                case stringAt(&document, "/lines/1/name") of
+                                    when Some(value as name: String) do
+                                        print("the second line: ");
+                                        printLn(asSpan(&name));
+                                        destroyString(name);
+                                    when None do
+                                        printLn("the second line: none");
+                                end case;
+                                case countAt(&document, "/lines") of
+                                    when Some(value as n: Index) do
+                                        print("lines in the JSON: ");
+                                        printLn(n);
+                                    when None do
+                                        printLn("lines in the JSON: none");
+                                end case;
+                                destroyJson(document);
+                            when Left(left as e: JsonError) do
+                                printLn("the JSON was refused");
+                        end case;
+                        destroyString(json);
+                    when None do
+                        printLn("no JSON");
+                end case;
+                destroyCsv(table);
+            when Left(left as e: CsvError) do
+                printLn("the order was refused");
+        end case;
+        -- The settings of the shop, in INI.
+        let settings: IniFile := readIni("[shop]\nname = Corner Cafe\nopen = yes\n\n[tax]\nrate = 19\n");
+        printSetting(&settings, "shop", "name");
+        print("open: ");
+        printLn(iniSwitch(&settings, "shop", "open"));
+        destroyIni(settings);
+        return ExitSuccess();
+    end;
+end module body.

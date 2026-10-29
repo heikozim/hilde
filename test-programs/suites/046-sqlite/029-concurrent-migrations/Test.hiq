@@ -1,0 +1,156 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.File (
+    removeFile
+);
+import Standard.Task (
+    Scope,
+    Task,
+    tasksAvailable,
+    openScope,
+    closeScope,
+    spawn,
+    join
+);
+import Standard.Sqlite (
+    Connection,
+    Writing,
+    SqlError,
+    openWriter,
+    closeDatabase,
+    migrate
+);
+
+module body Test is
+    record Count: Free is
+        n: Int64;
+    end;
+
+    constant databasePath: Span[Nat8, Static] := "/tmp/hilde-046-029.db";
+
+    function removeDatabase(): Unit is
+        let file: String := fromLiteral(databasePath);
+        let wal: String := fromLiteral("/tmp/hilde-046-029.db-wal");
+        let shm: String := fromLiteral("/tmp/hilde-046-029.db-shm");
+        let a: Bool := removeFile(asSpan(&file));
+        let b: Bool := removeFile(asSpan(&wal));
+        let c: Bool := removeFile(asSpan(&shm));
+        destroyString(file);
+        destroyString(wal);
+        destroyString(shm);
+        return nil;
+    end;
+
+    function wide(code: Int32): Int64 is
+        case toInt64(code) of
+            when Some(value as w: Int64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A connection of its own, the migrations run on it: 0 when that
+    -- worked, else the code of the failure.
+    function migrateOnce(round: Int64): Int64 is
+        case openWriter(databasePath) of
+            when Left(left as error: SqlError) do
+                return 1000 + wide(error.code);
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                var code: Int64 := 0;
+                case migrate(&!db, @migrations) of
+                    when Left(left as error: SqlError) do
+                        code := 2000 + wide(error.code);
+                    when Right(right as applied: Index) do
+                        skip;
+                end case;
+                closeDatabase(db);
+                return code;
+        end case;
+    end;
+
+    -- The rows of t after a round, -1 when they cannot be counted.
+    function rows(): Int64 is
+        case openWriter(databasePath) of
+            when Left(left as error: SqlError) do
+                return -1;
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                var n: Int64 := -1;
+                @query(&!db, "SELECT count(*) AS n FROM t") for c: Count do
+                    n := c.n;
+                else error do
+                    n := -1;
+                end for;
+                closeDatabase(db);
+                return n;
+        end case;
+    end;
+
+    -- One round: two tasks migrate the fresh file at once; true when both
+    -- worked and the file holds one row.
+    function runRound(r: Int64): Bool is
+        removeDatabase();
+        var good: Bool := false;
+        case openScope() of
+            when None do
+                skip;
+            when Some(value as made: Scope) do
+                var scope: Scope := made;
+                let job: Fn[Int64, Int64] := migrateOnce;
+                case spawn(&!scope, job, r) of
+                    when Left(left as back: Int64) do
+                        skip;
+                    when Right(right as first: Task[Int64]) do
+                        case spawn(&!scope, job, r) of
+                            when Left(left as back: Int64) do
+                                ignore(join(first));
+                            when Right(right as second: Task[Int64]) do
+                                let one: Int64 := join(first);
+                                let two: Int64 := join(second);
+                                good := ((one = 0) and (two = 0)) and (rows() = 1);
+                                if not good then
+                                    print("round ");
+                                    print(r);
+                                    print(": ");
+                                    print(one);
+                                    print(" ");
+                                    print(two);
+                                    print(" rows ");
+                                    printLn(rows());
+                                end if;
+                        end case;
+                end case;
+                closeScope(scope);
+        end case;
+        return good;
+    end;
+
+    function main(): ExitCode is
+        if not tasksAvailable() then
+            printLn("ok");
+            return ExitSuccess();
+        end if;
+        var bad: Int64 := 0;
+        var r: Int64 := 0;
+        while r < 100 do
+            if not runRound(r) then
+                bad := bad + 1;
+            end if;
+            r := r + 1;
+        end while;
+        removeDatabase();
+        if bad = 0 then
+            printLn("ok");
+            return ExitSuccess();
+        end if;
+        print("bad rounds ");
+        printLn(bad);
+        return ExitFailure();
+    end;
+end module body.

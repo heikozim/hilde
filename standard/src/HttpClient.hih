@@ -1,0 +1,197 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+An HTTPS client: one request, one answer, then the connection is closed.
+
+- Only https URLs are read.
+- The server's certificate is verified against the certificates in a file and the host name.
+- Every request has a time limit to connect, one for the whole exchange and a limit on size.
+- By default a host that is or resolves to a private or reserved address is refused.
+- Redirects are not followed: the caller sees the status and the Location header.
+- The time taken to resolve the name is not limited, as Standard.Resolve says.
+
+    let answer: Either[Failure, Response] :=
+        request(Get(), "https://example.org/status", "", "", "/etc/ssl/cert.pem", defaultLimits());
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+
+module Standard.HttpClient is
+    """
+    The method of a request.
+    """
+    union Method: Free is
+        """
+        GET, with no body.
+        """
+        case Get;
+        """
+        POST, with the body given.
+        """
+        case Post;
+    end;
+
+    """
+    The limits of one request.  connectMillis bounds each attempt to
+    connect, totalMillis the whole exchange from the first attempt to the
+    last byte, maximumBytes everything the server sends, header and body.
+    With publicOnly a host that is or resolves to a private, loopback,
+    link-local or otherwise reserved address is refused.
+    """
+    record Limits: Free is
+        connectMillis: Nat32;
+        totalMillis: Nat32;
+        maximumBytes: Index;
+        publicOnly: Bool;
+    end;
+
+    """
+    Ten seconds to connect, thirty for the whole exchange, 100 MiB, and
+    only public addresses.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function defaultLimits(): Limits;
+
+    """
+    Why a request has no answer.
+    """
+    union FailureKind: Free is
+        """
+        The URL is not an https URL this client reads.
+        """
+        case BadUrl;
+        """
+        A header line the caller gave is refused, or a GET carries a body.
+        """
+        case BadRequest;
+        """
+        The host has no address.
+        """
+        case NotResolved;
+        """
+        The host is or resolves to an address that is not public, and the
+        limits ask for public ones only.
+        """
+        case NotPublic;
+        """
+        No address of the host took the connection.
+        """
+        case ConnectFailed;
+        """
+        A time limit ran out.
+        """
+        case TimedOut;
+        """
+        TLS failed: the certificate, the handshake or the connection.
+        """
+        case TlsFailed;
+        """
+        The server sent more than maximumBytes.
+        """
+        case TooLarge;
+        """
+        The answer is not HTTP/1.0 or HTTP/1.1 as this client reads it.
+        """
+        case BadResponse;
+    end;
+
+    """
+    A failure: its kind, and a sentence for a person, which for TlsFailed
+    holds the TLS library's own words.
+    """
+    record Failure: Linear is
+        kind: FailureKind;
+        detail: String;
+    end;
+
+    """
+    An answer: the status code, the header lines as a block Standard.Http
+    reads, and the body, content, with any chunked transfer coding
+    removed.
+    """
+    record Response: Linear is
+        status: Nat16;
+        headers: String;
+        content: String;
+    end;
+
+    """
+    Where a URL points: the host as written, without brackets around an
+    IPv6 literal, the port, 443 when none is given, and the target, the
+    path and the query, a single slash when the URL has none.
+    """
+    record Target: Linear is
+        host: String;
+        port: Nat16;
+        path: String;
+    end;
+
+    """
+    The target of an https URL: https, then a host name by RFC 1123, a
+    dotted quad or an IPv6 literal in brackets, an optional port from 1 to
+    65535, and a path and query of visible ASCII.  A fragment is dropped.
+    None for any other scheme, for user information before the host, and
+    for anything else this client does not read.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function parseUrl(url: Span[Nat8, R]): Option[Target];
+
+    """
+    Gives back everything a target holds.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyTarget(target: Target): Unit;
+
+    """
+    Whether headers are header lines request takes: each Name: value, the
+    name a token, the value visible bytes, spaces and tabs, the lines
+    separated by CRLF or LF, and none of the names the client sets itself.
+    Empty headers are taken.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function validHeaderLines(headers: Span[Nat8, R]): Bool;
+
+    """
+    Sends one request to url and reads the answer.  headers holds extra
+    header lines, each Name: value, separated by line ends; Host,
+    Connection, Content-Length and Transfer-Encoding are set by the client
+    and refused there.  payload is the body of a POST; a GET takes an
+    empty one.  The certificates the
+    server's is verified against are in the file caFile.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [U: Region, H: Region, B: Region, C: Region]
+    function request(verb: Method, url: Span[Nat8, U], headers: Span[Nat8, H], payload: Span[Nat8, B], caFile: Span[Nat8, C], limits: Limits): Either[Failure, Response];
+
+    """
+    request for a server that asks for a client certificate: the client
+    presents the certificate chain in the PEM file certificateFile and
+    proves it holds the key in keyFile.  A Failure of kind TlsFailed when a
+    file cannot be read, the key does not belong to the certificate, or
+    the server refuses the certificate.
+    """
+    generic [U: Region, H: Region, B: Region, C: Region, E: Region, K: Region]
+    function requestAs(verb: Method, url: Span[Nat8, U], headers: Span[Nat8, H], payload: Span[Nat8, B], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], limits: Limits): Either[Failure, Response]
+        requires (spanLength(certificateFile) > 0) and (spanLength(keyFile) > 0);
+
+    """
+    Gives back everything a failure holds.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyFailure(failed: Failure): Unit;
+
+    """
+    Gives back everything an answer holds.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyResponse(response: Response): Unit;
+end module.

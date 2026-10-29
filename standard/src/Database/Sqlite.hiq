@@ -1,0 +1,398 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The slots of Standard.Database for SQLite and SQLCipher.  A connection,
+-- a transaction and a cursor of Standard.SqlCipher are erased into the
+-- database's own types and revealed here, as the type they were erased
+-- with: writing says whether a connection was opened for writing.
+import Standard.Buffer (
+    Buffer,
+    destroyEmpty,
+    remove,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Bindings.Database (
+    Erased,
+    erase,
+    unerase,
+    reveal,
+    revealWrite
+);
+import Standard.Database (
+    Database,
+    Writing,
+    Reading,
+    Backend,
+    SqliteBackend,
+    SqlCipherBackend,
+    DbError,
+    Values,
+    Value,
+    IntValue,
+    FloatValue,
+    BoolValue,
+    TimeValue,
+    TextValue,
+    BytesValue,
+    NullValue,
+    takeValues,
+    ColumnKind,
+    NullKind,
+    IntKind,
+    FloatKind,
+    BoolKind,
+    TimeKind,
+    TextKind,
+    BytesKind,
+    Column,
+    IntColumn,
+    FloatColumn,
+    BoolColumn,
+    TextColumn,
+    ErrorKind,
+    writerOf,
+    readerOf,
+    sqliteClose,
+    sqliteMigrate,
+    sqliteBegin,
+    sqliteEnd,
+    sqliteStart,
+    sqliteExecute,
+    sqliteAdvance,
+    sqliteColumn,
+    sqliteFinish,
+    sqliteKind
+);
+import Standard.SqlCipher (
+    Key,
+    Connection,
+    Writing as CipherWriting,
+    Reading as CipherReading,
+    SqlError,
+    Transaction as CipherTransaction,
+    Values as CipherValues,
+    Cursor as CipherCursor,
+    describe as cipherDescribe,
+    openWriter as cipherOpenWriter,
+    openReader as cipherOpenReader,
+    openPlainWriter as cipherOpenPlainWriter,
+    openPlainReader as cipherOpenPlainReader,
+    closeDatabase as cipherClose,
+    migrate as cipherMigrate,
+    begin as cipherBegin,
+    commit as cipherCommit,
+    rollback as cipherRollback,
+    noValues as cipherNoValues,
+    withInt64 as cipherWithInt64,
+    withFloat64 as cipherWithFloat64,
+    withText as cipherWithText,
+    withBlob as cipherWithBlob,
+    withInt64OrNull as cipherWithInt64OrNull,
+    start as cipherStart,
+    execute as cipherExecute,
+    advance as cipherAdvance,
+    columnInt64 as cipherColumnInt64,
+    columnFloat64 as cipherColumnFloat64,
+    columnText as cipherColumnText,
+    columnBlob as cipherColumnBlob,
+    columnBlobOrNone as cipherColumnBlobOrNone,
+    finish as cipherFinish
+);
+
+module body Standard.Database.Sqlite is
+    -- SQLite's result codes this driver classifies: the primary codes
+    -- busy, locked and constraint, and the extended codes of a unique
+    -- constraint and a primary key.
+    constant sqliteBusy: Int32 := 5;
+    constant sqliteLocked: Int32 := 6;
+    constant sqliteConstraint: Int32 := 19;
+    constant sqliteUnique: Int32 := 2067;
+    constant sqlitePrimaryKey: Int32 := 1555;
+
+    ---
+    --- The connection, transaction and cursor behind an erased box
+    ---
+
+    generic [R: Region]
+    function writer(connection: &![Erased, R]): &![Connection[CipherWriting], R] is
+        return revealWrite(connection);
+    end;
+
+    generic [R: Region]
+    function reader(connection: &![Erased, R]): &![Connection[CipherReading], R] is
+        return revealWrite(connection);
+    end;
+
+    generic [R: Region]
+    function rowsToAdvance(rows: &![Erased, R]): &![CipherCursor, R] is
+        return revealWrite(rows);
+    end;
+
+    generic [R: Region]
+    function rowsToRead(rows: &[Erased, R]): &[CipherCursor, R] is
+        return reveal(rows);
+    end;
+
+    function failed(error: SqlError, backend: Backend): DbError is
+        return DbError(backend => backend, code => error.code);
+    end;
+
+    ---
+    --- Opening
+    ---
+
+    function opened(result: Either[SqlError, Connection[CipherWriting]], backend: Backend): Either[DbError, Database[Writing]] is
+        case result of
+            when Left(left as error: SqlError) do
+                return Left(left => failed(error, backend));
+            when Right(right as connection: Connection[CipherWriting]) do
+                return Right(right => writerOf(erase(connection), backend));
+        end case;
+    end;
+
+    function openedReader(result: Either[SqlError, Connection[CipherReading]], backend: Backend): Either[DbError, Database[Reading]] is
+        case result of
+            when Left(left as error: SqlError) do
+                return Left(left => failed(error, backend));
+            when Right(right as connection: Connection[CipherReading]) do
+                return Right(right => readerOf(erase(connection), backend));
+        end case;
+    end;
+
+    generic [R: Region]
+    function openSqlite(path: Span[Nat8, R]): Either[DbError, Database[Writing]] is
+        return opened(cipherOpenPlainWriter(path), SqliteBackend());
+    end;
+
+    generic [R: Region]
+    function openSqliteReader(path: Span[Nat8, R]): Either[DbError, Database[Reading]] is
+        return openedReader(cipherOpenPlainReader(path), SqliteBackend());
+    end;
+
+    generic [R: Region]
+    function openSqlCipher(path: Span[Nat8, R], key: Key): Either[DbError, Database[Writing]] is
+        return opened(cipherOpenWriter(path, key), SqlCipherBackend());
+    end;
+
+    generic [R: Region]
+    function openSqlCipherReader(path: Span[Nat8, R], key: Key): Either[DbError, Database[Reading]] is
+        return openedReader(cipherOpenReader(path, key), SqlCipherBackend());
+    end;
+
+    ---
+    --- The slots
+    ---
+
+    pragma Implements(Name => "Standard.Database.sqliteClose");
+    function closeSqlite(connection: Erased, writing: Bool): Unit is
+        if writing then
+            let open: Connection[CipherWriting] := unerase(connection);
+            cipherClose(open);
+        else
+            let open: Connection[CipherReading] := unerase(connection);
+            cipherClose(open);
+        end if;
+        return nil;
+    end;
+
+    pragma Implements(Name => "Standard.Database.sqliteMigrate");
+    generic [R: Region]
+    function migrateSqlite(connection: &![Erased, R], backend: Backend, migrations: Span[Nat8, Static]): Either[DbError, Index] is
+        case cipherMigrate(writer(connection), migrations) of
+            when Left(left as error: SqlError) do
+                return Left(left => failed(error, backend));
+            when Right(right as count: Index) do
+                return Right(right => count);
+        end case;
+    end;
+
+    function begun(result: Either[SqlError, CipherTransaction], backend: Backend): Either[DbError, Erased] is
+        case result of
+            when Left(left as error: SqlError) do
+                return Left(left => failed(error, backend));
+            when Right(right as transaction: CipherTransaction) do
+                return Right(right => erase(transaction));
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.sqliteBegin");
+    generic [R: Region]
+    function beginSqlite(connection: &![Erased, R], backend: Backend, writing: Bool): Either[DbError, Erased] is
+        if writing then
+            return begun(cipherBegin(writer(connection)), backend);
+        else
+            return begun(cipherBegin(reader(connection)), backend);
+        end if;
+    end;
+
+    function done(result: Either[SqlError, Unit], backend: Backend): Either[DbError, Unit] is
+        case result of
+            when Left(left as error: SqlError) do
+                return Left(left => failed(error, backend));
+            when Right(right as ended: Unit) do
+                return Right(right => nil);
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.sqliteEnd");
+    generic [R: Region]
+    function endSqlite(connection: &![Erased, R], backend: Backend, writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit] is
+        let inner: CipherTransaction := unerase(transaction);
+        if writing then
+            if keep then
+                return done(cipherCommit(writer(connection), inner), backend);
+            else
+                cipherRollback(writer(connection), inner);
+            end if;
+        else
+            if keep then
+                return done(cipherCommit(reader(connection), inner), backend);
+            else
+                cipherRollback(reader(connection), inner);
+            end if;
+        end if;
+        return Right(right => nil);
+    end;
+
+    -- The values for SQLite: a Bool as 0 or 1, a timestamp as its integer.
+    function toCipher(values: Values): CipherValues is
+        var list: Buffer[Value] := takeValues(values);
+        var out: CipherValues := cipherNoValues();
+        while bufferLength(&list) > 0 do
+            case remove(&!list, 0) of
+                when IntValue(value as v: Int64) do
+                    out := cipherWithInt64(out, v);
+                when FloatValue(value as v: Float64) do
+                    out := cipherWithFloat64(out, v);
+                when BoolValue(value as v: Bool) do
+                    out := cipherWithInt64(out, boolInt(v));
+                when TimeValue(value as v: Int64) do
+                    out := cipherWithInt64(out, v);
+                when TextValue(value as s: String) do
+                    out := cipherWithText(out, asSpan(&s));
+                    destroyString(s);
+                when BytesValue(value as s: String) do
+                    out := cipherWithBlob(out, asSpan(&s));
+                    destroyString(s);
+                when NullValue do
+                    let none: Option[Int64] := None();
+                    out := cipherWithInt64OrNull(out, none);
+            end case;
+        end while;
+        destroyEmpty(list);
+        return out;
+    end;
+
+    function boolInt(value: Bool): Int64 is
+        var number: Int64 := 0;
+        if value then
+            number := number + 1;
+        end if;
+        return number;
+    end;
+
+    pragma Implements(Name => "Standard.Database.sqliteStart");
+    generic [R: Region]
+    function startSqlite(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased is
+        if writing then
+            return erase(cipherStart(writer(connection), sql, toCipher(values)));
+        else
+            return erase(cipherStart(reader(connection), sql, toCipher(values)));
+        end if;
+    end;
+
+    pragma Implements(Name => "Standard.Database.sqliteExecute");
+    generic [R: Region]
+    function executeSqlite(connection: &![Erased, R], backend: Backend, sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64] is
+        case cipherExecute(writer(connection), sql, toCipher(values)) of
+            when Left(left as error: SqlError) do
+                return Left(left => failed(error, backend));
+            when Right(right as count: Nat64) do
+                return Right(right => count);
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.sqliteAdvance");
+    generic [R: Region]
+    function advanceSqlite(rows: &![Erased, R]): Bool is
+        return cipherAdvance(rowsToAdvance(rows));
+    end;
+
+    generic [S: Region]
+    function isNone(value: Option[Span[Nat8, S]]): Bool is
+        case value of
+            when Some(value as v: Span[Nat8, S]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.sqliteColumn");
+    generic [R: Region]
+    function columnSqlite(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R] is
+        let cursor: &[CipherCursor, R] := rowsToRead(rows);
+        case kind of
+            when NullKind do
+                return BoolColumn(value => isNone(cipherColumnBlobOrNone(cursor, index)));
+            when IntKind do
+                return IntColumn(value => cipherColumnInt64(cursor, index));
+            when FloatKind do
+                return FloatColumn(value => cipherColumnFloat64(cursor, index));
+            when BoolKind do
+                return BoolColumn(value => cipherColumnInt64(cursor, index) /= boolInt(false));
+            when TimeKind do
+                return IntColumn(value => cipherColumnInt64(cursor, index));
+            when TextKind do
+                return TextColumn(value => cipherColumnText(cursor, index));
+            when BytesKind do
+                return TextColumn(value => cipherColumnBlob(cursor, index));
+        end case;
+    end;
+
+    function finished(result: Option[SqlError], backend: Backend): Option[DbError] is
+        case result of
+            when Some(value as error: SqlError) do
+                return Some(value => failed(error, backend));
+            when None do
+                return None();
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.sqliteFinish");
+    generic [R: Region]
+    function finishSqlite(connection: &![Erased, R], backend: Backend, writing: Bool, rows: Erased): Option[DbError] is
+        let cursor: CipherCursor := unerase(rows);
+        if writing then
+            return finished(cipherFinish(writer(connection), cursor), backend);
+        else
+            return finished(cipherFinish(reader(connection), cursor), backend);
+        end if;
+    end;
+
+    -- The primary code of an extended SQLite result code: its low byte.
+    function primaryOf(code: Int32): Int32 is
+        if code < 0 then
+            return code;
+        end if;
+        return code - ((code / 256) * 256);
+    end;
+
+    pragma Implements(Name => "Standard.Database.sqliteKind");
+    function kindSqlite(code: Int32): ErrorKind is
+        let primary: Int32 := primaryOf(code);
+        let unique: Bool := (code = sqliteUnique) or (code = sqlitePrimaryKey);
+        let busy: Bool := (primary = sqliteBusy) or (primary = sqliteLocked);
+        return ErrorKind(unique => unique, constraint => primary = sqliteConstraint, busy => busy, text => cipherDescribe(SqlError(code => code)));
+    end;
+end module body.

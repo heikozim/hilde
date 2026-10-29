@@ -1,0 +1,250 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    constantTimeEqual,
+    bytesToHex,
+    hexToBytes
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sha256,
+    hmacSha256,
+    sha384,
+    sha512,
+    sha3_256,
+    sha3_512,
+    hmacSha384,
+    hmacSha512,
+    hmacSha3_512,
+    hchacha20,
+    sealXChaCha20Poly1305,
+    openXChaCha20Poly1305
+);
+
+module body Standard.Libcrypto.Test is
+    -- The length of what randomBytes gave for count, or a value no count
+    -- has when it gave nothing.
+    function lengthOfRandom(count: Index): Index is
+        case randomBytes(count) of
+            when Some(value as bytes: String) do
+                let size: Index := length(&bytes);
+                destroyString(bytes);
+                return size;
+            when None do
+                return 99999;
+        end case;
+    end;
+
+    -- randomBytes gives the count asked for, from nothing up to a size a
+    -- salt or a key has and beyond.
+    function testRandomBytesLength(): Unit is
+        assertTrue(lengthOfRandom(0) = 0, "0 bytes give an empty string");
+        assertTrue(lengthOfRandom(1) = 1, "1 byte");
+        assertTrue(lengthOfRandom(16) = 16, "16 bytes, the size of a salt");
+        assertTrue(lengthOfRandom(32) = 32, "32 bytes, the size of a key");
+        assertTrue(lengthOfRandom(65536) = 65536, "65536 bytes");
+        return nil;
+    end;
+
+    -- Two draws of 32 bytes are not the same; that they are equal by
+    -- chance has a probability of one in two to the power of 256.
+    function testRandomBytesDiffer(): Unit is
+        case randomBytes(32) of
+            when Some(value as first: String) do
+                case randomBytes(32) of
+                    when Some(value as second: String) do
+                        assertTrue(not constantTimeEqual(asSpan(&first), asSpan(&second)), "two draws of 32 bytes differ");
+                        destroyString(second);
+                    when None do
+                        assertTrue(false, "the second draw gives bytes");
+                end case;
+                destroyString(first);
+            when None do
+                assertTrue(false, "the first draw gives bytes");
+        end case;
+        return nil;
+    end;
+
+    -- A count the library cannot take is refused before anything is
+    -- allocated.
+    function testRandomBytesTooMany(): Unit is
+        assertTrue(lengthOfRandom(2147483648) = 99999, "a count above the largest int gives None");
+        return nil;
+    end;
+
+    -- Whether a digest is the one written in hexadecimal; None is never it.
+    generic [S: Region]
+    function isHex(digest: Option[String], want: Span[Nat8, S]): Bool is
+        case digest of
+            when Some(value as bytes: String) do
+                let hex: String := bytesToHex(asSpan(&bytes));
+                let same: Bool := constantTimeEqual(asSpan(&hex), want);
+                destroyString(hex);
+                destroyString(bytes);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- count times the byte.
+    function repeated(byte: Nat8, count: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeByte(&!builder, byte);
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    -- The vectors of FIPS 180-2, appendix B: one block, none, two blocks.
+    function testSha256(): Unit is
+        assertTrue(isHex(sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), "abc");
+        assertTrue(isHex(sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), "the empty message");
+        assertTrue(isHex(sha256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"), "448 bits, two blocks");
+        return nil;
+    end;
+
+    -- The vectors of RFC 4231, cases 1, 2, 6 and 7: a key of 20 bytes, a
+    -- short key, and a key of 131 bytes, longer than a block, which the
+    -- HMAC hashes first.
+    function testHmacSha256(): Unit is
+        let twenty: String := repeated(#x0B, 20);
+        assertTrue(isHex(hmacSha256(asSpan(&twenty), "Hi There"), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"), "case 1");
+        destroyString(twenty);
+        assertTrue(isHex(hmacSha256("Jefe", "what do ya want for nothing?"), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"), "case 2");
+        let long: String := repeated(#xAA, 131);
+        assertTrue(isHex(hmacSha256(asSpan(&long), "Test Using Larger Than Block-Size Key - Hash Key First"), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"), "case 6");
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, "This is a test using a larger than block-size key and a larger than block-size data. ");
+        writeString(&!text, "The key needs to be hashed before being used by the HMAC algorithm.");
+        let message: String := finalize(text);
+        assertTrue(isHex(hmacSha256(asSpan(&long), asSpan(&message)), "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"), "case 7");
+        destroyString(message);
+        destroyString(long);
+        return nil;
+    end;
+
+    -- SHA-384 and SHA-512 on the messages of FIPS 180-2, appendix C and D,
+    -- and SHA3-256 and SHA3-512 on those of FIPS 202's examples: abc and
+    -- the empty message.
+    function testMoreDigests(): Unit is
+        assertTrue(isHex(sha384("abc"), "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"), "SHA-384 abc");
+        assertTrue(isHex(sha384(""), "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"), "SHA-384 empty");
+        assertTrue(isHex(sha512("abc"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"), "SHA-512 abc");
+        assertTrue(isHex(sha512(""), "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"), "SHA-512 empty");
+        assertTrue(isHex(sha3_256("abc"), "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532"), "SHA3-256 abc");
+        assertTrue(isHex(sha3_256(""), "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"), "SHA3-256 empty");
+        assertTrue(isHex(sha3_512("abc"), "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0"), "SHA3-512 abc");
+        assertTrue(isHex(sha3_512(""), "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26"), "SHA3-512 empty");
+        return nil;
+    end;
+
+    -- RFC 4231, cases 1, 2 and 6, with SHA-384 and SHA-512.
+    function testMoreHmacs(): Unit is
+        let twenty: String := repeated(#x0B, 20);
+        assertTrue(isHex(hmacSha384(asSpan(&twenty), "Hi There"), "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6"), "SHA-384 case 1");
+        assertTrue(isHex(hmacSha512(asSpan(&twenty), "Hi There"), "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"), "SHA-512 case 1");
+        destroyString(twenty);
+        assertTrue(isHex(hmacSha384("Jefe", "what do ya want for nothing?"), "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649"), "SHA-384 case 2");
+        assertTrue(isHex(hmacSha512("Jefe", "what do ya want for nothing?"), "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"), "SHA-512 case 2");
+        let long: String := repeated(#xAA, 131);
+        assertTrue(isHex(hmacSha384(asSpan(&long), "Test Using Larger Than Block-Size Key - Hash Key First"), "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952"), "SHA-384 case 6");
+        assertTrue(isHex(hmacSha512(asSpan(&long), "Test Using Larger Than Block-Size Key - Hash Key First"), "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598"), "SHA-512 case 6");
+        destroyString(long);
+        return nil;
+    end;
+
+    -- Another key gives another code, and so does another message.
+    function testHmacDiffers(): Unit is
+        assertTrue(not isHex(hmacSha256("Jeff", "what do ya want for nothing?"), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"), "another key");
+        assertTrue(not isHex(hmacSha256("Jefe", "what do ya want for nothing!"), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"), "another message");
+        return nil;
+    end;
+    -- The bytes a hexadecimal text names; a text that names none is the
+    -- test's own fault and gives an empty string, which fails the test.
+    function bytesOf(hex: Span[Nat8, Static]): String is
+        case hexToBytes(hex) of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                return repeated(0, 0);
+        end case;
+    end;
+
+    -- The test vector of HChaCha20 in draft-irtf-cfrg-xchacha-03, section
+    -- 2.2.1.
+    function testHChaCha20Vector(): Unit is
+        let key: String := bytesOf("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let nonce: String := bytesOf("000000090000004a0000000031415927");
+        assertTrue(isHex(hchacha20(asSpan(&key), asSpan(&nonce)), "82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc"), "the subkey of the draft's vector");
+        assertTrue(not isHex(hchacha20(asSpan(&key), asSpan(&key)), "82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc"), "a nonce of 32 bytes gives nothing");
+        destroyString(key);
+        destroyString(nonce);
+        return nil;
+    end;
+
+    -- A message sealed with a 24-byte nonce opens with the same key, nonce
+    -- and aad, and with no other.
+    function testXChaChaRoundTrip(): Unit is
+        let key: String := repeated(7, 32);
+        let other: String := repeated(8, 32);
+        let nonce: String := repeated(9, 24);
+        let short: String := repeated(9, 12);
+        case sealXChaCha20Poly1305(asSpan(&key), asSpan(&nonce), "attack at dawn", "header") of
+            when Some(value as sealed: String) do
+                assertTrue(length(&sealed) = 30, "ciphertext and a 16-byte tag");
+                assertTrue(isHex(openXChaCha20Poly1305(asSpan(&key), asSpan(&nonce), asSpan(&sealed), "header"), "61747461636b206174206461776e"), "opens to the message");
+                assertTrue(not isHex(openXChaCha20Poly1305(asSpan(&other), asSpan(&nonce), asSpan(&sealed), "header"), "61747461636b206174206461776e"), "another key opens nothing");
+                assertTrue(not isHex(openXChaCha20Poly1305(asSpan(&key), asSpan(&nonce), asSpan(&sealed), "other"), "61747461636b206174206461776e"), "another aad opens nothing");
+                assertTrue(not isHex(openXChaCha20Poly1305(asSpan(&key), asSpan(&short), asSpan(&sealed), "header"), "61747461636b206174206461776e"), "a 12-byte nonce opens nothing");
+                destroyString(sealed);
+            when None do
+                assertTrue(false, "sealing gave nothing");
+        end case;
+        assertTrue(not isHex(sealXChaCha20Poly1305(asSpan(&key), asSpan(&short), "attack at dawn", ""), ""), "a 12-byte nonce seals nothing");
+        destroyString(key);
+        destroyString(other);
+        destroyString(nonce);
+        destroyString(short);
+        return nil;
+    end;
+
+    -- HMAC with SHA3-512: 64 bytes, and another than with SHA-512.
+    function testHmacSha3_512(): Unit is
+        case hmacSha3_512("key", "message") of
+            when Some(value as code: String) do
+                assertTrue(length(&code) = 64, "64 bytes");
+                let hex: String := bytesToHex(asSpan(&code));
+                assertTrue(not isHex(hmacSha512("key", "message"), asSpan(&hex)), "another code than HMAC-SHA-512");
+                assertTrue(isHex(hmacSha3_512("key", "message"), asSpan(&hex)), "the same code twice");
+                destroyString(hex);
+                destroyString(code);
+            when None do
+                assertTrue(false, "HMAC-SHA3-512 gave nothing");
+        end case;
+        return nil;
+    end;
+end module body.

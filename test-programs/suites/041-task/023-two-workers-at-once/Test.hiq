@@ -1,0 +1,117 @@
+-- Unsafe: the two tasks share one raw cell, read and written atomically
+-- through @embed.  That is the point of the test -- it needs a signal
+-- that does not go through the task runtime -- and not a pattern.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullCheck,
+    allocate,
+    store,
+    deallocate
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join
+);
+
+module body Test is
+    -- Spins until the cell is 1, and never waits in the runtime while it
+    -- does: it keeps its worker busy until the runtime makes it let others
+    -- run.  Gives back the worker it ran on, or -1 when it was switched out
+    -- on the way: its worker started another fiber, or it went on on
+    -- another worker.  Only an answer of 0 or more shows that the setter
+    -- ran while the spinner ran.
+    function spinner(cell: Pointer[Int32]): Int32 is
+        let worker: Int32 := @embed(Int32, "hilde_task_worker_index()");
+        let runs: Int64 := @embed(Int64, "hilde_task_test_runs()");
+        var turns: Index := 0;
+        while @embed(Int32, "__atomic_load_n($1, __ATOMIC_ACQUIRE)", cell) = 0 do
+            turns := turns + 1;
+        end while;
+        let after: Int32 := @embed(Int32, "hilde_task_worker_index()");
+        let runsAfter: Int64 := @embed(Int64, "hilde_task_test_runs()");
+        if (after = worker) and (runsAfter = runs) then
+            return worker;
+        end if;
+        return -1;
+    end;
+
+    function setter(cell: Pointer[Int32]): Int32 is
+        @embed(Unit, "__atomic_store_n($1, 1, __ATOMIC_RELEASE)", cell);
+        return @embed(Int32, "hilde_task_worker_index()");
+    end;
+
+    function widen(value: Bool): Int32 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    -- One round in scope: the spinner is started first and holds one worker
+    -- until the setter has run on another.  Gives 1 when the two tasks ran
+    -- on different workers at the same time, 0 when that is not shown, a
+    -- negative number when a task could not be started.
+    generic [R: Region]
+    function round(scope: &![Scope, R], cell: Pointer[Int32]): Int32 is
+        store(cell, 0);
+        let spin: Fn[Pointer[Int32], Int32] := spinner;
+        let set: Fn[Pointer[Int32], Int32] := setter;
+        case spawn(&~scope, spin, cell) of
+            when Right(right as first: Task[Int32]) do
+                case spawn(&~scope, set, cell) of
+                    when Right(right as second: Task[Int32]) do
+                        let a: Int32 := join(first);
+                        let b: Int32 := join(second);
+                        return widen((a >= 0) and (a /= b));
+                    when Left(left as unused: Pointer[Int32]) do
+                        -- No second task: main sets the cell itself, so
+                        -- that the spinner ends and can be joined.
+                        @embed(Unit, "__atomic_store_n($1, 1, __ATOMIC_RELEASE)", unused);
+                        if join(first) >= 0 then
+                            return -2;
+                        end if;
+                        return -3;
+                end case;
+            when Left(left as unused: Pointer[Int32]) do
+                return -1;
+        end case;
+    end;
+
+    -- Four workers (env.txt).  Prints the number of workers, then 1 when
+    -- in one of at most 20 rounds the two tasks ran on different workers.
+    -- One round alone may run both on one worker: a worker that does not
+    -- take the setter before the spinner is made to let others run hands it
+    -- to the spinner's worker.  On one worker no round ever gives 1.
+    function main(): ExitCode is
+        let address: Address[Int32] := allocate();
+        case nullCheck(address) of
+            when Some(value as cell: Pointer[Int32]) do
+                case openScope() of
+                    when Some(value as opened: Scope) do
+                        var scope: Scope := opened;
+                        printLn(@embed(Int32, "hilde_task_workers_running()"));
+                        var rounds: Index := 0;
+                        var result: Int32 := 0;
+                        while (result = 0) and (rounds < 20) do
+                            rounds := rounds + 1;
+                            result := round(&!scope, cell);
+                        end while;
+                        printLn(result);
+                        closeScope(scope);
+                    when None do
+                        printLn(-2);
+                end case;
+                deallocate(cell);
+            when None do
+                printLn(-3);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

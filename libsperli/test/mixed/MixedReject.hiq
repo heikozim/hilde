@@ -1,0 +1,406 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Rank 0 of a job of two ranks whose rank 1 is another programme.  The
+-- programme makes the launch, writes the description of rank 1 to the file
+-- named by the second argument, and then plays a client that is wrong in the
+-- way named by the first argument: wrong-ca, no-cert, expired, foreign-job,
+-- wrong-rank, oversized, or good for a client that is right.  It prints one
+-- line, what: code, and exits with 0 when rank 1 was reached.
+import Standard.Arguments (
+    processArguments
+);
+import Standard.Buffer (
+    Buffer,
+    length,
+    removeLast,
+    destroyEmpty
+);
+import Standard.String (
+    String,
+    destroyString,
+    makeString,
+    storeNth,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    formatNat,
+    bytesToHex
+);
+import Standard.File (
+    FileDescriptor,
+    ConnectFailure,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFile,
+    connectTcp
+);
+import Standard.Task (
+    sleepFor
+);
+import Standard.Tls (
+    Client,
+    connectOver,
+    send as tlsSend,
+    receiveWithin,
+    closeClient
+);
+import Standard.SperliWire (
+    dataKind,
+    frameHeader
+);
+import Standard.SperliLaunch (
+    HostList,
+    Launch,
+    parseHostList,
+    destroyHostList,
+    newLaunch,
+    launchId,
+    launchPort,
+    launchCaPem,
+    launchExpiry,
+    describeRank,
+    tokenWith,
+    destroyLaunch
+);
+import Standard.Sperli (
+    Job,
+    Endpoint,
+    Peer,
+    readJob,
+    jobId,
+    jobIncarnation,
+    withToken,
+    destroyJob,
+    openEndpoint,
+    closeEndpoint,
+    connectPeer,
+    closePeer,
+    sendFrame,
+    sendRaw
+);
+
+module body Mixed.Reject is
+    function destroyWords(words: Buffer[String]): Unit is
+        var rest: Buffer[String] := words;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function newTwoRankLaunch(ports: Span[Nat8, Static]): Launch is
+        case parseHostList(ports, "") of
+            when Right(right as hosts: HostList) do
+                case newLaunch(&hosts, 2, 1, 600) of
+                    when Right(right as launch: Launch) do
+                        destroyHostList(hosts);
+                        return launch;
+                    when Left(left as code: Int32) do
+                        destroyHostList(hosts);
+                        abort("no launch");
+                end case;
+            when Left(left as code: Int32) do
+                abort("no host list");
+        end case;
+    end;
+
+    -- A launch of two ranks on the ports of other, with a CA of its own.
+    generic [R: Region]
+    function launchOnPortsOf(other: &[Launch, R]): Launch is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Nat32 := 0;
+        while i < 2 do
+            writeString(&!out, "localhost ");
+            let port: String := formatNat(widen(launchPort(other, i)));
+            writeString(&!out, asSpan(&port));
+            destroyString(port);
+            writeString(&!out, "\n");
+            i := i + 1;
+        end while;
+        let text: String := finalize(out);
+        case parseHostList(asSpan(&text), "") of
+            when Right(right as hosts: HostList) do
+                destroyString(text);
+                case newLaunch(&hosts, 2, 1, 600) of
+                    when Right(right as launch: Launch) do
+                        destroyHostList(hosts);
+                        return launch;
+                    when Left(left as code: Int32) do
+                        destroyHostList(hosts);
+                        abort("no launch on those ports");
+                end case;
+            when Left(left as code: Int32) do
+                destroyString(text);
+                abort("no host list of those ports");
+        end case;
+    end;
+
+    function widen(value: Nat16): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region]
+    function jobOf(launch: &[Launch, R], at: Nat32): Job is
+        case describeRank(launch, at) of
+            when Some(value as description: String) do
+                case readJob(asSpan(&description)) of
+                    when Right(right as job: Job) do
+                        destroyString(description);
+                        return job;
+                    when Left(left as code: Int32) do
+                        destroyString(description);
+                        abort("the description was refused");
+                end case;
+            when None do
+                abort("no description");
+        end case;
+    end;
+
+    -- Rank 0 holding a token made as the launcher would for the given job
+    -- id, rank and expiry.
+    generic [R: Region, J: Region]
+    function withMadeToken(launch: &[Launch, R], id: Span[Nat8, J], rank: Nat32, expiry: Nat64): Job is
+        let job: Job := jobOf(launch, 0);
+        case tokenWith(launch, id, rank, expiry, "localhost") of
+            when Some(value as token: String) do
+                let changed: Job := withToken(job, asSpan(&token));
+                destroyString(token);
+                return changed;
+            when None do
+                destroyJob(job);
+                abort("no token");
+        end case;
+    end;
+
+    -- The description of rank 1 as one line of hexadecimal digits in the
+    -- file name.  The file is the secret of the job: the caller made the
+    -- directory private.
+    generic [R: Region, N: Region]
+    function writeDescription(launch: &[Launch, R], name: Span[Nat8, N]): Bool is
+        case describeRank(launch, 1) of
+            when Some(value as description: String) do
+                let text: String := bytesToHex(asSpan(&description));
+                destroyString(description);
+                case openWrite(name) of
+                    when Some(value as opened: FileDescriptor) do
+                        var file: FileDescriptor := opened;
+                        let written: Bool := writeAll(&!file, asSpan(&text));
+                        let newline: Bool := writeAll(&!file, "\n");
+                        let closed: Bool := closeFile(file);
+                        destroyString(text);
+                        return (written and newline) and closed;
+                    when None do
+                        destroyString(text);
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The header of a frame whose length field is larger than the limit.
+    generic [R: Region]
+    function oversizedHeader(job: &[Job, R]): String is
+        let id: String := jobId(job);
+        var header: String := frameHeader(dataKind(), 0, asSpan(&id), jobIncarnation(job), 0, 0, 1, 2);
+        let low: Nat8 := 1;
+        let zero: Nat8 := 0;
+        storeNth(&!header, 0, low);
+        storeNth(&!header, 1, zero);
+        storeNth(&!header, 2, zero);
+        storeNth(&!header, 3, low);
+        destroyString(id);
+        return header;
+    end;
+
+    generic [R: Region, E: Region, F: Region]
+    function act(peer: &![Peer, R], job: &[Job, E], fault: Span[Nat8, F]): Int32 is
+        if equal(fault, "oversized") then
+            let header: String := oversizedHeader(job);
+            let code: Int32 := sendRaw(&~peer, asSpan(&header));
+            destroyString(header);
+            return code;
+        end if;
+        return sendFrame(&~peer, dataKind(), 2, "x");
+    end;
+
+    -- Connects as rank 0 with the job, shows what came of it, and for a
+    -- client that got in sends what the fault says.
+    generic [F: Region]
+    function connectWith(job: Job, fault: Span[Nat8, F]): Int32 is
+        var code: Int32 := 0 - 1;
+        case openEndpoint(&job, "mixed-reject-endpoint") of
+            when Left(left as why: Int32) do
+                print("endpoint: ");
+                printLn(why);
+                code := why;
+            when Right(right as endpoint: Endpoint) do
+                case connectPeer(&endpoint, &job, 1) of
+                    when Left(left as why: Int32) do
+                        print("connect: ");
+                        printLn(why);
+                        code := why;
+                    when Right(right as peer: Peer) do
+                        var open: Peer := peer;
+                        code := act(&!open, &job, fault);
+                        print("connect: 0 act: ");
+                        printLn(code);
+                        sleepFor(1000);
+                        closePeer(open);
+                end case;
+                closeEndpoint(endpoint);
+        end case;
+        destroyJob(job);
+        return code;
+    end;
+
+    -- The loopback address as four bytes, the form connectTcp takes.
+    function loopback(): String is
+        var address: String := makeString(4, 0);
+        let first: Nat8 := 127;
+        let last: Nat8 := 1;
+        storeNth(&!address, 0, first);
+        storeNth(&!address, 3, last);
+        return address;
+    end;
+
+    -- A client with no certificate at all, to the port of rank 1, trusting
+    -- the CA in the file mixed-reject-ca.pem.
+    function bareClient(port: Nat16): Int32 is
+        let address: String := loopback();
+        var tries: Nat32 := 0;
+        while tries < 100 do
+            case connectTcp(asSpan(&address), port, 5000) of
+                when Right(right as socket: FileDescriptor) do
+                    case connectOver(socket, "localhost", "mixed-reject-ca.pem", 5000) of
+                        when Right(right as opened: Client) do
+                            var client: Client := opened;
+                            case tlsSend(&!client, "x") of
+                                when Right(right as sent: Unit) do
+                                    skip;
+                                when Left(left as message: String) do
+                                    destroyString(message);
+                            end case;
+                            case receiveWithin(&!client, 10, 3000) of
+                                when Right(right as got: String) do
+                                    destroyString(got);
+                                when Left(left as message: String) do
+                                    destroyString(message);
+                            end case;
+                            closeClient(client);
+                        when Left(left as message: String) do
+                            destroyString(message);
+                    end case;
+                    destroyString(address);
+                    printLn("bare: done");
+                    return 0;
+                when Left(left as failure: ConnectFailure) do
+                    sleepFor(100);
+            end case;
+            tries := tries + 1;
+        end while;
+        destroyString(address);
+        printLn("bare: no connection");
+        return 1;
+    end;
+
+    function writeCa(pem: String): Bool is
+        case openWrite("mixed-reject-ca.pem") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, asSpan(&pem));
+                let closed: Bool := closeFile(file);
+                destroyString(pem);
+                return written and closed;
+            when None do
+                destroyString(pem);
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, F: Region]
+    function play(launch: &[Launch, R], fault: Span[Nat8, F]): Int32 is
+        if equal(fault, "wrong-ca") then
+            let other: Launch := launchOnPortsOf(launch);
+            let code: Int32 := connectWith(jobOf(&other, 0), fault);
+            destroyLaunch(other);
+            return code;
+        end if;
+        if equal(fault, "no-cert") then
+            if not writeCa(launchCaPem(launch)) then
+                return 1;
+            end if;
+            let code: Int32 := bareClient(launchPort(launch, 1));
+            let removed: Bool := removeFile("mixed-reject-ca.pem");
+            return code;
+        end if;
+        let id: String := launchId(launch);
+        var job: Job := jobOf(launch, 0);
+        if equal(fault, "expired") then
+            destroyJob(job);
+            job := withMadeToken(launch, asSpan(&id), 0, 1);
+        end if;
+        if equal(fault, "foreign-job") then
+            destroyJob(job);
+            job := withMadeToken(launch, "0123456789abcdef", 0, launchExpiry(launch));
+        end if;
+        if equal(fault, "wrong-rank") then
+            destroyJob(job);
+            job := withMadeToken(launch, asSpan(&id), 1, launchExpiry(launch));
+        end if;
+        destroyString(id);
+        return connectWith(job, fault);
+    end;
+
+    generic [F: Region, D: Region]
+    function run(fault: Span[Nat8, F], descriptionFile: Span[Nat8, D]): Int32 is
+        let launch: Launch := newTwoRankLaunch("localhost\nlocalhost\n");
+        var code: Int32 := 1;
+        if writeDescription(&launch, descriptionFile) then
+            code := play(&launch, fault);
+        else
+            printLn("the description was not written");
+        end if;
+        destroyLaunch(launch);
+        return code;
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        surrenderRoot(root);
+        var words: Buffer[String] := processArguments();
+        if length(&words) /= 2 then
+            destroyWords(words);
+            printLn("usage: MixedReject fault description-file");
+            return ExitFailure();
+        end if;
+        let file: String := removeLast(&!words);
+        let fault: String := removeLast(&!words);
+        destroyWords(words);
+        let code: Int32 := run(asSpan(&fault), asSpan(&file));
+        destroyString(fault);
+        destroyString(file);
+        if code = 0 then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+end module body.

@@ -1,0 +1,326 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    countOf,
+    substring,
+    bytesToHex
+);
+import Standard.Html (
+    TokenKind,
+    Document,
+    Policy,
+    parseHtml,
+    destroyDocument,
+    tokenCount,
+    tokenKind,
+    tokenText,
+    tokenSelfClosing,
+    attributeCount,
+    attributeName,
+    attributeValue,
+    attributeOf,
+    textOf,
+    escapeHtml,
+    basicPolicy,
+    makePolicy,
+    sanitize
+);
+
+module body Standard.Html.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function sameSpan(text: Span[Nat8, R], expected: Span[Nat8, Static]): Bool is
+        if spanLength(text) /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The bytes of text, written in hexadecimal, are expected.
+    generic [R: Region]
+    function hexIs(text: &[String, R], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let hex: String := bytesToHex(asSpan(text));
+        assertTrue(same(&hex, expected), message);
+        destroyString(hex);
+        return nil;
+    end;
+
+    function kindNumber(kind: Option[TokenKind]): Int32 is
+        case kind of
+            when Some(value as found: TokenKind) do
+                case found of
+                    when TextToken do
+                        return 1;
+                    when StartTag do
+                        return 2;
+                    when EndTag do
+                        return 3;
+                    when CommentToken do
+                        return 4;
+                    when DoctypeToken do
+                        return 5;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- html under the basic policy is expected.
+    function cleans(html: Span[Nat8, Static], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let clean: String := sanitize(html, basicPolicy());
+        assertTrue(same(&clean, expected), message);
+        destroyString(clean);
+        return nil;
+    end;
+
+    function cleansWith(html: Span[Nat8, Static], policy: Policy, expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let clean: String := sanitize(html, policy);
+        assertTrue(same(&clean, expected), message);
+        destroyString(clean);
+        return nil;
+    end;
+
+    function testTokens(): Unit is
+        let document: Document := parseHtml("<!DOCTYPE html><P Class=\"x\" id=a data-v='1 2' class=y>Fish &amp; chips&#33;<br/></p><!-- note -->");
+        assertTrue(tokenCount(&document) = 6, "six tokens");
+        assertTrue(kindNumber(tokenKind(&document, 0)) = 5, "a doctype first");
+        assertTrue(sameSpan(tokenText(&document, 0), "html"), "the doctype name");
+        assertTrue(kindNumber(tokenKind(&document, 1)) = 2, "then a start tag");
+        assertTrue(sameSpan(tokenText(&document, 1), "p"), "its name in small letters");
+        assertTrue(attributeCount(&document, 1) = 3, "three attributes, the second class dropped");
+        assertTrue(sameSpan(attributeName(&document, 1, 0), "class"), "the first attribute name");
+        assertTrue(sameSpan(attributeValue(&document, 1, 0), "x"), "the first of two values kept");
+        assertTrue(sameSpan(attributeValue(&document, 1, 1), "a"), "an unquoted value");
+        assertTrue(sameSpan(attributeValue(&document, 1, 2), "1 2"), "a value in single quotes");
+        assertTrue(sameSpan(tokenText(&document, 2), "Fish & chips!"), "text with references decoded");
+        assertTrue(sameSpan(tokenText(&document, 3), "br"), "a void element");
+        assertTrue(tokenSelfClosing(&document, 3), "with its slash");
+        assertTrue(kindNumber(tokenKind(&document, 4)) = 3, "an end tag");
+        assertTrue(kindNumber(tokenKind(&document, 5)) = 4, "a comment last");
+        assertTrue(sameSpan(tokenText(&document, 5), " note "), "the text of the comment");
+        assertTrue(kindNumber(tokenKind(&document, 6)) = 0, "no seventh token");
+        case attributeOf(&document, 1, "data-v") of
+            when Some(value as found: String) do
+                assertTrue(same(&found, "1 2"), "an attribute by name");
+                destroyString(found);
+            when None do
+                assertFailure("an attribute by name");
+        end case;
+        case attributeOf(&document, 1, "style") of
+            when Some(value as found: String) do
+                destroyString(found);
+                assertFailure("an attribute that is not there");
+            when None do
+                assertTrue(true, "an attribute that is not there");
+        end case;
+        destroyDocument(document);
+        return nil;
+    end;
+
+    -- A tag of 70 attributes keeps the first 64.
+    function testManyAttributes(): Unit is
+        var html: StringBuilder := makeStringBuilder();
+        writeString(&!html, "<p");
+        var i: Index := 0;
+        while i < 70 do
+            writeString(&!html, " a");
+            writeString(&!html, digitOf(i / 10));
+            writeString(&!html, digitOf(i - ((i / 10) * 10)));
+            i := i + 1;
+        end while;
+        writeString(&!html, ">");
+        let text: String := finalize(html);
+        let document: Document := parseHtml(asSpan(&text));
+        assertTrue(attributeCount(&document, 0) = 64, "64 attributes kept");
+        assertTrue(sameSpan(attributeName(&document, 0, 63), "a63"), "the 64th is the last");
+        destroyDocument(document);
+        destroyString(text);
+        return nil;
+    end;
+
+    function digitOf(digit: Index): Span[Nat8, Static] is
+        let digits: Span[Nat8, Static] := "0123456789";
+        return substring(digits, digit, digit + 1);
+    end;
+
+    function testRawText(): Unit is
+        let document: Document := parseHtml("<script>if (a < b && c) { x = '</b>'; }</SCRIPT ><textarea>&lt;b&gt;</textarea>");
+        assertTrue(tokenCount(&document) = 6, "six tokens");
+        assertTrue(sameSpan(tokenText(&document, 1), "if (a < b && c) { x = '</b>'; }"), "a tag in a script is text");
+        assertTrue(sameSpan(tokenText(&document, 2), "script"), "the end tag in capitals");
+        assertTrue(sameSpan(tokenText(&document, 4), "<b>"), "references in a textarea decoded");
+        destroyDocument(document);
+        return nil;
+    end;
+
+    function testReferences(): Unit is
+        let text: String := textOf("&#x41;&#66;&#0;&#xD800;&#1114112;&nbsp;&quot;&apos;&ampx &unknown; &#;");
+        hexIs(&text, "4142efbfbdefbfbdefbfbdc2a0222726782026756e6b6e6f776e3b2026233b", "numeric, named, invalid and unknown references");
+        destroyString(text);
+        let euro: String := textOf("&#8364;&#x1F600;");
+        hexIs(&euro, "e282acf09f9880", "three and four bytes of UTF-8");
+        destroyString(euro);
+        return nil;
+    end;
+
+    function testTextOf(): Unit is
+        let text: String := textOf("<h1>Title</h1><script>alert(1)</script><style>p{}</style><p>One <b>two</b><!-- no --></p>");
+        assertTrue(same(&text, "TitleOne two"), "text without tags, scripts, styles and comments");
+        destroyString(text);
+        let broken: String := textOf("a <b class=\"open");
+        assertTrue(same(&broken, "a "), "a tag the input ends in is no tag");
+        destroyString(broken);
+        return nil;
+    end;
+
+    function testEscape(): Unit is
+        let text: String := escapeHtml("<a href=\"x\">'&'</a>");
+        assertTrue(same(&text, "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;"), "the five characters escaped");
+        destroyString(text);
+        return nil;
+    end;
+
+    function testSanitizeKeeps(): Unit is
+        cleans("<p>Hello <b>world</b></p>", "<p>Hello <b>world</b></p>", "allowed elements kept");
+        cleans("<P><STRONG>x</STRONG></P>", "<p><strong>x</strong></p>", "names in small letters");
+        cleans("<a href=\"https://example.org/?a=1&amp;b=2\" title=t>x</a>",
+            "<a href=\"https://example.org/?a=1&amp;b=2\" title=\"t\" rel=\"nofollow noopener\">x</a>", "a link with its title");
+        cleans("<a href=\"/path#top\">x</a>", "<a href=\"/path#top\" rel=\"nofollow noopener\">x</a>", "a relative link");
+        cleans("<a href=\"mailto:a@example.org\">x</a>", "<a href=\"mailto:a@example.org\" rel=\"nofollow noopener\">x</a>", "a mail link");
+        cleans("1 < 2 & 3 > 2", "1 &lt; 2 &amp; 3 &gt; 2", "text escaped");
+        cleans("<br><br/>", "<br><br>", "void elements not closed");
+        return nil;
+    end;
+
+    function testSanitizeDrops(): Unit is
+        cleans("<script>alert(1)</script>ok", "ok", "a script dropped with its content");
+        cleans("<SCRIPT SRC=//evil.example/x.js></SCRIPT>ok", "ok", "a script in capitals");
+        cleans("<script/>alert(1)", "", "a script with a slash takes the rest");
+        cleans("<style>body{}</style><iframe src=x><b>in</b></iframe>ok", "ok", "style and iframe dropped");
+        cleans("<svg><svg><script>1</script></svg>x</svg>ok", "ok", "nested svg dropped as a whole");
+        cleans("<img src=x onerror=alert(1)>", "", "img is not in the basic policy");
+        cleans("<b onclick=\"alert(1)\" style=\"x\">x</b>", "<b>x</b>", "event handlers and style dropped");
+        cleans("<a href=\"javascript:alert(1)\">x</a>", "<a rel=\"nofollow noopener\">x</a>", "a javascript link");
+        cleans("<a href=\"JaVaScRiPt:alert(1)\">x</a>", "<a rel=\"nofollow noopener\">x</a>", "in mixed case");
+        cleans("<a href=\"java\tscript:alert(1)\">x</a>", "<a rel=\"nofollow noopener\">x</a>", "with a tab inside");
+        cleans("<a href=\"  javascript:alert(1)\">x</a>", "<a rel=\"nofollow noopener\">x</a>", "with spaces before");
+        cleans("<a href=\"&#106;avascript:alert(1)\">x</a>", "<a rel=\"nofollow noopener\">x</a>", "with a decimal reference");
+        cleans("<a href=\"&#x6A&#x61vascript:alert(1)\">x</a>", "<a rel=\"nofollow noopener\">x</a>", "with hex references without semicolons");
+        cleans("<a href=\"data:text/html;base64,PHNjcmlwdD4=\">x</a>", "<a rel=\"nofollow noopener\">x</a>", "a data link");
+        cleans("<a href=\"vbscript:x\">x</a>", "<a rel=\"nofollow noopener\">x</a>", "a vbscript link");
+        cleans("<a href=x rel=opener target=_blank>x</a>", "<a href=\"x\" rel=\"nofollow noopener\">x</a>", "rel and target replaced");
+        cleans("<p title=\"&quot;><script>alert(1)</script>\">x</p>", "<p title=\"&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\">x</p>",
+            "a value that closes its quote is escaped");
+        cleans("<!--<script>alert(1)</script>-->ok", "ok", "a comment dropped");
+        cleans("<![CDATA[<script>]]>ok", "]]&gt;ok", "a declaration dropped");
+        cleans("<div><p>x</div>", "<p>x</p>", "an element not allowed dropped, its content kept");
+        cleans("<b><i>x</b>y</i>", "<b><i>x</i></b>y", "overlapping elements closed in order");
+        cleans("<b>open", "<b>open</b>", "open elements closed at the end");
+        cleans("</p>x", "x", "an end tag without a start dropped");
+        cleans("<p>a <scr<script>ipt>alert(1)</script>", "<p>a ipt&gt;alert(1)</p>", "a split tag is one unknown tag");
+        cleans("<a href=x", "", "a tag the input ends in");
+        cleans("<textarea><script>alert(1)</script></textarea>ok", "ok", "a textarea dropped");
+        cleans("<noscript><p title=\"</noscript><img src=x onerror=alert(1)>\"></noscript>", "", "noscript dropped");
+        cleans("<math><mi xlink:href=\"javascript:alert(1)\">x</mi></math>", "", "math dropped");
+        return nil;
+    end;
+
+    function testDepth(): Unit is
+        var nested: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 101 do
+            writeString(&!nested, "<b>");
+            i := i + 1;
+        end while;
+        writeString(&!nested, "x");
+        let html: String := finalize(nested);
+        let clean: String := sanitize(asSpan(&html), basicPolicy());
+        assertTrue(countOf(asSpan(&clean), "<b>") = 100, "one hundred elements open, the one more dropped");
+        assertTrue(countOf(asSpan(&clean), "</b>") = 100, "and each closed");
+        destroyString(clean);
+        destroyString(html);
+        return nil;
+    end;
+
+    function testPolicy(): Unit is
+        case makePolicy("img,p,td", "src,alt,colspan,href", false) of
+            when Some(value as policy: Policy) do
+                cleansWith("<img src=\"https://example.org/a.png\" alt=\"a\" onerror=x><p alt=b>x</p>", policy,
+                    "<img src=\"https://example.org/a.png\" alt=\"a\"><p>x</p>", "an attribute only where it belongs");
+                cleansWith("<img src=\"javascript:alert(1)\">", policy, "<img>", "a script source dropped");
+                cleansWith("<a href=x>y</a>", policy, "y", "a not in the policy");
+                cleansWith("<td colspan=2>c</td>", policy, "<td colspan=\"2\">c</td>", "a cell");
+            when None do
+                assertFailure("a policy of known names");
+        end case;
+        case makePolicy("p,blink", "", false) of
+            when Some(value as policy: Policy) do
+                assertFailure("an unknown element refused");
+            when None do
+                assertTrue(true, "an unknown element refused");
+        end case;
+        case makePolicy("p", "onclick", false) of
+            when Some(value as policy: Policy) do
+                assertFailure("an unknown attribute refused");
+            when None do
+                assertTrue(true, "an unknown attribute refused");
+        end case;
+        case makePolicy("p,,b", "", false) of
+            when Some(value as policy: Policy) do
+                assertFailure("an empty name refused");
+            when None do
+                assertTrue(true, "an empty name refused");
+        end case;
+        case makePolicy("", "", false) of
+            when Some(value as policy: Policy) do
+                cleansWith("<p>x</p><b>y</b>", policy, "xy", "the empty policy keeps text only");
+            when None do
+                assertFailure("the empty policy");
+        end case;
+        return nil;
+    end;
+end module body.

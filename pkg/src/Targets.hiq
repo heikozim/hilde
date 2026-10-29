@@ -1,0 +1,421 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A module is known by the line module Name is of its interface; its
+-- imports are the lines that start with import in the interface and in the
+-- body beside it, and its targets the words of pragma Targets.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nth,
+    nthRef,
+    insertBack,
+    removeFirst,
+    removeLast,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    endsWith,
+    trim,
+    substring,
+    indexOf,
+    split,
+    lines
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf,
+    destroyProblem
+);
+import Pkg.Tree (
+    treeFiles
+);
+import Pkg.Files (
+    readText,
+    joinPath,
+    directoryNames
+);
+
+module body Pkg.Targets is
+    record Known: Linear is
+        name: String;
+        interface: String;
+        first: Bool;
+    end;
+
+    function destroyKnown(k: Known): Unit is
+        let { name: String, interface: String, first: Bool } := k;
+        destroyString(name);
+        destroyString(interface);
+        return nil;
+    end;
+
+    function destroyKnowns(all: Buffer[Known]): Unit is
+        var rest: Buffer[Known] := all;
+        while bufferLength(&rest) > 0 do
+            destroyKnown(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyReach(reach: Reach): Unit is
+        let { allowed: Buffer[String], limits: Buffer[String] } := reach;
+        destroyArguments(allowed);
+        destroyArguments(limits);
+        return nil;
+    end;
+
+    -- The module name of an interface text, or the empty text.
+    generic [T: Region]
+    function moduleOf(text: Span[Nat8, T]): String is
+        let all: Buffer[Span[Nat8, T]] := lines(text);
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let t: Span[Nat8, T] := trim(nth(&all, i));
+            if (startsWith(t, "module ") and endsWith(t, " is")) and (spanLength(t) > 10) then
+                let name: String := fromSpan(substring(t, 7, spanLength(t) - 3));
+                destroyFree(all);
+                return name;
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return fromLiteral("");
+    end;
+
+    -- Every interface below the directories, by its module name.
+    generic [D: Region]
+    function index(dirs: &[Buffer[String], D]): Buffer[Known] is
+        var out: Buffer[Known] := allocateEmpty();
+        var d: Index := 0;
+        while d < bufferLength(dirs) do
+            let dir: Span[Nat8, D] := asSpan(nthRef(dirs, d));
+            case treeFiles(dir) of
+                when Right(right as files: Buffer[String]) do
+                    addKnown(dir, &files, d = 0, &!out);
+                    destroyArguments(files);
+                when Left(left as p: Problem) do
+                    destroyProblem(p);
+            end case;
+            d := d + 1;
+        end while;
+        return out;
+    end;
+
+    generic [D: Region, F: Region, B: Region]
+    function addKnown(dir: Span[Nat8, D], files: &[Buffer[String], F], first: Bool, out: &![Buffer[Known], B]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            if endsWith(file, ".hih") then
+                let path: String := joinPath(dir, file);
+                case readText(asSpan(&path)) of
+                    when Some(value as text: String) do
+                        let name: String := moduleOf(asSpan(&text));
+                        destroyString(text);
+                        if length(&name) > 0 then
+                            insertBack(&~out, Known(name => name, interface => path, first => first));
+                        else
+                            destroyString(name);
+                            destroyString(path);
+                        end if;
+                    when None do
+                        destroyString(path);
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Where the module stands in the index, the first found, or the length.
+    generic [K: Region, N: Region]
+    function find(known: &[Buffer[Known], K], name: Span[Nat8, N]): Index is
+        var i: Index := 0;
+        while i < bufferLength(known) do
+            let k: &[Known, K] := nthRef(known, i);
+            if equal(asSpan(&(k->name)), name) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return bufferLength(known);
+    end;
+
+    -- The imports of a text: the name after import, up to a blank, a
+    -- parenthesis or a semicolon.
+    generic [T: Region, B: Region]
+    function addImports(text: Span[Nat8, T], out: &![Buffer[String], B]): Unit is
+        let all: Buffer[Span[Nat8, T]] := lines(text);
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let t: Span[Nat8, T] := trim(nth(&all, i));
+            if startsWith(t, "import ") then
+                var e: Index := 7;
+                while ((e < spanLength(t)) and (t[e] /= ' ')) and ((t[e] /= '(') and (t[e] /= ';')) do
+                    e := e + 1;
+                end while;
+                insertBack(&~out, fromSpan(substring(t, 7, e)));
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return nil;
+    end;
+
+    -- The words of pragma Targets in a text, or None when it has none.
+    generic [T: Region]
+    function targetsOf(text: Span[Nat8, T]): Option[Buffer[String]] is
+        case indexOf(text, "pragma Targets(Names => \"") of
+            when Some(value as at: Index) do
+                let start: Index := at + 25;
+                var e: Index := start;
+                while (e < spanLength(text)) and (text[e] /= '"') do
+                    e := e + 1;
+                end while;
+                let words: Buffer[Span[Nat8, T]] := split(substring(text, start, e), " ");
+                var out: Buffer[String] := allocateEmpty();
+                var i: Index := 0;
+                while i < bufferLength(&words) do
+                    let w: Span[Nat8, T] := nth(&words, i);
+                    if spanLength(w) > 0 then
+                        insertBack(&!out, fromSpan(w));
+                    end if;
+                    i := i + 1;
+                end while;
+                destroyFree(words);
+                return Some(value => out);
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [A: Region, W: Region]
+    function has(texts: &[Buffer[String], A], word: Span[Nat8, W]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(texts) do
+            if equal(asSpan(nthRef(texts, i)), word) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The allowed targets kept to those the module names; a target taken
+    -- away is noted with the module.
+    generic [T: Region, M: Region, L: Region]
+    function narrowed(allowed: Buffer[String], targets: &[Buffer[String], T], owner: Span[Nat8, M], limits: &![Buffer[String], L]): Buffer[String] is
+        var rest: Buffer[String] := allowed;
+        var kept: Buffer[String] := allocateEmpty();
+        while bufferLength(&rest) > 0 do
+            let a: String := removeFirst(&!rest);
+            if has(targets, asSpan(&a)) then
+                insertBack(&!kept, a);
+            else
+                var line: StringBuilder := makeStringBuilder();
+                writeString(&!line, asSpan(&a));
+                writeByte(&!line, ' ');
+                writeString(&!line, owner);
+                insertBack(&~limits, finalize(line));
+                destroyString(a);
+            end if;
+        end while;
+        destroyEmpty(rest);
+        return kept;
+    end;
+
+    function allTargets(): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        insertBack(&!out, fromLiteral("linux"));
+        insertBack(&!out, fromLiteral("openbsd"));
+        insertBack(&!out, fromLiteral("freebsd"));
+        insertBack(&!out, fromLiteral("darwin"));
+        insertBack(&!out, fromLiteral("wasm"));
+        return out;
+    end;
+
+    -- The modules of the first directory, to start the walk.
+    generic [K: Region, B: Region]
+    function starts(known: &[Buffer[Known], K], out: &![Buffer[String], B]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(known) do
+            let k: &[Known, K] := nthRef(known, i);
+            if k->first then
+                insertBack(&~out, fromSpan(asSpan(&(k->name))));
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [K: Region]
+    function interfaceAt(known: &[Buffer[Known], K], at: Index): String is
+        let k: &[Known, K] := nthRef(known, at);
+        return fromSpan(asSpan(&(k->interface)));
+    end;
+
+    generic [D: Region]
+    function reachTargets(dirs: &[Buffer[String], D]): Reach is
+        let known: Buffer[Known] := index(dirs);
+        var queue: Buffer[String] := allocateEmpty();
+        starts(&known, &!queue);
+        var visited: Buffer[String] := allocateEmpty();
+        var allowed: Buffer[String] := allTargets();
+        var limits: Buffer[String] := allocateEmpty();
+        while bufferLength(&queue) > 0 do
+            let name: String := removeFirst(&!queue);
+            if has(&visited, asSpan(&name)) then
+                destroyString(name);
+            else
+                let at: Index := find(&known, asSpan(&name));
+                if at < bufferLength(&known) then
+                    let interface: String := interfaceAt(&known, at);
+                    case readText(asSpan(&interface)) of
+                        when Some(value as text: String) do
+                            case targetsOf(asSpan(&text)) of
+                                when Some(value as targets: Buffer[String]) do
+                                    allowed := narrowed(allowed, &targets, asSpan(&name), &!limits);
+                                    destroyArguments(targets);
+                                when None do
+                                    skip;
+                            end case;
+                            addImports(asSpan(&text), &!queue);
+                            destroyString(text);
+                        when None do
+                            skip;
+                    end case;
+                    let besides: String := bodyOf(asSpan(&interface));
+                    case readText(asSpan(&besides)) of
+                        when Some(value as text: String) do
+                            addImports(asSpan(&text), &!queue);
+                            destroyString(text);
+                        when None do
+                            skip;
+                    end case;
+                    destroyString(besides);
+                    destroyString(interface);
+                end if;
+                insertBack(&!visited, name);
+            end if;
+        end while;
+        destroyEmpty(queue);
+        destroyArguments(visited);
+        destroyKnowns(known);
+        return Reach(allowed => allowed, limits => limits);
+    end;
+
+    -- The body beside an interface: .hiq in the place of .hih.
+    generic [P: Region]
+    function bodyOf(interface: Span[Nat8, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, substring(interface, 0, spanLength(interface) - 4));
+        writeString(&!out, ".hiq");
+        return finalize(out);
+    end;
+
+    generic [W: Region, R: Region]
+    function targetProblems(wanted: &[Buffer[String], W], reach: &[Reach, R]): Buffer[Problem] is
+        var out: Buffer[Problem] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(wanted) do
+            let target: Span[Nat8, W] := asSpan(nthRef(wanted, i));
+            if not has(&(reach->allowed), target) then
+                var message: StringBuilder := makeStringBuilder();
+                writeString(&!message, "hilde.toml names the target ");
+                writeString(&!message, target);
+                writeString(&!message, ", and a module the package reaches does not allow it: ");
+                let limit: String := limitOf(&(reach->limits), target);
+                writeString(&!message, asSpan(&limit));
+                destroyString(limit);
+                insertBack(&!out, problemOf(1523, finalize(message), fromLiteral("drop the target from hilde.toml, or the import that leaves it out")));
+            end if;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region, L: Region]
+    function packageDirs(root: Span[Nat8, R], library: Span[Nat8, L]): Buffer[String] is
+        var dirs: Buffer[String] := allocateEmpty();
+        insertBack(&!dirs, joinPath(root, "src"));
+        let vendor: String := joinPath(root, "vendor");
+        case directoryNames(asSpan(&vendor)) of
+            when Some(value as names: Buffer[String]) do
+                addTrees(asSpan(&vendor), &names, &!dirs);
+                destroyArguments(names);
+            when None do
+                skip;
+        end case;
+        destroyString(vendor);
+        insertBack(&!dirs, fromSpan(library));
+        return dirs;
+    end;
+
+    generic [V: Region, N: Region, B: Region]
+    function addTrees(vendor: Span[Nat8, V], names: &[Buffer[String], N], dirs: &![Buffer[String], B]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(names) do
+            let tree: String := joinPath(vendor, asSpan(nthRef(names, i)));
+            insertBack(&~dirs, joinPath(asSpan(&tree), "src"));
+            destroyString(tree);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function allowedText(reach: &[Reach, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let allowed: &[Buffer[String], R] := &(reach->allowed);
+        var i: Index := 0;
+        while i < bufferLength(allowed) do
+            writeString(&!out, asSpan(nthRef(allowed, i)));
+            writeByte(&!out, ' ');
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The module that took the target away, from the lines target module.
+    generic [L: Region, T: Region]
+    function limitOf(limits: &[Buffer[String], L], target: Span[Nat8, T]): String is
+        var i: Index := 0;
+        while i < bufferLength(limits) do
+            let line: Span[Nat8, L] := asSpan(nthRef(limits, i));
+            if (startsWith(line, target) and (spanLength(line) > (spanLength(target) + 1))) and (line[spanLength(target)] = ' ') then
+                return fromSpan(substring(line, spanLength(target) + 1, spanLength(line)));
+            end if;
+            i := i + 1;
+        end while;
+        return fromLiteral("a module that names no such target");
+    end;
+end module body.

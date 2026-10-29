@@ -1,0 +1,1 @@
+Directories are made, listed without . and .., refused for removal while not empty, and removed; a file offset is moved from the start, from here and from the end, a position before the start is refused, and a pipe cannot seek.

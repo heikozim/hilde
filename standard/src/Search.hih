@@ -1,0 +1,163 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Full-text search in a database of Standard.Database, with the FTS5 module of SQLite.
+
+- The index is the virtual table hilde_search: a key, a title and a body for each document.
+- Only the backends SQLite and SQLCipher have FTS5; prepareSearch refuses the others.
+- FTS5 must be built into that library; without it prepareSearch fails with SearchStorageFailed.
+- The tokenizer unicode61 finds words without case and diacritics: cafe finds the accented word.
+- Hits rank by bm25, a word in the title worth ten in the body, best first.
+- A snippet is escaped for HTML, the words found between two markers the caller chooses.
+- Typed text never reaches FTS5 as a query: its words become quoted strings that must all be found.
+- So no input can name a column, ask for words near each other, use an operator or fail to parse.
+- A word that ends in a star finds the words it begins.
+- At most 16 words of at most 64 bytes each are taken; the rest is dropped.
+- A key is the caller's name of a document, not empty; the table hilde_search_keys gives each key its row.
+- So putting a document in and taking it out find its row by an index, in time logarithmic in the documents.
+- Both tables are written only through this module: a row written past it has no key the module knows.
+
+    case search(&!db, asSpan(&typed), 10, 0, "<mark>", "</mark>") of
+        when Right(right as hits: Buffer[SearchHit]) do
+            renderHits(&hits);
+            destroyHits(hits);
+        when Left(left as error: SearchError) do
+            showNoResults(error);
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Transaction
+);
+
+module Standard.Search is
+    """
+    Why a call did not do its work.
+    """
+    union SearchError: Free is
+        """
+        The database refused a statement, for instance because its SQLite
+        has no FTS5.
+        """
+        case SearchStorageFailed is
+            error: DbError;
+        """
+        The database is PostgreSQL or MariaDB, which have no FTS5.
+        """
+        case SearchUnsupported;
+        """
+        The text searched for holds no word.
+        """
+        case NoWords;
+    end;
+
+    """
+    One document found.  Linear: destroyHits gives a list of them back.
+    """
+    record SearchHit: Linear is
+        """
+        The key it was indexed under.
+        """
+        key: String;
+        """
+        Its rank, bm25 of SQLite: the smaller the better, below 0 for a
+        document that holds the words.
+        """
+        rank: Float64;
+        """
+        Some words of the body around those found, escaped for HTML, with
+        the words found between the two markers, and an ellipsis where the
+        body goes on.
+        """
+        snippet: String;
+    end;
+
+    """
+    Makes the tables hilde_search and hilde_search_keys when the database
+    has none.  An index made before hilde_search_keys existed gets a key
+    entry for each of its rows, once.  Left SearchUnsupported on a backend
+    other than SQLite and SQLCipher, SearchStorageFailed when SQLite was
+    built without FTS5.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function prepareSearch(db: &![Database[Writing], R]): Either[SearchError, Unit];
+
+    """
+    Puts a document into the index under key, in place of what key had,
+    in a transaction of its own.  Fails inside a transaction of the
+    caller; indexDocumentIn is for that.  No ensures: the result is I/O.
+    """
+    generic [R: Region, K: Region, T: Region, B: Region]
+    function indexDocument(db: &![Database[Writing], R], key: Span[Nat8, K], title: Span[Nat8, T], content: Span[Nat8, B]): Either[SearchError, Unit]
+        requires spanLength(key) > 0;
+
+    """
+    indexDocument inside the caller's transaction on db, so that many
+    documents go in under one commit.  On Left the caller rolls the
+    transaction back, for part of the change may be written.  No ensures:
+    the result is I/O.
+    """
+    generic [R: Region, X: Region, K: Region, T: Region, B: Region]
+    function indexDocumentIn(db: &![Database[Writing], R], transaction: &[Transaction, X], key: Span[Nat8, K], title: Span[Nat8, T], content: Span[Nat8, B]): Either[SearchError, Unit]
+        requires spanLength(key) > 0;
+
+    """
+    Takes the document of key out of the index.  Right carries whether
+    there was one.  It runs in the caller's transaction when there is one.
+    No ensures: the result is I/O.
+    """
+    generic [R: Region, K: Region]
+    function removeDocument(db: &![Database[Writing], R], key: Span[Nat8, K]): Either[SearchError, Bool]
+        requires spanLength(key) > 0;
+
+    """
+    The query of FTS5 that searching for text runs: each word in double
+    quotes, a word that ends in a star with the star after the quotes.  A
+    word is a run of bytes that are not spaces and not punctuation of
+    ASCII; bytes above 127 belong to words.  None when text has no word.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function searchQuery(text: Span[Nat8, R]): Option[String];
+
+    """
+    The documents that hold every word of text, best first, at most limit
+    of them after the first offset; limit is held to 1 to 100 and offset
+    to 0 and more.  The snippet has at most 16 words of the body, escaped
+    for HTML, with each word found between before and after, which are
+    written as they stand, for instance the tags mark and /mark.  Left
+    NoWords when text has no word.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, T: Region, B: Region, A: Region]
+    function search(db: &![Database[Writing], R], text: Span[Nat8, T], limit: Int64, offset: Int64,
+        before: Span[Nat8, B], after: Span[Nat8, A]): Either[SearchError, Buffer[SearchHit]];
+
+    """
+    How many documents hold every word of text.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, T: Region]
+    function countMatches(db: &![Database[Writing], R], text: Span[Nat8, T]): Either[SearchError, Int64];
+
+    """
+    Gives back a list of hits.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyHits(hits: Buffer[SearchHit]): Unit;
+end module.

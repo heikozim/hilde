@@ -1,0 +1,1 @@
+A producer task and a consuming main over a channel of capacity 2 (the producer runs two ahead) and of capacity 0 (a rendezvous, strict alternation), and a rendezvous where the producer runs first and its first send waits for the receiver; a send to a closed receiver hands a Linear value back; a Linear value through a channel, and the end of the stream.

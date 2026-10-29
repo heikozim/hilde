@@ -1,0 +1,151 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Output is read before errors.  A child that fills the pipe of its errors
+-- while it still writes output would wait for this process; the
+-- programmes run here, git and the compiler, write little to standard
+-- error, far less than a pipe holds.
+import Standard.String (
+    String,
+    destroyString,
+    makeEmpty,
+    fromLiteral,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength,
+    nthRef,
+    nth,
+    destroyFree
+);
+import Standard.Text (
+    split
+);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue,
+    kindOfTarget,
+    kindRegular,
+    sameKind
+);
+import Pkg.Report (
+    Problem,
+    problemOf
+);
+
+module body Pkg.Process is
+    function destroyRan(ran: Ran): Unit is
+        let { exitCode: Int32, output: String, errors: String } := ran;
+        destroyString(output);
+        destroyString(errors);
+        return nil;
+    end;
+
+    generic [D: Region, N: Region]
+    function pathIn(directory: Span[Nat8, D], name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, directory);
+        writeByte(&!out, '/');
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [V: Region, N: Region]
+    function findIn(path: Span[Nat8, V], name: Span[Nat8, N]): Option[String] is
+        let parts: Buffer[Span[Nat8, V]] := split(path, ":");
+        var i: Index := 0;
+        while i < bufferLength(&parts) do
+            let dir: Span[Nat8, V] := nth(&parts, i);
+            if (spanLength(dir) > 0) and (dir[0] = '/') then
+                let candidate: String := pathIn(dir, name);
+                if sameKind(kindOfTarget(asSpan(&candidate)), kindRegular) then
+                    destroyFree(parts);
+                    return Some(value => candidate);
+                end if;
+                destroyString(candidate);
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(parts);
+        return None();
+    end;
+
+    generic [N: Region]
+    function findProgram(name: Span[Nat8, N]): Option[String] is
+        case environmentValue("PATH") of
+            when Some(value as path: String) do
+                let found: Option[String] := findIn(asSpan(&path), name);
+                destroyString(path);
+                return found;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Reads the descriptor to its end and closes it; what could not be read
+    -- is the empty text.
+    function drain(file: FileDescriptor): String is
+        var f: FileDescriptor := file;
+        let read: Option[String] := readAll(&!f);
+        let closed: Bool := closeFile(f);
+        case read of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    generic [P: Region, A: Region]
+    function runProgram(path: Span[Nat8, P], arguments: &[Buffer[String], A]): Either[Problem, Ran] is
+        var command: Command := makeCommand(path);
+        var i: Index := 0;
+        while i < bufferLength(arguments) do
+            command := addArgument(command, asSpan(nthRef(arguments, i)));
+            i := i + 1;
+        end while;
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed: Bool := closeFile(input);
+                let out: String := drain(output);
+                let err: String := drain(errors);
+                let status: ProcessStatus := waitProcess(process);
+                var code: Int32 := -1;
+                if exitedNormally(status) then
+                    code := exitCode(status);
+                end if;
+                return Right(right => Ran(exitCode => code, output => out, errors => err));
+            when None do
+                var message: StringBuilder := makeStringBuilder();
+                writeString(&!message, "a programme could not be started: ");
+                writeString(&!message, path);
+                return Left(left => problemOf(1508, finalize(message), fromLiteral("check that it is there and may be run")));
+        end case;
+    end;
+end module body.

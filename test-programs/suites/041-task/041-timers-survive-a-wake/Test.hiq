@@ -1,0 +1,159 @@
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    Sender,
+    Receiver,
+    Channel,
+    openChannel,
+    send,
+    closeSender,
+    closeReceiver,
+    Polled,
+    receiveWithin,
+    sleepFor
+);
+
+module body Test is
+    constant rounds: Int32 := 400;
+
+    -- Sends rounds values, one each millisecond, then closes.
+    function produce(sender: Sender[Int32]): Int32 is
+        var out: Sender[Int32] := sender;
+        var i: Int32 := 0;
+        var lost: Int32 := 0;
+        let pause: Nat32 := 1;
+        while i < rounds do
+            sleepFor(pause);
+            case send(&!out, i) of
+                when Some(value as back: Int32) do
+                    lost := lost + 1;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        closeSender(out);
+        return lost;
+    end;
+
+    -- Receives with a limit of one millisecond, so that the time of a wait
+    -- and the send that ends it fall together, until the channel closes.
+    -- Gives the number of values received.
+    function consume(receiver: Receiver[Int32]): Int32 is
+        var input: Receiver[Int32] := receiver;
+        var count: Int32 := 0;
+        var open: Bool := true;
+        let limit: Nat32 := 1;
+        while open do
+            case receiveWithin(&!input, limit) of
+                when Ready(value as v: Int32) do
+                    count := count + 1;
+                when Empty do
+                    skip;
+                when Closed do
+                    open := false;
+            end case;
+        end while;
+        closeReceiver(input);
+        return count;
+    end;
+
+    -- One producer and one consumer in a scope of their own.  Gives the
+    -- values received, or a negative number when a part could not start.
+    function pair(unused: Int32): Int32 is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                let result: Int32 := pairIn(&!scope);
+                closeScope(scope);
+                return result;
+            when None do
+                return -1;
+        end case;
+    end;
+
+    generic [R: Region]
+    function pairIn(scope: &![Scope, R]): Int32 is
+        let capacity: Index := 0;
+        let made: Option[Channel[Int32]] := openChannel(capacity);
+        case made of
+            when Some(value as ends: Channel[Int32]) do
+                let { sender: Sender[Int32], receiver: Receiver[Int32] } := ends;
+                let producer: Fn[Sender[Int32], Int32] := produce;
+                case spawn(&~scope, producer, sender) of
+                    when Right(right as sending: Task[Int32]) do
+                        let received: Int32 := consume(receiver);
+                        let lost: Int32 := join(sending);
+                        return received + lost;
+                    when Left(left as back: Sender[Int32]) do
+                        closeSender(back);
+                        closeReceiver(receiver);
+                        return -2;
+                end case;
+            when None do
+                return -3;
+        end case;
+    end;
+
+    -- Sleeps twenty times for five milliseconds; deadlines later than those
+    -- of the pairs, which must fire all the same.
+    function sleeper(unused: Int32): Int32 is
+        var done: Int32 := 0;
+        let pause: Nat32 := 5;
+        while done < 20 do
+            sleepFor(pause);
+            done := done + 1;
+        end while;
+        return done;
+    end;
+
+    generic [R: Region]
+    function runAll(scope: &![Scope, R]): Unit is
+        let p: Fn[Int32, Int32] := pair;
+        let s: Fn[Int32, Int32] := sleeper;
+        let zero: Int32 := 0;
+        case spawn(&~scope, p, zero) of
+            when Right(right as a: Task[Int32]) do
+                case spawn(&~scope, p, zero) of
+                    when Right(right as b: Task[Int32]) do
+                        case spawn(&~scope, s, zero) of
+                            when Right(right as c: Task[Int32]) do
+                                let fromA: Int32 := join(a);
+                                let fromB: Int32 := join(b);
+                                let slept: Int32 := join(c);
+                                let mine: Int32 := pair(zero);
+                                print("received ");
+                                printLn(fromA + fromB + mine);
+                                print("slept ");
+                                printLn(slept);
+                            when Left(left as n: Int32) do
+                                ignore(join(a));
+                                ignore(join(b));
+                                printLn(-4);
+                        end case;
+                    when Left(left as n: Int32) do
+                        ignore(join(a));
+                        printLn(-5);
+                end case;
+            when Left(left as n: Int32) do
+                printLn(-6);
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                runAll(&!scope);
+                closeScope(scope);
+            when None do
+                printLn(-1);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

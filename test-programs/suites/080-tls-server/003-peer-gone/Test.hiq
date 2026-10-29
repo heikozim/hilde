@@ -1,0 +1,246 @@
+-- Standard.Tls when the peer has gone: a client task connects, completes
+-- the handshake and closes; the server then writes to it until a write
+-- fails.  A write to a socket whose peer closed raises SIGPIPE, which ends
+-- the programme unless the write is made with MSG_NOSIGNAL; the send must
+-- answer Left and the programme go on to its last line.
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    TcpListener,
+    ConnectFailure,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readAll,
+    closeFile,
+    listenTcp,
+    tcpListenerPort,
+    acceptTcpWithin,
+    closeTcpListener,
+    connectTcp
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    closeScope,
+    spawn,
+    join
+);
+import Standard.Tls (
+    Client,
+    Server,
+    connectOver,
+    send,
+    receiveWithin,
+    closeClient,
+    makeServer,
+    acceptOver,
+    closeServer
+);
+
+module body Test is
+    -- A file of the tree, from HILDE_TREE.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    -- Runs the certificate script into the working directory.
+    function makeCertificate(): Bool is
+        let shell: String := fromLiteral("/bin/sh");
+        let script: String := inTree("/scripts/fuzz/tls-certificate.sh");
+        let here: String := fromLiteral(".");
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&shell)), asSpan(&script)), asSpan(&here));
+        destroyString(shell);
+        destroyString(script);
+        destroyString(here);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                let closedInput: Bool := closeFile(input);
+                var out: FileDescriptor := output;
+                var err: FileDescriptor := errors;
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                case readAll(&!err) of
+                    when Some(value as text: String) do
+                        printText(&text);
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                let closedOut: Bool := closeFile(out);
+                let closedErr: Bool := closeFile(err);
+                let status: ProcessStatus := waitProcess(process);
+                return exitedNormally(status) and (exitCode(status) = 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function loopback(): String is
+        var address: String := makeString(4, 0);
+        storeNth(&!address, 0, 127);
+        storeNth(&!address, 3, 1);
+        return address;
+    end;
+
+    -- The client: connects, completes the handshake, closes.
+    function clientSide(port: Nat16): String is
+        var out: StringBuilder := makeStringBuilder();
+        let address: String := loopback();
+        case connectTcp(asSpan(&address), port, 5000) of
+            when Right(right as socket: FileDescriptor) do
+                case connectOver(socket, "localhost", "server-cert.pem", 5000) of
+                    when Right(right as opened: Client) do
+                        closeClient(opened);
+                        writeString(&!out, "client: closed after the handshake\n");
+                    when Left(left as message: String) do
+                        writeString(&!out, "client: handshake failed\n");
+                        destroyString(message);
+                end case;
+            when Left(left as failure: ConnectFailure) do
+                writeString(&!out, "client: connect failed\n");
+        end case;
+        destroyString(address);
+        return finalize(out);
+    end;
+
+    -- Up to 200 writes of 16 KiB to a peer that has closed; true when one
+    -- of them failed.
+    generic [R: Region]
+    function writeUntilFailure(connection: &![Client, R]): Bool is
+        let chunk: String := makeString(16384, 120);
+        var tries: Index := 0;
+        var failed: Bool := false;
+        while (tries < 200) and (not failed) do
+            case send(&~connection, asSpan(&chunk)) of
+                when Right(right as sent: Unit) do
+                    skip;
+                when Left(left as message: String) do
+                    failed := true;
+                    destroyString(message);
+            end case;
+            tries := tries + 1;
+        end while;
+        destroyString(chunk);
+        return failed;
+    end;
+
+    generic [K: Region, L: Region, S: Region]
+    function run(scope: &![Scope, K], listener: &[TcpListener, L], server: &[Server, S], port: Nat16): Unit is
+        let talk: Fn[Nat16, String] := clientSide;
+        case spawn(&~scope, talk, port) of
+            when Right(right as task: Task[String]) do
+                case acceptTcpWithin(listener, 5000) of
+                    when Some(value as socket: FileDescriptor) do
+                        case acceptOver(server, socket, 5000) of
+                            when Right(right as opened: Client) do
+                                var connection: Client := opened;
+                                printLn("server: the handshake completed");
+                                let report: String := join(task);
+                                printText(&report);
+                                destroyString(report);
+                                print("server: a send to the closed peer failed: ");
+                                printLn(writeUntilFailure(&!connection));
+                                closeClient(connection);
+                                printLn("server: the programme goes on");
+                            when Left(left as message: String) do
+                                printLn("server: handshake failed");
+                                destroyString(message);
+                                let report: String := join(task);
+                                destroyString(report);
+                        end case;
+                    when None do
+                        printLn("server: nobody connected");
+                        let report: String := join(task);
+                        destroyString(report);
+                end case;
+            when Left(left as back: Nat16) do
+                printLn("the client task did not start");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        if not makeCertificate() then
+            printLn("no certificate");
+            return ExitFailure();
+        end if;
+        let address: String := loopback();
+        case listenTcp(asSpan(&address), 0) of
+            when Some(value as listener: TcpListener) do
+                let port: Nat16 := tcpListenerPort(&listener);
+                case makeServer("server-cert.pem", "server-key.pem") of
+                    when Right(right as server: Server) do
+                        case openScope() of
+                            when Some(value as opened: Scope) do
+                                var scope: Scope := opened;
+                                run(&!scope, &listener, &server, port);
+                                closeScope(scope);
+                            when None do
+                                printLn("no scope");
+                        end case;
+                        closeServer(server);
+                    when Left(left as message: String) do
+                        printLn("makeServer failed");
+                        destroyString(message);
+                end case;
+                print("listener closed: ");
+                printLn(closeTcpListener(listener));
+            when None do
+                printLn("listenTcp failed");
+        end case;
+        destroyString(address);
+        return ExitSuccess();
+    end;
+end module body.

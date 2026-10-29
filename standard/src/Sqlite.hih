@@ -1,0 +1,300 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+SQLite through the system's libsqlite3, with every query checked against the schema at compile time.
+
+- @query and @execute are checked when the programme is compiled, against the migrations' schema.
+- SQL outside the accepted forms does not compile, rather than run unchecked.
+- The files migrations/1-*.sql, 2-*.sql and on are the schema; migrate applies the new ones.
+- migrate runs each file in a transaction of its own and counts in pragma user_version.
+- Every table is strict, so SQLite refuses a value of a type the compiler did not assume.
+- Writing needs a Connection[Writing]; a write through a Connection[Reading] does not compile.
+- In WAL mode one writing and several reading connections work side by side, each in its own task.
+- Connection, Transaction and Cursor are linear; a transaction ends only by commit or rollback.
+- Text and blob columns are spans into SQLite's memory, valid for one row; copyText copies.
+- Prepared statements are kept per connection, keyed by the text of the query, until it closes.
+- The functions below Cursor, called by hand with SQL of one's own, run it unchecked.
+
+    @query(&!db, "SELECT id, name FROM users WHERE age > ?", age)
+        for row: User[R] do
+            printLn(row.name);
+        else error do
+            printLn(describe(error));
+        end for;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+
+module Standard.Sqlite is
+    """
+    The mode of a connection that may write.
+    """
+    record Writing: Free is
+    end;
+
+    """
+    The mode of a connection that only reads.
+    """
+    record Reading: Free is
+    end;
+
+    """
+    An open database.  Linear: it must be closed.
+    """
+    type Connection[M: Free]: Linear;
+
+    """
+    What went wrong: SQLite's extended result code, for instance 2067 for a
+    unique constraint, or newerDatabase from migrate.
+    """
+    record SqlError: Free is
+        code: Int32;
+    end;
+
+    """
+    migrate found a database with more migrations than this programme has.
+    """
+    constant newerDatabase: Int32;
+
+    """
+    SQLite's English description of the code of an error; for
+    newerDatabase, this module's.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    function describe(error: SqlError): Span[Nat8, Static];
+
+    """
+    Open the database file at path, creating it when it is not there, in
+    WAL mode, with foreign keys enforced and a busy timeout of five seconds.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function openWriter(path: Span[Nat8, R]): Either[SqlError, Connection[Writing]];
+
+    """
+    Open an existing database file for reading only.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function openReader(path: Span[Nat8, R]): Either[SqlError, Connection[Reading]];
+
+    """
+    Close the database, finalising every statement it kept.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [M: Free]
+    function closeDatabase(db: Connection[M]): Unit;
+
+    """
+    Apply the migrations embedded by @migrations that the database has not
+    seen yet.  Right carries how many were applied now.  Connections that
+    migrate one database at once apply each migration once.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function migrate(db: &![Connection[Writing], R], migrations: Span[Nat8, Static]): Either[SqlError, Index];
+
+    """
+    A transaction that is open.  Linear: commit or rollback ends it.
+    """
+    type Transaction: Linear;
+
+    """
+    Begin a transaction.  On a writing connection it is begin immediate, so
+    that the write lock is taken at once and not in the middle.  On a
+    reading one it is a plain begin, which fixes the snapshot at its first
+    read.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function begin(db: &![Connection[M], R]): Either[SqlError, Transaction];
+
+    """
+    Commit.  When the commit fails the transaction is rolled back, so
+    either way it is over.  Aborts when the transaction was begun on
+    another connection.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function commit(db: &![Connection[M], R], transaction: Transaction): Either[SqlError, Unit];
+
+    """
+    Roll back.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [M: Free, R: Region]
+    function rollback(db: &![Connection[M], R], transaction: Transaction): Unit;
+
+    """
+    How many statements this connection has prepared since it was opened.
+    It shows that a query run again is not prepared again.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [M: Free, R: Region]
+    function preparedCount(db: &![Connection[M], R]): Index;
+
+    """
+    A copy of borrowed text, as a String of its own.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): String;
+
+    ---
+    --- What @query and @execute generate.
+    ---
+
+    """
+    The values of the parameters of a statement, in the order of its
+    question marks.  Linear: a text or blob value is a copy the statement
+    then owns, so that the span it came from may end at once.  A text or
+    blob over SQLite's size limit, or of 2 GiB and more, makes the
+    statement fail with SQLITE_TOOBIG (18) rather than stop the programme.
+    """
+    type Values: Linear;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function noValues(): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withInt64(values: Values, value: Int64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withFloat64(values: Values, value: Float64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withBlob(values: Values, value: Span[Nat8, R]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withInt64OrNull(values: Values, value: Option[Int64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withFloat64OrNull(values: Values, value: Option[Float64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withTextOrNull(values: Values, value: Option[Span[Nat8, R]]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withBlobOrNull(values: Values, value: Option[Span[Nat8, R]]): Values;
+
+    """
+    A statement being run.  Linear: finish gives it back to the cache of the
+    connection.
+    """
+    type Cursor: Linear;
+
+    """
+    The statement for sql, from the cache of the connection or prepared now,
+    with values bound.  A failure is carried inside the cursor and reported
+    by finish.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [M: Free, R: Region]
+    function start(db: &![Connection[M], R], sql: Span[Nat8, Static], values: Values): Cursor;
+
+    """
+    The same, for a statement that writes.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function startWrite(db: &![Connection[Writing], R], sql: Span[Nat8, Static], values: Values): Cursor;
+
+    """
+    Run a statement that writes and returns no rows, to its end.  Right
+    carries how many rows it changed.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function execute(db: &![Connection[Writing], R], sql: Span[Nat8, Static], values: Values): Either[SqlError, Nat64];
+
+    """
+    Step.  true when a row is there; false at the end, or when the step
+    failed, which finish then reports.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool;
+
+    """
+    The columns of the current row.  A span points into the memory of
+    SQLite and is valid for this row only, which the region R of the borrow
+    says.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64;
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64;
+    """
+    No contract: a view into its argument, whose length depends on it.
+    """
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R];
+    """
+    No contract: a view into its argument, whose length depends on it.
+    """
+    generic [R: Region]
+    function columnBlob(cursor: &[Cursor, R], index: Int32): Span[Nat8, R];
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function columnInt64OrNone(cursor: &[Cursor, R], index: Int32): Option[Int64];
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function columnFloat64OrNone(cursor: &[Cursor, R], index: Int32): Option[Float64];
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function columnTextOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]];
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function columnBlobOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]];
+
+    """
+    End the statement: reset it and give it back to the cache of the
+    connection.  Some carries the first failure of its run.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function finish(db: &![Connection[M], R], cursor: Cursor): Option[SqlError];
+
+    """
+    The version of the SQLite library the programme runs with, for
+    version --full.
+    No contract: the library answers.
+    """
+    function libraryVersion(): Span[Nat8, Static];
+end module.

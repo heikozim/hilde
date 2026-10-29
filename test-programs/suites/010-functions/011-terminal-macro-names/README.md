@@ -1,0 +1,1 @@
+The streams of Standard.IO.Terminal in locals named stdin, stdout and stderr, and a result named errno, compiled beside the binding of libcrypto, whose headers bring stdio.h and errno.h, where all four are macros of the C library.  Parameters and locals carry a prefix in the generated C.

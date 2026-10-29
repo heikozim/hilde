@@ -1,0 +1,361 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    makeEmpty,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Listener,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    listenUnix,
+    acceptWithin,
+    closeListener,
+    readExactly,
+    readAll,
+    writeAll,
+    closeFile,
+    removeFile,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode
+);
+import Standard.Fcgi (
+    RecordHeader,
+    typeBeginRequest,
+    typeParams,
+    typeStdin,
+    typeStdout,
+    statusRequestComplete,
+    readHeader,
+    readContent,
+    headerKind,
+    headerRequestId,
+    bytesAfterHeader,
+    beginRequestRole,
+    beginRequestKeepConnection,
+    pairCount,
+    nthPairName,
+    nthPairValue,
+    makeRecord,
+    makeEndRequest
+);
+
+module body Test is
+    -- The content of the record at the start of bytes, empty when bytes
+    -- does not hold it.
+    generic [R: Region]
+    function contentOf(bytes: Span[Nat8, R], header: RecordHeader): String is
+        case readContent(bytes, 0, header) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromLiteral("");
+        end case;
+    end;
+
+    -- A file of the tree: the tree's path from HILDE_TREE, which
+    -- test-programs/runner.py sets, and rest after it.  With
+    -- the variable unset -- a run by hand -- the path is rest alone,
+    -- which names nothing, and the test fails where it opens it.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        let tail: String := fromLiteral(rest);
+        writeString(&!out, asSpan(&tail));
+        destroyString(tail);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    -- The client: scripts/socket/fcgi-client.py, a FastCGI client written
+    -- from the specification in Python.
+    generic [R: Region]
+    function clientCommand(path: &[String, R]): Command is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/socket/fcgi-client.py");
+        let command: Command :=
+            addArgument(addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script)), asSpan(path));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        return command;
+    end;
+
+    -- One whole record off the connection: the eight bytes of the header,
+    -- then as many as the header says follow it.
+    generic [R: Region]
+    function readRecord(connection: &![FileDescriptor, R]): Option[String] is
+        case readExactly(&~connection, 8) of
+            when Some(value as header: String) do
+                case bytesAfterHeader(asSpan(&header)) of
+                    when Some(value as rest: Index) do
+                        -- rest may be 0: an empty record, and reading 0
+                        -- bytes answers an empty string.
+                        case readExactly(&~connection, rest) of
+                            when Some(value as tail: String) do
+                                var builder: StringBuilder := makeStringBuilder();
+                                writeString(&!builder, asSpan(&header));
+                                writeString(&!builder, asSpan(&tail));
+                                destroyString(header);
+                                destroyString(tail);
+                                let some: Option[String] := Some(value => finalize(builder));
+                                return some;
+                            when None do
+                                destroyString(header);
+                                let none: Option[String] := None();
+                                return none;
+                        end case;
+                    when None do
+                        destroyString(header);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- Every parameter, a long value by its length only.
+    generic [R: Region]
+    function printParameters(block: &[String, R]): Unit is
+        let count: Index := pairCount(asSpan(block));
+        print("parameters: ");
+        printLn(count);
+        if count > 0 then
+            for i from 0 to count - 1 do
+                case nthPairName(asSpan(block), i) of
+                    when Some(value as name: String) do
+                        print("  ");
+                        printText(&name);
+                        destroyString(name);
+                    when None do
+                        print("  (no name)");
+                end case;
+                case nthPairValue(asSpan(block), i) of
+                    when Some(value as content: String) do
+                        if length(&content) > 40 then
+                            print(" is ");
+                            print(length(&content));
+                            printLn(" bytes");
+                        else
+                            print(" = ");
+                            printText(&content);
+                            printLn("");
+                        end if;
+                        destroyString(content);
+                    when None do
+                        printLn(" (no value)");
+                end case;
+            end for;
+        end if;
+        return nil;
+    end;
+
+    -- Write one record; a content too long for one is reported, not split.
+    generic [R: Region, S: Region]
+    function send(connection: &![FileDescriptor, R], kind: Nat8, requestId: Nat64,
+        content: &[String, S]): Bool is
+        case makeRecord(kind, requestId, asSpan(content)) of
+            when Some(value as bytes: String) do
+                let written: Bool := writeAll(&~connection, asSpan(&bytes));
+                destroyString(bytes);
+                return written;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Read the request record by record, answer it, close.  What the
+    -- responder sees is printed here; what the client sees, the client
+    -- prints.
+    function serve(connection: FileDescriptor): Unit is
+        var conn: FileDescriptor := connection;
+        var params: StringBuilder := makeStringBuilder();
+        var input: StringBuilder := makeStringBuilder();
+        var requestId: Nat64 := 0;
+        var reading: Bool := true;
+        var records: Index := 0;
+        while reading do
+            case readRecord(&!conn) of
+                when Some(value as bytes: String) do
+                    case readHeader(asSpan(&bytes), 0) of
+                        when Some(value as header: RecordHeader) do
+                            let kind: Nat8 := headerKind(header);
+                            let content: String := contentOf(asSpan(&bytes), header);
+                            records := records + 1;
+                            if kind = typeBeginRequest then
+                                requestId := headerRequestId(header);
+                                print("BEGIN_REQUEST id=");
+                                print(requestId);
+                                case beginRequestRole(asSpan(&content)) of
+                                    when Some(value as role: Nat64) do
+                                        print(" role=");
+                                        print(role);
+                                    when None do
+                                        print(" role=?");
+                                end case;
+                                case beginRequestKeepConnection(asSpan(&content)) of
+                                    when Some(value as keep: Bool) do
+                                        print(" keep-connection=");
+                                        printLn(keep);
+                                    when None do
+                                        printLn(" keep-connection=?");
+                                end case;
+                            else if kind = typeParams then
+                                if length(&content) > 0 then
+                                    writeString(&!params, asSpan(&content));
+                                end if;
+                            else if kind = typeStdin then
+                                if length(&content) > 0 then
+                                    writeString(&!input, asSpan(&content));
+                                else
+                                    reading := false;
+                                end if;
+                            else
+                                print("a record of kind ");
+                                printLn(kind);
+                            end if;
+                            destroyString(content);
+                        when None do
+                            printLn("a record that does not parse");
+                            reading := false;
+                    end case;
+                    destroyString(bytes);
+                when None do
+                    printLn("the connection ended before the request did");
+                    reading := false;
+            end case;
+        end while;
+        print("records read: ");
+        printLn(records);
+        let paramBlock: String := finalize(params);
+        printParameters(&paramBlock);
+        let inputText: String := finalize(input);
+        print("stdin: ");
+        printText(&inputText);
+        printLn("");
+        -- The answer: headers, a blank line, and the body it was sent.
+        var reply: StringBuilder := makeStringBuilder();
+        let head: String := fromLiteral("Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nechoed: ");
+        writeString(&!reply, asSpan(&head));
+        writeString(&!reply, asSpan(&inputText));
+        let replyText: String := finalize(reply);
+        let empty: String := makeEmpty();
+        let ending: String := makeEndRequest(requestId, 0, statusRequestComplete);
+        print("stdout written: ");
+        printLn(send(&!conn, typeStdout, requestId, &replyText));
+        print("empty stdout written: ");
+        printLn(send(&!conn, typeStdout, requestId, &empty));
+        print("end request written: ");
+        printLn(writeAll(&!conn, asSpan(&ending)));
+        -- The keep-connection flag was not set, so the responder closes.
+        print("connection closed: ");
+        printLn(closeFile(conn));
+        destroyString(paramBlock);
+        destroyString(inputText);
+        destroyString(head);
+        destroyString(replyText);
+        destroyString(empty);
+        destroyString(ending);
+        return nil;
+    end;
+
+    -- Close the child's pipes, print what it wrote, wait for it.
+    function finish(running: Running): Unit is
+        let { process: Process, input: FileDescriptor, output: FileDescriptor,
+            errors: FileDescriptor } := running;
+        closeFile(input);
+        var out: FileDescriptor := output;
+        var err: FileDescriptor := errors;
+        printLn("-- the client printed:");
+        case readAll(&!out) of
+            when Some(value as text: String) do
+                printText(&text);
+                destroyString(text);
+            when None do
+                printLn("(reading its output failed)");
+        end case;
+        case readAll(&!err) of
+            when Some(value as text: String) do
+                if length(&text) > 0 then
+                    printLn("-- and on its error stream:");
+                    printText(&text);
+                end if;
+                destroyString(text);
+            when None do
+                printLn("(reading its errors failed)");
+        end case;
+        closeFile(out);
+        closeFile(err);
+        let status: ProcessStatus := waitProcess(process);
+        print("client exited normally: ");
+        print(exitedNormally(status));
+        print(", code ");
+        printLn(exitCode(status));
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        let path: String := fromLiteral("hilde-049-002.sock");
+        removeFile(asSpan(&path));
+        -- The owner and a web server in the file's group.
+        case listenUnix(asSpan(&path), #o660) of
+            when Some(value as opened: Listener) do
+                let listener: Listener := opened;
+                case spawnProcess(clientCommand(&path)) of
+                    when Some(value as running: Running) do
+                        -- Ten seconds: a client that never comes fails the
+                        -- test instead of hanging it.
+                        case acceptWithin(&listener, 10000) of
+                            when Some(value as connection: FileDescriptor) do
+                                serve(connection);
+                            when None do
+                                printLn("no client connected within ten seconds");
+                        end case;
+                        finish(running);
+                    when None do
+                        printLn("the client could not be started");
+                end case;
+                print("listener closed: ");
+                printLn(closeListener(listener));
+            when None do
+                printLn("listen: failed");
+        end case;
+        destroyString(path);
+        return ExitSuccess();
+    end;
+end module body.

@@ -1,0 +1,148 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Graph made by several tasks at once: the numbers of the graphs
+-- stay apart.  Apart from the tests of the graph itself, because tasks are
+-- not there on every target the graph is there for.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    nth,
+    nthRef,
+    removeLast,
+    destroyFree as destroyFreeBuffer,
+    destroyEmpty as destroyEmptyBuffer
+);
+import Standard.Order (
+    equal
+);
+import Standard.Graph (
+    Graph,
+    NodeId,
+    makeGraph,
+    destroyFree,
+    containsNode,
+    addNode
+);
+import Standard.Sort (
+    sort
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    closeScope,
+    spawn,
+    join
+);
+import Standard.Testing (
+    assertTrue
+);
+
+module body Standard.GraphTasks.Test is
+    -- A node with a letter.  The parameter gives the literal its type.
+    generic [E: Type, R: Region]
+    function place(g: &![Graph[Nat8, E], R], letter: Nat8): NodeId is
+        return addNode(g, letter);
+    end;
+
+    ---
+    --- Graphs made by several tasks at the same time
+    ---
+
+    -- How many tasks make graphs, and how many graphs each one makes:
+    -- enough that the tasks run at the same time on several workers, few
+    -- enough that the test stays short under the thread checker.
+    constant makerTasks: Index := 4;
+    constant graphsPerTask: Index := 2000;
+
+    -- Makes count graphs one after the other, each with one node, and
+    -- hands back the numbers of those nodes.  Every node takes slot 0 in
+    -- generation 0, so two of these numbers can only differ in the graph
+    -- that gave them out.  A number its own graph does not hold is left
+    -- out, and the test counts the numbers it gets back.  The task asserts
+    -- nothing itself: four tasks printing at once would mix their lines.
+    function makeMany(count: Index): Buffer[NodeId] is
+        var found: Buffer[NodeId] := allocateEmpty();
+        var i: Index := 0;
+        while i < count do
+            var g: Graph[Nat8, Nat32] := makeGraph();
+            let node: NodeId := place(&!g, 'a');
+            if containsNode(&g, node) then
+                insertBack(&!found, node);
+            end if;
+            destroyFree(g);
+            i := i + 1;
+        end while;
+        return found;
+    end;
+
+    -- Several tasks make graphs at the same time.  Every graph must get a
+    -- number of its own, so once sorted no node number equals the next.
+    -- And no number of these graphs, which are all gone, may name the node
+    -- of a graph made afterwards, although it has the same slot and
+    -- generation.
+    function testTasksMakeGraphsAtOnce(): Unit is
+        var all: Buffer[NodeId] := allocateEmpty();
+        case openScope() of
+            when Some(value as scope: Scope) do
+                var open: Scope := scope;
+                var tasks: Buffer[Task[Buffer[NodeId]]] := allocateEmpty();
+                let many: Fn[Index, Buffer[NodeId]] := makeMany;
+                var t: Index := 0;
+                while t < makerTasks do
+                    case spawn(&!open, many, graphsPerTask) of
+                        when Right(right as task: Task[Buffer[NodeId]]) do
+                            insertBack(&!tasks, task);
+                        when Left(left as unused: Index) do
+                            assertTrue(false, "a task could be started");
+                    end case;
+                    t := t + 1;
+                end while;
+                assertTrue(length(&tasks) = makerTasks, "every task was started");
+                while length(&tasks) > 0 do
+                    var part: Buffer[NodeId] := join(removeLast(&!tasks));
+                    while length(&part) > 0 do
+                        insertBack(&!all, removeLast(&!part));
+                    end while;
+                    destroyEmptyBuffer(part);
+                end while;
+                destroyEmptyBuffer(tasks);
+                closeScope(open);
+            when None do
+                assertTrue(false, "a scope could be opened");
+        end case;
+        assertTrue(length(&all) = (makerTasks * graphsPerTask), "every graph held its own node, and every number came back");
+        let sorted: Buffer[NodeId] := sort(all);
+        var same: Index := 0;
+        var i: Index := 1;
+        while i < length(&sorted) do
+            if equal(nthRef(&sorted, i - 1), nthRef(&sorted, i)) then
+                same := same + 1;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue(same = 0, "no two graphs got the same number");
+        var later: Graph[Nat8, Nat32] := makeGraph();
+        let fresh: NodeId := place(&!later, 'z');
+        var hits: Index := 0;
+        var j: Index := 0;
+        while j < length(&sorted) do
+            if containsNode(&later, nth(&sorted, j)) then
+                hits := hits + 1;
+            end if;
+            j := j + 1;
+        end while;
+        assertTrue(hits = 0, "no number of a graph that is gone names the node of a later one");
+        assertTrue(containsNode(&later, fresh), "the later graph holds its own node");
+        destroyFree(later);
+        destroyFreeBuffer(sorted);
+        return nil;
+    end;
+end module body.

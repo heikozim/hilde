@@ -1,0 +1,1004 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Raft in a simulated cluster: the network is a buffer of
+-- messages, delivered in an order drawn from a seed, some of them lost,
+-- none between two groups of a partition.  After every event of the
+-- simulation the safety properties of Raft hold, asserted at the end of
+-- the function that runs the event: one leader at most per term, logs
+-- that agree on an entry agree on all before it, every leader holds every
+-- committed entry, and no two state machines differ in what both applied.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    destroyFree,
+    length,
+    nth,
+    nthRef,
+    storeNth,
+    insert,
+    insertBack,
+    remove,
+    removeFirst,
+    removeLast,
+    wholeSpan
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Standard.Raft (
+    StateMachine,
+    Config,
+    Message,
+    Node,
+    majority,
+    entryCommand,
+    messageVote,
+    messageAppend,
+    isWellFormed,
+    destroyMessage,
+    newNode,
+    destroyNode,
+    tick,
+    step,
+    propose,
+    proposeAddMember,
+    proposeRemoveMember,
+    takeMessages,
+    applyCommitted,
+    compactWith,
+    roleOf,
+    isLeader,
+    nodeId,
+    currentTerm,
+    leaderOf,
+    lastIndex,
+    commitIndex,
+    appliedIndex,
+    snapshotIndexOf,
+    termAt,
+    memberCount,
+    isMember
+);
+
+module body Standard.Raft.Test is
+    constant multiplier: Nat64 := 6364136223846793005;
+    constant increment: Nat64 := 1442695040888963407;
+    constant highBits: Nat64 := 4294967296;
+    constant drawRange: Nat64 := 1048576;
+    constant every: Nat64 := 7;
+    constant secondId: Nat64 := 2;
+    constant lossy: Nat64 := 20;
+    constant noLoss: Nat64 := 0;
+
+    ---
+    --- The state machine: the commands it was given, each ended by a semicolon
+    ---
+
+    record Machine: Linear is
+        bytes: Buffer[Nat8];
+    end;
+
+    constant semicolon: Nat8 := 59;
+    constant sideA: Nat8 := 0;
+
+    -- The bytes of data and a semicolon after the end of bytes.
+    generic [R: Region, D: Region]
+    function appendCommand(bytes: &![Buffer[Nat8], R], data: Span[Nat8, D]): Unit is
+        var i: Index := 0;
+        while i < spanLength(data) do
+            insertBack(&~bytes, data[i]);
+            i := i + 1;
+        end while;
+        insertBack(&~bytes, semicolon);
+        return nil;
+    end;
+
+    -- bytes holds data and nothing else.
+    generic [R: Region, D: Region]
+    function replaceBytes(bytes: &![Buffer[Nat8], R], data: Span[Nat8, D]): Unit is
+        while length(&bytes) > 0 do
+            let gone: Nat8 := removeLast(&~bytes);
+        end while;
+        var i: Index := 0;
+        while i < spanLength(data) do
+            insertBack(&~bytes, data[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    instance StateMachine(Machine) is
+        generic [R: Region, D: Region]
+        method applyCommand(machine: &![Machine, R], command: Span[Nat8, D]): Unit is
+            appendCommand(&!(machine->bytes), command);
+            return nil;
+        end;
+
+        generic [R: Region]
+        method takeSnapshot(machine: &[Machine, R]): String is
+            return fromSpan(wholeSpan(&(machine->bytes)));
+        end;
+
+        generic [R: Region, D: Region]
+        method restoreSnapshot(machine: &![Machine, R], data: Span[Nat8, D]): Bool is
+            replaceBytes(&!(machine->bytes), data);
+            return true;
+        end;
+    end;
+
+    function destroyMachine(machine: Machine): Unit is
+        let { bytes: Buffer[Nat8] } := machine;
+        destroyFree(bytes);
+        return nil;
+    end;
+
+    ---
+    --- The cluster
+    ---
+
+    -- nodes and machines are kept in the order of the ids, node i + 1 at
+    -- position i.  group says which side of a partition each node is on.
+    -- leaderTerms and leaderIds record every leader seen; committedTerms
+    -- the term of each committed index, as the first node to commit it had
+    -- it.
+    record Cluster: Linear is
+        nodes: Buffer[Node];
+        machines: Buffer[Machine];
+        network: Buffer[Message];
+        group: Buffer[Nat8];
+        random: Nat64;
+        dropPercent: Nat64;
+        leaderTerms: Buffer[Nat64];
+        leaderIds: Buffer[Nat64];
+        committedTerms: Buffer[Nat64];
+        checked: Bool;
+    end;
+
+    function noBytes(): Buffer[Nat8] is
+        return allocateEmpty();
+    end;
+
+    function noIds(): Buffer[Nat64] is
+        return allocateEmpty();
+    end;
+
+    function noMessages(): Buffer[Message] is
+        return allocateEmpty();
+    end;
+
+    function everyone(count: Nat64): Nat64 is
+        return count;
+    end;
+
+    function one(count: Nat64): Nat64 is
+        return 1;
+    end;
+
+    function idsUpTo(count: Nat64): Buffer[Nat64] is
+        var ids: Buffer[Nat64] := allocateEmpty();
+        var id: Nat64 := 1;
+        while id <= count do
+            insertBack(&!ids, id);
+            id := id + 1;
+        end while;
+        return ids;
+    end;
+
+    -- size nodes, of which the first members are members; quorum is the
+    -- rule of every node.
+    function makeCluster(size: Nat64, members: Nat64, seed: Nat64, quorum: Fn[Nat64, Nat64]): Cluster is
+        var nodes: Buffer[Node] := allocateEmpty();
+        var machines: Buffer[Machine] := allocateEmpty();
+        var group: Buffer[Nat8] := allocateEmpty();
+        var id: Nat64 := 1;
+        while id <= size do
+            let config: Config := Config(id => id, electionTicks => 10, heartbeatTicks => 3, seed => seed, quorum => quorum);
+            insertBack(&!nodes, newNode(config, idsUpTo(members)));
+            insertBack(&!machines, Machine(bytes => noBytes()));
+            insertBack(&!group, sideA);
+            id := id + 1;
+        end while;
+        return Cluster(
+            nodes => nodes,
+            machines => machines,
+            network => noMessages(),
+            group => group,
+            random => seed,
+            dropPercent => 0,
+            leaderTerms => noIds(),
+            leaderIds => noIds(),
+            committedTerms => noIds(),
+            checked => true
+        );
+    end;
+
+    function destroyCluster(cluster: Cluster): Unit is
+        let { nodes: Buffer[Node], machines: Buffer[Machine], network: Buffer[Message], group: Buffer[Nat8],
+            random: Nat64, dropPercent: Nat64, leaderTerms: Buffer[Nat64], leaderIds: Buffer[Nat64],
+            committedTerms: Buffer[Nat64], checked: Bool } := cluster;
+        var n: Buffer[Node] := nodes;
+        while length(&n) > 0 do
+            destroyNode(removeLast(&!n));
+        end while;
+        destroyEmpty(n);
+        var m: Buffer[Machine] := machines;
+        while length(&m) > 0 do
+            destroyMachine(removeLast(&!m));
+        end while;
+        destroyEmpty(m);
+        var w: Buffer[Message] := network;
+        while length(&w) > 0 do
+            destroyMessage(removeLast(&!w));
+        end while;
+        destroyEmpty(w);
+        destroyFree(group);
+        destroyFree(leaderTerms);
+        destroyFree(leaderIds);
+        destroyFree(committedTerms);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function draw(cluster: &![Cluster, R], below: Nat64): Nat64 is
+        cluster->random := modularAdd(modularMultiply(cluster->random, multiplier), increment);
+        let state: Nat64 := (cluster->random);
+        return rem(rem(state / highBits, drawRange), below);
+    end;
+
+    function slot(id: Nat64): Index is
+        case toIndex(id - 1) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.Raft.Test: an id did not fit an Index");
+        end case;
+    end;
+
+    function wide(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.Raft.Test: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    generic [R: Region]
+    function takeNode(cluster: &![Cluster, R], at: Index): Node is
+        return remove(&!(cluster->nodes), at);
+    end;
+
+    generic [R: Region]
+    function putNode(cluster: &![Cluster, R], at: Index, node: Node): Unit is
+        insert(&!(cluster->nodes), at, node);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function takeMachine(cluster: &![Cluster, R], at: Index): Machine is
+        return remove(&!(cluster->machines), at);
+    end;
+
+    generic [R: Region]
+    function putMachine(cluster: &![Cluster, R], at: Index, machine: Machine): Unit is
+        insert(&!(cluster->machines), at, machine);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function takeMessage(cluster: &![Cluster, R], at: Index): Message is
+        return remove(&!(cluster->network), at);
+    end;
+
+    generic [R: Region]
+    function send(cluster: &![Cluster, R], message: Message): Unit is
+        insertBack(&!(cluster->network), message);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function recordLeader(cluster: &![Cluster, R], term: Nat64, id: Nat64): Unit is
+        recordTerm(&~cluster, term);
+        insertBack(&!(cluster->leaderIds), id);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function recordTerm(cluster: &![Cluster, R], term: Nat64): Unit is
+        insertBack(&!(cluster->leaderTerms), term);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function recordCommitted(cluster: &![Cluster, R], term: Nat64): Unit is
+        insertBack(&!(cluster->committedTerms), term);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function nodeCount(cluster: &[Cluster, R]): Index is
+        return length(&(cluster->nodes));
+    end;
+
+    generic [R: Region]
+    function networkSize(cluster: &[Cluster, R]): Index is
+        return length(&(cluster->network));
+    end;
+
+    generic [R: Region]
+    function groupOf(cluster: &[Cluster, R], id: Nat64): Nat8 is
+        return nth(&(cluster->group), slot(id));
+    end;
+
+    generic [R: Region]
+    function committedCount(cluster: &[Cluster, R]): Nat64 is
+        return wide(length(&(cluster->committedTerms)));
+    end;
+
+    generic [R: Region]
+    function leaderSeen(cluster: &[Cluster, R], term: Nat64, id: Nat64): Bool is
+        var i: Index := 0;
+        while i < length(&(cluster->leaderTerms)) do
+            if (nth(&(cluster->leaderTerms), i) = term) and (nth(&(cluster->leaderIds), i) = id) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    ---
+    --- The safety properties
+    ---
+
+    -- One leader at most in a term.
+    generic [R: Region]
+    function electionSafe(cluster: &[Cluster, R]): Bool is
+        var i: Index := 0;
+        while i < length(&(cluster->leaderTerms)) do
+            var j: Index := i + 1;
+            while j < length(&(cluster->leaderTerms)) do
+                if (nth(&(cluster->leaderTerms), i) = nth(&(cluster->leaderTerms), j))
+                    and (nth(&(cluster->leaderIds), i) /= nth(&(cluster->leaderIds), j)) then
+                    return false;
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Two logs that hold an entry of the same index and term hold the
+    -- same entries up to it, as far as both still have them.
+    generic [A: Region, B: Region]
+    function pairMatches(a: &[Node, A], b: &[Node, B]): Bool is
+        var low: Nat64 := snapshotIndexOf(a);
+        if snapshotIndexOf(b) > low then
+            low := snapshotIndexOf(b);
+        end if;
+        var high: Nat64 := lastIndex(a);
+        if lastIndex(b) < high then
+            high := lastIndex(b);
+        end if;
+        var agreed: Bool := false;
+        var index: Nat64 := high;
+        while index > low do
+            let same: Bool := termAt(a, index) = termAt(b, index);
+            if agreed and (not same) then
+                return false;
+            end if;
+            if same then
+                agreed := true;
+            end if;
+            index := index - 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function logsMatch(cluster: &[Cluster, R]): Bool is
+        var i: Index := 0;
+        while i < length(&(cluster->nodes)) do
+            var j: Index := i + 1;
+            while j < length(&(cluster->nodes)) do
+                if not pairMatches(nthRef(&(cluster->nodes), i), nthRef(&(cluster->nodes), j)) then
+                    return false;
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Every leader holds every committed entry of its term or an earlier
+    -- one that its log has not yet given to a snapshot, with that term.  A
+    -- leader cut off in an old term owes nothing a later leader committed.
+    generic [R: Region]
+    function leadersComplete(cluster: &[Cluster, R]): Bool is
+        var i: Index := 0;
+        while i < length(&(cluster->nodes)) do
+            let node: &[Node, R] := nthRef(&(cluster->nodes), i);
+            if isLeader(node) then
+                var k: Index := 0;
+                while k < length(&(cluster->committedTerms)) do
+                    let index: Nat64 := wide(k) + 1;
+                    let committed: Nat64 := nth(&(cluster->committedTerms), k);
+                    let owed: Bool := (index > snapshotIndexOf(node)) and (committed <= currentTerm(node));
+                    if owed and (termAt(node, index) /= committed) then
+                        return false;
+                    end if;
+                    k := k + 1;
+                end while;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Of two state machines, the one that applied less applied the start
+    -- of what the other did.
+    generic [R: Region]
+    function machinesAgree(cluster: &[Cluster, R]): Bool is
+        var i: Index := 0;
+        while i < length(&(cluster->machines)) do
+            var j: Index := i + 1;
+            while j < length(&(cluster->machines)) do
+                let ma: &[Machine, R] := nthRef(&(cluster->machines), i);
+                let mb: &[Machine, R] := nthRef(&(cluster->machines), j);
+                let a: &[Buffer[Nat8], R] := &(ma->bytes);
+                let b: &[Buffer[Nat8], R] := &(mb->bytes);
+                var shorter: Index := length(a);
+                if length(b) < shorter then
+                    shorter := length(b);
+                end if;
+                var k: Index := 0;
+                while k < shorter do
+                    if nth(a, k) /= nth(b, k) then
+                        return false;
+                    end if;
+                    k := k + 1;
+                end while;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function safe(cluster: &[Cluster, R]): Bool is
+        return ((electionSafe(cluster) and logsMatch(cluster)) and leadersComplete(cluster)) and machinesAgree(cluster);
+    end;
+
+    ---
+    --- Events
+    ---
+
+    -- What a node did since the last look: its messages go to the
+    -- network, its committed entries to its machine, its leadership and
+    -- its commits to the record of the cluster.
+    generic [R: Region]
+    function observe(cluster: &![Cluster, R], at: Index): Unit is
+        var node: Node := takeNode(&~cluster, at);
+        var machine: Machine := takeMachine(&~cluster, at);
+        let applied: Index := applyCommitted(&!node, &!machine);
+        var out: Buffer[Message] := takeMessages(&!node);
+        while length(&out) > 0 do
+            send(&~cluster, removeFirst(&!out));
+        end while;
+        destroyEmpty(out);
+        if isLeader(&node) then
+            var seen: Bool := false;
+            var i: Index := 0;
+            seen := leaderSeen(&cluster, currentTerm(&node), nodeId(&node));
+            if not seen then
+                recordLeader(&~cluster, currentTerm(&node), nodeId(&node));
+            end if;
+        end if;
+        var index: Nat64 := committedCount(&cluster) + 1;
+        while (index <= commitIndex(&node)) and (index > snapshotIndexOf(&node)) do
+            recordCommitted(&~cluster, termAt(&node, index));
+            index := index + 1;
+        end while;
+        putMachine(&~cluster, at, machine);
+        putNode(&~cluster, at, node);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function observeAll(cluster: &![Cluster, R]): Unit is
+        var i: Index := 0;
+        while i < nodeCount(&cluster) do
+            observe(&~cluster, i);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- One message out of the network, chosen at random, so that messages
+    -- overtake each other; lost at the drop rate or across a partition.
+    generic [R: Region]
+    function deliverOne(cluster: &![Cluster, R]): Unit is
+        let count: Nat64 := wide(networkSize(&cluster));
+        if count = 0 then
+            return nil;
+        end if;
+        let pick: Index := slot(draw(&~cluster, count) + 1);
+        let message: Message := takeMessage(&~cluster, pick);
+        let receiver: Nat64 := message.receiver;
+        let sender: Nat64 := message.sender;
+        let size: Nat64 := wide(nodeCount(&cluster));
+        let rate: Nat64 := (cluster->dropPercent);
+        let lost: Bool := draw(&~cluster, 100) < rate;
+        var through: Bool := ((not lost) and (receiver <= size)) and (sender <= size);
+        if through then
+            through := groupOf(&cluster, receiver) = groupOf(&cluster, sender);
+        end if;
+        if through then
+            var node: Node := takeNode(&~cluster, slot(receiver));
+            step(&!node, message);
+            putNode(&~cluster, slot(receiver), node);
+            observe(&~cluster, slot(receiver));
+            if cluster->checked then
+                assertTrue(safe(&cluster), "safe after a delivery");
+            end if;
+        else
+            destroyMessage(message);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function tickOne(cluster: &![Cluster, R], at: Index): Unit is
+        var node: Node := takeNode(&~cluster, at);
+        tick(&!node);
+        putNode(&~cluster, at, node);
+        observe(&~cluster, at);
+        if cluster->checked then
+            assertTrue(safe(&cluster), "safe after a tick");
+        end if;
+        return nil;
+    end;
+
+    -- rounds of: a tick for every node, then every message then in the
+    -- network delivered or lost.
+    generic [R: Region]
+    function run(cluster: &![Cluster, R], rounds: Nat64): Unit is
+        var round: Nat64 := 0;
+        while round < rounds do
+            var i: Index := 0;
+            while i < nodeCount(&cluster) do
+                tickOne(&~cluster, i);
+                i := i + 1;
+            end while;
+            var budget: Index := networkSize(&cluster);
+            while (budget > 0) and (networkSize(&cluster) > 0) do
+                deliverOne(&~cluster);
+                budget := budget - 1;
+            end while;
+            round := round + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function leaderCount(cluster: &[Cluster, R]): Nat64 is
+        var count: Nat64 := 0;
+        var i: Index := 0;
+        while i < length(&(cluster->nodes)) do
+            if isLeader(nthRef(&(cluster->nodes), i)) then
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    -- The id of the leader of the highest term, 0 when there is none.
+    generic [R: Region]
+    function leaderId(cluster: &[Cluster, R]): Nat64 is
+        var id: Nat64 := 0;
+        var term: Nat64 := 0;
+        var i: Index := 0;
+        while i < length(&(cluster->nodes)) do
+            let node: &[Node, R] := nthRef(&(cluster->nodes), i);
+            if isLeader(node) and (currentTerm(node) >= term) then
+                id := nodeId(node);
+                term := currentTerm(node);
+            end if;
+            i := i + 1;
+        end while;
+        return id;
+    end;
+
+    generic [R: Region, D: Region]
+    function proposeTo(cluster: &![Cluster, R], id: Nat64, command: Span[Nat8, D]): Bool is
+        if id = 0 then
+            return false;
+        end if;
+        var node: Node := takeNode(&~cluster, slot(id));
+        let taken: Bool := propose(&!node, command);
+        putNode(&~cluster, slot(id), node);
+        observe(&~cluster, slot(id));
+        return taken;
+    end;
+
+    generic [R: Region, S: Region]
+    function machineIs(cluster: &[Cluster, R], id: Nat64, text: Span[Nat8, S]): Bool is
+        let machine: &[Machine, R] := nthRef(&(cluster->machines), slot(id));
+        return equal(wholeSpan(&(machine->bytes)), text);
+    end;
+
+    generic [R: Region]
+    function appliedBytes(cluster: &[Cluster, R], id: Nat64): Index is
+        let machine: &[Machine, R] := nthRef(&(cluster->machines), slot(id));
+        return length(&(machine->bytes));
+    end;
+
+    generic [R: Region]
+    function machinesEqual(cluster: &[Cluster, R], a: Nat64, b: Nat64): Bool is
+        let ma: &[Machine, R] := nthRef(&(cluster->machines), slot(a));
+        let mb: &[Machine, R] := nthRef(&(cluster->machines), slot(b));
+        let x: Span[Nat8, R] := wholeSpan(&(ma->bytes));
+        let y: Span[Nat8, R] := wholeSpan(&(mb->bytes));
+        return equal(x, y);
+    end;
+
+    generic [R: Region]
+    function compactAt(cluster: &![Cluster, R], id: Nat64): Bool is
+        var node: Node := takeNode(&~cluster, slot(id));
+        let machine: Machine := takeMachine(&~cluster, slot(id));
+        let done: Bool := compactWith(&!node, &machine);
+        putMachine(&~cluster, slot(id), machine);
+        putNode(&~cluster, slot(id), node);
+        return done;
+    end;
+
+    generic [R: Region]
+    function setGroup(cluster: &![Cluster, R], id: Nat64, group: Nat8): Unit is
+        storeNth(&!(cluster->group), slot(id), group);
+        return nil;
+    end;
+
+    -- The leader of the highest term among the nodes of group, 0 when none.
+    generic [R: Region]
+    function leaderOnSide(cluster: &[Cluster, R], group: Nat8): Nat64 is
+        var id: Nat64 := 0;
+        var term: Nat64 := 0;
+        var i: Index := 0;
+        while i < length(&(cluster->nodes)) do
+            let node: &[Node, R] := nthRef(&(cluster->nodes), i);
+            if (isLeader(node) and (nth(&(cluster->group), i) = group)) and (currentTerm(node) >= term) then
+                id := nodeId(node);
+                term := currentTerm(node);
+            end if;
+            i := i + 1;
+        end while;
+        return id;
+    end;
+
+    generic [R: Region]
+    function leaderAt(cluster: &[Cluster, R], at: Index): Nat64 is
+        return leaderOf(nthRef(&(cluster->nodes), at));
+    end;
+
+    generic [R: Region]
+    function termOf(cluster: &[Cluster, R], id: Nat64): Nat64 is
+        return currentTerm(nthRef(&(cluster->nodes), slot(id)));
+    end;
+
+    generic [R: Region]
+    function commitOf(cluster: &[Cluster, R], id: Nat64): Nat64 is
+        return commitIndex(nthRef(&(cluster->nodes), slot(id)));
+    end;
+
+    generic [R: Region]
+    function appliedOf(cluster: &[Cluster, R], id: Nat64): Nat64 is
+        return appliedIndex(nthRef(&(cluster->nodes), slot(id)));
+    end;
+
+    generic [R: Region]
+    function snapshotOf(cluster: &[Cluster, R], id: Nat64): Nat64 is
+        return snapshotIndexOf(nthRef(&(cluster->nodes), slot(id)));
+    end;
+
+    generic [R: Region]
+    function membersOf(cluster: &[Cluster, R], id: Nat64): Index is
+        return memberCount(nthRef(&(cluster->nodes), slot(id)));
+    end;
+
+    -- Whether node id counts member among its members.
+    generic [R: Region]
+    function memberOf(cluster: &[Cluster, R], id: Nat64, member: Nat64): Bool is
+        return isMember(nthRef(&(cluster->nodes), slot(id)), member);
+    end;
+
+    generic [R: Region]
+    function wellFormedCount(cluster: &[Cluster, R]): Index is
+        var count: Index := 0;
+        var i: Index := 0;
+        while i < length(&(cluster->network)) do
+            if isWellFormed(nthRef(&(cluster->network), i)) then
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    ---
+    --- The tests
+    ---
+
+    function testMajority(): Unit is
+        assertTrue(majority(1) = 1, "one of one");
+        assertTrue(majority(2) = 2, "two of two");
+        assertTrue(majority(3) = 2, "two of three");
+        assertTrue(majority(4) = 3, "three of four");
+        assertTrue(majority(5) = 3, "three of five");
+        assertTrue(entryCommand() = 0, "the kind of a command");
+        return nil;
+    end;
+
+    function testElection(): Unit is
+        var cluster: Cluster := makeCluster(3, 3, 11, majority);
+        run(&!cluster, 60);
+        assertTrue(leaderCount(&cluster) = 1, "one leader");
+        let leader: Nat64 := leaderId(&cluster);
+        assertTrue(leader > 0, "a leader exists");
+        var i: Index := 0;
+        while i < 3 do
+            assertTrue(leaderAt(&cluster, i) = leader, "every node follows the leader");
+            i := i + 1;
+        end while;
+        assertTrue(safe(&cluster), "safe");
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    function testReplication(): Unit is
+        var cluster: Cluster := makeCluster(3, 3, 12, majority);
+        run(&!cluster, 60);
+        let leader: Nat64 := leaderId(&cluster);
+        assertTrue(proposeTo(&!cluster, leader, "a"), "the leader takes a");
+        assertTrue(proposeTo(&!cluster, leader, "b"), "the leader takes b");
+        assertTrue(proposeTo(&!cluster, leader, "c"), "the leader takes c");
+        run(&!cluster, 20);
+        assertTrue(machineIs(&cluster, 1, "a;b;c;"), "node 1 applied a, b, c");
+        assertTrue(machineIs(&cluster, 2, "a;b;c;"), "node 2 applied a, b, c");
+        assertTrue(machineIs(&cluster, 3, "a;b;c;"), "node 3 applied a, b, c");
+        var other: Nat64 := 1;
+        if leader = 1 then
+            other := secondId;
+        end if;
+        assertFalse(proposeTo(&!cluster, other, "x"), "a follower takes no proposal");
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    -- The leader is cut off; the other two elect a new one in a higher
+    -- term and go on.  What the old leader took alone is never committed
+    -- and is gone from its log when the partition heals.
+    function testPartitionedLeader(): Unit is
+        var cluster: Cluster := makeCluster(3, 3, 13, majority);
+        run(&!cluster, 60);
+        let former: Nat64 := leaderId(&cluster);
+        let oldTerm: Nat64 := termOf(&cluster, former);
+        assertTrue(proposeTo(&!cluster, former, "a"), "a before the partition");
+        run(&!cluster, 10);
+        setGroup(&!cluster, former, 1);
+        assertTrue(proposeTo(&!cluster, former, "lost"), "the former leader takes lost alone");
+        run(&!cluster, 80);
+        let new: Nat64 := leaderId(&cluster);
+        assertTrue((new /= former) and (new > 0), "a new leader on the other side");
+        assertTrue(termOf(&cluster, new) > oldTerm, "in a higher term");
+        assertTrue(proposeTo(&!cluster, new, "b"), "the new leader takes b");
+        run(&!cluster, 20);
+        setGroup(&!cluster, former, 0);
+        run(&!cluster, 40);
+        assertTrue(leaderCount(&cluster) = 1, "one leader after the healing");
+        assertTrue(machineIs(&cluster, 1, "a;b;"), "node 1: a, b");
+        assertTrue(machineIs(&cluster, 2, "a;b;"), "node 2: a, b");
+        assertTrue(machineIs(&cluster, 3, "a;b;"), "node 3: a, b");
+        assertTrue(safe(&cluster), "safe");
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    -- A fifth of the messages lost and all of them out of order, while
+    -- whoever leads takes commands; then a quiet network.  The machines
+    -- end equal.
+    function testLossAndReordering(): Unit is
+        var cluster: Cluster := makeCluster(5, 5, 14, majority);
+        cluster.dropPercent := lossy;
+        var round: Nat64 := 0;
+        var taken: Nat64 := 0;
+        while round < 300 do
+            run(&!cluster, 1);
+            if rem(round, every) = 0 then
+                let head: Nat64 := leaderId(&cluster);
+                if proposeTo(&!cluster, head, "c") then
+                    taken := taken + 1;
+                end if;
+            end if;
+            round := round + 1;
+        end while;
+        cluster.dropPercent := noLoss;
+        run(&!cluster, 80);
+        assertTrue(taken > 10, "commands were taken");
+        assertTrue(appliedBytes(&cluster, 1) > 0, "commands were applied");
+        var id: Nat64 := 2;
+        while id <= 5 do
+            assertTrue(machinesEqual(&cluster, 1, id), "a machine equal to the first");
+            id := id + 1;
+        end while;
+        assertTrue(safe(&cluster), "safe");
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    -- Node 4 joins a cluster of three, then node 1 leaves; the cluster
+    -- goes on and node 4 has every command.
+    function testMembership(): Unit is
+        var cluster: Cluster := makeCluster(4, 3, 15, majority);
+        run(&!cluster, 60);
+        let leader: Nat64 := leaderId(&cluster);
+        assertTrue(proposeTo(&!cluster, leader, "a"), "a");
+        var node: Node := takeNode(&!cluster, slot(leader));
+        assertTrue(proposeAddMember(&!node, 4), "node 4 is added");
+        assertFalse(proposeAddMember(&!node, 4), "a second change waits for the first");
+        putNode(&!cluster, slot(leader), node);
+        observe(&!cluster, slot(leader));
+        run(&!cluster, 30);
+        assertTrue(memberOf(&cluster, 4, 4), "node 4 knows it is a member");
+        assertTrue(machineIs(&cluster, 4, "a;"), "node 4 caught up");
+        let now: Nat64 := leaderId(&cluster);
+        var leading: Node := takeNode(&!cluster, slot(now));
+        assertTrue(proposeRemoveMember(&!leading, 1), "node 1 is removed");
+        putNode(&!cluster, slot(now), leading);
+        observe(&!cluster, slot(now));
+        run(&!cluster, 80);
+        let last: Nat64 := leaderId(&cluster);
+        assertTrue((last /= 1) and (last > 0), "a leader that is not node 1");
+        assertTrue(membersOf(&cluster, last) = 3, "three members");
+        assertFalse(memberOf(&cluster, last, 1), "node 1 is no member");
+        assertTrue(proposeTo(&!cluster, last, "b"), "b");
+        run(&!cluster, 20);
+        assertTrue(machineIs(&cluster, 4, "a;b;"), "node 4: a, b");
+        assertTrue(safe(&cluster), "safe");
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    -- Node 3 is cut off while the others take ten commands and replace
+    -- their logs by snapshots; when it comes back it gets the snapshot.
+    function testSnapshot(): Unit is
+        var cluster: Cluster := makeCluster(3, 3, 16, majority);
+        run(&!cluster, 60);
+        var leader: Nat64 := leaderId(&cluster);
+        if leader = 3 then
+            setGroup(&!cluster, 3, 1);
+            run(&!cluster, 80);
+            setGroup(&!cluster, 3, 0);
+            run(&!cluster, 20);
+            leader := leaderId(&cluster);
+        end if;
+        setGroup(&!cluster, 3, 1);
+        var n: Nat64 := 0;
+        while n < 10 do
+            let head: Nat64 := leaderId(&cluster);
+            assertTrue(proposeTo(&!cluster, head, "s"), "a command while node 3 is away");
+            run(&!cluster, 2);
+            n := n + 1;
+        end while;
+        run(&!cluster, 10);
+        var id: Nat64 := 1;
+        while id <= 2 do
+            assertTrue(compactAt(&!cluster, id), "the log compacted");
+            assertTrue(snapshotOf(&cluster, id) = appliedOf(&cluster, id), "the snapshot ends at the applied index");
+            id := id + 1;
+        end while;
+        setGroup(&!cluster, 3, 0);
+        run(&!cluster, 40);
+        assertTrue(machineIs(&cluster, 3, "s;s;s;s;s;s;s;s;s;s;"), "node 3 restored the snapshot");
+        assertTrue(snapshotOf(&cluster, 3) > 0, "node 3 installed a snapshot");
+        assertTrue(safe(&cluster), "safe");
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    -- The commit rule is the caller's: with every member needed, one
+    -- member away stops all commits; with majority it does not.
+    function testCommitRule(): Unit is
+        var all: Cluster := makeCluster(3, 3, 17, everyone);
+        run(&!all, 60);
+        let leader: Nat64 := leaderId(&all);
+        assertTrue(leader > 0, "a leader with every vote");
+        var away: Nat64 := 1;
+        if leader = 1 then
+            away := secondId;
+        end if;
+        let before: Nat64 := commitOf(&all, leader);
+        setGroup(&!all, away, 1);
+        assertTrue(proposeTo(&!all, leader, "x"), "x is taken");
+        run(&!all, 5);
+        assertTrue(commitOf(&all, leader) = before, "nothing commits without every member");
+        setGroup(&!all, away, 0);
+        run(&!all, 30);
+        assertTrue(machineIs(&all, away, "x;"), "x commits when all are back");
+        destroyCluster(all);
+        var most: Cluster := makeCluster(3, 3, 17, majority);
+        run(&!most, 60);
+        let head: Nat64 := leaderId(&most);
+        var gone: Nat64 := 1;
+        if head = 1 then
+            gone := secondId;
+        end if;
+        setGroup(&!most, gone, 1);
+        assertTrue(proposeTo(&!most, head, "y"), "y is taken");
+        run(&!most, 5);
+        assertTrue(machineIs(&most, head, "y;"), "y commits with a majority");
+        destroyCluster(most);
+        return nil;
+    end;
+
+    -- With a quorum of one, each side of a partition elects its own leader
+    -- and commits alone; the checks of the simulation must see the logs
+    -- and the machines part.  This is the control that they can fail.
+    function testUnsafeRuleIsCaught(): Unit is
+        var cluster: Cluster := makeCluster(3, 3, 19, one);
+        cluster.checked := false;
+        run(&!cluster, 60);
+        let first: Nat64 := leaderId(&cluster);
+        assertTrue(first > 0, "a leader");
+        var other: Nat64 := 1;
+        if first = 1 then
+            other := secondId;
+        end if;
+        setGroup(&!cluster, first, 1);
+        run(&!cluster, 60);
+        assertTrue(proposeTo(&!cluster, first, "x"), "the cut-off leader takes x");
+        let second: Nat64 := leaderOnSide(&cluster, 0);
+        assertTrue(second > 0, "the other side has a leader of its own");
+        assertTrue(proposeTo(&!cluster, second, "y"), "that leader takes y");
+        run(&!cluster, 5);
+        assertFalse(safe(&cluster), "the checks see the damage");
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    function testWellFormed(): Unit is
+        var cluster: Cluster := makeCluster(3, 3, 18, majority);
+        run(&!cluster, 40);
+        -- Ticks without deliveries leave the heartbeats in the network.
+        var t: Nat64 := 0;
+        while t < 4 do
+            tickOne(&!cluster, 0);
+            tickOne(&!cluster, 1);
+            tickOne(&!cluster, 2);
+            t := t + 1;
+        end while;
+        assertTrue(networkSize(&cluster) > 0, "messages are in the network");
+        assertTrue(wellFormedCount(&cluster) = networkSize(&cluster), "every message of a node is well formed");
+        destroyCluster(cluster);
+        return nil;
+    end;
+end module body.

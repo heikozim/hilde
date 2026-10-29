@@ -1,0 +1,220 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Waiting on many descriptors at once.
+
+- The backend is epoll on Linux, kqueue on OpenBSD, FreeBSD and macOS, none elsewhere.
+- Without a backend createPoller returns None; backendAvailable says so before anything is built.
+- A descriptor ready to be read and written comes back as one event with both flags.
+- A descriptor is reported only for what it was opened for.
+- A pipe's reading end is reported writable only on OpenBSD, which opens both ends both ways.
+- Pipes, sockets and character devices can be watched; epoll refuses a regular file.
+- The poller owns only its own descriptor; the descriptors it watches stay the caller's.
+
+    case createPoller() of
+        when Some(value as made: Poller) do
+            var poller: Poller := made;
+            let watched: Bool := watchFile(&!poller, &socket, interestRead);
+            let ready: Option[Index] := waitFor(&!poller, 1000);
+            let first: Option[Event] := nthEvent(&poller, 0);
+            destroyPoller(poller);
+        when None do
+            useBlockingReads();
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.File (
+    FileDescriptor
+);
+import Standard.String (
+    String
+);
+
+module Standard.Poller is
+    ---
+    --- What this binary can do, before anything is built
+    ---
+
+    """
+    Which mechanism a poller is built on.
+    """
+    type Backend: Free;
+
+    """
+    No backend on this platform; createPoller returns None.
+    """
+    constant backendNone: Backend;
+
+    """
+    The epoll of Linux.
+    """
+    constant backendEpoll: Backend;
+
+    """
+    The kqueue of OpenBSD, FreeBSD and macOS.
+    """
+    constant backendKqueue: Backend;
+
+    """
+    The backend of this build.  It can be asked before anything is built.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function backendAvailable(): Backend;
+
+    """
+    Whether two backends are the same.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function sameBackend(left: Backend, right: Backend): Bool;
+
+    """
+    A line naming the backend, "poller:" and its name.
+    No contract: a text whose length follows its input.
+    """
+    function describeBackend(backend: Backend): String;
+
+    ---
+    --- What to wait for
+    ---
+
+    """
+    What a descriptor is watched for.
+    """
+    type Interest: Free;
+
+    """
+    Ready to be read from.
+    """
+    constant interestRead: Interest;
+
+    """
+    Ready to be written to.
+    """
+    constant interestWrite: Interest;
+
+    """
+    Either of the two.
+    """
+    constant interestReadWrite: Interest;
+
+    ---
+    --- The poller
+    ---
+
+    """
+    A set of descriptors being waited on.  It is linear: it owns a
+    descriptor of its own, and destroyPoller gives it back.
+    """
+    type Poller: Linear;
+
+    """
+    A new poller, or None when this platform has no backend or the kernel
+    refused.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    function createPoller(): Option[Poller];
+
+    """
+    Closes the poller's own descriptor.  The descriptors it watched stay
+    open: they belong to whoever opened them.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyPoller(poller: Poller): Unit;
+
+    """
+    Watches a descriptor.  Returns false when the backend refused it, as
+    epoll does for a regular file, or when it is watched already.  Unwatch
+    the file before closing it: the kernel forgets a file closed while
+    watched, but watchedCount keeps counting it.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function watchFile(poller: &![Poller, R],
+        file: &[FileDescriptor, S],
+        interest: Interest): Bool;
+
+    """
+    Changes what a watched descriptor is watched for.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function rewatchFile(poller: &![Poller, R],
+        file: &[FileDescriptor, S],
+        interest: Interest): Bool;
+
+    """
+    Stops watching a descriptor.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function unwatchFile(poller: &![Poller, R],
+        file: &[FileDescriptor, S]): Bool;
+
+    """
+    How many descriptors are watched.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function watchedCount(poller: &[Poller, R]): Index;
+
+    ---
+    --- Waiting, and what comes back
+    ---
+
+    """
+    Waits until something is ready, at most timeoutMillis milliseconds;
+    a negative timeout waits without end, zero returns at once.  Returns
+    how many descriptors are ready, zero on the timeout, or None when the
+    wait failed.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function waitFor(poller: &![Poller, R], timeoutMillis: Int32): Option[Index];
+
+    """
+    What one descriptor is ready for.
+    """
+    type Event: Free;
+
+    """
+    The event at index among those the last waitFor reported, or None
+    past the end.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function nthEvent(poller: &[Poller, R], index: Index): Option[Event];
+
+    """
+    The number of the descriptor the event is about.  A number and not a
+    descriptor, because the poller does not own the file; match it with
+    fileNumber of Standard.File.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function eventDescriptor(event: Event): Int32;
+
+    """
+    Whether the descriptor is ready to be read from.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function eventReadable(event: Event): Bool;
+
+    """
+    Whether the descriptor is ready to be written to.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function eventWritable(event: Event): Bool;
+
+    """
+    Whether the descriptor failed or the other end went away.  It can come
+    together with readable: read the last bytes before stopping.  The two
+    backends raise it at different moments, so learn the end from a read
+    that returns nothing, not from this flag alone.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function eventFailed(event: Event): Bool;
+end module.

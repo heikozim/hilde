@@ -1,0 +1,144 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Server-side sessions in a database of Standard.Database, with an idle and an absolute time limit.
+
+- A session is a row of the table hilde_sessions: digest of its token, times made and used, data.
+- The table works on every backend: SQLite, SQLCipher, PostgreSQL and MariaDB.
+- A token is 32 secure random bytes as 64 hexadecimal digits, given to the caller once.
+- Only the SHA-256 of a token is stored, so a copy of the database opens no session.
+- A session idle longer than the idle limit, or older than the absolute one, ends when loaded.
+- rotateSession at login gives a new token, so one an attacker set before opens nothing after.
+- Every time is seconds passed in by the caller, so a test can move the clock; below 0 is refused.
+- A token in a cookie is read back with Standard.Cookie.
+
+    let limits: SessionLimits := defaultSessionLimits();
+    case loadSession(&!db, asSpan(&cookieToken), limits, now) of
+        when Right(right as found: Option[String]) do
+            serveWith(found);
+        when Left(left as error: SessionError) do
+            reportFailure(error);
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError
+);
+
+module Standard.Session is
+    """
+    How long a session lives.  Free, so it copies.
+    """
+    record SessionLimits: Free is
+        """
+        Seconds without a use after which a session ends.
+        """
+        idleSeconds: Int64;
+        """
+        Seconds after which a session ends however it is used.
+        """
+        absoluteSeconds: Int64;
+    end;
+
+    """
+    30 minutes idle, 12 hours in all.
+    """
+    function defaultSessionLimits(): SessionLimits
+        ensures (result.idleSeconds = 1800) and (result.absoluteSeconds = 43200);
+
+    """
+    Why a call did not do its work.
+    """
+    union SessionError: Free is
+        """
+        The database refused a statement.
+        """
+        case StorageFailed is
+            error: DbError;
+        """
+        The random source or the digest of libcrypto failed.
+        """
+        case CryptoFailed;
+        """
+        A time below 0 was passed.
+        """
+        case BadTime;
+    end;
+
+    """
+    Makes the table hilde_sessions when the database has none.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function prepareSessions(db: &![Database[Writing], R]): Either[SessionError, Unit];
+
+    """
+    Whether token has the form of a session token: 64 lowercase
+    hexadecimal digits.  A token of another form is never looked up.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isSessionToken(token: Span[Nat8, R]): Bool;
+
+    """
+    A new session holding data, made at now.  Right holds its token.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, D: Region]
+    function createSession(db: &![Database[Writing], R], data: Span[Nat8, D], now: Int64): Either[SessionError, String];
+
+    """
+    The data of the session of token, which is used at now.  Right None
+    when there is no such session, the token has another form, or the
+    session is over its limits, which removes it.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, T: Region]
+    function loadSession(db: &![Database[Writing], R], token: Span[Nat8, T], limits: SessionLimits, now: Int64): Either[SessionError, Option[String]];
+
+    """
+    Replaces the data of the session of token and uses it at now.  Right
+    false when there is no such session.  The limits are not looked at:
+    load the session first.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, T: Region, D: Region]
+    function saveSession(db: &![Database[Writing], R], token: Span[Nat8, T], data: Span[Nat8, D], now: Int64): Either[SessionError, Bool];
+
+    """
+    A new token for the session of token, in one transaction: the data
+    moves to a session made at now, and the old token opens nothing any
+    more.  Right None when there is no such session or it is over its
+    limits.  A login must call it, so that a token an attacker set before
+    the login opens nothing after it.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, T: Region]
+    function rotateSession(db: &![Database[Writing], R], token: Span[Nat8, T], limits: SessionLimits, now: Int64): Either[SessionError, Option[String]];
+
+    """
+    Removes the session of token: the logout, after which the row and the
+    token are gone.  A token that opens nothing is no failure.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [R: Region, T: Region]
+    function destroySession(db: &![Database[Writing], R], token: Span[Nat8, T]): Either[SessionError, Unit];
+
+    """
+    Removes every session that is over its limits at now.  Right holds
+    how many.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function purgeSessions(db: &![Database[Writing], R], limits: SessionLimits, now: Int64): Either[SessionError, Nat64];
+end module.

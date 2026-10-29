@@ -1,0 +1,153 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte
+);
+import Standard.Cookie (
+    SameSite,
+    SameSiteStrict,
+    SameSiteLax,
+    SameSiteNone,
+    CookieOptions,
+    strictOptions,
+    isCookieName,
+    isCookieValue,
+    cookieValue,
+    setCookie,
+    deleteCookie
+);
+
+module body Standard.Cookie.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The value of name in header is expected.
+    function found(header: Span[Nat8, Static], name: Span[Nat8, Static], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case cookieValue(header, name) of
+            when Some(value as got: String) do
+                assertTrue(same(&got, expected), message);
+                destroyString(got);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function missing(header: Span[Nat8, Static], name: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case cookieValue(header, name) of
+            when Some(value as got: String) do
+                destroyString(got);
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    function written(made: Option[String], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case made of
+            when Some(value as header: String) do
+                assertTrue(same(&header, expected), message);
+                destroyString(header);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function refused(made: Option[String], message: Span[Nat8, Static]): Unit is
+        case made of
+            when Some(value as header: String) do
+                destroyString(header);
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    function testNamesAndValues(): Unit is
+        assertTrue(isCookieName("session"), "a word");
+        assertTrue(isCookieName("__Host-id"), "a prefix with a hyphen");
+        assertFalse(isCookieName(""), "empty");
+        assertFalse(isCookieName("a b"), "a space");
+        assertFalse(isCookieName("a=b"), "an equals sign");
+        assertFalse(isCookieName("a;b"), "a semicolon");
+        assertTrue(isCookieValue(""), "an empty value");
+        assertTrue(isCookieValue("abc123-_=."), "base64 with padding");
+        assertFalse(isCookieValue("a b"), "a space");
+        assertFalse(isCookieValue("a;b"), "a semicolon");
+        assertFalse(isCookieValue("a,b"), "a comma");
+        assertFalse(isCookieValue("a\"b"), "a quote inside");
+        assertFalse(isCookieValue("a\\b"), "a backslash");
+        return nil;
+    end;
+
+    function testReading(): Unit is
+        found("a=1; session=abc; b=2", "session", "abc", "in the middle");
+        found("session=abc", "session", "abc", "alone");
+        found("a=1;session=abc", "session", "abc", "no space after the semicolon");
+        found("  session = abc  ;x=y", "session", "abc", "spaces around");
+        found("session=\"abc\"", "session", "abc", "in quotes");
+        found("session=; a=1", "session", "", "empty");
+        found("session=one; session=two", "session", "one", "the first of two");
+        missing("sessionid=abc", "session", "a longer name is another name");
+        missing("Session=abc", "session", "names are compared with their case");
+        missing("a=1; b=2", "session", "absent");
+        missing("session", "session", "a pair without a value");
+        missing("session=a b", "session", "a value with a space");
+        missing("session=abc", "bad name", "a name that is no name");
+        missing("", "session", "an empty header");
+        return nil;
+    end;
+
+    function testWriting(): Unit is
+        written(setCookie("session", "abc", "/", strictOptions()),
+            "session=abc; Path=/; Secure; HttpOnly; SameSite=Strict", "the strict options");
+        let none: Option[Nat32] := None();
+        let hour: Nat32 := 3600;
+        let lax: CookieOptions := CookieOptions(maxAgeSeconds => Some(value => hour), secure => true, httpOnly => false, sameSite => SameSiteLax());
+        written(setCookie("theme", "dark", "/app", lax),
+            "theme=dark; Path=/app; Max-Age=3600; Secure; SameSite=Lax", "lax with an age");
+        written(deleteCookie("session", "/", strictOptions()),
+            "session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict", "removed");
+        let insecureNone: CookieOptions := CookieOptions(maxAgeSeconds => none, secure => false, httpOnly => true, sameSite => SameSiteNone());
+        refused(setCookie("a", "b", "/", insecureNone), "SameSite=None without Secure");
+        refused(setCookie("a b", "c", "/", strictOptions()), "a name with a space");
+        refused(setCookie("a", "b; Domain=evil.example", "/", strictOptions()), "a value that starts an attribute");
+        refused(setCookie("a", "b", "/x; Domain=evil.example", strictOptions()), "a path that starts an attribute");
+        refused(setCookie("a", "b", "x", strictOptions()), "a path without a slash");
+        refused(setCookie("a", "b", "/a b", strictOptions()), "a path with a space");
+        refused(setCookie("a", "b", "/a\r\nX: y", strictOptions()), "a path that ends the header");
+        refused(setCookie("a", "b", "", strictOptions()), "an empty path");
+        refused(setCookie("a", "b\r\nSet-Cookie: c=d", "/", strictOptions()), "a value that ends the header");
+        return nil;
+    end;
+end module body.

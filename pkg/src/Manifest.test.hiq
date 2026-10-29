@@ -1,0 +1,133 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Buffer (
+    length as bufferLength,
+    nthRef
+);
+import Standard.Text (
+    equal
+);
+import Standard.Semver (
+    Version,
+    makeVersion
+);
+import Pkg.Report (
+    Problem,
+    destroyProblem
+);
+import Pkg.Manifest (
+    Manifest,
+    Requirement,
+    isPrefix,
+    isPlainValue,
+    makeManifest,
+    makeRequirement,
+    readManifest,
+    formatManifest,
+    findRequirement,
+    setRequirement,
+    nameOf,
+    destroyManifest
+);
+
+module body Pkg.Manifest.Test is
+    constant full: Span[Nat8, Static] := "targets = [\"linux\", \"openbsd\"]\n\n[package]\nname = \"Acme.Json\"\nversion = \"v1.2.3\"\nsignify-key = \"RWSgBGDjdJGlv/Ssv2UqfdZ9kfEYS1czgn4S5ReDnx9m1cPHwyT0GMWY\"\ncapabilities = [\"foreign\"]\n\n[require]\n\"Acme.Text\" = { git = \"https://example.org/text.git\", version = \"v0.4.0\" }\n\"Acme.Io\" = { git = \"file:///srv/io\", version = \"v2.0.1\", signify-key = \"RWS\" }\n\n[c-source]\ncommit = true\ndir = \"c\"\n\n[policy]\nrequire-signatures = true\n";
+
+    function testPrefix(): Unit is
+        assertTrue(isPrefix("Acme"), "one part");
+        assertTrue(isPrefix("Acme.Json2"), "two parts with a digit");
+        assertTrue(not isPrefix("acme"), "a small first letter");
+        assertTrue(not isPrefix("Acme."), "a dot at the end");
+        assertTrue(not isPrefix("Acme..Json"), "two dots");
+        assertTrue(not isPrefix(""), "empty");
+        assertTrue(not isPrefix("Acme-Json"), "a hyphen");
+        assertTrue(isPlainValue("https://example.org/x.git"), "a URL");
+        assertTrue(not isPlainValue("a\"b"), "a quote");
+        return nil;
+    end;
+
+    function testRoundTrip(): Unit is
+        case readManifest(full) of
+            when Right(right as manifest: Manifest) do
+                assertTrue(equal(nameOf(&manifest), "Acme.Json"), "the name");
+                borrow r: &[Manifest, Q] := &manifest do
+                    assertTrue(r->version.minor = 2, "the version");
+                    assertTrue(bufferLength(&(r->needs)) = 2, "two requirements");
+                    assertTrue(bufferLength(&(r->targets)) = 2, "two targets");
+                    assertTrue(r->commitC, "c-source commit");
+                    assertTrue(r->requireSignatures, "policy");
+                end borrow;
+                let text: String := formatManifest(&manifest);
+                assertTrue(equal(asSpan(&text), full), "the canonical form is the text read");
+                case findRequirement(&manifest, "Acme.Io") of
+                    when Some(value as at: Index) do
+                        assertTrue(at = 1, "the second requirement");
+                    when None do
+                        assertFailure("Acme.Io was not found");
+                end case;
+                destroyString(text);
+                destroyManifest(manifest);
+            when Left(left as problem: Problem) do
+                assertFailure("the full manifest was refused");
+                destroyProblem(problem);
+        end case;
+        return nil;
+    end;
+
+    function testSet(): Unit is
+        var m: Manifest := makeManifest("Acme.App", makeVersion(0, 1, 0));
+        m := setRequirement(m, makeRequirement("Acme.Text", "file:///a", makeVersion(1, 0, 0), ""));
+        m := setRequirement(m, makeRequirement("Acme.Io", "file:///b", makeVersion(1, 0, 0), ""));
+        m := setRequirement(m, makeRequirement("Acme.Text", "file:///a", makeVersion(1, 1, 0), ""));
+        let text: String := formatManifest(&m);
+        assertTrue(equal(asSpan(&text), "[package]\nname = \"Acme.App\"\nversion = \"v0.1.0\"\n\n[require]\n\"Acme.Text\" = { git = \"file:///a\", version = \"v1.1.0\" }\n\"Acme.Io\" = { git = \"file:///b\", version = \"v1.0.0\" }\n"), "a requirement replaced in its place, one added");
+        destroyString(text);
+        destroyManifest(m);
+        return nil;
+    end;
+
+    function refused(text: Span[Nat8, Static], code: Int64, message: Span[Nat8, Static]): Unit is
+        case readManifest(text) of
+            when Right(right as manifest: Manifest) do
+                destroyManifest(manifest);
+                assertFailure(message);
+            when Left(left as problem: Problem) do
+                assertTrue(problem.code = code, message);
+                destroyProblem(problem);
+        end case;
+        return nil;
+    end;
+
+    function testRefused(): Unit is
+        refused("[package\n", 1502, "not TOML");
+        refused("[package]\nname = \"A\"\nversion = \"v1.0.0\"\ncolour = \"red\"\n", 1503, "an unknown key in package");
+        refused("[package]\nname = \"A\"\nversion = \"v1.0.0\"\n[extra]\n", 1503, "an unknown table");
+        refused("[package]\nversion = \"v1.0.0\"\n", 1504, "no name");
+        refused("[package]\nname = \"A\"\n", 1504, "no version");
+        refused("[package]\nname = \"a.b\"\nversion = \"v1.0.0\"\n", 1505, "a name that is no prefix");
+        refused("[package]\nname = \"A\"\nversion = \"1.0\"\n", 1505, "a version that is not vX.Y.Z");
+        refused("[package]\nname = \"A\"\nversion = \"v1.0.0\"\n[require]\n\"B\" = { version = \"v1.0.0\" }\n", 1504, "a requirement without git");
+        refused("[package]\nname = \"A\"\nversion = \"v1.0.0\"\n[require]\n\"B\" = { git = \"x\", version = \"v1\" }\n", 1505, "a requirement with a bad version");
+        refused("[package]\nname = \"A\"\nversion = \"v1.0.0\"\n[require]\n\"b\" = { git = \"x\", version = \"v1.0.0\" }\n", 1505, "a requirement that is no prefix");
+        refused("[package]\nname = \"A\"\nversion = \"v1.0.0\"\n[require]\n\"B\" = { git = \"x\", version = \"v1.0.0\", branch = \"main\" }\n", 1503, "an unknown key in a requirement");
+        refused("[package]\nname = \"A\"\nversion = \"v1.0.0\"\n[policy]\nrequire-signatures = \"yes\"\n", 1505, "a policy that is no Bool");
+        refused("targets = \"linux\"\n[package]\nname = \"A\"\nversion = \"v1.0.0\"\n", 1505, "targets that is no array");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,198 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test works in a directory of its own, made at its start and
+-- removed at its end.  A change is made before the wait, so the wait
+-- finds it at once; the time limits only bound a wait that finds nothing.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    openAppend,
+    writeAll,
+    closeFile,
+    removeFile,
+    renameFile,
+    createDirectory,
+    removeDirectory
+);
+import Standard.AtomicFile (
+    AtomicFailure,
+    writeAtomically
+);
+import Standard.Watch (
+    WatchResult,
+    WaitedOut,
+    WatchFailed,
+    Changed,
+    Watcher,
+    watchAvailable,
+    makeWatcher,
+    watchDirectory,
+    watchFile,
+    waitForChange,
+    destroyWatcher
+);
+
+module body Standard.Watch.Test is
+    -- The watch that changed, -1 when the time ran out, -2 on a failure.
+    function result(found: WatchResult): Int32 is
+        case found of
+            when WaitedOut do
+                return -1;
+            when WatchFailed do
+                return -2;
+            when Changed(watch as place: Index) do
+                case toInt32(place) of
+                    when Some(value as n: Int32) do
+                        return n;
+                    when None do
+                        return -3;
+                end case;
+        end case;
+    end;
+
+    function placeOf(added: Option[Index]): Int32 is
+        case added of
+            when Some(value as place: Index) do
+                case toInt32(place) of
+                    when Some(value as n: Int32) do
+                        return n;
+                    when None do
+                        return -3;
+                end case;
+            when None do
+                return -1;
+        end case;
+    end;
+
+    function write(path: Span[Nat8, Static], content: Span[Nat8, Static]): Bool is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, content);
+                let closed: Bool := closeFile(file);
+                return written and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function append(path: Span[Nat8, Static], content: Span[Nat8, Static]): Bool is
+        let mode: Nat32 := 384;
+        case openAppend(path, mode) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, content);
+                let closed: Bool := closeFile(file);
+                return written and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function testAvailable(): Unit is
+        assertTrue(watchAvailable(), "watching is built on Linux, OpenBSD and FreeBSD");
+        return nil;
+    end;
+
+    function testDirectory(): Unit is
+        let dir: Span[Nat8, Static] := "watch-test-1.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        case makeWatcher() of
+            when Some(value as made: Watcher) do
+                var watcher: Watcher := made;
+                assertTrue(placeOf(watchDirectory(&!watcher, dir)) = 0, "the directory is watch 0");
+                assertTrue(result(waitForChange(&!watcher, 50)) = -1, "nothing changed, the time runs out");
+                assertTrue(write("watch-test-1.dir/new", "x"), "a file was made in the directory");
+                assertTrue(result(waitForChange(&!watcher, 5000)) = 0, "the new name is a change of watch 0");
+                assertTrue(result(waitForChange(&!watcher, 50)) = -1, "the change was reported, nothing is left");
+                assertTrue(removeFile("watch-test-1.dir/new"), "the file was removed");
+                assertTrue(result(waitForChange(&!watcher, 5000)) = 0, "a removed name is a change too");
+                assertTrue(placeOf(watchDirectory(&!watcher, "watch-test-none.dir")) = -1, "a missing directory is not watched");
+                destroyWatcher(watcher);
+            when None do
+                assertTrue(false, "a watcher was made");
+        end case;
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testFile(): Unit is
+        let dir: Span[Nat8, Static] := "watch-test-2.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        assertTrue(write("watch-test-2.dir/log", "one\n"), "the file was written");
+        assertTrue(write("watch-test-2.dir/other", "x"), "another file was written");
+        case makeWatcher() of
+            when Some(value as made: Watcher) do
+                var watcher: Watcher := made;
+                assertTrue(placeOf(watchFile(&!watcher, "watch-test-2.dir/other")) = 0, "the other file is watch 0");
+                assertTrue(placeOf(watchFile(&!watcher, "watch-test-2.dir/log")) = 1, "the log is watch 1");
+                assertTrue(append("watch-test-2.dir/log", "two\n"), "a line was added to the log");
+                assertTrue(result(waitForChange(&!watcher, 5000)) = 1, "the write is a change of watch 1");
+                assertTrue(result(waitForChange(&!watcher, 50)) = -1, "nothing is left");
+                destroyWatcher(watcher);
+            when None do
+                assertTrue(false, "a watcher was made");
+        end case;
+        assertTrue(removeFile("watch-test-2.dir/log"), "the log was removed");
+        assertTrue(removeFile("watch-test-2.dir/other"), "the other file was removed");
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testReplaced(): Unit is
+        let dir: Span[Nat8, Static] := "watch-test-3.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        assertTrue(write("watch-test-3.dir/config", "old\n"), "the file was written");
+        case makeWatcher() of
+            when Some(value as made: Watcher) do
+                var watcher: Watcher := made;
+                assertTrue(placeOf(watchFile(&!watcher, "watch-test-3.dir/config")) = 0, "the file is watch 0");
+                let mode: Nat32 := 420;
+                case writeAtomically("watch-test-3.dir/config", "new\n", mode) of
+                    when Right(right: Unit) do
+                        assertTrue(true, "the file was replaced by a rename");
+                    when Left(left: AtomicFailure) do
+                        assertTrue(false, "the file was replaced by a rename");
+                end case;
+                assertTrue(result(waitForChange(&!watcher, 5000)) = 0, "the replacement is a change of the watched file");
+                destroyWatcher(watcher);
+            when None do
+                assertTrue(false, "a watcher was made");
+        end case;
+        assertTrue(removeFile("watch-test-3.dir/config"), "the file was removed");
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    -- A watched file renamed to another name stays the same file, so
+    -- nothing tells of the rename unless the watch asks for it.  A file
+    -- replaced by a rename over it, as above, is told of on Linux even
+    -- without that, because the kernel drops the watch of a file that is
+    -- gone and says so.
+    function testMovedAway(): Unit is
+        let dir: Span[Nat8, Static] := "watch-test-4.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        assertTrue(write("watch-test-4.dir/config", "old\n"), "the file was written");
+        case makeWatcher() of
+            when Some(value as made: Watcher) do
+                var watcher: Watcher := made;
+                assertTrue(placeOf(watchFile(&!watcher, "watch-test-4.dir/config")) = 0, "the file is watch 0");
+                assertTrue(renameFile("watch-test-4.dir/config", "watch-test-4.dir/elsewhere"), "the file was renamed");
+                assertTrue(result(waitForChange(&!watcher, 5000)) = 0, "the rename is a change of the watched file");
+                destroyWatcher(watcher);
+            when None do
+                assertTrue(false, "a watcher was made");
+        end case;
+        assertTrue(removeFile("watch-test-4.dir/elsewhere"), "the file was removed");
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+end module body.

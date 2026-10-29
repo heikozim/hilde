@@ -1,0 +1,319 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.RaftTcp: messages through the bytes and back, bytes that are no
+-- message refused, and one message over a TCP connection on the loopback
+-- address.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    nth,
+    nthRef,
+    insertBack
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    length as textLength,
+    getSpan,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Standard.File (
+    FileDescriptor,
+    TcpListener,
+    ConnectFailure,
+    listenTcp,
+    tcpListenerPort,
+    acceptTcpWithin,
+    closeTcpListener,
+    connectTcp,
+    closeFile
+);
+import Standard.Raft (
+    Entry,
+    Message,
+    messageAppend,
+    messageSnapshot,
+    messageVote,
+    destroyMessage
+);
+import Standard.RaftTcp (
+    frameLimit,
+    encodeMessage,
+    decodeMessage,
+    sendMessage,
+    receiveMessage
+);
+
+module body Standard.RaftTcp.Test is
+    constant memberOne: Nat64 := 1;
+    constant memberTwo: Nat64 := 2;
+    constant largestId: Nat64 := 18446744073709551615;
+    constant allBits: Nat8 := 255;
+    constant noBits: Nat8 := 0;
+    constant unknownKind: Nat8 := 9;
+    constant loopbackFirst: Nat8 := 127;
+    constant loopbackLast: Nat8 := 1;
+
+    function noEntries(): Buffer[Entry] is
+        return allocateEmpty();
+    end;
+
+    function noIds(): Buffer[Nat64] is
+        return allocateEmpty();
+    end;
+
+    -- An append from 1 to 2 with two entries, one of them empty.
+    function sampleAppend(): Message is
+        var entries: Buffer[Entry] := noEntries();
+        insertBack(&!entries, Entry(term => 3, kind => 0, data => fromLiteral("set x 1")));
+        insertBack(&!entries, Entry(term => 3, kind => 3, data => fromLiteral("")));
+        return Message(
+            kind => messageAppend(),
+            sender => 1,
+            receiver => 2,
+            term => 3,
+            index => 7,
+            logTerm => 2,
+            commit => 6,
+            success => false,
+            hint => 0,
+            entries => entries,
+            snapshot => fromLiteral(""),
+            members => noIds()
+        );
+    end;
+
+    function sampleSnapshot(): Message is
+        var members: Buffer[Nat64] := noIds();
+        insertBack(&!members, memberOne);
+        insertBack(&!members, memberTwo);
+        insertBack(&!members, largestId);
+        return Message(
+            kind => messageSnapshot(),
+            sender => 2,
+            receiver => 3,
+            term => 9,
+            index => 100,
+            logTerm => 8,
+            commit => 100,
+            success => true,
+            hint => 0,
+            entries => noEntries(),
+            snapshot => fromLiteral("the state"),
+            members => members
+        );
+    end;
+
+    generic [A: Region, B: Region]
+    function sameMessage(a: &[Message, A], b: &[Message, B]): Bool is
+        if ((((a->kind) /= (b->kind)) or ((a->sender) /= (b->sender))) or ((a->receiver) /= (b->receiver))) or ((a->term) /= (b->term)) then
+            return false;
+        end if;
+        if ((((a->index) /= (b->index)) or ((a->logTerm) /= (b->logTerm))) or ((a->commit) /= (b->commit))) or ((a->hint) /= (b->hint)) then
+            return false;
+        end if;
+        if (a->success) /= (b->success) then
+            return false;
+        end if;
+        if not equal(asSpan(&(a->snapshot)), asSpan(&(b->snapshot))) then
+            return false;
+        end if;
+        let ae: &[Buffer[Entry], A] := &(a->entries);
+        let be: &[Buffer[Entry], B] := &(b->entries);
+        if length(ae) /= length(be) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(ae) do
+            let x: &[Entry, A] := nthRef(ae, i);
+            let y: &[Entry, B] := nthRef(be, i);
+            if (((x->term) /= (y->term)) or ((x->kind) /= (y->kind))) or (not equal(asSpan(&(x->data)), asSpan(&(y->data)))) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        let am: &[Buffer[Nat64], A] := &(a->members);
+        let bm: &[Buffer[Nat64], B] := &(b->members);
+        if length(am) /= length(bm) then
+            return false;
+        end if;
+        var k: Index := 0;
+        while k < length(am) do
+            if nth(am, k) /= nth(bm, k) then
+                return false;
+            end if;
+            k := k + 1;
+        end while;
+        return true;
+    end;
+
+    function roundTrips(message: Message): Bool is
+        let bytes: String := encodeMessage(&message);
+        var same: Bool := false;
+        case decodeMessage(asSpan(&bytes)) of
+            when Some(value as back: Message) do
+                same := sameMessage(&message, &back);
+                destroyMessage(back);
+            when None do
+                skip;
+        end case;
+        destroyString(bytes);
+        destroyMessage(message);
+        return same;
+    end;
+
+    generic [R: Region]
+    function refused(bytes: Span[Nat8, R]): Bool is
+        case decodeMessage(bytes) of
+            when Some(value as message: Message) do
+                destroyMessage(message);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function testRoundTrip(): Unit is
+        assertTrue(frameLimit() = 16777216, "the frame limit");
+        assertTrue(roundTrips(sampleAppend()), "an append and back");
+        assertTrue(roundTrips(sampleSnapshot()), "a snapshot and back");
+        return nil;
+    end;
+
+    -- Every prefix of a message is refused, and so is one more byte.
+    function testTruncatedAndTrailing(): Unit is
+        let message: Message := sampleAppend();
+        let bytes: String := encodeMessage(&message);
+        destroyMessage(message);
+        let size: Index := textLength(&bytes);
+        assertTrue(size > 60, "the probe has its bytes");
+        assertFalse(refused(asSpan(&bytes)), "the whole message is taken");
+        var cut: Index := 0;
+        var refusals: Index := 0;
+        while cut < size do
+            if cut = 0 then
+                if refused("") then
+                    refusals := refusals + 1;
+                end if;
+            else
+                if refused(getSpan(&bytes, 0, cut - 1)) then
+                    refusals := refusals + 1;
+                end if;
+            end if;
+            cut := cut + 1;
+        end while;
+        assertTrue(refusals = size, "every shorter prefix is refused");
+        var longer: String := makeString(size + 1, 0);
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!longer, i, nthByteOf(&bytes, i));
+            i := i + 1;
+        end while;
+        assertTrue(refused(asSpan(&longer)), "a byte after the message is refused");
+        destroyString(longer);
+        destroyString(bytes);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function nthByteOf(text: &[String, R], at: Index): Nat8 is
+        let span: Span[Nat8, R] := asSpan(text);
+        return span[at];
+    end;
+
+    -- A count of entries the bytes cannot hold, a kind no node sends and a
+    -- message to itself.
+    function testRefused(): Unit is
+        let message: Message := sampleAppend();
+        var bytes: String := encodeMessage(&message);
+        destroyMessage(message);
+        -- The count of entries stands after 1 + 6 * 8 + 1 + 8 = 58 bytes.
+        storeNth(&!bytes, 58, allBits);
+        assertTrue(refused(asSpan(&bytes)), "a count of entries too large for the bytes");
+        storeNth(&!bytes, 58, noBits);
+        storeNth(&!bytes, 0, unknownKind);
+        assertTrue(refused(asSpan(&bytes)), "an unknown kind");
+        destroyString(bytes);
+        let vote: Message := Message(
+            kind => messageVote(),
+            sender => 4,
+            receiver => 4,
+            term => 1,
+            index => 0,
+            logTerm => 0,
+            commit => 0,
+            success => false,
+            hint => 0,
+            entries => noEntries(),
+            snapshot => fromLiteral(""),
+            members => noIds()
+        );
+        let self: String := encodeMessage(&vote);
+        destroyMessage(vote);
+        assertTrue(refused(asSpan(&self)), "a message to its own sender");
+        destroyString(self);
+        return nil;
+    end;
+
+    function loopback(): String is
+        var address: String := makeString(4, 0);
+        storeNth(&!address, 0, loopbackFirst);
+        storeNth(&!address, 3, loopbackLast);
+        return address;
+    end;
+
+    -- A snapshot through a TCP connection on 127.0.0.1: written by one end,
+    -- read by the other, equal to what was sent.
+    function testOverTcp(): Unit is
+        let address: String := loopback();
+        case listenTcp(asSpan(&address), 0) of
+            when Some(value as listener: TcpListener) do
+                let port: Nat16 := tcpListenerPort(&listener);
+                case connectTcp(asSpan(&address), port, 5000) of
+                    when Right(right as opened: FileDescriptor) do
+                        var client: FileDescriptor := opened;
+                        let message: Message := sampleSnapshot();
+                        assertTrue(sendMessage(&!client, &message), "the message was sent");
+                        case acceptTcpWithin(&listener, 5000) of
+                            when Some(value as accepted: FileDescriptor) do
+                                var server: FileDescriptor := accepted;
+                                case receiveMessage(&!server) of
+                                    when Some(value as got: Message) do
+                                        assertTrue(sameMessage(&message, &got), "the message arrived as sent");
+                                        destroyMessage(got);
+                                    when None do
+                                        assertTrue(false, "a message arrived");
+                                end case;
+                                assertTrue(closeFile(server), "the server end closed");
+                            when None do
+                                assertTrue(false, "the connection was accepted");
+                        end case;
+                        destroyMessage(message);
+                        assertTrue(closeFile(client), "the client end closed");
+                    when Left(left as failure: ConnectFailure) do
+                        assertTrue(false, "the client connected");
+                end case;
+                assertTrue(closeTcpListener(listener), "the listener closed");
+            when None do
+                assertTrue(false, "a listener on the loopback address");
+        end case;
+        destroyString(address);
+        return nil;
+    end;
+end module body.

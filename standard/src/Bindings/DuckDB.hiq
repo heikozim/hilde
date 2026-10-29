@@ -1,0 +1,1079 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Binds libduckdb through the declarations of Bindings.C.Duckdb.  Every
+-- statement of the caller is a prepared statement whose values are bound
+-- to its question marks, apart from its text.  The result is read through
+-- data chunks, the reader of the C interface that is not deprecated: a
+-- chunk holds up to some thousand rows, a vector per column, and the
+-- current row is an index into it.  The handles go to C by value and by
+-- address, which is written here with @embed against duckdb.h, which the
+-- generated module includes.  It is an unsafe module for that;
+-- Standard.DuckDB is the safe module built on it.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    nullPointer
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    insertBack,
+    remove,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    storeNth,
+    getSpan,
+    length as stringLength
+);
+import Bindings.C.Duckdb (
+    DuckDBSuccess,
+    DUCKDB_TYPE_BOOLEAN,
+    DUCKDB_TYPE_TINYINT,
+    DUCKDB_TYPE_SMALLINT,
+    DUCKDB_TYPE_INTEGER,
+    DUCKDB_TYPE_BIGINT,
+    DUCKDB_TYPE_FLOAT,
+    DUCKDB_TYPE_DOUBLE,
+    DUCKDB_TYPE_TIMESTAMP,
+    DUCKDB_TYPE_TIMESTAMP_TZ,
+    DUCKDB_TYPE_VARCHAR,
+    DUCKDB_TYPE_BLOB,
+    DUCKDB_ERROR_CONSTRAINT,
+    DUCKDB_ERROR_TRANSACTION,
+    DUCKDB_ERROR_CATALOG,
+    DUCKDB_ERROR_PARSER,
+    DUCKDB_ERROR_BINDER,
+    DUCKDB_ERROR_INVALID_INPUT,
+    DUCKDB_ERROR_PERMISSION,
+    duckdb_open_ext,
+    duckdb_close,
+    duckdb_connect,
+    duckdb_disconnect,
+    duckdb_create_config,
+    duckdb_set_config,
+    duckdb_destroy_config,
+    duckdb_free,
+    duckdb_library_version,
+    duckdb_prepare,
+    duckdb_prepare_error,
+    duckdb_destroy_prepare,
+    duckdb_nparams,
+    duckdb_bind_int64,
+    duckdb_bind_double,
+    duckdb_bind_varchar_length,
+    duckdb_bind_blob,
+    duckdb_bind_null,
+    duckdb_execute_prepared,
+    duckdb_query,
+    duckdb_destroy_result,
+    duckdb_result_error,
+    duckdb_result_error_type,
+    duckdb_rows_changed,
+    duckdb_column_count,
+    duckdb_column_type,
+    duckdb_data_chunk_get_size,
+    duckdb_data_chunk_get_vector,
+    duckdb_destroy_data_chunk,
+    duckdb_vector_get_data,
+    duckdb_vector_get_validity
+);
+
+module body Bindings.DuckDB is
+    -- message is a C copy of the words of the last failure, or null.
+    -- inTransaction is true between begin and its commit or rollback, and
+    -- failed is true when a statement failed in that time: DuckDB then
+    -- answers a commit with success and rolls back, so commit asks failed.
+    record Connection: Linear is
+        database: Address[Unit];
+        connection: Address[Unit];
+        message: Address[Nat8];
+        inTransaction: Bool;
+        failed: Bool;
+    end;
+
+    record Transaction: Linear is
+        handle: Address[Unit];
+    end;
+
+    union Value: Linear is
+        case IntValue is
+            value: Int64;
+        case FloatValue is
+            value: Float64;
+        case BoolValue is
+            value: Bool;
+        case TimeValue is
+            value: Int64;
+        case TextValue is
+            value: String;
+        case BytesValue is
+            value: String;
+        case NullValue;
+    end;
+
+    record Values: Linear is
+        items: Buffer[Value];
+    end;
+
+    -- A statement that was run.  result is C memory for a duckdb_result,
+    -- filled when the statement was executed; columns is 0 after a failure
+    -- and for a statement without rows.  chunk is the data chunk of the
+    -- current row or null, size its number of rows and at the index of the
+    -- current row in it.  message is a C copy of the words of the failure,
+    -- or null.
+    record Cursor: Linear is
+        handle: Address[Unit];
+        result: Address[Unit];
+        filled: Bool;
+        columns: Int32;
+        chunk: Address[Unit];
+        size: Nat64;
+        at: Nat64;
+        row: Bool;
+        failure: Int32;
+        message: Address[Nat8];
+        invariant columns >= 0;
+        invariant (not row) or (at < size);
+    end;
+
+    constant openFailed: Int32 := -1;
+    constant newerDatabase: Int32 := -2;
+    constant statementRefused: Int32 := -3;
+    constant duplicateKey: Int32 := -4;
+    constant writeConflict: Int32 := -5;
+    constant failedTransaction: Int32 := -6;
+    constant constraintType: Int32 := DUCKDB_ERROR_CONSTRAINT;
+    constant transactionType: Int32 := DUCKDB_ERROR_TRANSACTION;
+    constant catalogType: Int32 := DUCKDB_ERROR_CATALOG;
+    constant parserType: Int32 := DUCKDB_ERROR_PARSER;
+    constant binderType: Int32 := DUCKDB_ERROR_BINDER;
+    constant invalidInputType: Int32 := DUCKDB_ERROR_INVALID_INPUT;
+    constant permissionType: Int32 := DUCKDB_ERROR_PERMISSION;
+
+    ---
+    --- C memory
+    ---
+
+    function isNull(address: Address[Unit]): Bool is
+        return @embed(Bool, "($1 == NULL)", address);
+    end;
+
+    function isNullBytes(address: Address[Nat8]): Bool is
+        return @embed(Bool, "($1 == NULL)", address);
+    end;
+
+    function sameHandle(a: Address[Unit], b: Address[Unit]): Bool is
+        return @embed(Bool, "($1 == $2)", a, b);
+    end;
+
+    generic [R: Region]
+    function containsZero(value: Span[Nat8, R]): Bool is
+        var i: Index := 0;
+        while i < spanLength(value) do
+            if value[i] = 0 then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    function checkMemory(address: Address[Unit]): Unit is
+        if isNull(address) then
+            abort("Standard.DuckDB: out of memory");
+        end if;
+        return nil;
+    end;
+
+    -- size bytes of zeroed C memory, which release frees.
+    function zeroed(size: Index): Address[Unit] is
+        let address: Address[Unit] := @embed(Address[Unit], "hilde_calloc(1, (size_t)$1 + 1)", size);
+        checkMemory(address);
+        return address;
+    end;
+
+    function release(address: Address[Unit]): Unit is
+        @embed(Unit, "hilde_free($1)", address);
+        return nil;
+    end;
+
+    function releaseBytes(address: Address[Nat8]): Unit is
+        @embed(Unit, "hilde_free($1)", address);
+        return nil;
+    end;
+
+    -- A copy of the span with a zero byte after it; freed with releaseBytes.
+    generic [R: Region]
+    function cCopy(value: Span[Nat8, R]): Address[Nat8] is
+        let size: Index := spanLength(value);
+        let address: Address[Nat8] := @embed(Address[Nat8], "(hilde_nat8_t*)hilde_calloc(1, (size_t)$1 + 1)", size);
+        checkMemory(@embed(Address[Unit], "(void*)$1", address));
+        if size > 0 then
+            @embed(Unit, "memcpy($1, (void*)($2).data, $3)", address, value, size);
+        end if;
+        return address;
+    end;
+
+    -- A copy of the C string at text, freed with releaseBytes; a copy of
+    -- the empty string when text is null.
+    function cCopyOf(text: Address[Nat8]): Address[Nat8] is
+        return cCopy(staticSpan(text));
+    end;
+
+    function staticSpan(text: Address[Nat8]): Span[Nat8, Static] is
+        if isNullBytes(text) then
+            return "";
+        end if;
+        return @embed(Span[Nat8, Static], "hilde_make_span((void*)$1, strlen((const char*)$1))", text);
+    end;
+
+    -- A slot of C memory for one pointer, which an out parameter of
+    -- libduckdb fills; read with slotValue, freed with release.
+    function slot(): Address[Unit] is
+        return zeroed(@embed(Index, "sizeof(void*)"));
+    end;
+
+    function slotValue(at: Address[Unit]): Address[Unit] is
+        return @embed(Address[Unit], "(*(void**)$1)", at);
+    end;
+
+    function slotOf(at: Address[Unit]): Address[Address[Unit]] is
+        return @embed(Address[Address[Unit]], "((void**)$1)", at);
+    end;
+
+    -- A slot that holds value, for a function of libduckdb that takes the
+    -- address of a handle to destroy it.
+    function slotHolding(value: Address[Unit]): Address[Unit] is
+        let at: Address[Unit] := slot();
+        @embed(Unit, "(*(void**)$1 = $2)", at, value);
+        return at;
+    end;
+
+    ---
+    --- Opening and closing
+    ---
+
+    -- duckdb_set_config answers success for a name it does not know
+    -- (measured with libduckdb 1.5.6), so its answer proves nothing; the
+    -- settings are read back after the open by settingsHold.
+    function setOption(config: Address[Unit], name: Span[Nat8, Static], value: Span[Nat8, Static]): Int32 is
+        let key: Address[Nat8] := cCopy(name);
+        let text: Address[Nat8] := cCopy(value);
+        let rc: Int32 := duckdb_set_config(config, key, text);
+        releaseBytes(key);
+        releaseBytes(text);
+        if rc /= DuckDBSuccess then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    -- The configuration of every open: no reading or writing of other
+    -- files from SQL, no extension loaded or fetched, and the
+    -- configuration locked so that a statement cannot change it back.
+    function configure(config: Address[Unit], readOnly: Bool): Int32 is
+        var failures: Int32 := 0;
+        if readOnly then
+            failures := failures + setOption(config, "access_mode", "READ_ONLY");
+        else
+            failures := failures + setOption(config, "access_mode", "READ_WRITE");
+        end if;
+        failures := failures + setOption(config, "enable_external_access", "false");
+        failures := failures + setOption(config, "autoinstall_known_extensions", "false");
+        failures := failures + setOption(config, "autoload_known_extensions", "false");
+        failures := failures + setOption(config, "allow_community_extensions", "false");
+        failures := failures + setOption(config, "lock_configuration", "true");
+        return failures;
+    end;
+
+    function closeHandles(database: Address[Unit], connection: Address[Unit]): Unit is
+        if not isNull(connection) then
+            let at: Address[Unit] := slotHolding(connection);
+            duckdb_disconnect(slotOf(at));
+            release(at);
+        end if;
+        if not isNull(database) then
+            let at: Address[Unit] := slotHolding(database);
+            duckdb_close(slotOf(at));
+            release(at);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function connect(path: Span[Nat8, R], readOnly: Bool): Either[DuckError, Connection] is
+        -- libduckdb ends the path at a zero byte, so a path holding one
+        -- would name another file without a word.  It is refused here.
+        if containsZero(path) then
+            return Left(left => DuckError(code => openFailed));
+        end if;
+        let configSlot: Address[Unit] := slot();
+        if duckdb_create_config(slotOf(configSlot)) /= DuckDBSuccess then
+            release(configSlot);
+            return Left(left => DuckError(code => openFailed));
+        end if;
+        let config: Address[Unit] := slotValue(configSlot);
+        let configured: Int32 := configure(config, readOnly);
+        let databaseSlot: Address[Unit] := slot();
+        let errorSlot: Address[Unit] := slot();
+        var opened: Int32 := 1;
+        if configured = 0 then
+            let name: Address[Nat8] := cCopy(path);
+            opened := duckdb_open_ext(name, slotOf(databaseSlot), config, @embed(Address[Address[Nat8]], "((char**)$1)", errorSlot));
+            releaseBytes(name);
+        end if;
+        duckdb_destroy_config(slotOf(configSlot));
+        release(configSlot);
+        let words: Address[Unit] := slotValue(errorSlot);
+        if not isNull(words) then
+            duckdb_free(words);
+        end if;
+        release(errorSlot);
+        let database: Address[Unit] := slotValue(databaseSlot);
+        release(databaseSlot);
+        let none: Address[Unit] := nullPointer();
+        if opened /= DuckDBSuccess then
+            closeHandles(database, none);
+            return Left(left => DuckError(code => openFailed));
+        end if;
+        let connectionSlot: Address[Unit] := slot();
+        let connected: Int32 := duckdb_connect(database, slotOf(connectionSlot));
+        let connection: Address[Unit] := slotValue(connectionSlot);
+        release(connectionSlot);
+        if connected /= DuckDBSuccess then
+            closeHandles(database, connection);
+            return Left(left => DuckError(code => openFailed));
+        end if;
+        if not settingsHold(connection) then
+            closeHandles(database, connection);
+            return Left(left => DuckError(code => openFailed));
+        end if;
+        let noMessage: Address[Nat8] := nullPointer();
+        return Right(right => Connection(database => database, connection => connection, message => noMessage,
+            inTransaction => false, failed => false));
+    end;
+
+    -- Whether the settings of configure are those of the open database,
+    -- read back from DuckDB: one row of one boolean, true only when every
+    -- one holds.
+    function settingsHold(connection: Address[Unit]): Bool is
+        var cursor: Cursor := run(connection, "SELECT CAST(current_setting('enable_external_access') AS VARCHAR) = 'false' AND CAST(current_setting('autoinstall_known_extensions') AS VARCHAR) = 'false' AND CAST(current_setting('autoload_known_extensions') AS VARCHAR) = 'false' AND CAST(current_setting('allow_community_extensions') AS VARCHAR) = 'false' AND CAST(current_setting('lock_configuration') AS VARCHAR) = 'true'", noValues());
+        var holds: Bool := false;
+        if advance(&!cursor) then
+            if not isNullColumn(&cursor, 0) then
+                holds := columnBool(&cursor, 0);
+            end if;
+        end if;
+        let { handle: Address[Unit], result: Address[Unit], filled: Bool, columns: Int32, chunk: Address[Unit], size: Nat64,
+            at: Nat64, row: Bool, failure: Int32, message: Address[Nat8] } := cursor;
+        destroyChunk(chunk);
+        if filled then
+            duckdb_destroy_result(result);
+        end if;
+        release(result);
+        releaseBytes(message);
+        return holds and (failure = 0);
+    end;
+
+    function closeDatabase(db: Connection): Unit is
+        let { database: Address[Unit], connection: Address[Unit], message: Address[Nat8], inTransaction: Bool, failed: Bool } := db;
+        closeHandles(database, connection);
+        releaseBytes(message);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function lastMessage(db: &[Connection, R]): String is
+        return copyText(staticSpan(db->message));
+    end;
+
+    function libraryVersion(): Span[Nat8, Static] is
+        return staticSpan(duckdb_library_version());
+    end;
+
+    -- Keep message as the last words of the connection, freeing the ones
+    -- before; a null message leaves them.  A failure inside a transaction
+    -- marks it failed.
+    generic [R: Region]
+    function keepMessage(db: &![Connection, R], message: Address[Nat8], failure: Int32): Unit is
+        if not isNullBytes(message) then
+            releaseBytes(db->message);
+            db->message := message;
+        end if;
+        if (failure /= 0) and db->inTransaction then
+            db->failed := true;
+        end if;
+        return nil;
+    end;
+
+    ---
+    --- Values
+    ---
+
+    function noValues(): Values is
+        let items: Buffer[Value] := allocateEmpty();
+        return Values(items => items);
+    end;
+
+    function withValue(values: Values, value: Value): Values is
+        let { items: Buffer[Value] } := values;
+        var list: Buffer[Value] := items;
+        insertBack(&!list, value);
+        return Values(items => list);
+    end;
+
+    function withInt64(values: Values, value: Int64): Values is
+        return withValue(values, IntValue(value => value));
+    end;
+
+    function withFloat64(values: Values, value: Float64): Values is
+        return withValue(values, FloatValue(value => value));
+    end;
+
+    function withBool(values: Values, value: Bool): Values is
+        return withValue(values, BoolValue(value => value));
+    end;
+
+    function withTimestamp(values: Values, value: Int64): Values is
+        return withValue(values, TimeValue(value => value));
+    end;
+
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values is
+        return withValue(values, TextValue(value => copyText(value)));
+    end;
+
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values is
+        return withValue(values, BytesValue(value => copyText(value)));
+    end;
+
+    function withNull(values: Values): Values is
+        return withValue(values, NullValue());
+    end;
+
+    function dropValues(values: Values): Unit is
+        let { items: Buffer[Value] } := values;
+        var list: Buffer[Value] := items;
+        while bufferLength(&list) > 0 do
+            dropValue(remove(&!list, 0));
+        end while;
+        destroyEmpty(list);
+        return nil;
+    end;
+
+    function dropValue(item: Value): Unit is
+        case item of
+            when TextValue(value as s: String) do
+                destroyString(s);
+            when BytesValue(value as s: String) do
+                destroyString(s);
+            when IntValue(value as v: Int64) do
+                skip;
+            when FloatValue(value as v: Float64) do
+                skip;
+            when BoolValue(value as v: Bool) do
+                skip;
+            when TimeValue(value as v: Int64) do
+                skip;
+            when NullValue do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index is
+        return bufferLength(&(values->items));
+    end;
+
+    generic [R: Region]
+    function bytesOf(text: &[String, R]): Span[Nat8, R] is
+        let size: Index := stringLength(text);
+        if size = 0 then
+            return @embed(Span[Nat8, R], "hilde_make_span((void*)\"\", 0)");
+        end if;
+        return getSpan(text, 0, size - 1);
+    end;
+
+    -- Bind the values to the question marks of statement, the first to
+    -- number 1; 0, or 1 when libduckdb refused one.  The values are
+    -- consumed.
+    function bindAll(statement: Address[Unit], values: Values): Int32 is
+        let { items: Buffer[Value] } := values;
+        var list: Buffer[Value] := items;
+        var failures: Int32 := 0;
+        var number: Nat64 := 1;
+        while bufferLength(&list) > 0 do
+            var rc: Int32 := DuckDBSuccess;
+            case remove(&!list, 0) of
+                when IntValue(value as v: Int64) do
+                    rc := duckdb_bind_int64(statement, number, v);
+                when FloatValue(value as v: Float64) do
+                    rc := duckdb_bind_double(statement, number, v);
+                when BoolValue(value as v: Bool) do
+                    rc := @embed(Int32, "(int32_t)duckdb_bind_boolean((duckdb_prepared_statement)$1, (idx_t)$2, $3)", statement, number, v);
+                when TimeValue(value as v: Int64) do
+                    rc := @embed(Int32, "(int32_t)duckdb_bind_timestamp((duckdb_prepared_statement)$1, (idx_t)$2, (duckdb_timestamp){ .micros = $3 })", statement, number, v);
+                when TextValue(value as s: String) do
+                    let size: Nat64 := @embed(Nat64, "(uint64_t)$1", stringLength(&s));
+                    rc := duckdb_bind_varchar_length(statement, number, @embed(Address[Nat8], "(hilde_nat8_t*)($1).data", bytesOf(&s)), size);
+                    destroyString(s);
+                when BytesValue(value as s: String) do
+                    let size: Nat64 := @embed(Nat64, "(uint64_t)$1", stringLength(&s));
+                    rc := duckdb_bind_blob(statement, number, @embed(Address[Unit], "(void*)($1).data", bytesOf(&s)), size);
+                    destroyString(s);
+                when NullValue do
+                    rc := duckdb_bind_null(statement, number);
+            end case;
+            if rc /= DuckDBSuccess then
+                failures := 1;
+            end if;
+            number := number + 1;
+        end while;
+        destroyEmpty(list);
+        return failures;
+    end;
+
+    ---
+    --- Errors
+    ---
+
+    -- The code of the failure kept in result: the error type of DuckDB,
+    -- which names one type for every constraint and one for every
+    -- conflict of transactions.  A unique or primary key, which DuckDB
+    -- reports as Duplicate key, and a conflict between two writers are
+    -- told apart by its words.  An error type of 0 or less would read as
+    -- no failure here, so it is statementRefused.
+    function codeOf(result: Address[Unit]): Int32 is
+        let kind: Int32 := duckdb_result_error_type(result);
+        let words: Address[Nat8] := duckdb_result_error(result);
+        -- Outside a transaction DuckDB writes Duplicate key, inside one
+        -- duplicate key (measured with libduckdb 1.5.6).
+        let duplicate: Bool := @embed(Bool, "($1 != NULL && (strstr((const char*)$1, \"Duplicate key\") != NULL || strstr((const char*)$1, \"duplicate key\") != NULL))", words);
+        let conflict: Bool := @embed(Bool, "($1 != NULL && strstr((const char*)$1, \"onflict\") != NULL)", words);
+        if (kind = DUCKDB_ERROR_CONSTRAINT) and duplicate then
+            return duplicateKey;
+        else if (kind = DUCKDB_ERROR_TRANSACTION) and conflict then
+            return writeConflict;
+        else if kind <= 0 then
+            return statementRefused;
+        end if;
+        return kind;
+    end;
+
+    -- The code of a failed prepare, for which libduckdb gives words only:
+    -- DuckDB begins them with the name of the error type.
+    function codeOfWords(words: Address[Nat8]): Int32 is
+        if startsWith(words, "Permission Error:") then
+            return permissionType;
+        else if startsWith(words, "Catalog Error:") then
+            return catalogType;
+        else if startsWith(words, "Parser Error:") then
+            return parserType;
+        else if startsWith(words, "Binder Error:") then
+            return binderType;
+        else if startsWith(words, "Invalid Input Error:") then
+            return invalidInputType;
+        end if;
+        return statementRefused;
+    end;
+
+    function startsWith(words: Address[Nat8], prefix: Span[Nat8, Static]): Bool is
+        return @embed(Bool, "($1 != NULL && strncmp((const char*)$1, (const char*)($2).data, ($2).size) == 0)", words, prefix);
+    end;
+
+    ---
+    --- Running a statement
+    ---
+
+    -- Prepare sql, check that the values match its question marks, bind
+    -- them and execute it.  Each step runs only when the one before
+    -- worked; the values are consumed and the prepared statement destroyed
+    -- on every path, as libduckdb asks even after a failed prepare.
+    generic [S: Region]
+    function run(handle: Address[Unit], sql: Span[Nat8, S], values: Values): Cursor is
+        let result: Address[Unit] := zeroed(@embed(Index, "sizeof(duckdb_result)"));
+        let statementSlot: Address[Unit] := slot();
+        var failure: Int32 := 0;
+        var message: Address[Nat8] := nullPointer();
+        var prepared: Bool := false;
+        if containsZero(sql) then
+            failure := statementRefused;
+            message := cCopy("a statement holding a zero byte");
+        else
+            let text: Address[Nat8] := cCopy(sql);
+            let rc: Int32 := duckdb_prepare(handle, text, slotOf(statementSlot));
+            releaseBytes(text);
+            prepared := true;
+            if rc /= DuckDBSuccess then
+                failure := codeOfWords(duckdb_prepare_error(slotValue(statementSlot)));
+                message := cCopyOf(duckdb_prepare_error(slotValue(statementSlot)));
+            else if duckdb_nparams(slotValue(statementSlot)) /= @embed(Nat64, "(uint64_t)$1", valueCount(&values)) then
+                failure := statementRefused;
+                message := cCopy("the values do not match the question marks of the statement");
+            end if;
+        end if;
+        if failure /= 0 then
+            dropValues(values);
+        else if bindAll(slotValue(statementSlot), values) /= 0 then
+            failure := statementRefused;
+            message := cCopy("a value could not be bound to its question mark");
+        end if;
+        var filled: Bool := false;
+        if failure = 0 then
+            filled := true;
+            if duckdb_execute_prepared(slotValue(statementSlot), result) /= DuckDBSuccess then
+                failure := codeOf(result);
+                message := cCopyOf(duckdb_result_error(result));
+            end if;
+        end if;
+        if prepared then
+            duckdb_destroy_prepare(slotOf(statementSlot));
+        end if;
+        release(statementSlot);
+        var columns: Int32 := 0;
+        if failure = 0 then
+            columns := @embed(Int32, "(int32_t)$1", duckdb_column_count(result));
+        end if;
+        let none: Address[Unit] := nullPointer();
+        let zero: Nat64 := 0;
+        return Cursor(handle => handle, result => result, filled => filled, columns => columns, chunk => none, size => zero,
+            at => zero, row => false, failure => failure, message => message);
+    end;
+
+    generic [R: Region, S: Region]
+    function start(db: &![Connection, R], sql: Span[Nat8, S], values: Values): Cursor is
+        return run(db->connection, sql, values);
+    end;
+
+    generic [R: Region]
+    function rowsChanged(cursor: &[Cursor, R]): Nat64 is
+        if cursor->failure /= 0 then
+            let zero: Nat64 := 0;
+            return zero;
+        end if;
+        return duckdb_rows_changed(cursor->result);
+    end;
+
+    generic [R: Region, S: Region]
+    function execute(db: &![Connection, R], sql: Span[Nat8, S], values: Values): Either[DuckError, Nat64] is
+        let cursor: Cursor := run(db->connection, sql, values);
+        let count: Nat64 := rowsChanged(&cursor);
+        case finish(&~db, cursor) of
+            when Some(value as error: DuckError) do
+                return Left(left => error);
+            when None do
+                return Right(right => count);
+        end case;
+    end;
+
+    function destroyChunk(chunk: Address[Unit]): Unit is
+        if not isNull(chunk) then
+            let at: Address[Unit] := slotHolding(chunk);
+            duckdb_destroy_data_chunk(slotOf(at));
+            release(at);
+        end if;
+        return nil;
+    end;
+
+    -- The next row: the next index of the chunk, or the first row of the
+    -- next chunk that has one.  false at the end and after a failure.
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool is
+        if (cursor->failure /= 0) or (cursor->columns = 0) then
+            return false;
+        end if;
+        let one: Nat64 := 1;
+        if cursor->row and ((cursor->at + one) < cursor->size) then
+            cursor->at := cursor->at + one;
+            return true;
+        end if;
+        let zero: Nat64 := 0;
+        while true do
+            destroyChunk(cursor->chunk);
+            let chunk: Address[Unit] := @embed(Address[Unit], "(void*)duckdb_fetch_chunk(*(duckdb_result*)$1)", cursor->result);
+            cursor->chunk := chunk;
+            cursor->at := zero;
+            if isNull(chunk) then
+                cursor->size := zero;
+                cursor->row := false;
+                return false;
+            end if;
+            cursor->size := duckdb_data_chunk_get_size(chunk);
+            if cursor->size > zero then
+                cursor->row := true;
+                return true;
+            end if;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region]
+    function columnCount(cursor: &[Cursor, R]): Int32 is
+        if cursor->failure /= 0 then
+            return 0;
+        end if;
+        return cursor->columns;
+    end;
+
+    generic [R: Region]
+    function checkCell(cursor: &[Cursor, R], index: Int32): Unit is
+        if (cursor->failure /= 0) or (not cursor->row) then
+            abort("Standard.DuckDB: a column was read without a current row");
+        end if;
+        if index >= cursor->columns then
+            abort("Standard.DuckDB: a column past the last one was read");
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function vectorOf(cursor: &[Cursor, R], index: Int32): Address[Unit] is
+        checkCell(cursor, index);
+        return duckdb_data_chunk_get_vector(cursor->chunk, @embed(Nat64, "(uint64_t)$1", index));
+    end;
+
+    generic [R: Region]
+    function typeOf(cursor: &[Cursor, R], index: Int32): Int32 is
+        return duckdb_column_type(cursor->result, @embed(Nat64, "(uint64_t)$1", index));
+    end;
+
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool is
+        let validity: Address[Nat64] := duckdb_vector_get_validity(vectorOf(cursor, index));
+        if @embed(Bool, "($1 == NULL)", validity) then
+            return false;
+        end if;
+        return not @embed(Bool, "duckdb_validity_row_is_valid((uint64_t*)$1, (idx_t)$2)", validity, cursor->at);
+    end;
+
+    -- The data of the column's vector, after the checks every reader
+    -- makes: a current row, a column there, and not null.
+    generic [R: Region]
+    function dataOf(cursor: &[Cursor, R], index: Int32): Address[Unit] is
+        if isNullColumn(cursor, index) then
+            abort("Standard.DuckDB: a null column was read as a value; read it as an Option");
+        end if;
+        return duckdb_vector_get_data(vectorOf(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64 is
+        let data: Address[Unit] := dataOf(cursor, index);
+        let kind: Int32 := typeOf(cursor, index);
+        if kind = DUCKDB_TYPE_BIGINT then
+            return @embed(Int64, "((int64_t*)$1)[$2]", data, cursor->at);
+        else if kind = DUCKDB_TYPE_INTEGER then
+            return @embed(Int64, "(int64_t)((int32_t*)$1)[$2]", data, cursor->at);
+        else if kind = DUCKDB_TYPE_SMALLINT then
+            return @embed(Int64, "(int64_t)((int16_t*)$1)[$2]", data, cursor->at);
+        else if kind = DUCKDB_TYPE_TINYINT then
+            return @embed(Int64, "(int64_t)((int8_t*)$1)[$2]", data, cursor->at);
+        end if;
+        abort("Standard.DuckDB: the column is not a signed integer of 64 bits or fewer");
+    end;
+
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64 is
+        let data: Address[Unit] := dataOf(cursor, index);
+        let kind: Int32 := typeOf(cursor, index);
+        if kind = DUCKDB_TYPE_DOUBLE then
+            return @embed(Float64, "((double*)(void*)$1)[$2]", data, cursor->at);
+        else if kind = DUCKDB_TYPE_FLOAT then
+            return @embed(Float64, "(double)((float*)(void*)$1)[$2]", data, cursor->at);
+        end if;
+        abort("Standard.DuckDB: the column is not a DOUBLE or a FLOAT");
+    end;
+
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool is
+        let data: Address[Unit] := dataOf(cursor, index);
+        if typeOf(cursor, index) /= DUCKDB_TYPE_BOOLEAN then
+            abort("Standard.DuckDB: the column is not a BOOLEAN");
+        end if;
+        -- The byte is read as a byte: a bool read of a byte that is not 0
+        -- or 1 would be undefined in C.
+        return @embed(Bool, "(((const uint8_t*)$1)[$2] != 0)", data, cursor->at);
+    end;
+
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64 is
+        let data: Address[Unit] := dataOf(cursor, index);
+        let kind: Int32 := typeOf(cursor, index);
+        if (kind /= DUCKDB_TYPE_TIMESTAMP) and (kind /= DUCKDB_TYPE_TIMESTAMP_TZ) then
+            abort("Standard.DuckDB: the column is not a TIMESTAMP");
+        end if;
+        return @embed(Int64, "((duckdb_timestamp*)$1)[$2].micros", data, cursor->at);
+    end;
+
+    -- The bytes of a varchar or blob of the current row, which live in the
+    -- chunk: a span from it lasts while the row is lent.
+    generic [R: Region]
+    function stringAt(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        let data: Address[Unit] := dataOf(cursor, index);
+        return @embed(Span[Nat8, R], "hilde_make_span((void*)duckdb_string_t_data(&((duckdb_string_t*)$1)[$2]), (size_t)duckdb_string_t_length(((duckdb_string_t*)$1)[$2]))", data, cursor->at);
+    end;
+
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        if typeOf(cursor, index) /= DUCKDB_TYPE_VARCHAR then
+            abort("Standard.DuckDB: the column is not a VARCHAR");
+        end if;
+        return stringAt(cursor, index);
+    end;
+
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        let kind: Int32 := typeOf(cursor, index);
+        if (kind /= DUCKDB_TYPE_BLOB) and (kind /= DUCKDB_TYPE_VARCHAR) then
+            abort("Standard.DuckDB: the column is not a BLOB");
+        end if;
+        return stringAt(cursor, index);
+    end;
+
+    -- End a cursor: its chunk, its result and its memory.  The connection
+    -- keeps the words of a failure.
+    generic [R: Region]
+    function finish(db: &![Connection, R], cursor: Cursor): Option[DuckError] is
+        let { handle: Address[Unit], result: Address[Unit], filled: Bool, columns: Int32, chunk: Address[Unit], size: Nat64,
+            at: Nat64, row: Bool, failure: Int32, message: Address[Nat8] } := cursor;
+        if not sameHandle(handle, db->connection) then
+            abort("Standard.DuckDB: a statement was finished on another connection than it was started on");
+        end if;
+        destroyChunk(chunk);
+        if filled then
+            duckdb_destroy_result(result);
+        end if;
+        release(result);
+        keepMessage(&~db, message, failure);
+        if failure /= 0 then
+            return Some(value => DuckError(code => failure));
+        end if;
+        return None();
+    end;
+
+    -- Run sql, which may hold several statements, with no values: the
+    -- statements of a transaction and of a migration.  0, or the code of
+    -- the failure, whose words the connection keeps.
+    generic [R: Region]
+    function runScript(db: &![Connection, R], text: Address[Nat8]): Int32 is
+        let result: Address[Unit] := zeroed(@embed(Index, "sizeof(duckdb_result)"));
+        var failure: Int32 := 0;
+        if duckdb_query(db->connection, text, result) /= DuckDBSuccess then
+            failure := codeOf(result);
+            keepMessage(&~db, cCopyOf(duckdb_result_error(result)), failure);
+        end if;
+        duckdb_destroy_result(result);
+        release(result);
+        return failure;
+    end;
+
+    generic [R: Region]
+    function runStatic(db: &![Connection, R], sql: Span[Nat8, Static]): Int32 is
+        let text: Address[Nat8] := cCopy(sql);
+        let failure: Int32 := runScript(&~db, text);
+        releaseBytes(text);
+        return failure;
+    end;
+
+    ---
+    --- Transactions
+    ---
+
+    generic [R: Region]
+    function begin(db: &![Connection, R]): Either[DuckError, Transaction] is
+        let failure: Int32 := runStatic(&~db, "BEGIN TRANSACTION");
+        if failure /= 0 then
+            return Left(left => DuckError(code => failure));
+        end if;
+        db->inTransaction := true;
+        db->failed := false;
+        return Right(right => Transaction(handle => db->connection));
+    end;
+
+    generic [R: Region]
+    function commit(db: &![Connection, R], transaction: Transaction): Either[DuckError, Unit] is
+        let { handle: Address[Unit] } := transaction;
+        if not sameHandle(handle, db->connection) then
+            abort("Standard.DuckDB: a transaction was committed on another connection than it was begun on");
+        end if;
+        let failed: Bool := db->failed;
+        db->inTransaction := false;
+        db->failed := false;
+        if failed then
+            let back: Int32 := runStatic(&~db, "ROLLBACK");
+            return Left(left => DuckError(code => failedTransaction));
+        end if;
+        let failure: Int32 := runStatic(&~db, "COMMIT");
+        if failure /= 0 then
+            let back: Int32 := runStatic(&~db, "ROLLBACK");
+            return Left(left => DuckError(code => failure));
+        end if;
+        return Right(right => nil);
+    end;
+
+    generic [R: Region]
+    function rollback(db: &![Connection, R], transaction: Transaction): Unit is
+        let { handle: Address[Unit] } := transaction;
+        if not sameHandle(handle, db->connection) then
+            abort("Standard.DuckDB: a transaction was rolled back on another connection than it was begun on");
+        end if;
+        db->inTransaction := false;
+        db->failed := false;
+        let back: Int32 := runStatic(&~db, "ROLLBACK");
+        return nil;
+    end;
+
+    ---
+    --- Migrations
+    ---
+
+    -- The highest version in the ledger.
+    generic [R: Region]
+    function ledgerVersion(db: &![Connection, R]): Either[DuckError, Index] is
+        var cursor: Cursor := run(db->connection, "SELECT CAST(COALESCE(MAX(version), 0) AS BIGINT) FROM hilde_migrations", noValues());
+        var version: Index := 0;
+        if advance(&!cursor) then
+            case toIndex(columnInt64(&cursor, 0)) of
+                when Some(value as v: Index) do
+                    version := v;
+                when None do
+                    skip;
+            end case;
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DuckError) do
+                return Left(left => error);
+            when None do
+                return Right(right => version);
+        end case;
+    end;
+
+    function indexInt64(value: Index): Int64 is
+        case toInt64(value) of
+            when Some(value as v: Int64) do
+                return v;
+            when None do
+                abort("Standard.DuckDB: a migration number past Int64");
+        end case;
+    end;
+
+    -- Run one migration and write its number in the ledger, in one
+    -- transaction: DuckDB changes the form of a table inside a
+    -- transaction, so a migration that fails half way leaves nothing.
+    generic [R: Region]
+    function applyOne(db: &![Connection, R], script: Span[Nat8, Static], number: Index): Int32 is
+        var failure: Int32 := runStatic(&~db, "BEGIN TRANSACTION");
+        if failure /= 0 then
+            return failure;
+        end if;
+        let text: Address[Nat8] := cCopy(script);
+        failure := runScript(&~db, text);
+        releaseBytes(text);
+        if failure = 0 then
+            case execute(&~db, "INSERT INTO hilde_migrations (version) VALUES (?)", withInt64(noValues(), indexInt64(number))) of
+                when Left(left as error: DuckError) do
+                    failure := error.code;
+                when Right(right as count: Nat64) do
+                    skip;
+            end case;
+        end if;
+        if failure = 0 then
+            failure := runStatic(&~db, "COMMIT");
+        end if;
+        if failure /= 0 then
+            let back: Int32 := runStatic(&~db, "ROLLBACK");
+        end if;
+        return failure;
+    end;
+
+    -- A file of DuckDB is opened for writing by one programme at a time,
+    -- which the file lock of DuckDB holds, so no lock is taken here.
+    generic [R: Region]
+    function migrate(db: &![Connection, R], migrations: Span[Nat8, Static]): Either[DuckError, Index] is
+        var failure: Int32 := runStatic(&~db, "CREATE TABLE IF NOT EXISTS hilde_migrations (version BIGINT PRIMARY KEY, applied_at TIMESTAMP NOT NULL DEFAULT current_timestamp)");
+        if failure /= 0 then
+            return Left(left => DuckError(code => failure));
+        end if;
+        var have: Index := 0;
+        case ledgerVersion(&~db) of
+            when Left(left as error: DuckError) do
+                failure := error.code;
+            when Right(right as v: Index) do
+                have := v;
+        end case;
+        var at: Index := 0;
+        var number: Index := 0;
+        var applied: Index := 0;
+        let total: Index := spanLength(migrations);
+        while (failure = 0) and (at < total) do
+            var size: Index := 0;
+            while digitAt(migrations, at) do
+                size := ((size * 10) + byteIndex(migrations[at])) - 48;
+                at := at + 1;
+            end while;
+            at := at + 1;
+            number := number + 1;
+            if number > have then
+                failure := applyOne(&~db, spanPart(migrations, at, size), number);
+                if failure = 0 then
+                    applied := applied + 1;
+                end if;
+            end if;
+            at := at + size;
+        end while;
+        if failure /= 0 then
+            return Left(left => DuckError(code => failure));
+        end if;
+        if have > number then
+            return Left(left => DuckError(code => newerDatabase));
+        end if;
+        return Right(right => applied);
+    end;
+
+    function digitAt(migrations: Span[Nat8, Static], at: Index): Bool is
+        if at >= spanLength(migrations) then
+            return false;
+        end if;
+        let b: Nat8 := migrations[at];
+        return (b >= '0') and (b <= '9');
+    end;
+
+    function byteIndex(b: Nat8): Index is
+        case toIndex(b) of
+            when Some(value as v: Index) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    ---
+    --- Text
+    ---
+
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): String is
+        let size: Index := spanLength(text);
+        var copy: String := makeString(size, '0');
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!copy, i, text[i]);
+            i := i + 1;
+        end while;
+        return copy;
+    end;
+end module body.

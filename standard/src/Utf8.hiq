@@ -1,0 +1,321 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    writeByte
+);
+
+module body Standard.Utf8 is
+    record CodePoint: Free is
+        scalar: Nat32;
+    end;
+
+    record Decoded: Free is
+        point: CodePoint;
+        width: Index;
+    end;
+
+    -- The boundaries, written once.  The surrogate range is the block UTF-16
+    -- reserved for its own pairs; UTF-8 may not carry it, and a decoder that
+    -- does produces bytes no other decoder will read back.
+    constant maxScalar: Nat32 := 1114111;
+    constant firstSurrogate: Nat32 := 55296;
+    constant lastSurrogate: Nat32 := 57343;
+
+    -- The powers of two this file needs.  There is no shift operator, so
+    -- the bit work is multiplication and division; naming the numbers keeps
+    -- the arithmetic readable as the bit work it is.
+    constant twoToSix: Nat32 := 64;
+    constant twoToTwelve: Nat32 := 4096;
+    constant twoToEighteen: Nat32 := 262144;
+
+    ---
+    --- Internal: the conversions the typeclasses make Options
+    ---
+
+    -- A Nat8 always fits a Nat32.  The Option exists because the conversion
+    -- is a typeclass method and the typeclass cannot be told that; the
+    -- None branch is unreachable and returns a value that fails every test
+    -- below rather than one that passes any.
+    function widen(byte: Nat8): Nat32 is
+        case toNat32(byte) of
+            when Some(value as wide: Nat32) do
+                return wide;
+            when None do
+                return maxScalar;
+        end case;
+    end;
+
+    -- The other direction is a real narrowing, but every caller below has
+    -- already masked the value into 0..255.
+    function narrow(value: Nat32): Nat8 is
+        case toNat8(value) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function isContinuation(byte: Nat8): Bool is
+        let wide: Nat32 := widen(byte);
+        if wide < 128 then
+            return false;
+        end if;
+        return wide < 192;
+    end;
+
+    -- The low six bits of a continuation byte.
+    function tail(byte: Nat8): Nat32 is
+        return widen(byte) - 128;
+    end;
+
+    function isSurrogate(scalar: Nat32): Bool is
+        if scalar < firstSurrogate then
+            return false;
+        end if;
+        return scalar <= lastSurrogate;
+    end;
+
+    ---
+    --- A scalar value
+    ---
+
+    function makeCodePoint(scalar: Nat32): Option[CodePoint] is
+        var refused: Bool := false;
+        if scalar > maxScalar then
+            refused := true;
+        end if;
+        if isSurrogate(scalar) then
+            refused := true;
+        end if;
+        if refused then
+            let none: Option[CodePoint] := None();
+            return none;
+        end if;
+        let some: Option[CodePoint] := Some(value => CodePoint(scalar => scalar));
+        return some;
+    end;
+
+    function codePointValue(point: CodePoint): Nat32 is
+        return point.scalar;
+    end;
+
+    function encodedWidth(point: CodePoint): Index is
+        let scalar: Nat32 := point.scalar;
+        if scalar < 128 then
+            return 1;
+        end if;
+        if scalar < 2048 then
+            return 2;
+        end if;
+        if scalar < 65536 then
+            return 3;
+        end if;
+        return 4;
+    end;
+
+    function decodedPoint(decoded: Decoded): CodePoint is
+        return decoded.point;
+    end;
+
+    function decodedWidth(decoded: Decoded): Index is
+        return decoded.width;
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    -- Build the answer, after every check has been made.
+    function decodedOf(scalar: Nat32, width: Index): Option[Decoded] is
+        case makeCodePoint(scalar) of
+            when Some(value as point: CodePoint) do
+                let some: Option[Decoded] :=
+                    Some(value => Decoded(point => point, width => width));
+                return some;
+            when None do
+                -- A surrogate or a value above the maximum, written in
+                -- bytes that were otherwise well formed.  RFC 3629 refuses
+                -- it and so does this.
+                let none: Option[Decoded] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function decodeAt(text: Span[Nat8, R], at: Index): Option[Decoded] is
+        let size: Index := spanLength(text);
+        let none: Option[Decoded] := None();
+        if at >= size then
+            return none;
+        end if;
+        let lead: Nat32 := widen(text[at]);
+
+        -- One byte: 0xxxxxxx.
+        if lead < 128 then
+            return decodedOf(lead, 1);
+        end if;
+
+        -- A continuation byte where a leader belongs, or 0xC0 / 0xC1, which
+        -- can only ever begin an overlong two-byte form.
+        if lead < 194 then
+            return none;
+        end if;
+
+        -- Two bytes: 110xxxxx 10xxxxxx.
+        if lead < 224 then
+            if (at + 1) >= size then
+                return none;
+            end if;
+            if not isContinuation(text[at + 1]) then
+                return none;
+            end if;
+            let scalar: Nat32 :=
+                ((lead - 192) * twoToSix) + tail(text[at + 1]);
+            -- No overlong check is needed here and that is not an omission:
+            -- leaders 0xC0 and 0xC1 were refused above, and every leader
+            -- from 0xC2 up puts the scalar at 128 or more.
+            return decodedOf(scalar, 2);
+        end if;
+
+        -- Three bytes: 1110xxxx 10xxxxxx 10xxxxxx.
+        if lead < 240 then
+            if (at + 2) >= size then
+                return none;
+            end if;
+            if not isContinuation(text[at + 1]) then
+                return none;
+            end if;
+            if not isContinuation(text[at + 2]) then
+                return none;
+            end if;
+            -- Every binary operation is parenthesised: the language has no
+            -- precedence to fall back on, and a + b + c is a parse error.
+            let scalar: Nat32 :=
+                (((lead - 224) * twoToTwelve)
+                +(tail(text[at + 1]) * twoToSix))
+                +tail(text[at + 2]);
+            if scalar < 2048 then
+                -- Overlong: two bytes would have held it.
+                return none;
+            end if;
+            return decodedOf(scalar, 3);
+        end if;
+
+        -- Four bytes: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx.
+        if lead < 245 then
+            if (at + 3) >= size then
+                return none;
+            end if;
+            if not isContinuation(text[at + 1]) then
+                return none;
+            end if;
+            if not isContinuation(text[at + 2]) then
+                return none;
+            end if;
+            if not isContinuation(text[at + 3]) then
+                return none;
+            end if;
+            let scalar: Nat32 :=
+                ((((lead - 240) * twoToEighteen)
+                +(tail(text[at + 1]) * twoToTwelve))
+                +(tail(text[at + 2]) * twoToSix))
+                +tail(text[at + 3]);
+            if scalar < 65536 then
+                -- Overlong: three bytes would have held it.
+                return none;
+            end if;
+            return decodedOf(scalar, 4);
+        end if;
+
+        -- 0xF5 and above: no scalar value needs them, because the largest
+        -- one is U+10FFFF and its leader is 0xF4.
+        return none;
+    end;
+
+    generic [R: Region]
+    function countCodePoints(text: Span[Nat8, R]): Option[Index] is
+        let size: Index := spanLength(text);
+        var at: Index := 0;
+        var found: Index := 0;
+        var broken: Bool := false;
+        -- A while loop and not a for: the step is the width of whatever was
+        -- decoded, which is not known before it is decoded.
+        while at < size do
+            case decodeAt(text, at) of
+                when Some(value as decoded: Decoded) do
+                    found := found + 1;
+                    at := at + decodedWidth(decoded);
+                when None do
+                    broken := true;
+                    -- Leave the loop the only way a while can be left
+                    -- without a break: make its condition false.
+                    at := size;
+            end case;
+        end while;
+        if broken then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        let some: Option[Index] := Some(value => found);
+        return some;
+    end;
+
+    generic [R: Region]
+    function isValid(text: Span[Nat8, R]): Bool is
+        case countCodePoints(text) of
+            when Some(value as found: Index) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    generic [R: Region]
+    function appendCodePoint(builder: &![StringBuilder, R],
+        point: CodePoint): Unit is
+        let scalar: Nat32 := point.scalar;
+        if scalar < 128 then
+            -- &~ here as in every other branch: a plain builder
+            -- would consume the reference in one branch and not in the
+            -- others, which the linearity checker measures against each
+            -- other and refuses.
+            writeByte(&~builder, narrow(scalar));
+            return nil;
+        end if;
+        if scalar < 2048 then
+            writeByte(&~builder, narrow((scalar / twoToSix) + 192));
+            writeByte(&~builder, narrow(rem(scalar, twoToSix) + 128));
+            return nil;
+        end if;
+        if scalar < 65536 then
+            writeByte(&~builder, narrow((scalar / twoToTwelve) + 224));
+            writeByte(&~builder,
+                narrow(rem(scalar / twoToSix, twoToSix) + 128));
+            writeByte(&~builder, narrow(rem(scalar, twoToSix) + 128));
+            return nil;
+        end if;
+        writeByte(&~builder, narrow((scalar / twoToEighteen) + 240));
+        writeByte(&~builder,
+            narrow(rem(scalar / twoToTwelve, twoToSix) + 128));
+        writeByte(&~builder,
+            narrow(rem(scalar / twoToSix, twoToSix) + 128));
+        writeByte(&~builder, narrow(rem(scalar, twoToSix) + 128));
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,975 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    makeEmpty,
+    makeString,
+    storeNth,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    Listener,
+    TcpListener,
+    ConnectFailure,
+    listenUnix,
+    acceptWithin,
+    connectUnix,
+    closeListener,
+    removeFile,
+    listenTcp,
+    tcpListenerPort,
+    closeTcpListener,
+    connectTcp,
+    readAll,
+    writeAll,
+    closeFile
+);
+import Standard.Fcgi (
+    RecordHeader,
+    typeBeginRequest,
+    typeAbortRequest,
+    typeEndRequest,
+    typeParams,
+    typeStdin,
+    typeStdout,
+    typeGetValues,
+    typeGetValuesResult,
+    typeUnknown,
+    readHeader,
+    headerKind,
+    headerRequestId,
+    recordLength,
+    readContent,
+    pairCount,
+    nthPairName,
+    nthPairValue,
+    makeRecord,
+    makePair
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    closeScope,
+    spawn,
+    join,
+    sleepFor
+);
+import Standard.Signal (
+    Signals,
+    Wanted,
+    watchSignals,
+    stopWatching
+);
+import Standard.Text (
+    contains,
+    startsWith
+);
+import Standard.FcgiServer (
+    Limits,
+    Request,
+    Ending,
+    Finished,
+    TimedOut,
+    Malformed,
+    TooLarge,
+    WriteFailed,
+    defaultLimits,
+    makeRequest,
+    requestParam,
+    requestParams,
+    requestBody,
+    destroyRequest,
+    isFieldValue,
+    isHeaderBlock,
+    reasonPhrase,
+    cgiResponse,
+    cgiResponseWith,
+    serveConnection,
+    serveUnix,
+    serveTcp,
+    serveUnixUntil
+);
+import Standard.Context (
+    Context,
+    Derived,
+    Canceller,
+    background,
+    withTimeout,
+    cancel,
+    destroyContext
+);
+import Standard.Time (
+    monotonicNanos
+);
+
+module body Standard.FcgiServer.Test is
+    ---
+    --- What a web server sends
+    ---
+
+    -- The body of FCGI_BEGIN_REQUEST: the role, the keep flag, five zeros.
+    function beginBody(role: Nat8, keep: Bool): String is
+        var input: String := makeString(8, 0);
+        storeNth(&!input, 1, role);
+        if keep then
+            storeNth(&!input, 2, 1);
+        end if;
+        return input;
+    end;
+
+    generic [B: Region, S: Region]
+    function addRecord(out: &![StringBuilder, B], kind: Nat8, id: Nat64, content: Span[Nat8, S]): Unit is
+        case makeRecord(kind, id, content) of
+            when Some(value as bytes: String) do
+                writeString(&~out, asSpan(&bytes));
+                destroyString(bytes);
+            when None do
+                assertFailure("a record of the request could not be made");
+        end case;
+        return nil;
+    end;
+
+    generic [B: Region, N: Region, V: Region]
+    function addPair(out: &![StringBuilder, B], name: Span[Nat8, N], content: Span[Nat8, V]): Unit is
+        case makePair(name, content) of
+            when Some(value as bytes: String) do
+                writeString(&~out, asSpan(&bytes));
+                destroyString(bytes);
+            when None do
+                assertFailure("a pair could not be made");
+        end case;
+        return nil;
+    end;
+
+    -- A whole request with id: begin, two parameters, the body.
+    generic [B: Region, S: Region]
+    function addRequest(out: &![StringBuilder, B], id: Nat64, keep: Bool, input: Span[Nat8, S]): Unit is
+        let begin: String := beginBody(1, keep);
+        addRecord(&~out, typeBeginRequest, id, asSpan(&begin));
+        destroyString(begin);
+        var pairs: StringBuilder := makeStringBuilder();
+        addPair(&!pairs, "REQUEST_METHOD", "POST");
+        addPair(&!pairs, "SCRIPT_NAME", "/echo");
+        let block: String := finalize(pairs);
+        addRecord(&~out, typeParams, id, asSpan(&block));
+        destroyString(block);
+        addRecord(&~out, typeParams, id, "");
+        if spanLength(input) > 0 then
+            addRecord(&~out, typeStdin, id, input);
+        end if;
+        addRecord(&~out, typeStdin, id, "");
+        return nil;
+    end;
+
+    ---
+    --- The handler
+    ---
+
+    -- Answers with the method, the script name and the body.
+    function echo(request: Request): String is
+        var text: StringBuilder := makeStringBuilder();
+        case requestParam(&request, "REQUEST_METHOD") of
+            when Some(value as verb: String) do
+                writeString(&!text, asSpan(&verb));
+                destroyString(verb);
+            when None do
+                writeString(&!text, "no-method");
+        end case;
+        writeByte(&!text, ' ');
+        case requestParam(&request, "SCRIPT_NAME") of
+            when Some(value as name: String) do
+                writeString(&!text, asSpan(&name));
+                destroyString(name);
+            when None do
+                writeString(&!text, "no-name");
+        end case;
+        writeByte(&!text, ' ');
+        writeString(&!text, requestBody(&request));
+        let content: String := finalize(text);
+        destroyRequest(request);
+        let output: String := cgiResponse(200, "text/plain", asSpan(&content));
+        destroyString(content);
+        return output;
+    end;
+
+    ---
+    --- What comes back
+    ---
+
+    -- The records of an answer, summed up: the kinds in order as letters
+    -- (O stdout with content, o the empty stdout, E end request with its
+    -- protocol status as a digit, V get values result, U unknown type),
+    -- then the content of every stdout record.
+    record Summary: Linear is
+        kinds: String;
+        output: String;
+    end;
+
+    function summarize(answer: String): Summary is
+        let summary: Summary := summarizeBytes(&answer);
+        destroyString(answer);
+        return summary;
+    end;
+
+    generic [R: Region]
+    function summarizeBytes(bytes: &[String, R]): Summary is
+        var kinds: StringBuilder := makeStringBuilder();
+        var output: StringBuilder := makeStringBuilder();
+        var at: Index := 0;
+        var going: Bool := true;
+        while going do
+            case readHeader(asSpan(bytes), at) of
+                when Some(value as header: RecordHeader) do
+                    let kind: Nat8 := headerKind(header);
+                    case readContent(asSpan(bytes), at, header) of
+                        when Some(value as content: String) do
+                            if kind = typeStdout then
+                                if length(&content) > 0 then
+                                    writeByte(&!kinds, 'O');
+                                    writeString(&!output, asSpan(&content));
+                                else
+                                    writeByte(&!kinds, 'o');
+                                end if;
+                            else if kind = typeEndRequest then
+                                writeByte(&!kinds, 'E');
+                                writeByte(&!kinds, nthByte(&content, 4) + '0');
+                            else if kind = typeGetValuesResult then
+                                writeByte(&!kinds, 'V');
+                                writeString(&!output, asSpan(&content));
+                            else if kind = typeUnknown then
+                                writeByte(&!kinds, 'U');
+                            else
+                                writeByte(&!kinds, '?');
+                            end if;
+                            destroyString(content);
+                        when None do
+                            writeByte(&!kinds, '!');
+                    end case;
+                    at := at + recordLength(header);
+                when None do
+                    going := false;
+            end case;
+        end while;
+        if at /= length(bytes) then
+            writeByte(&!kinds, '#');
+        end if;
+        return Summary(kinds => finalize(kinds), output => finalize(output));
+    end;
+
+    generic [R: Region, S: Region]
+    function sameText(text: &[String, R], expected: Span[Nat8, S]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- 127.0.0.1 in network order, or its first count bytes.
+    function loopback(count: Index): String is
+        var address: String := makeString(count, 0);
+        storeNth(&!address, 0, 127);
+        if count = 4 then
+            storeNth(&!address, 3, 1);
+        end if;
+        return address;
+    end;
+
+    -- A record header of version 2, which no FastCGI record has.
+    function badHeader(): String is
+        var bad: String := makeString(8, 0);
+        storeNth(&!bad, 0, 2);
+        storeNth(&!bad, 1, 1);
+        storeNth(&!bad, 3, 1);
+        return bad;
+    end;
+
+    function destroySummary(summary: Summary): Unit is
+        let { kinds: String, output: String } := summary;
+        destroyString(kinds);
+        destroyString(output);
+        return nil;
+    end;
+
+    ---
+    --- The client, a task beside the server
+    ---
+
+    record Exchange: Linear is
+        path: String;
+        request: String;
+    end;
+
+    -- Connects to the socket at path, sends the request, reads until the
+    -- server closes.  Empty when it could not connect.
+    function talkUnix(exchange: Exchange): String is
+        let { path: String, request: String } := exchange;
+        var answer: String := makeEmpty();
+        var tries: Index := 0;
+        var done: Bool := false;
+        while (not done) and (tries < 50) do
+            case connectUnix(asSpan(&path)) of
+                when Some(value as opened: FileDescriptor) do
+                    var socket: FileDescriptor := opened;
+                    if writeAll(&!socket, asSpan(&request)) then
+                        case readAll(&!socket) of
+                            when Some(value as got: String) do
+                                destroyString(answer);
+                                answer := got;
+                            when None do
+                                skip;
+                        end case;
+                    end if;
+                    let closed: Bool := closeFile(socket);
+                    done := true;
+                when None do
+                    sleepFor(20);
+                    tries := tries + 1;
+            end case;
+        end while;
+        destroyString(path);
+        destroyString(request);
+        return answer;
+    end;
+
+    function watch(): Signals is
+        let wanted: Wanted := Wanted(hangup => false, interrupt => true, terminate => true, user1 => false, user2 => false);
+        case watchSignals(wanted) of
+            when Some(value as signals: Signals) do
+                return signals;
+            when None do
+                abort("the test could not watch signals");
+        end case;
+    end;
+
+    -- Serves exactly one connection on a fresh socket while a task sends
+    -- request and reads the answer, which is returned.
+    function exchangeUnix(name: Span[Nat8, Static], request: String, limits: Limits): String is
+        let path: String := fromLiteral(name);
+        let removed: Bool := removeFile(asSpan(&path));
+        var answer: String := makeEmpty();
+        case listenUnix(asSpan(&path), #o600) of
+            when Some(value as listener: Listener) do
+                case openScope() of
+                    when Some(value as opened: Scope) do
+                        var scope: Scope := opened;
+                        let talk: Fn[Exchange, String] := talkUnix;
+                        let exchange: Exchange := Exchange(path => fromLiteral(name), request => request);
+                        case spawn(&!scope, talk, exchange) of
+                            when Right(right as task: Task[String]) do
+                                var signals: Signals := watch();
+                                case serveUnix(&listener, echo, limits, &!signals) of
+                                    when Some(value as accepted: Index) do
+                                        assertTrue(accepted = 1, "one connection accepted");
+                                    when None do
+                                        assertFailure("the loop could not start");
+                                end case;
+                                let stopped: Bool := stopWatching(signals);
+                                destroyString(answer);
+                                answer := join(task);
+                            when Left(left as back: Exchange) do
+                                let { path as p: String, request as r: String } := back;
+                                destroyString(p);
+                                destroyString(r);
+                                assertFailure("the client task did not start");
+                        end case;
+                        closeScope(scope);
+                    when None do
+                        destroyString(request);
+                        assertFailure("no scope");
+                end case;
+                assertTrue(closeListener(listener), "the listener closed");
+            when None do
+                destroyString(request);
+                assertFailure("listenUnix failed");
+        end case;
+        destroyString(path);
+        return answer;
+    end;
+
+    function oneConnection(): Limits is
+        let base: Limits := defaultLimits();
+        let limits: Limits := Limits(
+            workers => 2,
+            connections => 1,
+            paramsBytes => base.paramsBytes,
+            bodyBytes => base.bodyBytes,
+            requestMilliseconds => 5000,
+            writeMilliseconds => 5000
+        );
+        return limits;
+    end;
+
+    ---
+    --- The tests
+    ---
+
+    -- cgiResponse writes the status with its phrase, the type, an empty
+    -- line and the body.
+    function testCgiResponse(): Unit is
+        let output: String := cgiResponse(404, "text/html", "<p>gone</p>");
+        assertTrue(sameText(&output, "Status: 404 Not Found\r\nContent-Type: text/html\r\n\r\n<p>gone</p>"), "a 404 with its phrase");
+        destroyString(output);
+        let odd: String := cgiResponse(299, "text/plain", "");
+        assertTrue(sameText(&odd, "Status: 299 Unknown\r\nContent-Type: text/plain\r\n\r\n"), "an unknown status");
+        destroyString(odd);
+        return nil;
+    end;
+
+    -- text/plain with the byte b in the middle.
+    function withByte(b: Nat8): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "text/");
+        writeByte(&!out, b);
+        writeString(&!out, "plain");
+        return finalize(out);
+    end;
+
+    function fieldValueWith(b: Nat8): Bool is
+        let text: String := withByte(b);
+        let answer: Bool := isFieldValue(asSpan(&text));
+        destroyString(text);
+        return answer;
+    end;
+
+    -- isFieldValue takes printable ASCII, a tab and bytes from 128 on, and
+    -- refuses every byte that could end a header line or start another.
+    function testIsFieldValue(): Unit is
+        assertTrue(isFieldValue("text/html; charset=utf-8"), "a type with a parameter");
+        assertTrue(isFieldValue(""), "the empty value");
+        assertTrue(fieldValueWith(9), "a tab");
+        assertTrue(fieldValueWith(32), "a space");
+        assertTrue(fieldValueWith(126), "a tilde");
+        assertTrue(fieldValueWith(128), "the byte 128");
+        assertTrue(fieldValueWith(255), "the byte 255");
+        assertFalse(fieldValueWith(13), "a carriage return");
+        assertFalse(fieldValueWith(10), "a line feed");
+        assertFalse(fieldValueWith(0), "a NUL");
+        assertFalse(fieldValueWith(31), "the byte 31");
+        assertFalse(fieldValueWith(127), "DEL");
+        assertFalse(isFieldValue("text/plain\r\nSet-Cookie: a=b"), "a header smuggled in");
+        return nil;
+    end;
+
+    -- reasonPhrase names known statuses and says Unknown for the rest.
+    function testReasonPhrase(): Unit is
+        let ok: Span[Nat8, Static] := reasonPhrase(200);
+        assertTrue(spanLength(ok) = 2, "200 is OK");
+        let gone: Span[Nat8, Static] := reasonPhrase(404);
+        assertTrue(spanLength(gone) = 9, "404 is Not Found");
+        let odd: Span[Nat8, Static] := reasonPhrase(299);
+        assertTrue(spanLength(odd) = 7, "299 is Unknown");
+        return nil;
+    end;
+
+    -- isHeaderBlock takes complete lines of name, colon, space and value,
+    -- and refuses whatever could end the header or bring a nameless line.
+    function testIsHeaderBlock(): Unit is
+        assertTrue(isHeaderBlock(""), "the empty block");
+        assertTrue(isHeaderBlock("Location: /next\r\n"), "one line");
+        assertTrue(isHeaderBlock("Set-Cookie: a=b; Path=/\r\nAllow: GET, POST\r\n"), "two lines");
+        assertTrue(isHeaderBlock("X-Empty: \r\n"), "an empty value");
+        assertFalse(isHeaderBlock("Location: /next"), "no line end");
+        assertFalse(isHeaderBlock("Location: /next\n"), "a bare line feed");
+        assertFalse(isHeaderBlock("Location: /next\r\n\r\n<p>body</p>"), "an empty line that ends the header");
+        assertFalse(isHeaderBlock(": no name\r\n"), "no name");
+        assertFalse(isHeaderBlock("Bad Name: x\r\n"), "a space in the name");
+        assertFalse(isHeaderBlock("Location:/next\r\n"), "no space after the colon");
+        assertFalse(isHeaderBlock("Location: a\rb\r\n"), "a carriage return inside the value");
+        assertFalse(isHeaderBlock("Location: a\nSet-Cookie: b\r\n"), "a line feed inside the value");
+        return nil;
+    end;
+
+    -- cgiResponseWith puts the block between the type and the empty line.
+    function testCgiResponseWith(): Unit is
+        let output: String := cgiResponseWith(303, "text/plain", "Location: /done\r\nSet-Cookie: s=1\r\n", "moved");
+        assertTrue(sameText(&output, "Status: 303 See Other\r\nContent-Type: text/plain\r\nLocation: /done\r\nSet-Cookie: s=1\r\n\r\nmoved"), "two header lines");
+        destroyString(output);
+        let plain: String := cgiResponseWith(200, "text/plain", "", "x");
+        assertTrue(sameText(&plain, "Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nx"), "no header lines");
+        destroyString(plain);
+        return nil;
+    end;
+
+    -- A request made by hand answers its parameters and body.
+    function testRequestByHand(): Unit is
+        var pairs: StringBuilder := makeStringBuilder();
+        addPair(&!pairs, "QUERY_STRING", "a=1");
+        addPair(&!pairs, "REQUEST_METHOD", "GET");
+        let request: Request := makeRequest(finalize(pairs), fromLiteral("body"));
+        case requestParam(&request, "REQUEST_METHOD") of
+            when Some(value as verb: String) do
+                assertTrue(sameText(&verb, "GET"), "the method");
+                destroyString(verb);
+            when None do
+                assertFailure("the method was not found");
+        end case;
+        case requestParam(&request, "REQUEST") of
+            when Some(value as wrong: String) do
+                destroyString(wrong);
+                assertFailure("a prefix of a name matched");
+            when None do
+                assertSuccess("a prefix of a name does not match");
+        end case;
+        assertTrue(pairCount(requestParams(&request)) = 2, "two pairs");
+        assertTrue(spanLength(requestBody(&request)) = 4, "the body");
+        destroyRequest(request);
+        return nil;
+    end;
+
+    -- One request over a Unix socket: the handler's output in one stdout
+    -- record, the empty one, and the end with status 0.
+    function testOneRequest(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        addRequest(&!out, 1, false, "hello");
+        let answer: String := exchangeUnix("fcgi-server-one.sock", finalize(out), oneConnection());
+        let { kinds: String, output: String } := summarize(answer);
+        assertTrue(sameText(&kinds, "OoE0"), "stdout, the empty stdout, end request complete");
+        assertTrue(sameText(&output, "Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nPOST /echo hello"), "the handler's output");
+        destroyString(kinds);
+        destroyString(output);
+        return nil;
+    end;
+
+    -- Two requests on a kept connection, then a third that does not keep
+    -- it: three answers on one connection, then the server closes.
+    function testKeptConnection(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        addRequest(&!out, 1, true, "one");
+        addRequest(&!out, 2, true, "two");
+        addRequest(&!out, 3, false, "three");
+        let answer: String := exchangeUnix("fcgi-server-kept.sock", finalize(out), oneConnection());
+        let { kinds: String, output: String } := summarize(answer);
+        assertTrue(sameText(&kinds, "OoE0OoE0OoE0"), "three answers");
+        assertTrue(contains(asSpan(&output), "POST /echo two"), "the second body");
+        assertTrue(contains(asSpan(&output), "POST /echo three"), "the third body");
+        destroyString(kinds);
+        destroyString(output);
+        return nil;
+    end;
+
+    -- A second request begun while the first is open is refused with
+    -- FCGI_CANT_MPX_CONN, and the first is answered.
+    function testNoMultiplexing(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        let begin: String := beginBody(1, false);
+        addRecord(&!out, typeBeginRequest, 1, asSpan(&begin));
+        addRecord(&!out, typeBeginRequest, 2, asSpan(&begin));
+        destroyString(begin);
+        addRecord(&!out, typeParams, 1, "");
+        addRecord(&!out, typeStdin, 1, "");
+        let answer: String := exchangeUnix("fcgi-server-mpx.sock", finalize(out), oneConnection());
+        let { kinds: String, output: String } := summarize(answer);
+        assertTrue(sameText(&kinds, "E1OoE0"), "the second refused, the first answered");
+        destroyString(kinds);
+        destroyString(output);
+        return nil;
+    end;
+
+    -- A role other than responder is refused with FCGI_UNKNOWN_ROLE.
+    function testUnknownRole(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        let begin: String := beginBody(2, false);
+        addRecord(&!out, typeBeginRequest, 7, asSpan(&begin));
+        destroyString(begin);
+        let answer: String := exchangeUnix("fcgi-server-role.sock", finalize(out), oneConnection());
+        let { kinds: String, output: String } := summarize(answer);
+        assertTrue(sameText(&kinds, "E3"), "unknown role");
+        destroyString(kinds);
+        destroyString(output);
+        return nil;
+    end;
+
+    -- FCGI_GET_VALUES is answered with the variables asked for that the
+    -- protocol names; an unknown management record with FCGI_UNKNOWN_TYPE.
+    function testManagementRecords(): Unit is
+        var asked: StringBuilder := makeStringBuilder();
+        addPair(&!asked, "FCGI_MPXS_CONNS", "");
+        addPair(&!asked, "FCGI_MAX_CONNS", "");
+        addPair(&!asked, "SOMETHING_ELSE", "");
+        let block: String := finalize(asked);
+        var out: StringBuilder := makeStringBuilder();
+        addRecord(&!out, typeGetValues, 0, asSpan(&block));
+        destroyString(block);
+        addRecord(&!out, 99, 0, "");
+        addRequest(&!out, 1, false, "");
+        let answer: String := exchangeUnix("fcgi-server-values.sock", finalize(out), oneConnection());
+        let { kinds: String, output: String } := summarize(answer);
+        assertTrue(sameText(&kinds, "VUOoE0"), "values, unknown type, then the request");
+        assertTrue(pairCount(getSpan(&output, 0, 34)) = 2, "two variables answered");
+        destroyString(kinds);
+        destroyString(output);
+        return nil;
+    end;
+
+    -- An aborted request ends with FCGI_REQUEST_COMPLETE and no output.
+    function testAbort(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        let begin: String := beginBody(1, false);
+        addRecord(&!out, typeBeginRequest, 4, asSpan(&begin));
+        destroyString(begin);
+        addRecord(&!out, typeAbortRequest, 4, "");
+        let answer: String := exchangeUnix("fcgi-server-abort.sock", finalize(out), oneConnection());
+        let { kinds: String, output: String } := summarize(answer);
+        assertTrue(sameText(&kinds, "E0"), "only the end");
+        destroyString(kinds);
+        destroyString(output);
+        return nil;
+    end;
+
+    -- A body one byte over the limit is answered with 413, a body at the
+    -- limit is served.
+    function testBodyLimit(): Unit is
+        let base: Limits := oneConnection();
+        let limits: Limits := Limits(
+            workers => 1,
+            connections => 1,
+            paramsBytes => base.paramsBytes,
+            bodyBytes => 5,
+            requestMilliseconds => 5000,
+            writeMilliseconds => 5000
+        );
+        var over: StringBuilder := makeStringBuilder();
+        addRequest(&!over, 1, false, "123456");
+        let refused: String := exchangeUnix("fcgi-server-big.sock", finalize(over), limits);
+        let { kinds: String, output: String } := summarize(refused);
+        assertTrue(sameText(&kinds, "OoE0"), "an answer");
+        assertTrue(startsWith(asSpan(&output), "Status: 413 Content Too Large"), "413");
+        destroyString(kinds);
+        destroyString(output);
+        var at: StringBuilder := makeStringBuilder();
+        addRequest(&!at, 1, false, "12345");
+        let served: String := exchangeUnix("fcgi-server-fits.sock", finalize(at), limits);
+        let { kinds as servedKinds: String, output as servedOutput: String } := summarize(served);
+        assertTrue(contains(asSpan(&servedOutput), "POST /echo 12345"), "a body at the limit is served");
+        destroyString(servedKinds);
+        destroyString(servedOutput);
+        return nil;
+    end;
+
+    -- Parameters over their limit are answered with 431.
+    function testParamsLimit(): Unit is
+        let base: Limits := oneConnection();
+        let limits: Limits := Limits(
+            workers => 1,
+            connections => 1,
+            paramsBytes => 10,
+            bodyBytes => base.bodyBytes,
+            requestMilliseconds => 5000,
+            writeMilliseconds => 5000
+        );
+        var out: StringBuilder := makeStringBuilder();
+        addRequest(&!out, 1, false, "x");
+        let answer: String := exchangeUnix("fcgi-server-params.sock", finalize(out), limits);
+        let { kinds: String, output: String } := summarize(answer);
+        assertTrue(startsWith(asSpan(&output), "Status: 431 Request Header Fields Too Large"), "431");
+        destroyString(kinds);
+        destroyString(output);
+        return nil;
+    end;
+
+    -- A request that stops after its first record is closed when the time
+    -- runs out, without an answer: serveConnection says TimedOut.
+    function testSlowRequest(): Unit is
+        let path: String := fromLiteral("fcgi-server-slow.sock");
+        let removed: Bool := removeFile(asSpan(&path));
+        case listenUnix(asSpan(&path), #o600) of
+            when Some(value as listener: Listener) do
+                case connectUnix(asSpan(&path)) of
+                    when Some(value as opened: FileDescriptor) do
+                        var client: FileDescriptor := opened;
+                        var out: StringBuilder := makeStringBuilder();
+                        let begin: String := beginBody(1, false);
+                        addRecord(&!out, typeBeginRequest, 1, asSpan(&begin));
+                        destroyString(begin);
+                        let first: String := finalize(out);
+                        assertTrue(writeAll(&!client, asSpan(&first)), "the first record written");
+                        destroyString(first);
+                        case acceptWithin(&listener, 2000) of
+                            when Some(value as socket: FileDescriptor) do
+                                let base: Limits := oneConnection();
+                                let limits: Limits := Limits(
+                                    workers => 1,
+                                    connections => 1,
+                                    paramsBytes => base.paramsBytes,
+                                    bodyBytes => base.bodyBytes,
+                                    requestMilliseconds => 300,
+                                    writeMilliseconds => 300
+                                );
+                                case serveConnection(socket, echo, limits) of
+                                    when TimedOut do
+                                        assertSuccess("timed out");
+                                    when Finished do
+                                        assertFailure("finished");
+                                    when Malformed do
+                                        assertFailure("malformed");
+                                    when TooLarge do
+                                        assertFailure("too large");
+                                    when WriteFailed do
+                                        assertFailure("write failed");
+                                end case;
+                            when None do
+                                assertFailure("nothing accepted");
+                        end case;
+                        case readAll(&!client) of
+                            when Some(value as rest: String) do
+                                assertTrue(length(&rest) = 0, "no answer to a late request");
+                                destroyString(rest);
+                            when None do
+                                assertFailure("the client could not read");
+                        end case;
+                        let closed: Bool := closeFile(client);
+                    when None do
+                        assertFailure("connect failed");
+                end case;
+                assertTrue(closeListener(listener), "closed");
+            when None do
+                assertFailure("listenUnix failed");
+        end case;
+        destroyString(path);
+        return nil;
+    end;
+
+    -- A record that is no record: the connection is Malformed.
+    function testMalformed(): Unit is
+        let path: String := fromLiteral("fcgi-server-bad.sock");
+        let removed: Bool := removeFile(asSpan(&path));
+        case listenUnix(asSpan(&path), #o600) of
+            when Some(value as listener: Listener) do
+                case connectUnix(asSpan(&path)) of
+                    when Some(value as opened: FileDescriptor) do
+                        var client: FileDescriptor := opened;
+                        -- Version 2 in the first byte.
+                        let bad: String := badHeader();
+                        assertTrue(writeAll(&!client, asSpan(&bad)), "written");
+                        destroyString(bad);
+                        case acceptWithin(&listener, 2000) of
+                            when Some(value as socket: FileDescriptor) do
+                                case serveConnection(socket, echo, oneConnection()) of
+                                    when Malformed do
+                                        assertSuccess("malformed");
+                                    when Finished do
+                                        assertFailure("finished");
+                                    when TimedOut do
+                                        assertFailure("timed out");
+                                    when TooLarge do
+                                        assertFailure("too large");
+                                    when WriteFailed do
+                                        assertFailure("write failed");
+                                end case;
+                            when None do
+                                assertFailure("nothing accepted");
+                        end case;
+                        let closed: Bool := closeFile(client);
+                    when None do
+                        assertFailure("connect failed");
+                end case;
+                assertTrue(closeListener(listener), "closed");
+            when None do
+                assertFailure("listenUnix failed");
+        end case;
+        destroyString(path);
+        return nil;
+    end;
+
+    ---
+    --- Over TCP
+    ---
+
+    record TcpExchange: Linear is
+        port: Nat16;
+        request: String;
+    end;
+
+    function talkTcp(exchange: TcpExchange): String is
+        let { port: Nat16, request: String } := exchange;
+        var answer: String := makeEmpty();
+        let address: String := loopback(4);
+        case connectTcp(asSpan(&address), port, 5000) of
+            when Right(right as opened: FileDescriptor) do
+                var socket: FileDescriptor := opened;
+                if writeAll(&!socket, asSpan(&request)) then
+                    case readAll(&!socket) of
+                        when Some(value as got: String) do
+                            destroyString(answer);
+                            answer := got;
+                        when None do
+                            skip;
+                    end case;
+                end if;
+                let closed: Bool := closeFile(socket);
+            when Left(left as failure: ConnectFailure) do
+                skip;
+        end case;
+        destroyString(address);
+        destroyString(request);
+        return answer;
+    end;
+
+    -- Three connections over TCP on a port the kernel chose, served by two
+    -- workers: three answers, and the loop returns after the third.
+    function testTcp(): Unit is
+        let address: String := loopback(4);
+        case listenTcp(asSpan(&address), 0) of
+            when Some(value as listener: TcpListener) do
+                let port: Nat16 := tcpListenerPort(&listener);
+                assertTrue(port > 0, "a port was chosen");
+                case openScope() of
+                    when Some(value as opened: Scope) do
+                        var scope: Scope := opened;
+                        let talk: Fn[TcpExchange, String] := talkTcp;
+                        var first: StringBuilder := makeStringBuilder();
+                        addRequest(&!first, 1, false, "first");
+                        var second: StringBuilder := makeStringBuilder();
+                        addRequest(&!second, 1, false, "second");
+                        var third: StringBuilder := makeStringBuilder();
+                        addRequest(&!third, 1, false, "third");
+                        let a: Either[TcpExchange, Task[String]] := spawn(&!scope, talk, TcpExchange(port => port, request => finalize(first)));
+                        let b: Either[TcpExchange, Task[String]] := spawn(&!scope, talk, TcpExchange(port => port, request => finalize(second)));
+                        let c: Either[TcpExchange, Task[String]] := spawn(&!scope, talk, TcpExchange(port => port, request => finalize(third)));
+                        let base: Limits := oneConnection();
+                        let limits: Limits := Limits(
+                            workers => 2,
+                            connections => 3,
+                            paramsBytes => base.paramsBytes,
+                            bodyBytes => base.bodyBytes,
+                            requestMilliseconds => 5000,
+                            writeMilliseconds => 5000
+                        );
+                        var signals: Signals := watch();
+                        case serveTcp(&listener, echo, limits, &!signals) of
+                            when Some(value as accepted: Index) do
+                                assertTrue(accepted = 3, "three connections accepted");
+                            when None do
+                                assertFailure("the loop could not start");
+                        end case;
+                        let stopped: Bool := stopWatching(signals);
+                        var all: StringBuilder := makeStringBuilder();
+                        collect(a, &!all);
+                        collect(b, &!all);
+                        collect(c, &!all);
+                        let answers: String := finalize(all);
+                        let { kinds: String, output: String } := summarize(answers);
+                        assertTrue(sameText(&kinds, "OoE0OoE0OoE0"), "three answers");
+                        assertTrue(contains(asSpan(&output), "POST /echo first"), "first");
+                        assertTrue(contains(asSpan(&output), "POST /echo second"), "second");
+                        assertTrue(contains(asSpan(&output), "POST /echo third"), "third");
+                        destroyString(kinds);
+                        destroyString(output);
+                        closeScope(scope);
+                    when None do
+                        assertFailure("no scope");
+                end case;
+                assertTrue(closeTcpListener(listener), "closed");
+            when None do
+                assertFailure("listenTcp failed");
+        end case;
+        destroyString(address);
+        return nil;
+    end;
+
+    generic [B: Region]
+    function collect(started: Either[TcpExchange, Task[String]], out: &![StringBuilder, B]): Unit is
+        case started of
+            when Right(right as task: Task[String]) do
+                let answer: String := join(task);
+                writeString(&~out, asSpan(&answer));
+                destroyString(answer);
+            when Left(left as back: TcpExchange) do
+                let { port: Nat16, request: String } := back;
+                destroyString(request);
+                assertFailure("a client task did not start");
+        end case;
+        return nil;
+    end;
+
+    -- The address must be 4 or 16 bytes.
+    function testTcpRefusesAddress(): Unit is
+        let short: String := loopback(3);
+        case listenTcp(asSpan(&short), 0) of
+            when Some(value as listener: TcpListener) do
+                let closed: Bool := closeTcpListener(listener);
+                assertFailure("three bytes were taken for an address");
+            when None do
+                assertSuccess("refused");
+        end case;
+        destroyString(short);
+        return nil;
+    end;
+
+    -- A loop bound to a context of 300 ms returns when the deadline has
+    -- passed, without a connection.
+    function testUntilDeadline(): Unit is
+        let path: String := fromLiteral("fcgi-server-until.sock");
+        let removed: Bool := removeFile(asSpan(&path));
+        case listenUnix(asSpan(&path), #o600) of
+            when Some(value as listener: Listener) do
+                let root: Context := background();
+                case withTimeout(&root, 300) of
+                    when Some(value as made: Derived) do
+                        let { context: Context, canceller: Canceller } := made;
+                        let before: Nat64 := clock();
+                        case serveUnixUntil(&listener, echo, defaultLimits(), &context) of
+                            when Some(value as accepted: Index) do
+                                assertTrue(accepted = 0, "nobody connected");
+                            when None do
+                                assertFailure("the loop could not start");
+                        end case;
+                        let waited: Nat64 := clock() - before;
+                        assertTrue(waited >= 250000000, "the loop ran until the deadline");
+                        assertTrue(waited < 30000000000, "and stopped there, long before an endless loop would");
+                        cancel(canceller);
+                        destroyContext(context);
+                    when None do
+                        assertFailure("no context");
+                end case;
+                destroyContext(root);
+                assertTrue(closeListener(listener), "closed");
+            when None do
+                assertFailure("listenUnix failed");
+        end case;
+        destroyString(path);
+        return nil;
+    end;
+
+    function clock(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as nanos: Nat64) do
+                return nanos;
+            when None do
+                abort("no monotonic clock");
+        end case;
+    end;
+end module body.

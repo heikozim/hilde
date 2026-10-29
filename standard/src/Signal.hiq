@@ -1,0 +1,320 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The handler of the runtime only counts the signal and
+-- writes a byte to a pipe of the runtime; nothing else runs in it.
+-- The runtime counts every watched signal; a watch keeps
+-- the count of each kind it has taken, and a signal is new when the
+-- runtime's count differs from it.  So two arrivals between two takes are
+-- one answer, and nothing is lost between a look and a wait: waitSignal
+-- looks at the counts before and after it empties the pipe.
+import Standard.String (
+    String,
+    length as stringLength,
+    nthByte,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    openWrite,
+    readAll,
+    writeAll,
+    closeFile,
+    setFileMode,
+    removeFileIfThere
+);
+import Bindings.Signal (
+    watchMask,
+    arrivals,
+    waitPipe,
+    drainPipe,
+    stopMask,
+    setAlarm,
+    currentProcess,
+    sendTo
+);
+
+module body Standard.Signal is
+    constant zeroIndex: Index := 0;
+    -- Mode 0644: the owner writes, everyone reads the number.
+    constant pidMode: Nat32 := 420;
+    constant largestPid: Int64 := 2147483647;
+    constant ten: Int64 := 10;
+    constant zero: Int64 := 0;
+    constant mostDigits: Index := 10;
+
+    record Signals: Linear is
+        hangup: Nat32;
+        interrupt: Nat32;
+        terminate: Nat32;
+        user1: Nat32;
+        user2: Nat32;
+    end;
+
+    function kindIndex(kind: SignalKind): Nat8 is
+        case kind of
+            when Hangup do
+                return 0;
+            when Interrupt do
+                return 1;
+            when Terminate do
+                return 2;
+            when User1 do
+                return 3;
+            when User2 do
+                return 4;
+        end case;
+    end;
+
+    function bitOf(wanted: Bool, bit: Nat8): Nat8 is
+        if wanted then
+            return bit;
+        else
+            return 0;
+        end if;
+    end;
+
+    function watchSignals(wanted: Wanted): Option[Signals] is
+        let low: Nat8 := bitOf(wanted.hangup, 1) + bitOf(wanted.interrupt, 2);
+        let high: Nat8 := (bitOf(wanted.terminate, 4) + bitOf(wanted.user1, 8)) + bitOf(wanted.user2, 16);
+        let mask: Nat8 := low + high;
+        if (mask = 0) or (not watchMask(mask)) then
+            let none: Option[Signals] := None();
+            return none;
+        end if;
+        let made: Signals := Signals(
+            hangup => arrivals(0),
+            interrupt => arrivals(1),
+            terminate => arrivals(2),
+            user1 => arrivals(3),
+            user2 => arrivals(4)
+        );
+        return Some(value => made);
+    end;
+
+    generic [R: Region]
+    function takenOf(signals: &![Signals, R], kind: SignalKind): Nat32 is
+        case kind of
+            when Hangup do
+                return signals->hangup;
+            when Interrupt do
+                return signals->interrupt;
+            when Terminate do
+                return signals->terminate;
+            when User1 do
+                return signals->user1;
+            when User2 do
+                return signals->user2;
+        end case;
+    end;
+
+    generic [R: Region]
+    function takeSignal(signals: &![Signals, R], kind: SignalKind): Bool is
+        let now: Nat32 := arrivals(kindIndex(kind));
+        if now = takenOf(&~signals, kind) then
+            return false;
+        end if;
+        case kind of
+            when Hangup do
+                signals->hangup := now;
+            when Interrupt do
+                signals->interrupt := now;
+            when Terminate do
+                signals->terminate := now;
+            when User1 do
+                signals->user1 := now;
+            when User2 do
+                signals->user2 := now;
+        end case;
+        return true;
+    end;
+
+    -- Whether any kind has arrived that the watch has not taken.
+    generic [R: Region]
+    function anyNew(signals: &![Signals, R]): Bool is
+        let first: Bool := (arrivals(0) /= signals->hangup) or (arrivals(1) /= signals->interrupt);
+        let second: Bool := (arrivals(2) /= signals->terminate) or (arrivals(3) /= signals->user1);
+        return (first or second) or (arrivals(4) /= signals->user2);
+    end;
+
+    generic [R: Region]
+    function waitSignal(signals: &![Signals, R], milliseconds: Nat32): Bool is
+        if anyNew(&~signals) then
+            drainPipe();
+            return true;
+        end if;
+        -- A signal between the look above and the wait below leaves its
+        -- byte in the pipe, so the wait ends at once.
+        let woken: Bool := waitPipe(milliseconds);
+        return anyNew(&~signals);
+    end;
+
+    generic [R: Region]
+    function shutdownRequested(signals: &![Signals, R]): Bool is
+        let interrupted: Bool := takeSignal(&~signals, Interrupt());
+        let terminated: Bool := takeSignal(&~signals, Terminate());
+        return interrupted or terminated;
+    end;
+
+    function stopWatching(signals: Signals): Bool is
+        let { hangup: Nat32, interrupt: Nat32, terminate: Nat32, user1: Nat32, user2: Nat32 } := signals;
+        return stopMask();
+    end;
+
+    function sendSignal(process: Int32, kind: SignalKind): Bool is
+        -- 0 and the negative numbers name process groups to kill(2); a
+        -- PID file never holds them.
+        if process < 1 then
+            return false;
+        end if;
+        return sendTo(process, kindIndex(kind));
+    end;
+
+    function limitShutdown(seconds: Nat32): Nat32 is
+        return setAlarm(seconds);
+    end;
+
+    ---
+    --- PID files
+    ---
+
+    function processNumber(): Int32 is
+        return currentProcess();
+    end;
+
+    -- The decimal digits of a positive number and a line feed.
+    function numberLine(number: Int32): String is
+        var digits: StringBuilder := makeStringBuilder();
+        var rest: Int64 := widen(number);
+        var divisor: Int64 := 1;
+        while (divisor * ten) <= rest do
+            divisor := divisor * ten;
+        end while;
+        while divisor > zero do
+            writeByte(&!digits, digitOf(rest / divisor));
+            rest := rem(rest, divisor);
+            divisor := divisor / ten;
+        end while;
+        writeByte(&!digits, '\n');
+        return finalize(digits);
+    end;
+
+    function widen(number: Int32): Int64 is
+        case toInt64(number) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Standard.Signal: an Int32 did not fit an Int64");
+        end case;
+    end;
+
+    function digitOf(value: Int64): Nat8 is
+        case toNat8(value) of
+            when Some(value as small: Nat8) do
+                return small + '0';
+            when None do
+                abort("Standard.Signal: a digit did not fit a Nat8");
+        end case;
+    end;
+
+    generic [R: Region]
+    function writePidFile(path: Span[Nat8, R]): Bool is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let line: String := numberLine(processNumber());
+                let moded: Bool := setFileMode(&!file, pidMode);
+                let written: Bool := writeAll(&!file, asSpan(&line));
+                destroyString(line);
+                let closed: Bool := closeFile(file);
+                return (moded and written) and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The number text holds: decimal digits, at most one line feed after
+    -- them, from 1 to the largest Int32.
+    generic [R: Region]
+    function parsePid(text: &[String, R]): Option[Int32] is
+        var size: Index := stringLength(text);
+        if (size > zeroIndex) and (nthByte(text, size - 1) = '\n') then
+            size := size - 1;
+        end if;
+        if (size = zeroIndex) or (size > mostDigits) then
+            let none: Option[Int32] := None();
+            return none;
+        end if;
+        var total: Int64 := zero;
+        var i: Index := zeroIndex;
+        while i < size do
+            let byte: Nat8 := nthByte(text, i);
+            if (byte < '0') or (byte > '9') then
+                let none: Option[Int32] := None();
+                return none;
+            end if;
+            total := (total * ten) + digitValue(byte);
+            i := i + 1;
+        end while;
+        if (total < 1) or (total > largestPid) then
+            let none: Option[Int32] := None();
+            return none;
+        end if;
+        case toInt32(total) of
+            when Some(value as number: Int32) do
+                return Some(value => number);
+            when None do
+                let none: Option[Int32] := None();
+                return none;
+        end case;
+    end;
+
+    function digitValue(byte: Nat8): Int64 is
+        case toInt64(byte - '0') of
+            when Some(value as digit: Int64) do
+                return digit;
+            when None do
+                abort("Standard.Signal: a digit did not fit an Int64");
+        end case;
+    end;
+
+    generic [R: Region]
+    function readPidFile(path: Span[Nat8, R]): Option[Int32] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let content: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case content of
+                    when Some(value as text: String) do
+                        let number: Option[Int32] := parsePid(&text);
+                        destroyString(text);
+                        return number;
+                    when None do
+                        let none: Option[Int32] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Int32] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function removePidFile(path: Span[Nat8, R]): Bool is
+        return removeFileIfThere(path);
+    end;
+end module body.

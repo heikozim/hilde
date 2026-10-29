@@ -1,0 +1,1255 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  A request is built as RFC 8555 section 6.2 says: the
+-- protected header with alg ES256, the nonce, the URL and either the JWK
+-- of the key (for newAccount) or the account URL as kid; the payload in
+-- base64url, empty for a POST-as-GET; the signature over the two joined by
+-- a dot.  The nonce lives in a buffer of the account, so that a request
+-- through a write reference can replace it with the one each answer
+-- brings.
+import Standard.String (
+    String,
+    makeEmpty,
+    fromLiteral,
+    fromSpan,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    insertBack,
+    removeLast,
+    lengthMut,
+    nthMut
+);
+import Standard.Base64 (
+    encodeUnpadded
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.Http (
+    headerValue
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    JsonWriter,
+    readJson,
+    destroyJson,
+    stringAt,
+    countAt,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    beginArray,
+    endArray,
+    writeName,
+    writeString as writeJsonString,
+    writeBool,
+    finishJson
+);
+import Standard.HttpClient (
+    Limits,
+    Method,
+    Get,
+    Post,
+    Failure,
+    FailureKind,
+    Response,
+    request,
+    destroyFailure,
+    destroyResponse
+);
+import Standard.X509 (
+    PrivateKey,
+    KeyKind,
+    EcP256,
+    EcP384,
+    EcP521,
+    Ed25519Key,
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
+    keyKindOf,
+    publicKeyDer,
+    signMessage,
+    destroyPrivateKey
+);
+import Standard.Text (
+    substring
+);
+
+module body Standard.Acme is
+    constant noIndex: Index := 0;
+    constant badNonce: Span[Nat8, Static] := "urn:ietf:params:acme:error:badNonce";
+
+    record AcmeError: Linear is
+        kind: String;
+        detail: String;
+    end;
+
+    function destroyAcmeError(error: AcmeError): Unit is
+        let { kind: String, detail: String } := error;
+        destroyString(kind);
+        destroyString(detail);
+        return nil;
+    end;
+
+    function failure(kind: Span[Nat8, Static], detail: Span[Nat8, Static]): AcmeError is
+        return AcmeError(kind => fromLiteral(kind), detail => fromLiteral(detail));
+    end;
+
+    record Account: Linear is
+        key: PrivateKey;
+        caFile: String;
+        limits: Limits;
+        kid: String;
+        newNonceUrl: String;
+        newOrderUrl: String;
+        nonce: Buffer[Nat8];
+        pointX: String;
+        pointY: String;
+        invariant length(&kid) > 0;
+        invariant length(&newNonceUrl) > 0;
+        invariant length(&newOrderUrl) > 0;
+        invariant length(&pointX) = 43;
+        invariant length(&pointY) = 43;
+    end;
+
+    record Order: Linear is
+        url: String;
+        status: String;
+        finalizeUrl: String;
+        authorizations: String;
+        certificateUrl: String;
+    end;
+
+    function destroyOrder(order: Order): Unit is
+        let { url: String, status: String, finalizeUrl: String, authorizations: String, certificateUrl: String } := order;
+        destroyString(url);
+        destroyString(status);
+        destroyString(finalizeUrl);
+        destroyString(authorizations);
+        destroyString(certificateUrl);
+        return nil;
+    end;
+
+    record Challenge: Linear is
+        name: String;
+        kind: String;
+        token: String;
+        url: String;
+    end;
+
+    function destroyChallenge(challenge: Challenge): Unit is
+        let { name: String, kind: String, token: String, url: String } := challenge;
+        destroyString(name);
+        destroyString(kind);
+        destroyString(token);
+        destroyString(url);
+        return nil;
+    end;
+
+    ---
+    --- Encodings
+    ---
+
+    generic [R: Region]
+    function base64Url(bytes: Span[Nat8, R]): String is
+        let plain: String := encodeUnpadded(bytes);
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < length(&plain) do
+            let byte: Nat8 := nthByte(&plain, i);
+            if byte = '+' then
+                writeByte(&!out, '-');
+            else if byte = '/' then
+                writeByte(&!out, '_');
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(plain);
+        return finalize(out);
+    end;
+
+    -- One integer of a DER signature at at, as 32 bytes written to out;
+    -- the index after it, or 0 when it is no such integer.
+    generic [R: Region, B: Region]
+    function integerAt(der: Span[Nat8, R], at: Index, out: &![StringBuilder, B]): Index is
+        let size: Index := spanLength(der);
+        if ((at + 2) > size) or (der[at] /= 2) then
+            return noIndex;
+        end if;
+        case toIndex(der[at + 1]) of
+            when Some(value as count: Index) do
+                var start: Index := at + 2;
+                let stop: Index := start + count;
+                if ((count = 0) or (count > 33)) or (stop > size) then
+                    return 0;
+                end if;
+                while ((stop - start) > 32) and (der[start] = 0) do
+                    start := start + 1;
+                end while;
+                if (stop - start) > 32 then
+                    return 0;
+                end if;
+                let width: Index := 32;
+                var pad: Index := width - (stop - start);
+                while pad > 0 do
+                    writeByte(&~out, 0);
+                    pad := pad - 1;
+                end while;
+                var i: Index := start;
+                while i < stop do
+                    writeByte(&~out, der[i]);
+                    i := i + 1;
+                end while;
+                return stop;
+            when None do
+                return noIndex;
+        end case;
+    end;
+
+    generic [R: Region]
+    function isEs256Size(signature: &[Option[String], R]): Bool is
+        case signature of
+            when Some(value as raw: &[String, R]) do
+                return length(raw) = 64;
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [R: Region]
+    function joseSignature(der: Span[Nat8, R]): Option[String] is
+        let size: Index := spanLength(der);
+        if (size < 8) or (der[0] /= 48) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case toIndex(der[1]) of
+            when Some(value as envelope: Index) do
+                if (envelope + 2) /= size then
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+        var out: StringBuilder := makeStringBuilder();
+        let afterR: Index := integerAt(der, 2, &!out);
+        var afterS: Index := 0;
+        if afterR > 0 then
+            afterS := integerAt(der, afterR, &!out);
+        end if;
+        let raw: String := finalize(out);
+        if (afterS = size) and (length(&raw) = 64) then
+            let some: Option[String] := Some(value => raw);
+            return some;
+        else
+            destroyString(raw);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    -- The 27 bytes before the point in the SubjectPublicKeyInfo of a P-256
+    -- key: the algorithm id-ecPublicKey, the curve prime256v1, the bit
+    -- string, and 4 for a point that is not compressed.
+    function p256Prefix(): String is
+        var out: StringBuilder := makeStringBuilder();
+        let bytes: Span[Nat8, Static] := "3059301306072a8648ce3d020106082a8648ce3d030107034200";
+        var i: Index := 0;
+        while (i + 1) < spanLength(bytes) do
+            writeByte(&!out, (hexValue(bytes[i]) * 16) + hexValue(bytes[i + 1]));
+            i := i + 2;
+        end while;
+        writeByte(&!out, 4);
+        return finalize(out);
+    end;
+
+    function hexValue(digit: Nat8): Nat8 is
+        if (digit >= '0') and (digit <= '9') then
+            return digit - '0';
+        end if;
+        return (digit - 'a') + 10;
+    end;
+
+    -- The coordinates of a P-256 key in base64url, from its DER public key.
+    record Point: Linear is
+        x: String;
+        y: String;
+    end;
+
+    generic [R: Region]
+    function pointOf(der: Span[Nat8, R]): Option[Point] is
+        let prefix: String := p256Prefix();
+        let size: Index := length(&prefix);
+        var good: Bool := spanLength(der) = (size + 64);
+        var i: Index := 0;
+        while good and (i < size) do
+            if der[i] /= nthByte(&prefix, i) then
+                good := false;
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(prefix);
+        if not good then
+            let none: Option[Point] := None();
+            return none;
+        end if;
+        let x: String := base64Url(substring(der, size, size + 32));
+        let y: String := base64Url(substring(der, size + 32, size + 64));
+        let some: Option[Point] := Some(value => Point(x => x, y => y));
+        return some;
+    end;
+
+    ---
+    --- The account's key
+    ---
+
+    generic [R: Region]
+    function jwkText(account: &![Account, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"");
+        let x: String := pointXOf(&~account);
+        writeString(&!out, asSpan(&x));
+        destroyString(x);
+        writeString(&!out, "\",\"y\":\"");
+        let y: String := pointYOf(&~account);
+        writeString(&!out, asSpan(&y));
+        destroyString(y);
+        writeString(&!out, "\"}");
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function thumbprint(account: &![Account, R]): String is
+        let text: String := jwkText(&~account);
+        case sha256(asSpan(&text)) of
+            when Some(value as digest: String) do
+                destroyString(text);
+                let encoded: String := base64Url(asSpan(&digest));
+                destroyString(digest);
+                return encoded;
+            when None do
+                destroyString(text);
+                abort("Standard.Acme: SHA-256 failed");
+        end case;
+    end;
+
+    generic [R: Region, T: Region]
+    function keyAuthorization(account: &![Account, R], token: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, token);
+        writeByte(&!out, '.');
+        let print: String := thumbprint(&~account);
+        writeString(&!out, asSpan(&print));
+        destroyString(print);
+        return finalize(out);
+    end;
+
+    generic [R: Region, T: Region]
+    function dnsChallengeValue(account: &![Account, R], token: Span[Nat8, T]): String is
+        let text: String := keyAuthorization(&~account, token);
+        case sha256(asSpan(&text)) of
+            when Some(value as digest: String) do
+                destroyString(text);
+                let encoded: String := base64Url(asSpan(&digest));
+                destroyString(digest);
+                return encoded;
+            when None do
+                destroyString(text);
+                abort("Standard.Acme: SHA-256 failed");
+        end case;
+    end;
+
+    generic [R: Region]
+    function accountUrl(account: &![Account, R]): String is
+        return kidOf(&~account);
+    end;
+
+    function closeAccount(account: Account): PrivateKey is
+        let { key: PrivateKey, caFile: String, limits: Limits, kid: String, newNonceUrl: String, newOrderUrl: String,
+            nonce: Buffer[Nat8], pointX: String, pointY: String } := account;
+        destroyString(caFile);
+        destroyString(kid);
+        destroyString(newNonceUrl);
+        destroyString(newOrderUrl);
+        var rest: Buffer[Nat8] := nonce;
+        clearBuffer(&!rest);
+        destroyEmpty(rest);
+        destroyString(pointX);
+        destroyString(pointY);
+        return key;
+    end;
+
+    generic [B: Region]
+    function clearBuffer(buffer: &![Buffer[Nat8], B]): Unit is
+        while lengthMut(&~buffer) > 0 do
+            let byte: Nat8 := removeLast(&~buffer);
+        end while;
+        return nil;
+    end;
+
+    generic [B: Region, S: Region]
+    function setBuffer(buffer: &![Buffer[Nat8], B], text: Span[Nat8, S]): Unit is
+        clearBuffer(&~buffer);
+        var i: Index := 0;
+        while i < spanLength(text) do
+            insertBack(&~buffer, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function contentOf(response: &[Response, R]): Span[Nat8, R] is
+        return asSpan(&(response->content));
+    end;
+
+    generic [R: Region]
+    function headersOf(response: &[Response, R]): Span[Nat8, R] is
+        return asSpan(&(response->headers));
+    end;
+
+    generic [R: Region]
+    function statusOf(response: &[Response, R]): Nat16 is
+        return response->status;
+    end;
+
+    ---
+    --- Requests
+    ---
+
+    -- An AcmeError from an HttpClient failure.
+    function transport(failed: Failure): AcmeError is
+        let { kind as ignored: FailureKind, detail: String } := failed;
+        return AcmeError(kind => fromLiteral("transport"), detail => detail);
+    end;
+
+    -- An AcmeError from a problem document, or from the status alone.
+    generic [R: Region]
+    function problem(response: &[Response, R]): AcmeError is
+        case readJson(asSpan(&(response->content))) of
+            when Right(right as document: Json) do
+                var kind: String := fromLiteral("protocol");
+                var detail: String := fromLiteral("the server refused the request");
+                case stringAt(&document, "/type") of
+                    when Some(value as found: String) do
+                        destroyString(kind);
+                        kind := found;
+                    when None do
+                        skip;
+                end case;
+                case stringAt(&document, "/detail") of
+                    when Some(value as found: String) do
+                        destroyString(detail);
+                        detail := found;
+                    when None do
+                        skip;
+                end case;
+                destroyJson(document);
+                return AcmeError(kind => kind, detail => detail);
+            when Left(left as error: JsonError) do
+                return failure("protocol", "the server refused the request without a problem document");
+        end case;
+    end;
+
+    generic [R: Region]
+    function isBadNonce(response: &[Response, R]): Bool is
+        if response->status /= 400 then
+            return false;
+        end if;
+        case readJson(asSpan(&(response->content))) of
+            when Right(right as document: Json) do
+                var bad: Bool := false;
+                case stringAt(&document, "/type") of
+                    when Some(value as kind: String) do
+                        bad := sameText(asSpan(&kind), badNonce);
+                        destroyString(kind);
+                    when None do
+                        skip;
+                end case;
+                destroyJson(document);
+                return bad;
+            when Left(left as error: JsonError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameText(left: Span[Nat8, R], right: Span[Nat8, S]): Bool is
+        if spanLength(left) /= spanLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(left) do
+            if left[i] /= right[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    ---
+    --- The slots of an account through a write reference: each helper uses
+    --- up the reference it is given, so a caller passes a reborrow.
+    ---
+
+    generic [R: Region]
+    function nonceLength(account: &![Account, R]): Index is
+        return lengthMut(&!(account->nonce));
+    end;
+
+    generic [R: Region, S: Region]
+    function setNonce(account: &![Account, R], text: Span[Nat8, S]): Unit is
+        setBuffer(&!(account->nonce), text);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function clearNonce(account: &![Account, R]): Unit is
+        clearBuffer(&!(account->nonce));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function nonceText(account: &![Account, R]): String is
+        let buffer: &![Buffer[Nat8], R] := &!(account->nonce);
+        let size: Index := lengthMut(&~buffer);
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < size do
+            writeByte(&!out, nthMut(&~buffer, i));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function caFileOf(account: &![Account, R]): String is
+        return fromSpan(asSpan(&(account->caFile)));
+    end;
+
+    generic [R: Region]
+    function kidOf(account: &![Account, R]): String is
+        return fromSpan(asSpan(&(account->kid)));
+    end;
+
+    generic [R: Region]
+    function newNonceUrlOf(account: &![Account, R]): String is
+        return fromSpan(asSpan(&(account->newNonceUrl)));
+    end;
+
+    generic [R: Region]
+    function newOrderUrlOf(account: &![Account, R]): String is
+        return fromSpan(asSpan(&(account->newOrderUrl)));
+    end;
+
+    generic [R: Region]
+    function pointXOf(account: &![Account, R]): String is
+        return fromSpan(asSpan(&(account->pointX)));
+    end;
+
+    generic [R: Region]
+    function pointYOf(account: &![Account, R]): String is
+        return fromSpan(asSpan(&(account->pointY)));
+    end;
+
+    generic [R: Region]
+    function limitsOf(account: &![Account, R]): Limits is
+        return account->limits;
+    end;
+
+    generic [R: Region, M: Region]
+    function signAs(account: &![Account, R], message: Span[Nat8, M]): Option[String] is
+        return signatureOf(&(account->key), message);
+    end;
+
+    -- Takes the Replay-Nonce of an answer into the account.
+    generic [R: Region, S: Region]
+    function takeNonce(account: &![Account, R], response: &[Response, S]): Unit is
+        case headerValue(asSpan(&(response->headers)), "Replay-Nonce") of
+            when Some(value as nonce: String) do
+                setNonce(&~account, asSpan(&nonce));
+                destroyString(nonce);
+            when None do
+                clearNonce(&~account);
+        end case;
+        return nil;
+    end;
+
+    -- A fresh nonce from newNonce when the account has none.
+    generic [R: Region]
+    function ensureNonce(account: &![Account, R]): Option[AcmeError] is
+        if nonceLength(&~account) > 0 then
+            let none: Option[AcmeError] := None();
+            return none;
+        end if;
+        let url: String := newNonceUrlOf(&~account);
+        let ca: String := caFileOf(&~account);
+        let limits: Limits := limitsOf(&~account);
+        let answer: Either[Failure, Response] := request(Get(), asSpan(&url), "", "", asSpan(&ca), limits);
+        destroyString(url);
+        destroyString(ca);
+        case answer of
+            when Right(right as response: Response) do
+                takeNonce(&~account, &response);
+                destroyResponse(response);
+            when Left(left as failed: Failure) do
+                let some: Option[AcmeError] := Some(value => transport(failed));
+                return some;
+        end case;
+        if nonceLength(&~account) = 0 then
+            let some: Option[AcmeError] := Some(value => failure("protocol", "newNonce gave no Replay-Nonce"));
+            return some;
+        end if;
+        let none: Option[AcmeError] := None();
+        return none;
+    end;
+
+    -- The signed body of a request to url with payload, or of a POST-as-GET.
+    generic [R: Region, U: Region, P: Region]
+    function signedBody(account: &![Account, R], url: Span[Nat8, U], payload: Span[Nat8, P], asGet: Bool): Option[String] is
+        let kid: String := kidOf(&~account);
+        let pointX: String := pointXOf(&~account);
+        let pointY: String := pointYOf(&~account);
+        var header: JsonWriter := makeJsonWriter();
+        beginObject(&!header);
+        writeName(&!header, "alg");
+        writeJsonString(&!header, "ES256");
+        if length(&kid) = 0 then
+            writeName(&!header, "jwk");
+            beginObject(&!header);
+            writeName(&!header, "crv");
+            writeJsonString(&!header, "P-256");
+            writeName(&!header, "kty");
+            writeJsonString(&!header, "EC");
+            writeName(&!header, "x");
+            writeJsonString(&!header, asSpan(&pointX));
+            writeName(&!header, "y");
+            writeJsonString(&!header, asSpan(&pointY));
+            endObject(&!header);
+        else
+            writeName(&!header, "kid");
+            writeJsonString(&!header, asSpan(&kid));
+        end if;
+        destroyString(kid);
+        destroyString(pointX);
+        destroyString(pointY);
+        writeName(&!header, "nonce");
+        let nonce: String := nonceText(&~account);
+        writeJsonString(&!header, asSpan(&nonce));
+        destroyString(nonce);
+        writeName(&!header, "url");
+        writeJsonString(&!header, url);
+        endObject(&!header);
+        case finishJson(header) of
+            when Some(value as protectedJson: String) do
+                let protected: String := base64Url(asSpan(&protectedJson));
+                destroyString(protectedJson);
+                var encodedPayload: String := makeEmpty();
+                if not asGet then
+                    destroyString(encodedPayload);
+                    encodedPayload := base64Url(payload);
+                end if;
+                var input: StringBuilder := makeStringBuilder();
+                writeString(&!input, asSpan(&protected));
+                writeByte(&!input, '.');
+                writeString(&!input, asSpan(&encodedPayload));
+                let signingInput: String := finalize(input);
+                let signature: Option[String] := signAs(&~account, asSpan(&signingInput));
+                destroyString(signingInput);
+                case signature of
+                    when Some(value as raw: String) do
+                        let encoded: String := base64Url(asSpan(&raw));
+                        destroyString(raw);
+                        var envelope: JsonWriter := makeJsonWriter();
+                        beginObject(&!envelope);
+                        writeName(&!envelope, "protected");
+                        writeJsonString(&!envelope, asSpan(&protected));
+                        writeName(&!envelope, "payload");
+                        writeJsonString(&!envelope, asSpan(&encodedPayload));
+                        writeName(&!envelope, "signature");
+                        writeJsonString(&!envelope, asSpan(&encoded));
+                        endObject(&!envelope);
+                        destroyString(encoded);
+                        destroyString(protected);
+                        destroyString(encodedPayload);
+                        return finishJson(envelope);
+                    when None do
+                        destroyString(protected);
+                        destroyString(encodedPayload);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [K: Region, M: Region]
+    function signatureOf(key: &[PrivateKey, K], message: Span[Nat8, M]): Option[String] is
+        case signMessage(key, message) of
+            when Some(value as der: String) do
+                let raw: Option[String] := joseSignature(asSpan(&der));
+                destroyString(der);
+                return raw;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- One signed POST; a badNonce answer is tried once more with the nonce
+    -- it brought.  An answer of 400 or above is a Left.
+    generic [R: Region, U: Region, P: Region]
+    function post(account: &![Account, R], url: Span[Nat8, U], payload: Span[Nat8, P], asGet: Bool, accept: Span[Nat8, Static]): Either[AcmeError, Response] is
+        var attempt: Index := 0;
+        while attempt < 2 do
+            case ensureNonce(&~account) of
+                when Some(value as error: AcmeError) do
+                    let failed: Either[AcmeError, Response] := Left(left => error);
+                    return failed;
+                when None do
+                    skip;
+            end case;
+            case signedBody(&~account, url, payload, asGet) of
+                when Some(value as envelope: String) do
+                    clearNonce(&~account);
+                    let ca: String := caFileOf(&~account);
+                    let limits: Limits := limitsOf(&~account);
+                    let answer: Either[Failure, Response] := request(Post(), url, accept, asSpan(&envelope), asSpan(&ca), limits);
+                    destroyString(ca);
+                    destroyString(envelope);
+                    case answer of
+                        when Right(right as response: Response) do
+                            takeNonce(&~account, &response);
+                            if (attempt = 0) and isBadNonce(&response) then
+                                destroyResponse(response);
+                                attempt := attempt + 1;
+                            else if statusOf(&response) >= 400 then
+                                let error: AcmeError := problem(&response);
+                                destroyResponse(response);
+                                let failed: Either[AcmeError, Response] := Left(left => error);
+                                return failed;
+                            else
+                                let good: Either[AcmeError, Response] := Right(right => response);
+                                return good;
+                            end if;
+                        when Left(left as failed: Failure) do
+                            let error: Either[AcmeError, Response] := Left(left => transport(failed));
+                            return error;
+                    end case;
+                when None do
+                    let failed: Either[AcmeError, Response] := Left(left => failure("key", "the request could not be signed"));
+                    return failed;
+            end case;
+        end while;
+        let failed: Either[AcmeError, Response] := Left(left => failure(badNonce, "the server refused two nonces"));
+        return failed;
+    end;
+
+    constant jose: Span[Nat8, Static] := "Content-Type: application/jose+json";
+    constant josePem: Span[Nat8, Static] := "Content-Type: application/jose+json\nAccept: application/pem-certificate-chain";
+
+    ---
+    --- Account
+    ---
+
+    -- The string at pointer of document, or an empty one.
+    generic [R: Region]
+    function textAt(document: &[Json, R], pointer: Span[Nat8, Static]): String is
+        case stringAt(document, pointer) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    -- The coordinates of the key, when it is a P-256 key.
+    generic [R: Region]
+    function pointOfKey(key: &[PrivateKey, R]): Either[AcmeError, Point] is
+        if not isP256(keyKindOf(key)) then
+            let wrong: Either[AcmeError, Point] := Left(left => failure("key", "an ACME account key must be a P-256 key"));
+            return wrong;
+        end if;
+        case publicKeyDer(key) of
+            when Some(value as der: String) do
+                let found: Option[Point] := pointOf(asSpan(&der));
+                destroyString(der);
+                case found of
+                    when Some(value as point: Point) do
+                        let good: Either[AcmeError, Point] := Right(right => point);
+                        return good;
+                    when None do
+                        let bad: Either[AcmeError, Point] := Left(left => failure("key", "the public key is not a P-256 point"));
+                        return bad;
+                end case;
+            when None do
+                let bad: Either[AcmeError, Point] := Left(left => failure("key", "the public key could not be read"));
+                return bad;
+        end case;
+    end;
+
+    generic [D: Region, C: Region, F: Region]
+    function openAccount(directoryUrl: Span[Nat8, D], key: PrivateKey, contact: Span[Nat8, C],
+        caFile: Span[Nat8, F], limits: Limits): Either[AcmeError, Account] is
+        case pointOfKey(&key) of
+            when Right(right as point: Point) do
+                return withDirectory(directoryUrl, key, point, contact, caFile, limits);
+            when Left(left as error: AcmeError) do
+                return refusedWith(key, error);
+        end case;
+    end;
+
+    -- The directory read, then the account registered.
+    generic [D: Region, C: Region, F: Region]
+    function withDirectory(directoryUrl: Span[Nat8, D], key: PrivateKey, point: Point, contact: Span[Nat8, C],
+        caFile: Span[Nat8, F], limits: Limits): Either[AcmeError, Account] is
+        case request(Get(), directoryUrl, "", "", caFile, limits) of
+            when Right(right as response: Response) do
+                if statusOf(&response) /= 200 then
+                    destroyResponse(response);
+                    dropPoint(Some(value => point));
+                    return refusedWith(key, failure("protocol", "the directory did not answer 200"));
+                else
+                    case readJson(contentOf(&response)) of
+                        when Right(right as document: Json) do
+                            let newNonceUrl: String := textAt(&document, "/newNonce");
+                            let newAccountUrl: String := textAt(&document, "/newAccount");
+                            let newOrderUrl: String := textAt(&document, "/newOrder");
+                            destroyJson(document);
+                            destroyResponse(response);
+                            -- An account holds both URLs, never empty (the invariants
+                            -- of Account); a directory without one is the server's fault.
+                            let missing: Bool := (length(&newNonceUrl) = 0) or (length(&newAccountUrl) = 0);
+                            if missing or (length(&newOrderUrl) = 0) then
+                                destroyString(newNonceUrl);
+                                destroyString(newAccountUrl);
+                                destroyString(newOrderUrl);
+                                dropPoint(Some(value => point));
+                                return refusedWith(key, failure("protocol", "the directory names no newNonce, newAccount or newOrder"));
+                            else
+                                let { x: String, y: String } := point;
+                                let noNonce: Buffer[Nat8] := allocateEmpty();
+                                let account: Account := Account(
+                                    key => key,
+                                    caFile => fromSpan(caFile),
+                                    limits => limits,
+                                    kid => makeEmpty(),
+                                    newNonceUrl => newNonceUrl,
+                                    newOrderUrl => newOrderUrl,
+                                    nonce => noNonce,
+                                    pointX => x,
+                                    pointY => y
+                                );
+                                let registered: Either[AcmeError, Account] := register(account, &newAccountUrl, contact);
+                                destroyString(newAccountUrl);
+                                return registered;
+                            end if;
+                        when Left(left as error: JsonError) do
+                            destroyResponse(response);
+                            dropPoint(Some(value => point));
+                            return refusedWith(key, failure("protocol", "the directory is no JSON"));
+                    end case;
+                end if;
+            when Left(left as failed: Failure) do
+                dropPoint(Some(value => point));
+                return refusedWith(key, transport(failed));
+        end case;
+    end;
+
+    function dropPoint(point: Option[Point]): Unit is
+        case point of
+            when Some(value as found: Point) do
+                let { x: String, y: String } := found;
+                destroyString(x);
+                destroyString(y);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function isP256(kind: KeyKind): Bool is
+        case kind of
+            when EcP256 do
+                return true;
+            when EcP384 | EcP521 | Ed25519Key | Rsa2048 | Rsa3072 | Rsa4096 | MlDsa44 | MlDsa65 | MlDsa87 do
+                return false;
+        end case;
+    end;
+
+    -- A Left that the caller gets with the key it gave: the key is lost
+    -- otherwise, and it is the caller's.  The key is destroyed here, since
+    -- an Either carries one value; the caller makes a new one.
+    function refusedWith(key: PrivateKey, error: AcmeError): Either[AcmeError, Account] is
+        destroyPrivateKey(key);
+        let failed: Either[AcmeError, Account] := Left(left => error);
+        return failed;
+    end;
+
+    -- newAccount with the JWK; the Location of the answer is the kid.
+    generic [N: Region, C: Region]
+    function register(account: Account, newAccountUrl: &[String, N], contact: Span[Nat8, C]): Either[AcmeError, Account] is
+        var payload: JsonWriter := makeJsonWriter();
+        beginObject(&!payload);
+        writeName(&!payload, "termsOfServiceAgreed");
+        writeBool(&!payload, true);
+        if spanLength(contact) > 0 then
+            writeName(&!payload, "contact");
+            beginArray(&!payload);
+            var address: StringBuilder := makeStringBuilder();
+            writeString(&!address, "mailto:");
+            writeString(&!address, contact);
+            let mailto: String := finalize(address);
+            writeJsonString(&!payload, asSpan(&mailto));
+            destroyString(mailto);
+            endArray(&!payload);
+        end if;
+        endObject(&!payload);
+        var opened: Account := account;
+        case finishJson(payload) of
+            when Some(value as text: String) do
+                let answer: Either[AcmeError, Response] := post(&!opened, asSpan(newAccountUrl), asSpan(&text), false, jose);
+                destroyString(text);
+                case answer of
+                    when Right(right as response: Response) do
+                        case headerValue(headersOf(&response), "Location") of
+                            when Some(value as location: String) do
+                                destroyResponse(response);
+                                if length(&location) = 0 then
+                                    destroyString(location);
+                                    return refusedWith(closeAccount(opened), failure("protocol", "newAccount gave an empty Location"));
+                                else
+                                    let { key: PrivateKey, caFile: String, limits: Limits, kid: String, newNonceUrl: String, newOrderUrl: String,
+                                        nonce: Buffer[Nat8], pointX: String, pointY: String } := opened;
+                                    destroyString(kid);
+                                    let done: Account := Account(key => key, caFile => caFile, limits => limits, kid => location,
+                                        newNonceUrl => newNonceUrl, newOrderUrl => newOrderUrl, nonce => nonce,
+                                        pointX => pointX, pointY => pointY);
+                                    let good: Either[AcmeError, Account] := Right(right => done);
+                                    return good;
+                                end if;
+                            when None do
+                                destroyResponse(response);
+                                return refusedWith(closeAccount(opened), failure("protocol", "newAccount gave no Location"));
+                        end case;
+                    when Left(left as error: AcmeError) do
+                        return refusedWith(closeAccount(opened), error);
+                end case;
+            when None do
+                return refusedWith(closeAccount(opened), failure("protocol", "the payload could not be written"));
+        end case;
+    end;
+
+    ---
+    --- Orders
+    ---
+
+    -- An order from its JSON at url.
+    generic [R: Region, U: Region]
+    function orderOf(response: &[Response, R], url: Span[Nat8, U]): Either[AcmeError, Order] is
+        case readJson(asSpan(&(response->content))) of
+            when Right(right as document: Json) do
+                var list: StringBuilder := makeStringBuilder();
+                case countAt(&document, "/authorizations") of
+                    when Some(value as count: Index) do
+                        var i: Index := 0;
+                        while i < count do
+                            var pointer: StringBuilder := makeStringBuilder();
+                            writeString(&!pointer, "/authorizations/");
+                            writeDecimal(&!pointer, i);
+                            let path: String := finalize(pointer);
+                            case stringAt(&document, asSpan(&path)) of
+                                when Some(value as link: String) do
+                                    if i > 0 then
+                                        writeByte(&!list, ' ');
+                                    end if;
+                                    writeString(&!list, asSpan(&link));
+                                    destroyString(link);
+                                when None do
+                                    skip;
+                            end case;
+                            destroyString(path);
+                            i := i + 1;
+                        end while;
+                    when None do
+                        skip;
+                end case;
+                let order: Order := Order(
+                    url => fromSpan(url),
+                    status => textAt(&document, "/status"),
+                    finalizeUrl => textAt(&document, "/finalize"),
+                    authorizations => finalize(list),
+                    certificateUrl => textAt(&document, "/certificate")
+                );
+                destroyJson(document);
+                let good: Either[AcmeError, Order] := Right(right => order);
+                return good;
+            when Left(left as error: JsonError) do
+                let failed: Either[AcmeError, Order] := Left(left => failure("protocol", "the order is no JSON"));
+                return failed;
+        end case;
+    end;
+
+    generic [B: Region]
+    function writeDecimal(out: &![StringBuilder, B], number: Index): Unit is
+        let ten: Index := 10;
+        if number >= ten then
+            writeDecimal(&~out, number / ten);
+        end if;
+        case toNat8(number - ((number / ten) * ten)) of
+            when Some(value as digit: Nat8) do
+                writeByte(&~out, digit + 48);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, N: Region]
+    function newOrder(account: &![Account, R], names: Span[Nat8, N]): Either[AcmeError, Order] is
+        var payload: JsonWriter := makeJsonWriter();
+        beginObject(&!payload);
+        writeName(&!payload, "identifiers");
+        beginArray(&!payload);
+        var start: Index := 0;
+        var at: Index := 0;
+        while at <= spanLength(names) do
+            if (at = spanLength(names)) or (names[at] = ',') then
+                if at > start then
+                    beginObject(&!payload);
+                    writeName(&!payload, "type");
+                    writeJsonString(&!payload, "dns");
+                    writeName(&!payload, "value");
+                    writeJsonString(&!payload, substring(names, start, at));
+                    endObject(&!payload);
+                end if;
+                start := at + 1;
+            end if;
+            at := at + 1;
+        end while;
+        endArray(&!payload);
+        endObject(&!payload);
+        case finishJson(payload) of
+            when Some(value as text: String) do
+                let url: String := newOrderUrlOf(&~account);
+                let answer: Either[AcmeError, Response] := post(&~account, asSpan(&url), asSpan(&text), false, jose);
+                destroyString(url);
+                destroyString(text);
+                case answer of
+                    when Right(right as response: Response) do
+                        case headerValue(headersOf(&response), "Location") of
+                            when Some(value as location: String) do
+                                let order: Either[AcmeError, Order] := orderOf(&response, asSpan(&location));
+                                destroyString(location);
+                                destroyResponse(response);
+                                return order;
+                            when None do
+                                destroyResponse(response);
+                                let failed: Either[AcmeError, Order] := Left(left => failure("protocol", "newOrder gave no Location"));
+                                return failed;
+                        end case;
+                    when Left(left as error: AcmeError) do
+                        let failed: Either[AcmeError, Order] := Left(left => error);
+                        return failed;
+                end case;
+            when None do
+                let failed: Either[AcmeError, Order] := Left(left => failure("protocol", "the payload could not be written"));
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, U: Region]
+    function fetchOrder(account: &![Account, R], url: Span[Nat8, U]): Either[AcmeError, Order] is
+        case post(&~account, url, "", true, jose) of
+            when Right(right as response: Response) do
+                let order: Either[AcmeError, Order] := orderOf(&response, url);
+                destroyResponse(response);
+                return order;
+            when Left(left as error: AcmeError) do
+                let failed: Either[AcmeError, Order] := Left(left => error);
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, U: Region, K: Region]
+    function challengeOf(account: &![Account, R], authorizationUrl: Span[Nat8, U], kind: Span[Nat8, K]): Either[AcmeError, Challenge] is
+        case post(&~account, authorizationUrl, "", true, jose) of
+            when Right(right as response: Response) do
+                case readJson(contentOf(&response)) of
+                    when Right(right as document: Json) do
+                        destroyResponse(response);
+                        let found: Either[AcmeError, Challenge] := findChallenge(&document, kind);
+                        destroyJson(document);
+                        return found;
+                    when Left(left as error: JsonError) do
+                        destroyResponse(response);
+                        let failed: Either[AcmeError, Challenge] := Left(left => failure("protocol", "the authorization is no JSON"));
+                        return failed;
+                end case;
+            when Left(left as error: AcmeError) do
+                let failed: Either[AcmeError, Challenge] := Left(left => error);
+                return failed;
+        end case;
+    end;
+
+    generic [D: Region, K: Region]
+    function findChallenge(document: &[Json, D], kind: Span[Nat8, K]): Either[AcmeError, Challenge] is
+        case countAt(document, "/challenges") of
+            when Some(value as count: Index) do
+                var i: Index := 0;
+                while i < count do
+                    let typePath: String := pointerTo(i, "/type");
+                    let kindHere: String := textOf(document, &typePath);
+                    destroyString(typePath);
+                    let same: Bool := sameText(asSpan(&kindHere), kind);
+                    destroyString(kindHere);
+                    if same then
+                        let tokenPath: String := pointerTo(i, "/token");
+                        let urlPath: String := pointerTo(i, "/url");
+                        let challenge: Challenge := Challenge(
+                            name => textAt(document, "/identifier/value"),
+                            kind => fromSpan(kind),
+                            token => textOf(document, &tokenPath),
+                            url => textOf(document, &urlPath)
+                        );
+                        destroyString(tokenPath);
+                        destroyString(urlPath);
+                        let good: Either[AcmeError, Challenge] := Right(right => challenge);
+                        return good;
+                    end if;
+                    i := i + 1;
+                end while;
+            when None do
+                skip;
+        end case;
+        let failed: Either[AcmeError, Challenge] := Left(left => failure("protocol", "the authorization has no challenge of that type"));
+        return failed;
+    end;
+
+    function pointerTo(index: Index, rest: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/challenges/");
+        writeDecimal(&!out, index);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    generic [D: Region, P: Region]
+    function textOf(document: &[Json, D], pointer: &[String, P]): String is
+        case stringAt(document, asSpan(pointer)) of
+            when Some(value as found: String) do
+                return found;
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    generic [R: Region, U: Region]
+    function respond(account: &![Account, R], challengeUrl: Span[Nat8, U]): Either[AcmeError, Unit] is
+        case post(&~account, challengeUrl, "{}", false, jose) of
+            when Right(right as response: Response) do
+                destroyResponse(response);
+                let done: Either[AcmeError, Unit] := Right(right => nil);
+                return done;
+            when Left(left as error: AcmeError) do
+                let failed: Either[AcmeError, Unit] := Left(left => error);
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, U: Region]
+    function authorizationStatus(account: &![Account, R], url: Span[Nat8, U]): Either[AcmeError, String] is
+        case post(&~account, url, "", true, jose) of
+            when Right(right as response: Response) do
+                case readJson(contentOf(&response)) of
+                    when Right(right as document: Json) do
+                        let status: String := textAt(&document, "/status");
+                        destroyJson(document);
+                        destroyResponse(response);
+                        let good: Either[AcmeError, String] := Right(right => status);
+                        return good;
+                    when Left(left as error: JsonError) do
+                        destroyResponse(response);
+                        let failed: Either[AcmeError, String] := Left(left => failure("protocol", "the authorization is no JSON"));
+                        return failed;
+                end case;
+            when Left(left as error: AcmeError) do
+                let failed: Either[AcmeError, String] := Left(left => error);
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, O: Region, Q: Region]
+    function finalizeOrder(account: &![Account, R], order: &[Order, O], csrDer: Span[Nat8, Q]): Either[AcmeError, Order] is
+        var payload: JsonWriter := makeJsonWriter();
+        beginObject(&!payload);
+        writeName(&!payload, "csr");
+        let encoded: String := base64Url(csrDer);
+        writeJsonString(&!payload, asSpan(&encoded));
+        destroyString(encoded);
+        endObject(&!payload);
+        case finishJson(payload) of
+            when Some(value as text: String) do
+                let answer: Either[AcmeError, Response] := post(&~account, asSpan(&(order->finalizeUrl)), asSpan(&text), false, jose);
+                destroyString(text);
+                case answer of
+                    when Right(right as response: Response) do
+                        let next: Either[AcmeError, Order] := orderOf(&response, asSpan(&(order->url)));
+                        destroyResponse(response);
+                        return next;
+                    when Left(left as error: AcmeError) do
+                        let failed: Either[AcmeError, Order] := Left(left => error);
+                        return failed;
+                end case;
+            when None do
+                let failed: Either[AcmeError, Order] := Left(left => failure("protocol", "the payload could not be written"));
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, U: Region]
+    function downloadCertificate(account: &![Account, R], url: Span[Nat8, U]): Either[AcmeError, String] is
+        case post(&~account, url, "", true, josePem) of
+            when Right(right as response: Response) do
+                let { status: Nat16, headers: String, content: String } := response;
+                destroyString(headers);
+                let good: Either[AcmeError, String] := Right(right => content);
+                return good;
+            when Left(left as error: AcmeError) do
+                let failed: Either[AcmeError, String] := Left(left => error);
+                return failed;
+        end case;
+    end;
+end module body.

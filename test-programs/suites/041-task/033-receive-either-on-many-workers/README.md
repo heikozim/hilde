@@ -1,0 +1,1 @@
+receiveEither on four workers: in each of four rounds two producer tasks send 1 to 2000 and a consumer task takes from both until both are closed, on channels of capacity 0, 1, 3 and 64; each round prints the two sums as one number, 2001000 times a million plus 2001000.

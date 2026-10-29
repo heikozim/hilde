@@ -1,0 +1,123 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.File (
+    FileDescriptor,
+    closeFile,
+    readAll,
+    Command,
+    makeCommand,
+    addArgument,
+    Process,
+    Running,
+    spawnProcess,
+    waitProcess,
+    ProcessStatus,
+    exitedNormally,
+    exitCode
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    yieldNow
+);
+
+module body Test is
+    function now(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as t: Nat64) do
+                return t;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Reads what the child writes, which comes two seconds after it starts.
+    function reader(output: FileDescriptor): Unit is
+        var file: FileDescriptor := output;
+        case readAll(&!file) of
+            when Some(value as text: String) do
+                if length(&text) > 0 then
+                    printLn("the task read the line of the child");
+                else
+                    printLn("the task read nothing");
+                end if;
+                destroyString(text);
+            when None do
+                printLn("the read failed");
+        end case;
+        let closed: Bool := closeFile(file);
+        return nil;
+    end;
+
+    -- Starts the child, hands its output to a task and lets the task run
+    -- first.  The task finds nothing to read yet, and main must run again
+    -- while it waits: well within the two seconds, not after the line.
+    generic [R: Region]
+    function both(scope: &![Scope, R]): Unit is
+        let path: String := fromLiteral("/bin/sh");
+        let flag: String := fromLiteral("-c");
+        let script: String := fromLiteral("sleep 2; echo late");
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&path)), asSpan(&flag)), asSpan(&script));
+        destroyString(path);
+        destroyString(flag);
+        destroyString(script);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                let closedInput: Bool := closeFile(input);
+                let closedErrors: Bool := closeFile(errors);
+                let read: Fn[FileDescriptor, Unit] := reader;
+                case spawn(&~scope, read, output) of
+                    when Right(right as task: Task[Unit]) do
+                        let before: Nat64 := now();
+                        yieldNow();
+                        let after: Nat64 := now();
+                        let second: Nat64 := 1000000000;
+                        let waited: Nat64 := after - before;
+                        if waited < second then
+                            printLn("main ran while the task waited");
+                        else
+                            printLn("main waited for the line");
+                        end if;
+                        join(task);
+                    when Left(left as back: FileDescriptor) do
+                        let closedOutput: Bool := closeFile(back);
+                        printLn(-2);
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                if exitedNormally(status) and (exitCode(status) = 0) then
+                    printLn("the child ended");
+                else
+                    printLn("the child ended otherwise");
+                end if;
+            when None do
+                printLn("the child did not start");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                both(&!scope);
+                closeScope(scope);
+            when None do
+                printLn(-2);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

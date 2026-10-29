@@ -1,0 +1,428 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+JSON as RFC 8259 defines it, read strictly into a document and written through a writer.
+
+- A text is checked from its first byte to its last when it is read, and the document kept.
+- A value is found by a JSON Pointer of RFC 6901; one that leads nowhere gives None.
+- A cursor walks the children of an array or object in time linear in its text.
+- Reading refuses rather than guesses, and a refusal names the fault and the byte offset.
+- A name twice in one object, a lone surrogate and nesting deeper than mostDepth are refused.
+- Nothing here aborts on bad input.
+- Numbers are kept as the text they were written in; integerAt reads one within Int64.
+- A writer puts commas, colons and quotes, and escapes what a string needs.
+- A call to a writer out of order spoils it, and finishJson then gives None.
+
+    var writer: JsonWriter := makeJsonWriter();
+    beginObject(&!writer);
+    writeName(&!writer, "id");
+    writeInteger(&!writer, 42);
+    endObject(&!writer);
+    let text: Option[String] := finishJson(writer);
+
+    case readJson(asSpan(&body)) of
+        when Right(right as document: Json) do
+            let id: Option[Int64] := integerAt(&document, "/id");
+            destroyJson(document);
+        when Left(left as refused: JsonError) do
+            printLn(refused.offset);
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.String (
+    String
+);
+
+module Standard.Json is
+    """
+    What was wrong with a text readJson refused.
+    """
+    union JsonFault: Free is
+        """
+        The text ends inside a value, or holds none.
+        """
+        case CutShort;
+        """
+        A byte that cannot stand where it stands, such as a comma before a
+        closing bracket, a bracket that closes what was not opened, or a
+        letter outside a string.
+        """
+        case ByteOutOfPlace;
+        """
+        A number not written as RFC 8259 writes one: a leading zero, a
+        point or an exponent without digits after it.
+        """
+        case BadNumber;
+        """
+        A backslash in a string followed by anything but one of the nine
+        escapes, or the escape u without four hexadecimal digits.
+        """
+        case BadEscape;
+        """
+        A byte below 32 in a string, where it has to be escaped.
+        """
+        case ControlInString;
+        """
+        Bytes in a string that are not well-formed UTF-8.
+        """
+        case NotUtf8;
+        """
+        An escape u of a surrogate that is not one half of a pair.
+        """
+        case LoneSurrogate;
+        """
+        A value nested deeper than mostDepth.
+        """
+        case NestedTooDeep;
+        """
+        A name twice in one object, compared after its escapes are read.
+        """
+        case DuplicateName;
+        """
+        Something other than white space after the value.
+        """
+        case TextAfterValue;
+    end;
+
+    """
+    A refusal: what was wrong, and the byte where it was found.  For a
+    duplicate name it is the brace that closes the object.
+    """
+    record JsonError: Free is
+        fault: JsonFault;
+        offset: Index;
+    end;
+
+    """
+    The kind of a value.
+    """
+    union JsonKind: Free is
+        case JsonNull;
+        case JsonBoolean;
+        case JsonNumber;
+        case JsonString;
+        case JsonArray;
+        case JsonObject;
+    end;
+
+    """
+    How deep arrays and objects may be nested: 128.  The value of a
+    document that is an array holding an array is at depth 2.
+    """
+    constant mostDepth: Index;
+
+    """
+    A document that has been read.  Linear: destroyJson gives it back.
+    """
+    type Json: Linear;
+
+    """
+    Read and check a whole text.  The Right is the document, the Left the
+    first thing that was wrong with it.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function readJson(text: Span[Nat8, R]): Either[JsonError, Json];
+
+    """
+    Give a document back.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyJson(document: Json): Unit;
+
+    """
+    The kind of the value the pointer leads to, or None.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function kindAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[JsonKind];
+
+    """
+    The string the pointer leads to, with its escapes read, or None when
+    the value there is not a string.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function stringAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[String];
+
+    """
+    The number the pointer leads to, as the text it was written in, or
+    None when the value there is not a number.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function numberAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[String];
+
+    """
+    The number the pointer leads to as an Int64: None when it is not a
+    number, has a fraction or an exponent, or lies outside Int64.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function integerAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[Int64];
+
+    """
+    The true or false the pointer leads to, or None.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function boolAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[Bool];
+
+    """
+    Whether the pointer leads to null.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, P: Region]
+    function isNullAt(document: &[Json, R], pointer: Span[Nat8, P]): Bool;
+
+    """
+    How many elements the array, or members the object, the pointer leads
+    to has; None for any other value.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function countAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[Index];
+
+    """
+    The name of member n, counting from 0 in the order of the text, of the
+    object the pointer leads to, with its escapes read; None when there is
+    no such member or the value is not an object.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function nameAt(document: &[Json, R], pointer: Span[Nat8, P], n: Index): Option[String];
+
+    """
+    The text of the value the pointer leads to, as it stands in the
+    document, or None.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function valueTextAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[String];
+
+    ---
+    --- Walking the children of a container
+    ---
+
+    -- These carry no clauses: each gives an Option, None for a cursor of
+    -- another document, and childIsNull a fact of the text that no clause
+    -- could say more cheaply than the function itself.
+
+    """
+    A place among the children of an array or an object of one document:
+    an element, or a member with its name.  It holds no memory.  Every
+    function that takes one refuses a cursor of another document.
+    """
+    type JsonCursor: Free;
+
+    """
+    The first child of the array or object the pointer leads to.  None when
+    the pointer leads nowhere, to a value that is no container, or to an
+    empty one.  With nextChild it walks a container in time linear in the
+    length of its text, where countAt and a pointer per child take time
+    quadratic in it.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, P: Region]
+    function firstChildAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[JsonCursor];
+
+    """
+    The first child of the array or object at the cursor, to walk a
+    container inside a container.  None when the value at the cursor is no
+    container or an empty one, or the cursor is of another document.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function firstChildOf(document: &[Json, R], cursor: JsonCursor): Option[JsonCursor];
+
+    """
+    The child after the cursor in the same container.  None after the last
+    one, or for a cursor of another document.  Time linear in the length of
+    the value at the cursor.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function nextChild(document: &[Json, R], cursor: JsonCursor): Option[JsonCursor];
+
+    """
+    The kind of the value at the cursor, or None for a cursor of another
+    document.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function childKind(document: &[Json, R], cursor: JsonCursor): Option[JsonKind];
+
+    """
+    The name of the member at the cursor, with its escapes read.  None for
+    an element of an array, or a cursor of another document.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function childName(document: &[Json, R], cursor: JsonCursor): Option[String];
+
+    """
+    The string at the cursor with its escapes read, or None when the value
+    there is no string or the cursor is of another document.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function childString(document: &[Json, R], cursor: JsonCursor): Option[String];
+
+    """
+    The number at the cursor as it was written, or None when the value
+    there is no number or the cursor is of another document.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function childNumber(document: &[Json, R], cursor: JsonCursor): Option[String];
+
+    """
+    The number at the cursor as an Int64, or None when the value there is
+    no number, not an integer within Int64, or the cursor is of another
+    document.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function childInteger(document: &[Json, R], cursor: JsonCursor): Option[Int64];
+
+    """
+    The boolean at the cursor, or None when the value there is none or the
+    cursor is of another document.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function childBool(document: &[Json, R], cursor: JsonCursor): Option[Bool];
+
+    """
+    Whether the value at the cursor is null; false for a cursor of another
+    document.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function childIsNull(document: &[Json, R], cursor: JsonCursor): Bool;
+
+    """
+    How many elements or members the array or object at the cursor holds,
+    or None when the value there is no container or the cursor is of
+    another document.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function childCount(document: &[Json, R], cursor: JsonCursor): Option[Index];
+
+    """
+    The text of the value at the cursor as it stands in the document, or
+    None for a cursor of another document.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function childText(document: &[Json, R], cursor: JsonCursor): Option[String];
+
+    ---
+    --- Writing
+    ---
+
+    """
+    A document being written.  Linear: finishJson gives it back.
+    """
+    type JsonWriter: Linear;
+
+    """
+    A writer that puts nothing between the tokens.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function makeJsonWriter(): JsonWriter;
+
+    """
+    A writer that puts every member and element on a line of its own,
+    indented by two spaces for each level, and a space after a colon.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function makePrettyJsonWriter(): JsonWriter;
+
+    """
+    Open an object where a value may stand.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function beginObject(writer: &![JsonWriter, R]): Unit;
+
+    """
+    Close the innermost object, which must not be waiting for a value.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function endObject(writer: &![JsonWriter, R]): Unit;
+
+    """
+    Open an array where a value may stand.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function beginArray(writer: &![JsonWriter, R]): Unit;
+
+    """
+    Close the innermost array.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function endArray(writer: &![JsonWriter, R]): Unit;
+
+    """
+    The name of the next member of the innermost object.  It must be
+    UTF-8.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region, S: Region]
+    function writeName(writer: &![JsonWriter, R], name: Span[Nat8, S]): Unit;
+
+    """
+    A string value, escaped.  It must be UTF-8.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region, S: Region]
+    function writeString(writer: &![JsonWriter, R], value: Span[Nat8, S]): Unit;
+
+    """
+    A whole number.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function writeInteger(writer: &![JsonWriter, R], value: Int64): Unit;
+
+    """
+    A number given as its text, which must be a number as RFC 8259
+    writes one; the writer is spoiled by any other text.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region, S: Region]
+    function writeNumber(writer: &![JsonWriter, R], text: Span[Nat8, S]): Unit;
+
+    """
+    true or false.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function writeBool(writer: &![JsonWriter, R], value: Bool): Unit;
+
+    """
+    null.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function writeNull(writer: &![JsonWriter, R]): Unit;
+
+    """
+    The text written, when it is one complete value that readJson takes;
+    None when a call came out of order, a container is still open, nothing
+    was written, or the text would be refused, a name twice in one object
+    for one.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    function finishJson(writer: JsonWriter): Option[String];
+end module.

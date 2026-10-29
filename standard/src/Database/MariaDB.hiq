@@ -1,0 +1,348 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The slots of Standard.Database for MariaDB.  A connection, a
+-- transaction and a cursor of Standard.MariaDB are erased into the
+-- database's own types and revealed here, as the type they were erased
+-- with: writing says whether a connection was opened for writing.
+import Standard.Buffer (
+    Buffer,
+    destroyEmpty,
+    remove,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Bindings.Database (
+    Erased,
+    erase,
+    unerase,
+    reveal,
+    revealWrite
+);
+import Standard.Database (
+    Database,
+    Writing,
+    Reading,
+    MariaDBBackend,
+    DbError,
+    Values,
+    Value,
+    IntValue,
+    FloatValue,
+    BoolValue,
+    TimeValue,
+    TextValue,
+    BytesValue,
+    NullValue,
+    takeValues,
+    ColumnKind,
+    NullKind,
+    IntKind,
+    FloatKind,
+    BoolKind,
+    TimeKind,
+    TextKind,
+    BytesKind,
+    Column,
+    IntColumn,
+    FloatColumn,
+    BoolColumn,
+    TextColumn,
+    ErrorKind,
+    writerOf,
+    readerOf,
+    mariadbClose,
+    mariadbMigrate,
+    mariadbBegin,
+    mariadbEnd,
+    mariadbStart,
+    mariadbExecute,
+    mariadbAdvance,
+    mariadbColumn,
+    mariadbFinish,
+    mariadbKind
+);
+import Standard.MariaDB (
+    Connection,
+    Writing as MariaWriting,
+    Reading as MariaReading,
+    MariaError,
+    Transaction as MariaTransaction,
+    Values as MariaValues,
+    Cursor as MariaCursor,
+    describe as mariaDescribe,
+    isUniqueViolation as mariaIsUniqueViolation,
+    isConstraintViolation as mariaIsConstraintViolation,
+    isBusy as mariaIsBusy,
+    openWriter as mariaOpenWriter,
+    openReader as mariaOpenReader,
+    closeDatabase as mariaClose,
+    migrate as mariaMigrate,
+    begin as mariaBegin,
+    commit as mariaCommit,
+    rollback as mariaRollback,
+    noValues as mariaNoValues,
+    withInt64 as mariaWithInt64,
+    withFloat64 as mariaWithFloat64,
+    withBool as mariaWithBool,
+    withTimestamp as mariaWithTimestamp,
+    withText as mariaWithText,
+    withBytes as mariaWithBytes,
+    withNull as mariaWithNull,
+    start as mariaStart,
+    execute as mariaExecute,
+    advance as mariaAdvance,
+    columnInt64 as mariaColumnInt64,
+    columnFloat64 as mariaColumnFloat64,
+    columnBool as mariaColumnBool,
+    columnTimestamp as mariaColumnTimestamp,
+    columnText as mariaColumnText,
+    columnBytes as mariaColumnBytes,
+    isNullColumn as mariaIsNullColumn,
+    finish as mariaFinish
+);
+
+module body Standard.Database.MariaDB is
+    ---
+    --- The connection, transaction and cursor behind an erased box
+    ---
+
+    generic [R: Region]
+    function writer(connection: &![Erased, R]): &![Connection[MariaWriting], R] is
+        return revealWrite(connection);
+    end;
+
+    generic [R: Region]
+    function reader(connection: &![Erased, R]): &![Connection[MariaReading], R] is
+        return revealWrite(connection);
+    end;
+
+    generic [R: Region]
+    function rowsToAdvance(rows: &![Erased, R]): &![MariaCursor, R] is
+        return revealWrite(rows);
+    end;
+
+    generic [R: Region]
+    function rowsToRead(rows: &[Erased, R]): &[MariaCursor, R] is
+        return reveal(rows);
+    end;
+
+    function failed(error: MariaError): DbError is
+        return DbError(backend => MariaDBBackend(), code => error.code);
+    end;
+
+    ---
+    --- Opening
+    ---
+
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openMariaDB(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F]): Either[DbError, Database[Writing]] is
+        case mariaOpenWriter(host, port, database, user, password, caFile) of
+            when Left(left as error: MariaError) do
+                return Left(left => failed(error));
+            when Right(right as connection: Connection[MariaWriting]) do
+                return Right(right => writerOf(erase(connection), MariaDBBackend()));
+        end case;
+    end;
+
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openMariaDBReader(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F]): Either[DbError, Database[Reading]] is
+        case mariaOpenReader(host, port, database, user, password, caFile) of
+            when Left(left as error: MariaError) do
+                return Left(left => failed(error));
+            when Right(right as connection: Connection[MariaReading]) do
+                return Right(right => readerOf(erase(connection), MariaDBBackend()));
+        end case;
+    end;
+
+    ---
+    --- The slots
+    ---
+
+    pragma Implements(Name => "Standard.Database.mariadbClose");
+    function closeMariaDB(connection: Erased, writing: Bool): Unit is
+        if writing then
+            let open: Connection[MariaWriting] := unerase(connection);
+            mariaClose(open);
+        else
+            let open: Connection[MariaReading] := unerase(connection);
+            mariaClose(open);
+        end if;
+        return nil;
+    end;
+
+    pragma Implements(Name => "Standard.Database.mariadbMigrate");
+    generic [R: Region]
+    function migrateMariaDB(connection: &![Erased, R], migrations: Span[Nat8, Static]): Either[DbError, Index] is
+        case mariaMigrate(writer(connection), migrations) of
+            when Left(left as error: MariaError) do
+                return Left(left => failed(error));
+            when Right(right as count: Index) do
+                return Right(right => count);
+        end case;
+    end;
+
+    function begun(result: Either[MariaError, MariaTransaction]): Either[DbError, Erased] is
+        case result of
+            when Left(left as error: MariaError) do
+                return Left(left => failed(error));
+            when Right(right as transaction: MariaTransaction) do
+                return Right(right => erase(transaction));
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.mariadbBegin");
+    generic [R: Region]
+    function beginMariaDB(connection: &![Erased, R], writing: Bool): Either[DbError, Erased] is
+        if writing then
+            return begun(mariaBegin(writer(connection)));
+        else
+            return begun(mariaBegin(reader(connection)));
+        end if;
+    end;
+
+    function done(result: Either[MariaError, Unit]): Either[DbError, Unit] is
+        case result of
+            when Left(left as error: MariaError) do
+                return Left(left => failed(error));
+            when Right(right as ended: Unit) do
+                return Right(right => nil);
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.mariadbEnd");
+    generic [R: Region]
+    function endMariaDB(connection: &![Erased, R], writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit] is
+        let inner: MariaTransaction := unerase(transaction);
+        if writing then
+            if keep then
+                return done(mariaCommit(writer(connection), inner));
+            else
+                mariaRollback(writer(connection), inner);
+            end if;
+        else
+            if keep then
+                return done(mariaCommit(reader(connection), inner));
+            else
+                mariaRollback(reader(connection), inner);
+            end if;
+        end if;
+        return Right(right => nil);
+    end;
+
+    function toMaria(values: Values): MariaValues is
+        var list: Buffer[Value] := takeValues(values);
+        var out: MariaValues := mariaNoValues();
+        while bufferLength(&list) > 0 do
+            case remove(&!list, 0) of
+                when IntValue(value as v: Int64) do
+                    out := mariaWithInt64(out, v);
+                when FloatValue(value as v: Float64) do
+                    out := mariaWithFloat64(out, v);
+                when BoolValue(value as v: Bool) do
+                    out := mariaWithBool(out, v);
+                when TimeValue(value as v: Int64) do
+                    out := mariaWithTimestamp(out, v);
+                when TextValue(value as s: String) do
+                    out := mariaWithText(out, asSpan(&s));
+                    destroyString(s);
+                when BytesValue(value as s: String) do
+                    out := mariaWithBytes(out, asSpan(&s));
+                    destroyString(s);
+                when NullValue do
+                    out := mariaWithNull(out);
+            end case;
+        end while;
+        destroyEmpty(list);
+        return out;
+    end;
+
+    generic [M: Free, R: Region]
+    function run(connection: &![Connection[M], R], sql: Span[Nat8, Static], values: Values): Erased is
+        return erase(mariaStart(connection, sql, toMaria(values)));
+    end;
+
+    pragma Implements(Name => "Standard.Database.mariadbStart");
+    generic [R: Region]
+    function startMariaDB(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased is
+        if writing then
+            return run(writer(connection), sql, values);
+        else
+            return run(reader(connection), sql, values);
+        end if;
+    end;
+
+    pragma Implements(Name => "Standard.Database.mariadbExecute");
+    generic [R: Region]
+    function executeMariaDB(connection: &![Erased, R], sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64] is
+        case mariaExecute(writer(connection), sql, toMaria(values)) of
+            when Left(left as error: MariaError) do
+                return Left(left => failed(error));
+            when Right(right as count: Nat64) do
+                return Right(right => count);
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.mariadbAdvance");
+    generic [R: Region]
+    function advanceMariaDB(rows: &![Erased, R]): Bool is
+        return mariaAdvance(rowsToAdvance(rows));
+    end;
+
+    pragma Implements(Name => "Standard.Database.mariadbColumn");
+    generic [R: Region]
+    function columnMariaDB(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R] is
+        let cursor: &[MariaCursor, R] := rowsToRead(rows);
+        case kind of
+            when NullKind do
+                return BoolColumn(value => mariaIsNullColumn(cursor, index));
+            when IntKind do
+                return IntColumn(value => mariaColumnInt64(cursor, index));
+            when FloatKind do
+                return FloatColumn(value => mariaColumnFloat64(cursor, index));
+            when BoolKind do
+                return BoolColumn(value => mariaColumnBool(cursor, index));
+            when TimeKind do
+                return IntColumn(value => mariaColumnTimestamp(cursor, index));
+            when TextKind do
+                return TextColumn(value => mariaColumnText(cursor, index));
+            when BytesKind do
+                return TextColumn(value => mariaColumnBytes(cursor, index));
+        end case;
+    end;
+
+    function finished(result: Option[MariaError]): Option[DbError] is
+        case result of
+            when Some(value as error: MariaError) do
+                return Some(value => failed(error));
+            when None do
+                return None();
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.mariadbFinish");
+    generic [R: Region]
+    function finishMariaDB(connection: &![Erased, R], writing: Bool, rows: Erased): Option[DbError] is
+        let cursor: MariaCursor := unerase(rows);
+        if writing then
+            return finished(mariaFinish(writer(connection), cursor));
+        else
+            return finished(mariaFinish(reader(connection), cursor));
+        end if;
+    end;
+
+    pragma Implements(Name => "Standard.Database.mariadbKind");
+    function kindMariaDB(code: Int32): ErrorKind is
+        let error: MariaError := MariaError(code => code);
+        return ErrorKind(unique => mariaIsUniqueViolation(error), constraint => mariaIsConstraintViolation(error), busy => mariaIsBusy(error), text => mariaDescribe(error));
+    end;
+end module body.

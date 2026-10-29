@@ -1,0 +1,166 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.SperliExport: a session whose join failed refuses every call
+-- with its code, and a session of one rank keeps one result at a time.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    asSpan,
+    getSpanMut,
+    nthByte
+);
+import Standard.Text (
+    bytesToHex
+);
+import Standard.SperliError (
+    badJob,
+    startFailed
+);
+import Standard.SperliLaunch (
+    HostList,
+    Launch,
+    parseHostList,
+    destroyHostList,
+    newLaunch,
+    describeRank,
+    destroyLaunch
+);
+import Standard.SperliExport (
+    Session,
+    openSession,
+    sessionCode,
+    sessionRank,
+    sessionSize,
+    resultLength,
+    takeResult,
+    sessionSend,
+    sessionRecv,
+    sessionBarrier,
+    sessionBcast,
+    sessionReduce,
+    sessionAllreduce,
+    sessionGather,
+    sessionScatter,
+    sessionUseCheckpoints,
+    sessionCheckpoint,
+    sessionResume,
+    closeSession,
+    notReady,
+    resultPending,
+    resultMissing,
+    maxDescription,
+    maxMessage,
+    maxCollective,
+    maxState,
+    maxPath
+);
+
+module body Standard.SperliExport.Test is
+    function testConstants(): Unit is
+        assertTrue(maxDescription() = 4194304, "the longest description");
+        assertTrue(maxMessage() = 16777216, "the longest message");
+        assertTrue(maxCollective() = 16777200, "the longest collective");
+        assertTrue(maxState() = 268435456, "the largest state");
+        assertTrue(maxPath() = 4096, "the longest path");
+        assertTrue(notReady() = -6, "not ready");
+        assertTrue(resultPending() = -11, "a result is pending");
+        assertTrue(resultMissing() = -10, "no result");
+        return nil;
+    end;
+
+    -- A session that holds no comm answers every call with notReady and
+    -- the join code stays readable.
+    function testFailedJoin(): Unit is
+        var session: Session := openSession("not hexadecimal");
+        assertTrue(sessionCode(&session) = badJob(), "the join code is badJob");
+        assertTrue(sessionRank(&session) = 0, "no rank");
+        assertTrue(sessionSize(&session) = 0, "no size");
+        assertTrue(resultLength(&session) = 0, "no result");
+        assertTrue(sessionSend(&!session, 0, 0, "data") = notReady(), "send");
+        assertTrue(sessionRecv(&!session, 0, 0) = notReady(), "recv");
+        assertTrue(sessionBarrier(&!session) = notReady(), "barrier");
+        assertTrue(sessionBcast(&!session, 0, "data") = notReady(), "bcast");
+        assertTrue(sessionReduce(&!session, 0, 1, 1, "data") = notReady(), "reduce");
+        assertTrue(sessionAllreduce(&!session, 1, 1, "data") = notReady(), "allreduce");
+        assertTrue(sessionGather(&!session, 0, "data") = notReady(), "gather");
+        assertTrue(sessionScatter(&!session, 0, "data") = notReady(), "scatter");
+        assertTrue(sessionUseCheckpoints(&!session, "dir") = notReady(), "checkpoint directory");
+        assertTrue(sessionCheckpoint(&!session, "data") = notReady(), "checkpoint");
+        assertTrue(sessionResume(&!session) = notReady(), "resume");
+        closeSession(session);
+        return nil;
+    end;
+
+    function testEmptyDescription(): Unit is
+        let session: Session := openSession("");
+        assertTrue(sessionCode(&session) = badJob(), "an empty description is badJob");
+        closeSession(session);
+        return nil;
+    end;
+
+    -- The hexadecimal description of rank 0 of a job of one rank.
+    function descriptionOfOne(): String is
+        case parseHostList("localhost\n", "") of
+            when Right(right as hosts: HostList) do
+                case newLaunch(&hosts, 1, 1, 600) of
+                    when Right(right as launch: Launch) do
+                        destroyHostList(hosts);
+                        case describeRank(&launch, 0) of
+                            when Some(value as description: String) do
+                                let text: String := bytesToHex(asSpan(&description));
+                                destroyString(description);
+                                destroyLaunch(launch);
+                                return text;
+                            when None do
+                                destroyLaunch(launch);
+                                abort("no description");
+                        end case;
+                    when Left(left as code: Int32) do
+                        destroyHostList(hosts);
+                        abort("no launch");
+                end case;
+            when Left(left as code: Int32) do
+                abort("no host list");
+        end case;
+    end;
+
+    -- One rank keeps one result: a second call that makes data is refused
+    -- until takeResult has handed the first on, and an empty answer is kept
+    -- as none.
+    function testOneRank(): Unit is
+        let text: String := descriptionOfOne();
+        var session: Session := openSession(asSpan(&text));
+        destroyString(text);
+        assertTrue(sessionCode(&session) = 0, "the join holds");
+        assertTrue(sessionRank(&session) = 0, "rank 0");
+        assertTrue(sessionSize(&session) = 1, "one rank");
+        assertTrue(sessionBarrier(&!session) = 0, "barrier of one");
+        assertTrue(sessionSend(&!session, 0, 0, "data") = startFailed(), "no peer to send to");
+        assertTrue(sessionBcast(&!session, 0, "hello") = 0, "bcast of one");
+        assertTrue(resultLength(&session) = 5, "five bytes are kept");
+        assertTrue(sessionGather(&!session, 0, "x") = resultPending(), "gather is refused");
+        assertTrue(sessionBarrier(&!session) = 0, "a call that makes no data still goes");
+        var out: String := makeString(5, 0);
+        assertTrue(takeResult(&!session, getSpanMut(&!out, 0, 4)) = 0, "the result is taken");
+        assertTrue(resultLength(&session) = 0, "and gone");
+        assertTrue(takeResult(&!session, getSpanMut(&!out, 0, 4)) = resultMissing(), "taken once");
+        assertTrue(nthByte(&out, 0) = 104, "the bytes are those of hello");
+        assertTrue(nthByte(&out, 4) = 111, "to the last");
+        destroyString(out);
+        assertTrue(sessionGather(&!session, 0, "") = 0, "an empty gather");
+        assertTrue(resultLength(&session) = 0, "an empty result is not kept");
+        assertTrue(sessionReduce(&!session, 0, 1, 1, "abcd") = 0, "reduce of one");
+        assertTrue(resultLength(&session) = 4, "four bytes");
+        closeSession(session);
+        return nil;
+    end;
+end module body.

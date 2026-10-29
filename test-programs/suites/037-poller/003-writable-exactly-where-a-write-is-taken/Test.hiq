@@ -1,0 +1,166 @@
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    fileNumber,
+    Pipe,
+    openPipe,
+    closePipe,
+    readEnd,
+    readEndMut,
+    writeEndMut,
+    writeAll
+);
+import Standard.Poller (
+    Backend,
+    backendNone,
+    backendAvailable,
+    sameBackend,
+    Poller,
+    createPoller,
+    destroyPoller,
+    interestRead,
+    interestWrite,
+    watchFile,
+    rewatchFile,
+    unwatchFile,
+    watchedCount,
+    waitFor,
+    Event,
+    nthEvent,
+    eventDescriptor,
+    eventReadable,
+    eventWritable
+);
+
+module body Test is
+    function widen(value: Bool): Int32 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    function hasBackend(): Bool is
+        return not sameBackend(backendAvailable(), backendNone);
+    end;
+
+    generic [R: Region]
+    function readyOr(poller: &![Poller, R], timeout: Int32,
+        fallback: Index): Index is
+        case waitFor(poller, timeout) of
+            when Some(value as ready: Index) do
+                return ready;
+            when None do
+                return fallback;
+        end case;
+    end;
+
+    generic [R: Region]
+    function eventIsFor(poller: &[Poller, R], number: Int32): Bool is
+        let first: Index := 0;
+        case nthEvent(poller, first) of
+            when Some(value as event: Event) do
+                if eventDescriptor(event) /= number then
+                    return false;
+                end if;
+                return eventReadable(event);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the first event of the last wait is about the descriptor
+    -- with this number and says it is ready to be written.  False when the
+    -- last wait reported nothing.
+    generic [R: Region]
+    function firstWritableFor(poller: &[Poller, R], number: Int32): Bool is
+        let first: Index := 0;
+        case nthEvent(poller, first) of
+            when Some(value as event: Event) do
+                if eventDescriptor(event) /= number then
+                    return false;
+                end if;
+                return eventWritable(event);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function main(): ExitCode is
+        -- Without a backend the test fails at its first line.
+        if not hasBackend() then
+            printLn(0);
+            return ExitSuccess();
+        end if;
+
+        var payload: String := fromLiteral("x");
+        let zero: Index := 0;
+        let one: Index := 1;
+        let unreachable: Index := 99;
+
+        -- 1. There is a backend.
+        printLn(1);
+
+        case createPoller() of
+            when Some(value as made: Poller) do
+                var poller: Poller := made;
+                -- 2. It builds a poller.
+                printLn(1);
+
+                case openPipe() of
+                    when Some(value as opened: Pipe) do
+                        var pipe: Pipe := opened;
+                        let number: Int32 := fileNumber(readEnd(&pipe));
+                        -- 3. The reading end is watched for writing,
+                        printLn(widen(watchFile(&!poller, readEnd(&pipe),
+                            interestWrite)));
+                        -- 4. and it is the only one watched.
+                        printLn(widen(watchedCount(&poller) = one));
+                        let ready: Index := readyOr(&!poller, 0, unreachable);
+                        let reported: Bool := firstWritableFor(&poller, number);
+                        -- 5. Whatever was ready is the reading end, reported
+                        --    writable.
+                        printLn(widen(widen(ready = one) = widen(reported)));
+                        -- Linux and macOS open a pipe's reading end for
+                        -- reading only and refuse this write.  OpenBSD opens
+                        -- both ends for reading and writing, and the byte
+                        -- goes the other way through the pipe.
+                        let taken: Bool := writeAll(readEndMut(&!pipe),
+                            asSpan(&payload));
+                        -- 6. The reading end was reported writable exactly
+                        --    when a write to it is taken.
+                        printLn(widen(widen(reported) = widen(taken)));
+                        -- 7. Now it is watched for reading.
+                        printLn(widen(rewatchFile(&!poller, readEnd(&pipe),
+                            interestRead)));
+                        -- 8. Nothing is ready yet: the control for line 10.
+                        printLn(widen(readyOr(&!poller, 0, unreachable) = zero));
+                        -- 9. One byte into the writing end.
+                        printLn(widen(writeAll(writeEndMut(&!pipe),
+                            asSpan(&payload))));
+                        -- 10. Exactly one descriptor is ready,
+                        printLn(widen(readyOr(&!poller, 0, unreachable) = one));
+                        -- 11. and it is the reading end, ready to be read.
+                        printLn(widen(eventIsFor(&poller, number)));
+                        -- 12. Unwatching it is accepted,
+                        printLn(widen(unwatchFile(&!poller, readEnd(&pipe))));
+                        -- 13. and the count is back at zero.
+                        printLn(widen(watchedCount(&poller) = zero));
+                        -- 14. Both ends close.
+                        printLn(widen(closePipe(pipe)));
+                    when None do
+                        printLn(0);
+                end case;
+                destroyPoller(poller);
+            when None do
+                printLn(0);
+        end case;
+        destroyString(payload);
+        return ExitSuccess();
+    end;
+end module body.

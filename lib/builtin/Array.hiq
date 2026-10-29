@@ -1,0 +1,229 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The array keeps a pointer to its elements, their number and its room.
+-- Every function that reaches an element checks the index first, in
+-- checkedAt; the pointer never leaves this module.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    allocateBuffer,
+    resizeArray,
+    deallocate,
+    nullCheck,
+    positiveOffset,
+    store,
+    load,
+    memmove,
+    arraySizeInBytes,
+    span,
+    spanWrite
+);
+
+module body Hilde.Array is
+    record Array[T: Type]: Linear is
+        capacity: Index;
+        size: Index;
+        data: Pointer[T];
+    end;
+
+    generic [T: Type]
+    function allocateArray(capacity: Index): Option[Array[T]] is
+        var room: Index := 1;
+        if capacity > 1 then
+            room := capacity;
+        end if;
+        let address: Address[T] := allocateBuffer(room);
+        case nullCheck(address) of
+            when Some(value as data: Pointer[T]) do
+                return Some(value => Array(capacity => room, size => 0, data => data));
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [T: Type, R: Region]
+    function arrayLength(array: &[Array[T], R]): Index is
+        return array->size;
+    end;
+
+    -- The address of the element at pos, once pos is known to be one of
+    -- the elements; otherwise the programme stops with message.
+    generic [T: Type, R: Region]
+    function checkedAt(array: &[Array[T], R], pos: Index, message: Span[Nat8, Static]): Pointer[T] is
+        if pos >= array->size then
+            abort(message);
+        end if;
+        return positiveOffset(array->data, pos);
+    end;
+
+    generic [T: Free, R: Region]
+    function arrayNth(array: &[Array[T], R], pos: Index): T is
+        return load(checkedAt(array, pos, "Hilde.Array.arrayNth: index out of range"));
+    end;
+
+    -- A reference is a pointer in C, so the address of the element is the
+    -- reference.  Its region is the one of the borrow of the array, and the
+    -- array cannot change while that borrow lives.
+    generic [T: Type, R: Region]
+    function arrayNthRef(array: &[Array[T], R], pos: Index): &[T, R] is
+        let at: Pointer[T] := checkedAt(array, pos, "Hilde.Array.arrayNthRef: index out of range");
+        return @embed(&[T, R], "$1", at);
+    end;
+
+    generic [T: Free, R: Region]
+    function arrayStore(array: &![Array[T], R], pos: Index, value: T): Unit is
+        store(checkedAt(&array, pos, "Hilde.Array.arrayStore: index out of range"), value);
+        return nil;
+    end;
+
+    generic [T: Type, R: Region]
+    function arraySwap(array: &![Array[T], R], pos: Index, value: T): T is
+        let at: Pointer[T] := checkedAt(&array, pos, "Hilde.Array.arraySwap: index out of range");
+        let previous: T := load(at);
+        store(at, value);
+        return previous;
+    end;
+
+    generic [T: Type, R: Region]
+    function arraySwapIndex(array: &![Array[T], R], a: Index, b: Index): Unit is
+        let atA: Pointer[T] := checkedAt(&array, a, "Hilde.Array.arraySwapIndex: first index out of range");
+        let atB: Pointer[T] := checkedAt(&array, b, "Hilde.Array.arraySwapIndex: second index out of range");
+        let elementA: T := load(atA);
+        let elementB: T := load(atB);
+        store(atA, elementB);
+        store(atB, elementA);
+        return nil;
+    end;
+
+    generic [T: Type, R: Region]
+    function arrayApply(array: &![Array[T], R], pos: Index, fn: Fn[T, T]): Unit is
+        let at: Pointer[T] := checkedAt(&array, pos, "Hilde.Array.arrayApply: index out of range");
+        let old: T := load(at);
+        -- In a let of its own: a call through a function pointer written
+        -- as the argument of another call is C the code generator gets
+        -- wrong (a statement ends inside the argument list).
+        let new: T := fn(old);
+        store(at, new);
+        return nil;
+    end;
+
+    -- Double the room.  The contents move with it: resizeArray is realloc,
+    -- which copies them and frees the old block, so nothing is read from
+    -- the old pointer afterwards.
+    generic [T: Type, R: Region]
+    function grow(array: &![Array[T], R]): Unit is
+        let bigger: Index := array->capacity * 2;
+        let address: Address[T] := resizeArray(array->data, bigger);
+        case nullCheck(address) of
+            when Some(value as data: Pointer[T]) do
+                array->capacity := bigger;
+                array->data := data;
+            when None do
+                abort("Hilde.Array.arrayInsert: out of memory");
+        end case;
+        return nil;
+    end;
+
+    generic [T: Type, R: Region]
+    function arrayInsert(array: &![Array[T], R], pos: Index, value: T): Unit is
+        if pos > array->size then
+            abort("Hilde.Array.arrayInsert: index out of range");
+        end if;
+        if array->size = array->capacity then
+            grow(&~array);
+        end if;
+        let at: Pointer[T] := positiveOffset(array->data, pos);
+        if pos < array->size then
+            memmove(
+                source => at,
+                destination => positiveOffset(at, 1),
+                count => arraySizeInBytes(sizeof(T), array->size - pos)
+            );
+        end if;
+        store(at, value);
+        array->size := array->size + 1;
+        return nil;
+    end;
+
+    generic [T: Type, R: Region]
+    function arrayRemove(array: &![Array[T], R], pos: Index): T is
+        let at: Pointer[T] := checkedAt(&array, pos, "Hilde.Array.arrayRemove: index out of range");
+        let element: T := load(at);
+        if (pos + 1) < array->size then
+            memmove(
+                source => positiveOffset(at, 1),
+                destination => at,
+                count => arraySizeInBytes(sizeof(T), (array->size - pos) - 1)
+            );
+        end if;
+        array->size := array->size - 1;
+        return element;
+    end;
+
+    -- The bounds of a span: start not after final, final one of the
+    -- elements.  Both are included.
+    generic [T: Type, R: Region]
+    function checkSpan(array: &[Array[T], R], start: Index, final: Index): Unit is
+        if start > final then
+            abort("Hilde.Array.arraySpan: start is greater than final");
+        end if;
+        if final >= array->size then
+            abort("Hilde.Array.arraySpan: final index out of range");
+        end if;
+        return nil;
+    end;
+
+    generic [T: Type, R: Region]
+    function arraySpan(array: &[Array[T], R], start: Index, final: Index): Span[T, R] is
+        checkSpan(array, start, final);
+        return span(&(array->data), start, final);
+    end;
+
+    generic [T: Type, R: Region]
+    function arraySpanMut(array: &![Array[T], R], start: Index, final: Index): Span![T, R] is
+        checkSpan(&array, start, final);
+        return spanWrite(&!(array->data), start, final);
+    end;
+
+    -- The span is made here and not through span: a start and a final that
+    -- are both included cannot describe no element at all, and the size of
+    -- the array is the span's size as it stands.
+    generic [T: Type, R: Region]
+    function arrayWholeSpan(array: &[Array[T], R]): Span[T, R] is
+        let data: Pointer[T] := array->data;
+        let size: Index := array->size;
+        return @embed(Span[T, R], "hilde_make_span($1, $2)", data, size);
+    end;
+
+    generic [T: Type]
+    function destroyEmptyArray(array: Array[T]): Unit is
+        let { capacity: Index, size: Index, data: Pointer[T] } := array;
+        if size /= 0 then
+            abort("Hilde.Array.destroyEmptyArray: the array is not empty");
+        end if;
+        deallocate(data);
+        return nil;
+    end;
+
+    generic [T: Free]
+    function destroyFreeArray(array: Array[T]): Unit is
+        let { capacity: Index, size: Index, data: Pointer[T] } := array;
+        deallocate(data);
+        return nil;
+    end;
+
+    generic [T: Free]
+    function destroyWipedArray(array: Array[T]): Unit is
+        let { capacity: Index, size: Index, data: Pointer[T] } := array;
+        @embed(Unit, "hilde_wipe($1, $2 * $3)", data, sizeof(T), capacity);
+        deallocate(data);
+        return nil;
+    end;
+end module body.

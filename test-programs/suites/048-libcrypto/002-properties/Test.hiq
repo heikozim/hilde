@@ -1,0 +1,228 @@
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth,
+    getSpan
+);
+import Standard.Libcrypto (
+    sealAes256Gcm,
+    openAes256Gcm,
+    sealChaCha20Poly1305,
+    openChaCha20Poly1305,
+    x25519PublicKey,
+    x25519SharedSecret,
+    ed25519PublicKey,
+    ed25519Sign,
+    ed25519Verify
+);
+
+module body Test is
+    -- The bytes start, start+1, ... -- count of them.
+    function sequence(start: Index, count: Index): String is
+        var out: String := makeString(count, 0);
+        var i: Index := 0;
+        while i < count do
+            case toNat8(start + i) of
+                when Some(value as b: Nat8) do
+                    storeNth(&!out, i, b);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- 100 bytes that are not a sequence: (i * 13 + 5) mod 256.
+    function long(): String is
+        var out: String := makeString(100, 0);
+        var i: Index := 0;
+        while i < 100 do
+            let v: Index := (i * 13) + 5;
+            case toNat8(v - ((v / 256) * 256)) of
+                when Some(value as b: Nat8) do
+                    storeNth(&!out, i, b);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- A String that is not empty, as a span.
+    generic [R: Region]
+    function spanOf(text: &[String, R]): Span[Nat8, R] is
+        return getSpan(text, 0, length(text) - 1);
+    end;
+
+    function hexDigit(n: Nat8): Nat8 is
+        if n < 10 then
+            return n + '0';
+        end if;
+        return (n + 'a') - 10;
+    end;
+
+    -- The bytes as lowercase hex.  print writes a Nat8 as a decimal
+    -- number, so the digits go into a String first.
+    generic [R: Region]
+    function printHex(text: &[String, R]): Unit is
+        let size: Index := length(text);
+        if size = 0 then
+            return nil;
+        end if;
+        var hex: String := makeString(size * 2, 0);
+        var i: Index := 0;
+        while i < size do
+            let b: Nat8 := nthByte(text, i);
+            let high: Nat8 := b / 16;
+            storeNth(&!hex, i * 2, hexDigit(high));
+            storeNth(&!hex, (i * 2) + 1, hexDigit(b - (high * 16)));
+            i := i + 1;
+        end while;
+        print(getSpan(&hex, 0, (size * 2) - 1));
+        destroyString(hex);
+        return nil;
+    end;
+
+    function said(label: Span[Nat8, Static], value: Bool): Unit is
+        print(label);
+        printLn(value);
+        return nil;
+    end;
+
+    -- Is it there, and the same as expected?
+    generic [R: Region]
+    function sameAs(result: Option[String], expected: &[String, R]): Bool is
+        case result of
+            when Some(value as bytes: String) do
+                var equal: Bool := length(&bytes) = length(expected);
+                var i: Index := 0;
+                while equal and (i < length(&bytes)) do
+                    equal := nthByte(&bytes, i) = nthByte(expected, i);
+                    i := i + 1;
+                end while;
+                destroyString(bytes);
+                return equal;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNone(result: Option[String]): Bool is
+        case result of
+            when Some(value as bytes: String) do
+                destroyString(bytes);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- The same bytes with one bit of the last one flipped.
+    generic [R: Region]
+    function tampered(text: &[String, R]): String is
+        let size: Index := length(text);
+        var out: String := makeString(size, 0);
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!out, i, nthByte(text, i));
+            i := i + 1;
+        end while;
+        let last: Nat8 := nthByte(text, size - 1);
+        let one: Nat8 := 1;
+        storeNth(&!out, size - 1, bitwiseXor(last, one));
+        return out;
+    end;
+
+    function main(): ExitCode is
+        let key: String := sequence(0, 32);
+        let other: String := sequence(32, 32);
+        let shortKey: String := sequence(0, 31);
+        let nonce: String := sequence(0, 12);
+        let zero: String := makeString(32, 0);
+        let longText: String := long();
+        let aad: Span[Nat8, Static] := "header";
+        let message: Span[Nat8, Static] := "attack at dawn";
+        case sealAes256Gcm(spanOf(&key), spanOf(&nonce), spanOf(&longText), aad) of
+            when Some(value as sealed: String) do
+                said("aes-256-gcm opens to the plaintext: ",
+                    sameAs(openAes256Gcm(spanOf(&key), spanOf(&nonce), spanOf(&sealed), aad), &longText));
+                let bad: String := tampered(&sealed);
+                said("aes-256-gcm with one bit of the tag flipped is refused: ",
+                    isNone(openAes256Gcm(spanOf(&key), spanOf(&nonce), spanOf(&bad), aad)));
+                said("aes-256-gcm with other associated data is refused: ",
+                    isNone(openAes256Gcm(spanOf(&key), spanOf(&nonce), spanOf(&sealed), "footer")));
+                destroyString(bad);
+                destroyString(sealed);
+            when None do
+                printLn("aes-256-gcm seal FAILED");
+        end case;
+        case sealChaCha20Poly1305(spanOf(&key), spanOf(&nonce), spanOf(&longText), aad) of
+            when Some(value as sealed: String) do
+                said("chacha20-poly1305 opens to the plaintext: ",
+                    sameAs(openChaCha20Poly1305(spanOf(&key), spanOf(&nonce), spanOf(&sealed), aad), &longText));
+                let bad: String := tampered(&sealed);
+                said("chacha20-poly1305 with one bit of the tag flipped is refused: ",
+                    isNone(openChaCha20Poly1305(spanOf(&key), spanOf(&nonce), spanOf(&bad), aad)));
+                destroyString(bad);
+                destroyString(sealed);
+            when None do
+                printLn("chacha20-poly1305 seal FAILED");
+        end case;
+        said("aes-256-gcm with a 31-byte key is refused: ",
+            isNone(sealAes256Gcm(spanOf(&shortKey), spanOf(&nonce), message, aad)));
+        case x25519PublicKey(spanOf(&key)) of
+            when Some(value as publicA: String) do
+                case x25519PublicKey(spanOf(&other)) of
+                    when Some(value as publicB: String) do
+                        case x25519SharedSecret(spanOf(&key), spanOf(&publicB)) of
+                            when Some(value as ab: String) do
+                                said("x25519 agrees both ways: ",
+                                    sameAs(x25519SharedSecret(spanOf(&other), spanOf(&publicA)), &ab));
+                                destroyString(ab);
+                            when None do
+                                printLn("x25519 shared FAILED");
+                        end case;
+                        destroyString(publicB);
+                    when None do
+                        printLn("x25519 public-b FAILED");
+                end case;
+                destroyString(publicA);
+            when None do
+                printLn("x25519 public-a FAILED");
+        end case;
+        said("x25519 with an all-zero public key is refused: ",
+            isNone(x25519SharedSecret(spanOf(&key), spanOf(&zero))));
+        case ed25519PublicKey(spanOf(&key)) of
+            when Some(value as public: String) do
+                case ed25519Sign(spanOf(&key), message) of
+                    when Some(value as signature: String) do
+                        said("ed25519 verifies its signature: ",
+                            ed25519Verify(spanOf(&public), message, spanOf(&signature)));
+                        said("ed25519 refuses it for another message: ",
+                            not ed25519Verify(spanOf(&public), "attack at dusk", spanOf(&signature)));
+                        let bad: String := tampered(&signature);
+                        said("ed25519 refuses a signature with one bit flipped: ",
+                            not ed25519Verify(spanOf(&public), message, spanOf(&bad)));
+                        destroyString(bad);
+                        destroyString(signature);
+                    when None do
+                        printLn("ed25519 sign FAILED");
+                end case;
+                destroyString(public);
+            when None do
+                printLn("ed25519 public FAILED");
+        end case;
+        destroyString(key);
+        destroyString(other);
+        destroyString(shortKey);
+        destroyString(nonce);
+        destroyString(zero);
+        destroyString(longText);
+        return ExitSuccess();
+    end;
+end module body.

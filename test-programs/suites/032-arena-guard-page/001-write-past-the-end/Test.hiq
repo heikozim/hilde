@@ -1,0 +1,89 @@
+-- Unsafe, because reaching past the end of the arena needs pointer
+-- arithmetic.  That is the point: the guard page is what stands between a
+-- programme that does this and the rest of the address space.
+pragma Unsafe_Module;
+
+import Standard.Arena (
+    Arena,
+    createArena,
+    arenaAllocate,
+    freeArena
+);
+import Hilde.Memory (
+    Pointer,
+    refMutToPointer,
+    positiveOffset,
+    store
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal,
+    writeByte
+);
+import Standard.IO.Terminal (
+    StandardError,
+    acquireError,
+    releaseError
+);
+
+module body Test is
+    -- The byte offset written to.  The block is rounded up to one page and
+    -- the guard page is the page after it, so 4400 is inside the guard page
+    -- on any system whose page is 4096 bytes, and past the end of the
+    -- mapping on any system with a larger one.  Either way it must fault.
+    constant pastTheEnd: Index := 4400;
+
+    function openArena(): Arena is
+        let asked: ByteSize := 1;
+        case createArena(asked) of
+            when Some(value: Arena) do
+                return value;
+            when None do
+                abort("Arena creation failed.");
+        end case;
+    end;
+
+    -- The one line of stderr this programme ever writes, and it writes it
+    -- before the faulting store.  The end-to-end harness has exactly one
+    -- shape for a programme that must not finish: a non-zero exit and
+    -- stderr that matches.  A hardware fault produces no message of its
+    -- own, so the programme says what it is about to do, and then does it.
+    generic [R: Region]
+    function sayWhatIsAboutToHappen(term: &![TerminalCapability, R]): Unit is
+        var stderr: StandardError := acquireError(&~term);
+        writeByte(&!stderr, 'g');
+        writeByte(&!stderr, 'u');
+        writeByte(&!stderr, 'a');
+        writeByte(&!stderr, 'r');
+        writeByte(&!stderr, 'd');
+        writeByte(&!stderr, 10);
+        releaseError(stderr);
+        return nil;
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var mutRoot: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!mutRoot);
+        sayWhatIsAboutToHappen(&!terminal);
+        releaseTerminal(terminal);
+        surrenderRoot(mutRoot);
+
+        var arena: Arena := openArena();
+        borrow r: &![Arena, R] := &!arena do
+            let slot: Option[&![Nat8, R]] := arenaAllocate(r);
+            case slot of
+                when Some(value: &![Nat8, R]) do
+                    let base: Pointer[Nat8] := refMutToPointer(value);
+                    let far: Pointer[Nat8] := positiveOffset(base, pastTheEnd);
+                    let mark: Nat8 := 1;
+                    -- This store must not return.
+                    store(far, mark);
+                when None do
+                    printLn(0);
+            end case;
+        end borrow;
+        freeArena(arena);
+        return ExitSuccess();
+    end;
+end module body.

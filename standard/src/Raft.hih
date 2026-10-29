@@ -1,0 +1,317 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Raft consensus as a state machine of its own: messages and ticks go in, messages and committed entries come out.
+
+- No network, no disk and no clock: the caller sends the messages, stores what must survive and ticks.
+- One leader at most in a term; an entry once committed stays in the log of every later leader.
+- An entry is committed when quorum of the member count have it and it is of the leader's term.
+- quorum is the caller's; majority, more than half, keeps two quorums from missing each other.
+- One change of the members at a time, one server added or removed, taking effect when it is in the log.
+- A follower that is too far behind gets a snapshot of the state machine instead of the entries.
+- The state machine is any type with an instance of StateMachine.
+
+    var node: Node := newNode(Config(id => 1, electionTicks => 10, heartbeatTicks => 2, seed => 7, quorum => majority), members);
+    tick(&!node);
+    let outgoing: Buffer[Message] := takeMessages(&!node);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.Buffer (
+    Buffer
+);
+import Standard.String (
+    String
+);
+
+module Standard.Raft is
+    """
+    What the caller's state machine does with committed entries: apply
+    one command, give its whole state as bytes, and take a state back from
+    such bytes, false when they do not parse.
+    """
+    typeclass StateMachine(T: Type) is
+        """
+        No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+        """
+        generic [R: Region, D: Region]
+        method applyCommand(machine: &![T, R], command: Span[Nat8, D]): Unit;
+        """
+        No contract: a text whose length follows its input.
+        """
+        generic [R: Region]
+        method takeSnapshot(machine: &[T, R]): String;
+        """
+        No contract: the answer is a Bool, nothing cheaper holds.
+        """
+        generic [R: Region, D: Region]
+        method restoreSnapshot(machine: &![T, R], data: Span[Nat8, D]): Bool;
+    end;
+
+    """
+    The settings of a node.  id is not 0.  A follower that hears nothing
+    for electionTicks to twice that many ticks, drawn from seed, stands
+    for election; a leader sends to every member each heartbeatTicks.
+    quorum maps the member count to how many must agree.
+    """
+    record Config: Free is
+        id: Nat64;
+        electionTicks: Nat32;
+        heartbeatTicks: Nat32;
+        seed: Nat64;
+        quorum: Fn[Nat64, Nat64];
+    end;
+
+    """
+    More than half of count: the quorum of standard Raft.
+    """
+    function majority(count: Nat64): Nat64
+        ensures (result > (count / 2)) and (result <= (count + 1));
+
+    """
+    The kinds of entries: a command for the state machine, a member added,
+    a member removed, and the empty entry a new leader writes.
+    """
+    function entryCommand(): Nat8
+        ensures result = 0;
+    function entryAddMember(): Nat8
+        ensures result = 1;
+    function entryRemoveMember(): Nat8
+        ensures result = 2;
+    function entryEmpty(): Nat8
+        ensures result = 3;
+
+    """
+    One entry of the log: its term, its kind and its bytes.  The bytes of
+    a change of the members are the member's id, eight bytes, most
+    significant first.
+    """
+    record Entry: Linear is
+        term: Nat64;
+        kind: Nat8;
+        data: String;
+    end;
+
+    """
+    The kinds of messages: a request for a vote and its answer, entries to
+    append and the answer, a snapshot to install and the answer.
+    """
+    function messageVote(): Nat8
+        ensures result = 1;
+    function messageVoteReply(): Nat8
+        ensures result = 2;
+    function messageAppend(): Nat8
+        ensures result = 3;
+    function messageAppendReply(): Nat8
+        ensures result = 4;
+    function messageSnapshot(): Nat8
+        ensures result = 5;
+    function messageSnapshotReply(): Nat8
+        ensures result = 6;
+
+    """
+    A message between two nodes.  index and logTerm are the last entry of
+    a candidate, the entry before those of an append, or the last entry a
+    snapshot holds.  commit is the leader's commit index.  success says
+    whether a vote was granted or an append taken.  hint is the last index
+    a follower holds after an append, or would need, after a refusal.
+    entries, snapshot and members are empty where the kind has none.
+    """
+    record Message: Linear is
+        kind: Nat8;
+        sender: Nat64;
+        receiver: Nat64;
+        term: Nat64;
+        index: Nat64;
+        logTerm: Nat64;
+        commit: Nat64;
+        success: Bool;
+        hint: Nat64;
+        entries: Buffer[Entry];
+        snapshot: String;
+        members: Buffer[Nat64];
+    end;
+
+    """
+    Whether message could have come from a node of this module: a known
+    kind, two ids that are not 0 and differ, and entries, a snapshot or
+    members only where its kind carries them.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isWellFormed(message: &[Message, R]): Bool;
+
+    """
+    Frees message.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyMessage(message: Message): Unit;
+
+    """
+    A node of the cluster.  Linear: destroyNode gives it back.
+    """
+    type Node: Linear;
+
+    """
+    A follower in term 0 with an empty log, whose members are members.
+    The node itself is usually among them; a node that is not waits to be
+    added.  Stops the programme for an id of 0, a heartbeat of 0 ticks or
+    an election timeout not longer than the heartbeat.
+    """
+    function newNode(config: Config, members: Buffer[Nat64]): Node
+        requires ((config.id > 0) and (config.heartbeatTicks > 0)) and (config.electionTicks > config.heartbeatTicks)
+        ensures ((currentTerm(&result) = 0) and (lastIndex(&result) = 0)) and (roleOf(&result) = 0);
+
+    """
+    Frees node.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyNode(node: Node): Unit;
+
+    """
+    One tick of the logical clock: a follower or candidate that has waited
+    out its timeout stands for election, a leader sends its heartbeat.
+    """
+    generic [R: Region]
+    function tick(node: &![Node, R]): Unit
+        ensures currentTerm(&node) >= old(currentTerm(&node));
+
+    """
+    Takes one message addressed to the node.  A message to another node
+    or one that is not well formed is dropped.  The term and the commit
+    index never go back.
+    """
+    generic [R: Region]
+    function step(node: &![Node, R], message: Message): Unit
+        ensures (currentTerm(&node) >= old(currentTerm(&node))) and (commitIndex(&node) >= old(commitIndex(&node)));
+
+    """
+    A command appended to the leader's log and sent to the followers.
+    False, and nothing appended, when the node is not the leader.
+    """
+    generic [R: Region, D: Region]
+    function propose(node: &![Node, R], command: Span[Nat8, D]): Bool
+        ensures (not result) or (lastIndex(&node) = (old(lastIndex(&node)) + 1));
+
+    """
+    A member added or removed by the leader through an entry of its log.
+    False when the node is not the leader, a change is not yet committed,
+    the id is 0, or it is a member already, or not one to remove.
+    """
+    generic [R: Region]
+    function proposeAddMember(node: &![Node, R], member: Nat64): Bool
+        ensures (not result) or (lastIndex(&node) = (old(lastIndex(&node)) + 1));
+    generic [R: Region]
+    function proposeRemoveMember(node: &![Node, R], member: Nat64): Bool
+        ensures (not result) or (lastIndex(&node) = (old(lastIndex(&node)) + 1));
+
+    """
+    The messages the node has to send, in the order it made them; the
+    node keeps none.  The caller stores the term, the vote and the log
+    before it sends them, where they must survive a restart.
+    """
+    generic [R: Region]
+    function takeMessages(node: &![Node, R]): Buffer[Message]
+        ensures pendingMessages(&node) = 0;
+
+    """
+    How many messages the node holds for takeMessages.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function pendingMessages(node: &[Node, R]): Index;
+
+    """
+    Applies the committed entries the machine has not seen, in the order
+    of the log: a snapshot the node installed first, then each command.
+    Changes of the members are not given to the machine.  The count of
+    entries and snapshots applied comes back.
+    """
+    generic [T: Type(StateMachine), R: Region, M: Region]
+    function applyCommitted(node: &![Node, R], machine: &![T, M]): Index
+        ensures appliedIndex(&node) = commitIndex(&node);
+
+    """
+    Replaces the applied part of the log by a snapshot of machine, which
+    must have been given every entry up to appliedIndex.  False, and
+    nothing changed, when no entry was applied since the last snapshot.
+    """
+    generic [T: Type(StateMachine), R: Region, M: Region]
+    function compactWith(node: &![Node, R], machine: &[T, M]): Bool
+        ensures snapshotIndexOf(&node) <= appliedIndex(&node);
+
+    """
+    What the node is: 0 a follower, 1 a candidate, 2 the leader.
+    """
+    generic [R: Region]
+    function roleOf(node: &[Node, R]): Nat8
+        ensures result <= 2;
+    """
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isLeader(node: &[Node, R]): Bool;
+    generic [R: Region]
+    function nodeId(node: &[Node, R]): Nat64
+        ensures result > 0;
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function currentTerm(node: &[Node, R]): Nat64;
+
+    """
+    The id of the leader the node follows, 0 when it knows none.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function leaderOf(node: &[Node, R]): Nat64;
+
+    """
+    The indexes of the log: the last entry, the last committed one, the
+    last applied one and the last the snapshot holds.  Each is 0 when
+    there is none.
+    """
+    generic [R: Region]
+    function lastIndex(node: &[Node, R]): Nat64
+        ensures result >= commitIndex(node);
+    generic [R: Region]
+    function commitIndex(node: &[Node, R]): Nat64
+        ensures result >= appliedIndex(node);
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function appliedIndex(node: &[Node, R]): Nat64;
+    generic [R: Region]
+    function snapshotIndexOf(node: &[Node, R]): Nat64
+        ensures result <= commitIndex(node);
+
+    """
+    The term of the entry at index; 0 when the log no longer holds it or
+    does not hold it yet, and for index 0.  The snapshot's last index
+    keeps its term.
+    """
+    generic [R: Region]
+    function termAt(node: &[Node, R], index: Nat64): Nat64
+        ensures (index > 0) or (result = 0);
+
+    """
+    The members as the node's log has them now, and whether id is one.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function memberCount(node: &[Node, R]): Index;
+    generic [R: Region]
+    function memberAt(node: &[Node, R], position: Index): Nat64
+        requires position < memberCount(node);
+    """
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isMember(node: &[Node, R], id: Nat64): Bool;
+end module.

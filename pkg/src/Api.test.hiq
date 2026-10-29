@@ -1,0 +1,125 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength,
+    nthRef
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Pkg.Report (
+    Problem,
+    destroyProblem
+);
+import Pkg.Files (
+    writeText,
+    makeDirectories
+);
+import Pkg.Tree (
+    removeTree
+);
+import Pkg.Api (
+    Declaration,
+    ApiDiff,
+    declarationsOf,
+    diffTrees,
+    levelName,
+    destroyDeclarations,
+    destroyDiff
+);
+
+module body Pkg.Api.Test is
+    constant base: Span[Nat8, Static] := "\"\"\"\nThe head.\n\"\"\"\nmodule Acme.M is\n    \"\"\"\n    Twice.\n    \"\"\"\n    function double(n: Int64): Int64\n        requires n < 1000\n        ensures result = (n * 2);\n\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n\n    record Pair: Free is\n        a: Int64;\n        b: Int64;\n    end;\nend module.\n";
+
+    function cleared(path: Span[Nat8, Static]): Unit is
+        case removeTree(path) of
+            when Right(right as done: Unit) do
+                skip;
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure("a tree was not removed");
+        end case;
+        return nil;
+    end;
+
+    function testRead(): Unit is
+        let all: Buffer[Declaration] := declarationsOf(base);
+        assertTrue(bufferLength(&all) = 4, "the module and three declarations");
+        destroyDeclarations(all);
+        return nil;
+    end;
+
+    -- The level of the change from base to text, and whether the changes
+    -- name the part.
+    function levelOf(text: Span[Nat8, Static], want: Span[Nat8, Static], part: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        cleared("_api-test");
+        assertTrue(makeDirectories("_api-test/old"), "old made");
+        assertTrue(makeDirectories("_api-test/new"), "new made");
+        assertTrue(makeDirectories("_api-test/use"), "use made");
+        assertTrue(writeText("_api-test/old/M.hih", base), "old written");
+        assertTrue(writeText("_api-test/new/M.hih", text), "new written");
+        assertTrue(writeText("_api-test/use/Use.hiq", "module body Use is\n    function f(): Int64 is\n        return double(2);\n    end;\nend module body.\n"), "a caller written");
+        case diffTrees("_api-test/old", "_api-test/new", "_api-test/use") of
+            when Right(right as diff: ApiDiff) do
+                assertTrue(equal(levelName(diff.level), want), message);
+                let { level: Nat8, changes: Buffer[String], sites: Buffer[String] } := diff;
+                if spanLength(part) > 0 then
+                    assertTrue(anyHas(&changes, part), message);
+                end if;
+                if equal(want, "major") and contains(part, "double") then
+                    assertTrue(bufferLength(&sites) = 1, "the call of double is found");
+                    assertTrue(anyHas(&sites, "Use.hiq:3: double"), "by file and line");
+                end if;
+                destroyDiff(ApiDiff(level => level, changes => changes, sites => sites));
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure(message);
+        end case;
+        cleared("_api-test");
+        return nil;
+    end;
+
+    generic [B: Region]
+    function anyHas(texts: &[Buffer[String], B], part: Span[Nat8, Static]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(texts) do
+            if contains(asSpan(nthRef(texts, i)), part) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    function testLevels(): Unit is
+        levelOf(base, "patch", "", "the same interface is patch");
+        levelOf("\"\"\"\nThe head.\n\"\"\"\nmodule Acme.M is\n    -- A comment between declarations.\n    ---\n    \"\"\"\n    Twice.\n    \"\"\"\n    function double(n: Int64): Int64\n        -- A comment inside a declaration.\n        requires n < 1000\n        ensures result = (n * 2);\n\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n\n    record Pair: Free is\n        -- The first.\n        a: Int64;\n        b: Int64;\n    end;\nend module.\n", "patch", "", "comments are no interface");
+        levelOf("\"\"\"\nAnother head.\n\"\"\"\nmodule Acme.M is\n    \"\"\"\n    Twice the number.\n    \"\"\"\n    function double(n: Int64): Int64\n        requires n < 1000\n        ensures result = (n * 2);\n\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n\n    record Pair: Free is\n        a: Int64;\n        b: Int64;\n    end;\nend module.\n", "patch", "", "docstrings are no interface");
+        levelOf("module Acme.M is\n    function double(n: Int64): Int64\n        requires n < 1000\n        ensures result = (n * 2);\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n    record Pair: Free is\n        a: Int64;\n        b: Int64;\n    end;\n    function half(n: Int64): Int64;\nend module.\n", "minor", "added Acme.M function half", "a function added is minor");
+        levelOf("module Acme.M is\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n    record Pair: Free is\n        a: Int64;\n        b: Int64;\n    end;\nend module.\n", "major", "removed Acme.M function double", "a function removed is major");
+        levelOf("module Acme.M is\n    function double(n: Int32): Int64\n        requires n < 1000\n        ensures result = (n * 2);\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n    record Pair: Free is\n        a: Int64;\n        b: Int64;\n    end;\nend module.\n", "major", "changed Acme.M function double", "a changed signature is major");
+        levelOf("module Acme.M is\n    function double(n: Int64): Int64\n        requires n < 100\n        ensures result = (n * 2);\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n    record Pair: Free is\n        a: Int64;\n        b: Int64;\n    end;\nend module.\n", "major", "requires added or changed in Acme.M function double", "a changed requires is major");
+        levelOf("module Acme.M is\n    function double(n: Int64): Int64\n        ensures result = (n * 2);\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n    record Pair: Free is\n        a: Int64;\n        b: Int64;\n    end;\nend module.\n", "minor", "requires removed from", "a requires removed is minor");
+        levelOf("module Acme.M is\n    function double(n: Int64): Int64\n        requires n < 1000;\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n    record Pair: Free is\n        a: Int64;\n        b: Int64;\n    end;\nend module.\n", "major", "ensures removed or changed in", "an ensures removed is major");
+        levelOf("module Acme.M is\n    function double(n: Int64): Int64\n        requires n < 1000\n        ensures result = (n * 2);\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index\n        ensures result <= spanLength(s);\n    record Pair: Free is\n        a: Int64;\n        b: Int64;\n    end;\nend module.\n", "minor", "ensures added to", "an ensures added is minor");
+        levelOf("module Acme.M is\n    function double(n: Int64): Int64\n        requires n < 1000\n        ensures result = (n * 2);\n    generic [R: Region]\n    function size(s: Span[Nat8, R]): Index;\n    record Pair: Free is\n        a: Int64;\n    end;\nend module.\n", "major", "changed Acme.M record Pair", "a record changed is major");
+        return nil;
+    end;
+end module body.

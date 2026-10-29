@@ -1,0 +1,256 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module over Bindings.Context.  Each derived context makes a pipe
+-- of its own and waits on its reading end.  Nothing is ever written into a
+-- pipe: its reading end becomes readable only when the writing end is
+-- closed, and then it stays so, which is what makes a cancel visible to
+-- every holder of a reading end without a lock.  A context holds the
+-- node of its own reading end, which refers to the node of its parent, so
+-- a chain of n levels holds n reading ends.  A deadline is a moment of the
+-- monotonic clock in nanoseconds.
+import Standard.Time (
+    monotonicNanos
+);
+import Bindings.Context (
+    Ends,
+    Node,
+    openEnds,
+    closeNumber,
+    emptyNode,
+    nodeBelow,
+    releaseNode,
+    nodeReady
+);
+
+module body Standard.Context is
+    constant depthLimit: Index := 64;
+    constant nanosPerMilli: Nat64 := 1000000;
+    constant largestWait: Nat32 := 2147483647;
+    constant noMillis: Nat32 := 0;
+    constant noNanos: Nat64 := 0;
+
+    record Context: Linear is
+        node: Node;
+        deadline: Option[Nat64];
+        depth: Index;
+    end;
+
+    record Canceller: Linear is
+        writing: Int32;
+    end;
+
+    function maxDepth(): Index is
+        return depthLimit;
+    end;
+
+    function background(): Context is
+        let none: Option[Nat64] := None();
+        return Context(node => emptyNode(), deadline => none, depth => 0);
+    end;
+
+    function earlier(left: Option[Nat64], right: Option[Nat64]): Option[Nat64] is
+        case left of
+            when Some(value as a: Nat64) do
+                case right of
+                    when Some(value as b: Nat64) do
+                        if b < a then
+                            return right;
+                        end if;
+                        return left;
+                    when None do
+                        return left;
+                end case;
+            when None do
+                return right;
+        end case;
+    end;
+
+    generic [R: Region]
+    function derive(parent: &[Context, R], deadline: Option[Nat64]): Option[Derived] is
+        if parent->depth >= depthLimit then
+            let none: Option[Derived] := None();
+            return none;
+        end if;
+        case openEnds() of
+            when Some(value as ends: Ends) do
+                case nodeBelow(ends.reading, &(parent->node)) of
+                    when Some(value as node: Node) do
+                        let context: Context := Context(
+                            node => node,
+                            deadline => earlier(parent->deadline, deadline),
+                            depth => parent->depth + 1
+                        );
+                        let derived: Derived := Derived(context => context, canceller => Canceller(writing => ends.writing));
+                        let some: Option[Derived] := Some(value => derived);
+                        return some;
+                    when None do
+                        closeNumber(ends.reading);
+                        closeNumber(ends.writing);
+                        let none: Option[Derived] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Derived] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function withCancel(parent: &[Context, R]): Option[Derived] is
+        let none: Option[Nat64] := None();
+        return derive(parent, none);
+    end;
+
+    generic [R: Region]
+    function withTimeout(parent: &[Context, R], milliseconds: Nat32): Option[Derived] is
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                case toNat64(milliseconds) of
+                    when Some(value as wide: Nat64) do
+                        let at: Option[Nat64] := Some(value => now + (wide * nanosPerMilli));
+                        return derive(parent, at);
+                    when None do
+                        let none: Option[Derived] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Derived] := None();
+                return none;
+        end case;
+    end;
+
+    function cancel(canceller: Canceller): Unit is
+        let { writing: Int32 } := canceller;
+        closeNumber(writing);
+        return nil;
+    end;
+
+    -- Nanoseconds left until the deadline; None for no deadline, Some 0
+    -- when it has passed or the clock cannot be read.
+    function nanosLeft(deadline: Option[Nat64]): Option[Nat64] is
+        case deadline of
+            when Some(value as at: Nat64) do
+                case monotonicNanos() of
+                    when Some(value as now: Nat64) do
+                        if now >= at then
+                            let zero: Option[Nat64] := Some(value => noNanos);
+                            return zero;
+                        end if;
+                        let left: Option[Nat64] := Some(value => at - now);
+                        return left;
+                    when None do
+                        let zero: Option[Nat64] := Some(value => noNanos);
+                        return zero;
+                end case;
+            when None do
+                let none: Option[Nat64] := None();
+                return none;
+        end case;
+    end;
+
+    function pastDeadline(deadline: Option[Nat64]): Bool is
+        case nanosLeft(deadline) of
+            when Some(value as left: Nat64) do
+                return left = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function done(context: &[Context, R]): Done is
+        if nodeReady(&(context->node), 0) /= 0 then
+            return Cancelled();
+        end if;
+        if pastDeadline(context->deadline) then
+            return DeadlineExceeded();
+        end if;
+        return NotDone();
+    end;
+
+    generic [R: Region]
+    function isDone(context: &[Context, R]): Bool is
+        case done(context) of
+            when NotDone do
+                return false;
+            when Cancelled do
+                return true;
+            when DeadlineExceeded do
+                return true;
+        end case;
+    end;
+
+    -- Milliseconds, rounded up, in at most largestWait.
+    function millisOf(nanos: Nat64): Nat32 is
+        let millis: Nat64 := (nanos + (nanosPerMilli - 1)) / nanosPerMilli;
+        case toNat32(millis) of
+            when Some(value as small: Nat32) do
+                if small > largestWait then
+                    return largestWait;
+                end if;
+                return small;
+            when None do
+                return largestWait;
+        end case;
+    end;
+
+    generic [R: Region]
+    function remainingMilliseconds(context: &[Context, R], upTo: Nat32): Nat32 is
+        if isDone(context) then
+            return noMillis;
+        end if;
+        case nanosLeft(context->deadline) of
+            when Some(value as left: Nat64) do
+                let millis: Nat32 := millisOf(left);
+                if millis < upTo then
+                    return millis;
+                end if;
+                return upTo;
+            when None do
+                return upTo;
+        end case;
+    end;
+
+    function toWait(milliseconds: Nat32): Int32 is
+        var bounded: Nat32 := milliseconds;
+        if bounded > largestWait then
+            bounded := largestWait;
+        end if;
+        case toInt32(bounded) of
+            when Some(value as wait: Int32) do
+                return wait;
+            when None do
+                return 2147483647;
+        end case;
+    end;
+
+    generic [R: Region]
+    function waitDone(context: &[Context, R], milliseconds: Nat32): Done is
+        let first: Done := done(context);
+        case first of
+            when NotDone do
+                skip;
+            when Cancelled do
+                return first;
+            when DeadlineExceeded do
+                return first;
+        end case;
+        -- The wait ends at the deadline too: then the time is what is
+        -- left of it, and done is asked again afterwards.
+        let wait: Nat32 := remainingMilliseconds(context, milliseconds);
+        let ready: Int32 := nodeReady(&(context->node), toWait(wait));
+        return done(context);
+    end;
+
+    function destroyContext(context: Context): Unit is
+        let { node: Node, deadline: Option[Nat64], depth: Index } := context;
+        releaseNode(node);
+        return nil;
+    end;
+end module body.

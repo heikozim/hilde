@@ -1,0 +1,181 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    makeString,
+    storeNth,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.X509 (
+    PrivateKey,
+    EcP256,
+    generateKey,
+    signMessage,
+    destroyPrivateKey
+);
+import Standard.Acme (
+    base64Url,
+    isEs256Size,
+    joseSignature
+);
+
+module body Standard.Acme.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function encodes(bytes: Span[Nat8, Static], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let encoded: String := base64Url(bytes);
+        assertTrue(same(&encoded, expected), message);
+        destroyString(encoded);
+        return nil;
+    end;
+
+    -- isEs256Size: None and 64 bytes hold, 63 and 65 bytes do not.
+    function testIsEs256Size(): Unit is
+        let none: Option[String] := None();
+        assertTrue(isEs256Size(&none), "None");
+        let right: Option[String] := Some(value => makeString(64, 0));
+        assertTrue(isEs256Size(&right), "64 bytes");
+        let short: Option[String] := Some(value => makeString(63, 0));
+        assertFalse(isEs256Size(&short), "63 bytes");
+        let long: Option[String] := Some(value => makeString(65, 0));
+        assertFalse(isEs256Size(&long), "65 bytes");
+        dropOption(none);
+        dropOption(right);
+        dropOption(short);
+        dropOption(long);
+        return nil;
+    end;
+
+    function dropOption(value: Option[String]): Unit is
+        case value of
+            when Some(value as text: String) do
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The vectors of RFC 4648 section 10, without padding, and the two
+    -- characters that base64url changes.
+    function testBase64Url(): Unit is
+        encodes("", "", "empty");
+        encodes("f", "Zg", "one byte");
+        encodes("fo", "Zm8", "two bytes");
+        encodes("foo", "Zm9v", "three bytes");
+        encodes("foobar", "Zm9vYmFy", "six bytes");
+        var high: String := makeString(3, 0);
+        storeNth(&!high, 0, 251);
+        storeNth(&!high, 1, 255);
+        storeNth(&!high, 2, 191);
+        let encoded: String := base64Url(asSpan(&high));
+        assertTrue(same(&encoded, "-_-_"), "a minus and an underscore for plus and slash");
+        destroyString(encoded);
+        destroyString(high);
+        return nil;
+    end;
+
+    -- A DER signature of numbers with a leading zero and of numbers shorter
+    -- than 32 bytes becomes 64 bytes, each number padded on the left.
+    function testJoseSignature(): Unit is
+        var der: String := makeString(41, 0);
+        -- A sequence of 39 bytes: an integer of 33 bytes (a zero, then 0x80 and
+        -- 31 times 1), an integer of 2 bytes (0x01 0x02).
+        storeNth(&!der, 0, 48);
+        storeNth(&!der, 1, 39);
+        storeNth(&!der, 2, 2);
+        storeNth(&!der, 3, 33);
+        storeNth(&!der, 4, 0);
+        storeNth(&!der, 5, 128);
+        var i: Index := 6;
+        while i < 37 do
+            storeNth(&!der, i, 1);
+            i := i + 1;
+        end while;
+        storeNth(&!der, 37, 2);
+        storeNth(&!der, 38, 2);
+        storeNth(&!der, 39, 1);
+        storeNth(&!der, 40, 2);
+        case joseSignature(asSpan(&der)) of
+            when Some(value as raw: String) do
+                assertTrue(length(&raw) = 64, "64 bytes");
+                assertTrue(nthByte(&raw, 0) = 128, "the leading zero of r is gone");
+                assertTrue(nthByte(&raw, 31) = 1, "r ends where it ended");
+                assertTrue(nthByte(&raw, 32) = 0, "s is padded on the left");
+                assertTrue((nthByte(&raw, 62) = 1) and (nthByte(&raw, 63) = 2), "s at the end");
+                destroyString(raw);
+            when None do
+                assertFailure("a good signature was refused");
+        end case;
+        storeNth(&!der, 1, 40);
+        case joseSignature(asSpan(&der)) of
+            when Some(value as raw: String) do
+                destroyString(raw);
+                assertFailure("a length that does not fit was taken");
+            when None do
+                assertSuccess("a length that does not fit is refused");
+        end case;
+        destroyString(der);
+        return nil;
+    end;
+
+    -- Every signature of a P-256 key comes out as 64 bytes.
+    function testRealSignatures(): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                var round: Index := 0;
+                var good: Index := 0;
+                while round < 50 do
+                    case signMessage(&key, "the signing input") of
+                        when Some(value as der: String) do
+                            case joseSignature(asSpan(&der)) of
+                                when Some(value as raw: String) do
+                                    if length(&raw) = 64 then
+                                        good := good + 1;
+                                    end if;
+                                    destroyString(raw);
+                                when None do
+                                    skip;
+                            end case;
+                            destroyString(der);
+                        when None do
+                            skip;
+                    end case;
+                    round := round + 1;
+                end while;
+                assertTrue(good = 50, "50 signatures of 64 bytes");
+                destroyPrivateKey(key);
+            when None do
+                assertFailure("no key");
+        end case;
+        return nil;
+    end;
+end module body.

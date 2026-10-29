@@ -1,0 +1,309 @@
+-- Standard.PcreJit: every pattern is compiled twice, by Standard.Pcre for
+-- the interpreter and by Standard.PcreJit for machine code, and find_all
+-- runs on both.  Each line says whether the JIT made machine code, the
+-- hits of both, and whether they are the same.  One pattern has a feature
+-- the JIT refuses, so it falls back and still finds the same.  The last
+-- line is the control of the comparison: two different patterns, which it
+-- must call different.  Patterns and texts are written %xx where a byte is
+-- not printable ASCII, or is %, a quote or a backslash, and decoded here.
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Pcre (
+    Regex,
+    compile,
+    destroyRegex,
+    Hit,
+    find_all
+);
+import Standard.PcreJit (
+    Compiled,
+    compile as compileJit,
+    jitBuiltIn
+);
+import Standard.Buffer (
+    Buffer,
+    destroyFree,
+    length as bufferLength,
+    nth
+);
+
+module body Test is
+    constant ten: Nat8 := 10;
+    constant tenIndex: Index := 10;
+    constant sixteen: Nat8 := 16;
+    constant limit: Nat32 := 1000000;
+
+    function nibble(c: Nat8): Nat8 is
+        if c <= '9' then
+            return c - '0';
+        end if;
+        return (c - 'A') + ten;
+    end;
+
+    function decode(encoded: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(encoded);
+        var i: Index := 0;
+        while i < size do
+            let c: Nat8 := encoded[i];
+            if c = '%' then
+                let high: Nat8 := nibble(encoded[i + 1]);
+                let low: Nat8 := nibble(encoded[i + 2]);
+                writeByte(&!out, (high * sixteen) + low);
+                i := i + 3;
+            else
+                writeByte(&!out, c);
+                i := i + 1;
+            end if;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [B: Region]
+    function writeNumber(out: &![StringBuilder, B], value: Index): Unit is
+        if value >= tenIndex then
+            writeNumber(&~out, value / tenIndex);
+        end if;
+        let digit: Index := value - ((value / tenIndex) * tenIndex);
+        case toNat8(digit) of
+            when Some(value as d: Nat8) do
+                writeByte(&~out, d + '0');
+            when None do
+                abort("digit");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        let size: Index := length(text);
+        print("[");
+        if size > 0 then
+            print(getSpan(text, 0, size - 1));
+        end if;
+        print("]");
+        return nil;
+    end;
+
+    -- The hits of find_all as "start,stop" separated by blanks, or the
+    -- message of a failed search.
+    generic [R: Region, S: Region]
+    function hitsOf(re: &[Regex, R], text: &[String, S]): String is
+        var out: StringBuilder := makeStringBuilder();
+        case find_all(re, asSpan(text)) of
+            when Right(right as hits: Buffer[Hit]) do
+                let count: Index := bufferLength(&hits);
+                var i: Index := 0;
+                while i < count do
+                    let hit: Hit := nth(&hits, i);
+                    if i > 0 then
+                        writeByte(&!out, ' ');
+                    end if;
+                    writeNumber(&!out, hit.start);
+                    writeByte(&!out, ',');
+                    writeNumber(&!out, hit.stop);
+                    i := i + 1;
+                end while;
+                destroyFree(hits);
+            when Left(left as message: String) do
+                writeString(&!out, "failed ");
+                writeString(&!out, asSpan(&message));
+                destroyString(message);
+        end case;
+        return finalize(out);
+    end;
+
+    generic [R: Region, S: Region]
+    function same(a: &[String, R], b: &[String, S]): Bool is
+        let size: Index := length(a);
+        if size /= length(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(a, i) /= nthByte(b, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Pattern interpreted runs through Standard.Pcre, pattern jitted
+    -- through Standard.PcreJit, both over the same text.
+    function compare(name: Span[Nat8, Static], interpreted: Span[Nat8, Static], jitted: Span[Nat8, Static], subject: Span[Nat8, Static], matchLimit: Nat32): Unit is
+        print(name);
+        print(": ");
+        let p: String := decode(interpreted);
+        let q: String := decode(jitted);
+        let t: String := decode(subject);
+        let plain: Either[String, Regex] := compile(asSpan(&p), matchLimit);
+        let machine: Either[String, Compiled] := compileJit(asSpan(&q), matchLimit);
+        case plain of
+            when Right(right as re: Regex) do
+                case machine of
+                    when Right(right as compiled: Compiled) do
+                        let { regex: Regex, fallBack: Option[String] } := compiled;
+                        case fallBack of
+                            when None do
+                                print("jit yes");
+                            when Some(value as reason: String) do
+                                print("jit no ");
+                                printText(&reason);
+                                destroyString(reason);
+                        end case;
+                        let a: String := hitsOf(&re, &t);
+                        let b: String := hitsOf(&regex, &t);
+                        print(", interpreter ");
+                        printText(&a);
+                        print(", jit ");
+                        printText(&b);
+                        if same(&a, &b) then
+                            printLn(", same");
+                        else
+                            printLn(", DIFFERENT");
+                        end if;
+                        destroyString(a);
+                        destroyString(b);
+                        destroyRegex(regex);
+                    when Left(left as message: String) do
+                        print("jit compile error ");
+                        printText(&message);
+                        printLn("");
+                        destroyString(message);
+                end case;
+                destroyRegex(re);
+            when Left(left as message: String) do
+                print("compile error ");
+                printText(&message);
+                printLn("");
+                destroyString(message);
+                case machine of
+                    when Right(right as compiled: Compiled) do
+                        let { regex: Regex, fallBack: Option[String] } := compiled;
+                        case fallBack of
+                            when None do
+                                skip;
+                            when Some(value as reason: String) do
+                                destroyString(reason);
+                        end case;
+                        destroyRegex(regex);
+                    when Left(left as other: String) do
+                        destroyString(other);
+                end case;
+        end case;
+        destroyString(p);
+        destroyString(q);
+        destroyString(t);
+        return nil;
+    end;
+
+    function row(name: Span[Nat8, Static], pattern: Span[Nat8, Static], subject: Span[Nat8, Static]): Unit is
+        compare(name, pattern, pattern, subject, limit);
+        return nil;
+    end;
+
+    -- A group repeated count times: each repetition is a place to come
+    -- back to, kept by the interpreter on the heap and by machine code on
+    -- its stack, so the length decides which limit is reached first.
+    function deep(count: Index): Unit is
+        print("deep repetition ");
+        print(count);
+        print(": ");
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeByte(&!out, 'a');
+            i := i + 1;
+        end while;
+        writeByte(&!out, 'c');
+        let t: String := finalize(out);
+        let plain: Either[String, Regex] := compile("(a|b)*c", 100000000);
+        let machine: Either[String, Compiled] := compileJit("(a|b)*c", 100000000);
+        case plain of
+            when Right(right as re: Regex) do
+                case machine of
+                    when Right(right as compiled: Compiled) do
+                        let { regex: Regex, fallBack: Option[String] } := compiled;
+                        case fallBack of
+                            when None do
+                                print("jit yes");
+                            when Some(value as reason: String) do
+                                print("jit no");
+                                destroyString(reason);
+                        end case;
+                        let a: String := hitsOf(&re, &t);
+                        let b: String := hitsOf(&regex, &t);
+                        print(", interpreter ");
+                        printText(&a);
+                        print(", jit ");
+                        printText(&b);
+                        printLn("");
+                        destroyString(a);
+                        destroyString(b);
+                        destroyRegex(regex);
+                    when Left(left as message: String) do
+                        destroyString(message);
+                end case;
+                destroyRegex(re);
+            when Left(left as message: String) do
+                destroyString(message);
+                case machine of
+                    when Right(right as compiled: Compiled) do
+                        let { regex: Regex, fallBack: Option[String] } := compiled;
+                        case fallBack of
+                            when None do
+                                skip;
+                            when Some(value as reason: String) do
+                                destroyString(reason);
+                        end case;
+                        destroyRegex(regex);
+                    when Left(left as other: String) do
+                        destroyString(other);
+                end case;
+        end case;
+        destroyString(t);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        print("jit built in: ");
+        printLn(jitBuiltIn());
+        row("literal", "error", "an error, no error here: error%0Aok");
+        row("alternation without case", "(?i)warning|critical|fatal", "Warning: CRITICAL fatal warnings");
+        row("mail address", "[A-Za-z0-9._%25+-]+@[A-Za-z0-9.-]+%5C.[A-Za-z]{2,}", "to alice@example.org and bob.smith@mail.example.com");
+        row("date and time", "%5Cb%5Cd{4}-%5Cd{2}-%5Cd{2}T%5Cd{2}:%5Cd{2}:%5Cd{2}%5Cb", "at 2026-10-12T18:40:16 and 2026-10-13T00:06:24.");
+        row("backreference", "(%5Cw+)%5Cs+%5C1", "data data request ok ok");
+        row("dollar before a final newline", "a$", "ba%0A");
+        row("empty matches", "x*", "ab");
+        row("lookahead", "a(?=b)", "abacab");
+        row("two-byte letter", ".", "%C3%A9");
+        -- Exponential for a backtracking engine: the match limit holds for
+        -- machine code as it does for the interpreter.
+        compare("match limit", "(a+)+$", "(a+)+$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", 1000);
+        compare("match limit of zero", "a", "a", "a", 0);
+        -- A callout right before the assertion of a condition is one of the
+        -- two things the JIT of PCRE2 does not compile.
+        row("fall-back", "(?(?C1)(?=a)ab|cd)", "ab cd");
+        deep(1000);
+        deep(100000);
+        deep(1000000);
+        deep(4000000);
+        -- The control: a and b are different patterns.
+        compare("control", "a", "b", "abab", limit);
+        return ExitSuccess();
+    end;
+end module body.

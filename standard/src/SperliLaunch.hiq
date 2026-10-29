@@ -1,0 +1,1226 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as count,
+    nth,
+    nthRef,
+    nthMut,
+    swapNth,
+    insertBack,
+    removeFirst,
+    removeLast,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.String (
+    String,
+    fromSpan,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    destroyWiped,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize as build
+);
+import Standard.Text (
+    lines,
+    trim,
+    indexOfByte,
+    parseNat,
+    substring,
+    toLower,
+    endsWith,
+    equal,
+    bytesToHex,
+    formatNat
+);
+import Standard.Resolve (
+    validHostname
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Standard.File (
+    FileDescriptor,
+    TcpListener,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    openRead,
+    readAll,
+    closeFile,
+    writeAll,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    listenTcp,
+    tcpListenerPort,
+    closeTcpListener
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    closeScope,
+    spawn,
+    join
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.X509 (
+    KeyKind,
+    Ed25519Key,
+    PrivateKey,
+    Certificate,
+    generateKey,
+    privateKeyToPem,
+    certificateToPem,
+    selfSigned,
+    issue,
+    isDnsNameList,
+    destroyPrivateKey,
+    destroyCertificate
+);
+import Standard.CompositeSig (
+    CompositeKey,
+    generateKeyPair,
+    publicKeyOf,
+    seedsOf,
+    destroyCompositeKey
+);
+import Standard.SperliError (
+    refusedHost,
+    badLaunch,
+    startFailed,
+    restartStatus,
+    describe
+);
+import Standard.SperliWire (
+    hostRefused,
+    certificateName,
+    signJoinToken
+);
+
+module body Standard.SperliLaunch is
+    constant byteBase: Nat64 := 256;
+    constant byteMask: Nat64 := 255;
+    constant lifetimeDay: Nat64 := 86400;
+
+    function sshPort(): Nat16 is
+        return 62222;
+    end;
+
+    function basePort(): Nat16 is
+        return 47000;
+    end;
+
+    function wide(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliLaunch: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function wide32(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliLaunch: a Nat32 did not fit a Nat64");
+        end case;
+    end;
+
+    function narrow(value: Nat64): Index is
+        case toIndex(value) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.SperliLaunch: a length did not fit an Index");
+        end case;
+    end;
+
+    function narrow32(value: Nat64): Nat32 is
+        case toNat32(value) of
+            when Some(value as at: Nat32) do
+                return at;
+            when None do
+                abort("Standard.SperliLaunch: a number did not fit a Nat32");
+        end case;
+    end;
+
+    function narrow16(value: Nat64): Nat16 is
+        case toNat16(value) of
+            when Some(value as at: Nat16) do
+                return at;
+            when None do
+                abort("Standard.SperliLaunch: a number did not fit a Nat16");
+        end case;
+    end;
+
+    function wide16(value: Nat16): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliLaunch: a Nat16 did not fit a Nat64");
+        end case;
+    end;
+
+    ---
+    --- The host list
+    ---
+
+    record HostList: Linear is
+        hosts: Buffer[String];
+        ports: Buffer[Nat16];
+        invariant count(&hosts) = count(&ports);
+        invariant count(&hosts) <= 4096;
+    end;
+
+    function noStrings(): Buffer[String] is
+        return allocateEmpty();
+    end;
+
+    function noPorts(): Buffer[Nat16] is
+        return allocateEmpty();
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var rest: Buffer[String] := strings;
+        while count(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyHostList(list: HostList): Unit is
+        let { hosts: Buffer[String], ports: Buffer[Nat16] } := list;
+        destroyStrings(hosts);
+        destroyFree(ports);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function hostCount(hosts: &[HostList, R]): Index is
+        return count(&(hosts->hosts));
+    end;
+
+    -- Whether host is name or a name below it; both in lower case.
+    generic [H: Region, N: Region]
+    function underName(host: Span[Nat8, H], name: Span[Nat8, N]): Bool is
+        if equal(host, name) then
+            return true;
+        end if;
+        if spanLength(host) <= spanLength(name) then
+            return false;
+        end if;
+        if not endsWith(host, name) then
+            return false;
+        end if;
+        return host[(spanLength(host) - spanLength(name)) - 1] = 46;
+    end;
+
+    -- Whether the names of the deny text, one on each line, include host or
+    -- a name above it.
+    generic [H: Region, D: Region]
+    function denied(host: Span[Nat8, H], deny: Span[Nat8, D]): Bool is
+        let low: String := toLower(host);
+        let entries: Buffer[Span[Nat8, D]] := lines(deny);
+        var found: Bool := false;
+        var i: Index := 0;
+        while i < count(&entries) do
+            let name: String := toLower(trim(nth(&entries, i)));
+            if (length(&name) > 0) and underName(asSpan(&low), asSpan(&name)) then
+                found := true;
+            end if;
+            destroyString(name);
+            i := i + 1;
+        end while;
+        destroyFree(entries);
+        destroyString(low);
+        return found;
+    end;
+
+    -- The port of a line behind its host: empty for none, a number up to
+    -- 65535, and 65536 for text that is no port.
+    generic [R: Region]
+    function portOf(rest: Span[Nat8, R]): Nat64 is
+        if spanLength(rest) = 0 then
+            return 0;
+        end if;
+        case parseNat(rest) of
+            when Some(value as port: Nat64) do
+                if (port >= 1) and (port <= 65535) then
+                    return port;
+                end if;
+                return 65536;
+            when None do
+                return 65536;
+        end case;
+    end;
+
+    generic [T: Region, D: Region]
+    function parseHostList(text: Span[Nat8, T], deny: Span[Nat8, D]): Either[Int32, HostList] is
+        var hosts: Buffer[String] := noStrings();
+        var ports: Buffer[Nat16] := noPorts();
+        var code: Int32 := 0;
+        let entries: Buffer[Span[Nat8, T]] := lines(text);
+        var i: Index := 0;
+        while (code = 0) and (i < count(&entries)) do
+            let line: Span[Nat8, T] := trim(nth(&entries, i));
+            if (spanLength(line) > 0) and (line[0] /= 35) then
+                var hostEnd: Index := spanLength(line);
+                case indexOfByte(line, 32) of
+                    when Some(value as at: Index) do
+                        hostEnd := at;
+                    when None do
+                        skip;
+                end case;
+                case indexOfByte(line, 9) of
+                    when Some(value as at: Index) do
+                        if at < hostEnd then
+                            hostEnd := at;
+                        end if;
+                    when None do
+                        skip;
+                end case;
+                let host: Span[Nat8, T] := substring(line, 0, hostEnd);
+                let port: Nat64 := portOf(trim(substring(line, hostEnd, spanLength(line))));
+                if hostRefused(host) or denied(host, deny) then
+                    code := refusedHost();
+                else
+                    if (not validHostname(host)) or (port > 65535) then
+                        code := badLaunch();
+                    else
+                        insertBack(&!hosts, fromSpan(host));
+                        insertBack(&!ports, narrow16(port));
+                    end if;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(entries);
+        if (code = 0) and (count(&hosts) > 0) and (count(&hosts) <= 4096) then
+            let made: Either[Int32, HostList] := Right(right => HostList(hosts => hosts, ports => ports));
+            return made;
+        end if;
+        destroyStrings(hosts);
+        destroyFree(ports);
+        if code = 0 then
+            code := badLaunch();
+        end if;
+        let failed: Either[Int32, HostList] := Left(left => code);
+        return failed;
+    end;
+
+    ---
+    --- The keys of a job
+    ---
+
+    record Launch: Linear is
+        id: String;
+        ranks: Nat32;
+        incarnation: Nat32;
+        hosts: Buffer[String];
+        ports: Buffer[Nat16];
+        publicKey: String;
+        signer: CompositeKey;
+        ca: Certificate;
+        caKey: PrivateKey;
+        expiry: Nat64;
+        days: Nat32;
+        invariant length(&id) = 16;
+        invariant (ranks >= 1) and (ranks <= 4096);
+        invariant count(&hosts) = count(&ports);
+        invariant incarnation >= 1;
+        invariant expiry > 0;
+    end;
+
+    record Keys: Linear is
+        id: String;
+        signer: CompositeKey;
+        caKey: PrivateKey;
+        ca: Certificate;
+    end;
+
+    -- The id, the key pair of the tokens, and the CA of a job.
+    function makeKeys(days: Nat32): Option[Keys] is
+        case randomBytes(16) of
+            when None do
+                let none: Option[Keys] := None();
+                return none;
+            when Some(value as id: String) do
+                case generateKeyPair() of
+                    when None do
+                        destroyString(id);
+                        let none: Option[Keys] := None();
+                        return none;
+                    when Some(value as signer: CompositeKey) do
+                        case generateKey(Ed25519Key()) of
+                            when None do
+                                destroyString(id);
+                                destroyCompositeKey(signer);
+                                let none: Option[Keys] := None();
+                                return none;
+                            when Some(value as caKey: PrivateKey) do
+                                case selfSigned(&caKey, "sperli-ca", "", days, true) of
+                                    when None do
+                                        destroyString(id);
+                                        destroyCompositeKey(signer);
+                                        destroyPrivateKey(caKey);
+                                        let none: Option[Keys] := None();
+                                        return none;
+                                    when Some(value as ca: Certificate) do
+                                        let made: Option[Keys] := Some(value => Keys(id => id, signer => signer, caKey => caKey, ca => ca));
+                                        return made;
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- Whether host is this machine: localhost or an address of 127.
+    generic [H: Region]
+    function isLocal(host: Span[Nat8, H]): Bool is
+        if equal(host, "localhost") then
+            return true;
+        end if;
+        return (spanLength(host) > 4) and (host[0] = 49) and (host[1] = 50) and (host[2] = 55) and (host[3] = 46);
+    end;
+
+    function loopback(): String is
+        var address: String := makeString(4, 0);
+        let first: Nat8 := 127;
+        let last: Nat8 := 1;
+        storeNth(&!address, 0, first);
+        storeNth(&!address, 3, last);
+        return address;
+    end;
+
+    -- The port of every rank: the one the line names, a free one for a rank
+    -- on this machine, basePort and the rank for any other.  Empty when a
+    -- free port could not be had.
+    generic [R: Region]
+    function choosePorts(hosts: &[HostList, R], ranks: Nat32): Buffer[Nat16] is
+        var ports: Buffer[Nat16] := noPorts();
+        var listeners: Buffer[TcpListener] := allocateEmpty();
+        let address: String := loopback();
+        var ok: Bool := true;
+        var i: Index := 0;
+        while i < narrow(wide32(ranks)) do
+            let named: Nat16 := nth(&(hosts->ports), i);
+            if named /= 0 then
+                insertBack(&!ports, named);
+            else
+                if isLocal(asSpan(nthRef(&(hosts->hosts), i))) then
+                    case listenTcp(asSpan(&address), 0) of
+                        when Some(value as listener: TcpListener) do
+                            insertBack(&!ports, tcpListenerPort(&listener));
+                            insertBack(&!listeners, listener);
+                        when None do
+                            ok := false;
+                    end case;
+                else
+                    insertBack(&!ports, narrow16(wide16(basePort()) + wide(i)));
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(address);
+        while count(&listeners) > 0 do
+            let closed: Bool := closeTcpListener(removeLast(&!listeners));
+        end while;
+        destroyEmpty(listeners);
+        if ok then
+            return ports;
+        end if;
+        destroyFree(ports);
+        return noPorts();
+    end;
+
+    generic [R: Region]
+    function copyHosts(hosts: &[HostList, R], ranks: Nat32): Buffer[String] is
+        var copy: Buffer[String] := noStrings();
+        var i: Index := 0;
+        while i < narrow(wide32(ranks)) do
+            insertBack(&!copy, fromSpan(asSpan(nthRef(&(hosts->hosts), i))));
+            i := i + 1;
+        end while;
+        return copy;
+    end;
+
+    generic [R: Region]
+    function newLaunch(hosts: &[HostList, R], ranks: Nat32, incarnation: Nat32, lifetime: Nat32): Either[Int32, Launch] is
+        if hostCount(hosts) < narrow(wide32(ranks)) then
+            let short: Either[Int32, Launch] := Left(left => badLaunch());
+            return short;
+        end if;
+        var days: Nat64 := (wide32(lifetime) / lifetimeDay) + 2;
+        if days > 36500 then
+            days := 36500;
+        end if;
+        let ports: Buffer[Nat16] := choosePorts(hosts, ranks);
+        case makeKeys(narrow32(days)) of
+            when None do
+                destroyFree(ports);
+                let failed: Either[Int32, Launch] := Left(left => startFailed());
+                return failed;
+            when Some(value as keys: Keys) do
+                let { id: String, signer: CompositeKey, caKey: PrivateKey, ca: Certificate } := keys;
+                if count(&ports) /= narrow(wide32(ranks)) then
+                    destroyFree(ports);
+                    destroyString(id);
+                    destroyCompositeKey(signer);
+                    destroyPrivateKey(caKey);
+                    destroyCertificate(ca);
+                    let failed: Either[Int32, Launch] := Left(left => startFailed());
+                    return failed;
+                end if;
+                let publicKey: String := publicKeyOf(&signer);
+                let made: Either[Int32, Launch] := Right(right => Launch(id => id, ranks => ranks, incarnation => incarnation,
+                    hosts => copyHosts(hosts, ranks), ports => ports, publicKey => publicKey, signer => signer, ca => ca,
+                    caKey => caKey, expiry => (wallNanos() / 1000000000) + wide32(lifetime), days => narrow32(days)));
+                return made;
+        end case;
+    end;
+
+    generic [R: Region]
+    function launchId(launch: &[Launch, R]): String is
+        return fromSpan(asSpan(&(launch->id)));
+    end;
+
+    generic [R: Region]
+    function launchRanks(launch: &[Launch, R]): Nat32 is
+        return launch->ranks;
+    end;
+
+    generic [R: Region]
+    function launchPublicKey(launch: &[Launch, R]): String is
+        return fromSpan(asSpan(&(launch->publicKey)));
+    end;
+
+    generic [R: Region]
+    function launchPort(launch: &[Launch, R], rank: Nat32): Nat16 is
+        return nth(&(launch->ports), narrow(wide32(rank)));
+    end;
+
+    generic [R: Region]
+    function launchHost(launch: &[Launch, R], rank: Nat32): String is
+        return fromSpan(asSpan(nthRef(&(launch->hosts), narrow(wide32(rank)))));
+    end;
+
+    generic [R: Region]
+    function launchCaPem(launch: &[Launch, R]): String is
+        case certificateToPem(&(launch->ca)) of
+            when Some(value as pem: String) do
+                return pem;
+            when None do
+                abort("Standard.SperliLaunch: the CA has no PEM text");
+        end case;
+    end;
+
+    generic [R: Region]
+    function launchExpiry(launch: &[Launch, R]): Nat64 is
+        return launch->expiry;
+    end;
+
+    function destroyLaunch(launch: Launch): Unit is
+        let { id: String, ranks: Nat32, incarnation: Nat32, hosts: Buffer[String], ports: Buffer[Nat16], publicKey: String,
+            signer: CompositeKey, ca: Certificate, caKey: PrivateKey, expiry: Nat64, days: Nat32 } := launch;
+        destroyString(id);
+        destroyStrings(hosts);
+        destroyFree(ports);
+        destroyString(publicKey);
+        destroyCompositeKey(signer);
+        destroyCertificate(ca);
+        destroyPrivateKey(caKey);
+        return nil;
+    end;
+
+    generic [R: Region, J: Region, H: Region]
+    function tokenWith(launch: &[Launch, R], job: Span[Nat8, J], rank: Nat32, expiry: Nat64, host: Span[Nat8, H]): Option[String] is
+        return signJoinToken(&(launch->signer), job, rank, launch->ranks, launch->incarnation, expiry, host);
+    end;
+
+    ---
+    --- The description of a rank
+    ---
+
+    generic [O: Region]
+    function putNumber(out: &![StringBuilder, O], value: Nat64, width: Index): Unit is
+        var rest: Nat64 := value;
+        var i: Index := 0;
+        while i < width do
+            case toNat8(bitwiseAnd(rest, byteMask)) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&~out, byte);
+                when None do
+                    skip;
+            end case;
+            rest := rest / byteBase;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [O: Region, T: Region]
+    function putText(out: &![StringBuilder, O], text: Span[Nat8, T], width: Index): Unit is
+        putNumber(&~out, wide(spanLength(text)), width);
+        writeString(&~out, text);
+        return nil;
+    end;
+
+    -- The description of rank, with the PEM text of its certificate and
+    -- key and its token.
+    generic [R: Region, C: Region, K: Region, Y: Region, T: Region, S: Region]
+    function assemble(launch: &[Launch, R], rank: Nat32, caPem: Span[Nat8, C], certificatePem: Span[Nat8, K], keyPem: Span[Nat8, Y], token: Span[Nat8, T], seeds: Span[Nat8, S]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "SPJD");
+        putNumber(&!out, 1, 2);
+        putNumber(&!out, 0, 2);
+        writeString(&!out, asSpan(&(launch->id)));
+        putNumber(&!out, wide32(launch->ranks), 4);
+        putNumber(&!out, wide32(rank), 4);
+        putNumber(&!out, wide32(launch->incarnation), 4);
+        var i: Index := 0;
+        while i < narrow(wide32(launch->ranks)) do
+            putNumber(&!out, wide16(nth(&(launch->ports), i)), 2);
+            putText(&!out, asSpan(nthRef(&(launch->hosts), i)), 2);
+            i := i + 1;
+        end while;
+        putText(&!out, asSpan(&(launch->publicKey)), 2);
+        putText(&!out, token, 2);
+        putText(&!out, caPem, 4);
+        putText(&!out, certificatePem, 4);
+        putText(&!out, keyPem, 4);
+        putText(&!out, seeds, 2);
+        return build(out);
+    end;
+
+    -- The PEM texts and the token of rank, assembled.
+    generic [R: Region, C: Region, K: Region]
+    function describeWith(launch: &[Launch, R], rank: Nat32, certificate: &[Certificate, C], key: &[PrivateKey, K]): Option[String] is
+        case certificateToPem(certificate) of
+            when None do
+                let none: Option[String] := None();
+                return none;
+            when Some(value as certificatePem: String) do
+                case privateKeyToPem(key) of
+                    when None do
+                        destroyString(certificatePem);
+                        let none: Option[String] := None();
+                        return none;
+                    when Some(value as keyPem: String) do
+                        case certificateToPem(&(launch->ca)) of
+                            when None do
+                                destroyString(certificatePem);
+                                destroyWiped(keyPem);
+                                let none: Option[String] := None();
+                                return none;
+                            when Some(value as caPem: String) do
+                                let host: &[String, R] := nthRef(&(launch->hosts), narrow(wide32(rank)));
+                                case signJoinToken(&(launch->signer), asSpan(&(launch->id)), rank, launch->ranks, launch->incarnation, launch->expiry, asSpan(host)) of
+                                    when None do
+                                        destroyString(certificatePem);
+                                        destroyWiped(keyPem);
+                                        destroyString(caPem);
+                                        let none: Option[String] := None();
+                                        return none;
+                                    when Some(value as token: String) do
+                                        -- Rank 0 signs the COMMIT files of the job and gets the seeds of the key.
+                                        var seeds: String := fromSpan("");
+                                        if rank = 0 then
+                                            destroyString(seeds);
+                                            seeds := seedsOf(&(launch->signer));
+                                        end if;
+                                        let whole: String := assemble(launch, rank, asSpan(&caPem), asSpan(&certificatePem), asSpan(&keyPem), asSpan(&token), asSpan(&seeds));
+                                        destroyWiped(seeds);
+                                        destroyString(certificatePem);
+                                        destroyWiped(keyPem);
+                                        destroyString(caPem);
+                                        destroyString(token);
+                                        let described: Option[String] := Some(value => whole);
+                                        return described;
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region]
+    function describeRank(launch: &[Launch, R], rank: Nat32): Option[String] is
+        let slot: Index := narrow(wide32(rank));
+        if (rank >= (launch->ranks)) or (not isDnsNameList(asSpan(nthRef(&(launch->hosts), slot)))) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case generateKey(Ed25519Key()) of
+            when None do
+                let none: Option[String] := None();
+                return none;
+            when Some(value as rankKey: PrivateKey) do
+                let name: String := certificateName(asSpan(&(launch->id)), rank);
+                case issue(&(launch->ca), &(launch->caKey), &rankKey, asSpan(&name), asSpan(nthRef(&(launch->hosts), slot)), launch->days, false) of
+                    when None do
+                        destroyString(name);
+                        destroyPrivateKey(rankKey);
+                        let none: Option[String] := None();
+                        return none;
+                    when Some(value as certificate: Certificate) do
+                        let described: Option[String] := describeWith(launch, rank, &certificate, &rankKey);
+                        destroyCertificate(certificate);
+                        destroyString(name);
+                        destroyPrivateKey(rankKey);
+                        return described;
+                end case;
+        end case;
+    end;
+
+    ---
+    --- The command line
+    ---
+
+    function destroyRunOptions(options: RunOptions): Unit is
+        let { ranks: Nat32, hostsFile: String, denyFile: String, checkpointDir: String, checkpointEvery: Nat32,
+            restartMax: Nat32, resume: String, program: String, arguments: Buffer[String] } := options;
+        destroyString(hostsFile);
+        destroyString(denyFile);
+        destroyString(checkpointDir);
+        destroyString(resume);
+        destroyString(program);
+        destroyStrings(arguments);
+        return nil;
+    end;
+
+    -- The number the word at at+1 holds, or 4294967296 when there is none
+    -- or it is no number below 4294967296.
+    generic [R: Region]
+    function valueAfter(words: &[Buffer[String], R], at: Index): Nat64 is
+        if (at + 1) >= count(words) then
+            return 4294967296;
+        end if;
+        case parseNat(asSpan(nthRef(words, at + 1))) of
+            when Some(value as number: Nat64) do
+                if number < 4294967296 then
+                    return number;
+                end if;
+                return 4294967296;
+            when None do
+                return 4294967296;
+        end case;
+    end;
+
+    generic [R: Region]
+    function textAfter(words: &[Buffer[String], R], at: Index): String is
+        if (at + 1) >= count(words) then
+            return fromSpan("");
+        end if;
+        return fromSpan(asSpan(nthRef(words, at + 1)));
+    end;
+
+    generic [R: Region]
+    function startsWithDash(words: &[Buffer[String], R], at: Index): Bool is
+        let word: &[String, R] := nthRef(words, at);
+        return (length(word) > 0) and (nthByte(word, 0) = 45);
+    end;
+
+    generic [R: Region]
+    function wordIs(words: &[Buffer[String], R], at: Index, name: Span[Nat8, Static]): Bool is
+        return equal(asSpan(nthRef(words, at)), name);
+    end;
+
+    generic [R: Region]
+    function parseRunArguments(words: &[Buffer[String], R]): Either[Int32, RunOptions] is
+        var ranks: Nat64 := 0;
+        var hostsFile: String := fromSpan("");
+        var denyFile: String := fromSpan("");
+        var checkpointDir: String := fromSpan("");
+        var checkpointEvery: Nat64 := 0;
+        var restartMax: Nat64 := 0;
+        var resume: String := fromSpan("");
+        var program: String := fromSpan("");
+        var arguments: Buffer[String] := noStrings();
+        var code: Int32 := 0;
+        var i: Index := 0;
+        while (code = 0) and (i < count(words)) and (length(&program) = 0) do
+            if wordIs(words, i, "-n") then
+                ranks := valueAfter(words, i);
+                i := i + 2;
+            else
+                if wordIs(words, i, "--hosts") then
+                    destroyString(hostsFile);
+                    hostsFile := textAfter(words, i);
+                    i := i + 2;
+                else
+                    if wordIs(words, i, "--deny-hosts") then
+                        destroyString(denyFile);
+                        denyFile := textAfter(words, i);
+                        i := i + 2;
+                    else
+                        if wordIs(words, i, "--checkpoint-dir") then
+                            destroyString(checkpointDir);
+                            checkpointDir := textAfter(words, i);
+                            i := i + 2;
+                        else
+                            if wordIs(words, i, "--checkpoint-every") then
+                                checkpointEvery := valueAfter(words, i);
+                                i := i + 2;
+                            else
+                                if wordIs(words, i, "--restart-max") then
+                                    restartMax := valueAfter(words, i);
+                                    i := i + 2;
+                                else
+                                    if wordIs(words, i, "--resume") then
+                                        destroyString(resume);
+                                        resume := textAfter(words, i);
+                                        i := i + 2;
+                                    else
+                                        if startsWithDash(words, i) then
+                                            code := badLaunch();
+                                        else
+                                            destroyString(program);
+                                            program := fromSpan(asSpan(nthRef(words, i)));
+                                            i := i + 1;
+                                        end if;
+                                    end if;
+                                end if;
+                            end if;
+                        end if;
+                    end if;
+                end if;
+            end if;
+        end while;
+        while (code = 0) and (i < count(words)) do
+            insertBack(&!arguments, fromSpan(asSpan(nthRef(words, i))));
+            i := i + 1;
+        end while;
+        if (((code = 0) and (ranks >= 1)) and ((ranks <= 4096) and (length(&hostsFile) > 0))) and ((length(&program) > 0) and ((checkpointEvery < 4294967296) and (restartMax < 4294967296))) then
+            let made: Either[Int32, RunOptions] := Right(right => RunOptions(ranks => narrow32(ranks), hostsFile => hostsFile,
+                denyFile => denyFile, checkpointDir => checkpointDir, checkpointEvery => narrow32(checkpointEvery),
+                restartMax => narrow32(restartMax), resume => resume, program => program, arguments => arguments));
+            return made;
+        end if;
+        destroyString(hostsFile);
+        destroyString(denyFile);
+        destroyString(checkpointDir);
+        destroyString(resume);
+        destroyString(program);
+        destroyStrings(arguments);
+        let failed: Either[Int32, RunOptions] := Left(left => badLaunch());
+        return failed;
+    end;
+
+    ---
+    --- Running the ranks
+    ---
+
+    -- The text of a pipe to its end; the pipe is closed.
+    function drain(file: FileDescriptor): String is
+        var pipe: FileDescriptor := file;
+        var text: String := fromSpan("");
+        case readAll(&!pipe) of
+            when Some(value as read: String) do
+                destroyString(text);
+                text := read;
+            when None do
+                skip;
+        end case;
+        let closed: Bool := closeFile(pipe);
+        return text;
+    end;
+
+    record Started: Linear is
+        rank: Nat32;
+        process: Process;
+        out: Either[String, Task[String]];
+        err: Either[String, Task[String]];
+    end;
+
+    function noStarted(): Buffer[Started] is
+        return allocateEmpty();
+    end;
+
+    -- text in single quotes, as a shell reads it as one word.
+    generic [T: Region]
+    function quoted(text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "'");
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] = 39 then
+                writeString(&!out, "'\\''");
+            else
+                writeByte(&!out, text[i]);
+            end if;
+            i := i + 1;
+        end while;
+        writeString(&!out, "'");
+        return build(out);
+    end;
+
+    generic [H: Region, P: Region, A: Region]
+    function commandFor(host: Span[Nat8, H], program: Span[Nat8, P], arguments: &[Buffer[String], A]): Command is
+        if isLocal(host) then
+            var command: Command := makeCommand(program);
+            var i: Index := 0;
+            while i < count(arguments) do
+                command := addArgument(command, asSpan(nthRef(arguments, i)));
+                i := i + 1;
+            end while;
+            return command;
+        end if;
+        var remote: StringBuilder := makeStringBuilder();
+        let first: String := quoted(program);
+        writeString(&!remote, asSpan(&first));
+        destroyString(first);
+        var k: Index := 0;
+        while k < count(arguments) do
+            writeString(&!remote, " ");
+            let next: String := quoted(asSpan(nthRef(arguments, k)));
+            writeString(&!remote, asSpan(&next));
+            destroyString(next);
+            k := k + 1;
+        end while;
+        let line: String := build(remote);
+        let port: String := formatNat(wide16(sshPort()));
+        var command: Command := makeCommand("/usr/bin/ssh");
+        command := addArgument(command, "-p");
+        command := addArgument(command, asSpan(&port));
+        command := addArgument(command, "-o");
+        command := addArgument(command, "BatchMode=yes");
+        command := addArgument(command, host);
+        command := addArgument(command, asSpan(&line));
+        destroyString(port);
+        destroyString(line);
+        return command;
+    end;
+
+    -- The description of rank on one line of hexadecimal digits.
+    generic [L: Region]
+    function descriptionLine(launch: &[Launch, L], rank: Nat32): Option[String] is
+        case describeRank(launch, rank) of
+            when None do
+                let none: Option[String] := None();
+                return none;
+            when Some(value as bytes: String) do
+                var out: StringBuilder := makeStringBuilder();
+                let hex: String := bytesToHex(asSpan(&bytes));
+                writeString(&!out, asSpan(&hex));
+                writeString(&!out, "\n");
+                destroyString(hex);
+                destroyWiped(bytes);
+                let line: Option[String] := Some(value => build(out));
+                return line;
+        end case;
+    end;
+
+    generic [S: Region]
+    function startReader(scope: &![Scope, S], file: FileDescriptor): Either[String, Task[String]] is
+        case spawn(&~scope, drain, file) of
+            when Right(right as task: Task[String]) do
+                let started: Either[String, Task[String]] := Right(right => task);
+                return started;
+            when Left(left as back: FileDescriptor) do
+                let direct: Either[String, Task[String]] := Left(left => drain(back));
+                return direct;
+        end case;
+    end;
+
+    function finishReader(reader: Either[String, Task[String]]): String is
+        case reader of
+            when Left(left as text: String) do
+                return text;
+            when Right(right as task: Task[String]) do
+                return join(task);
+        end case;
+    end;
+
+    -- The text of a rank's pipe, line by line behind its rank.
+    generic [T: Region]
+    function show(rank: Nat32, label: Span[Nat8, Static], text: Span[Nat8, T]): Unit is
+        let entries: Buffer[Span[Nat8, T]] := lines(text);
+        var i: Index := 0;
+        while i < count(&entries) do
+            print("[rank ");
+            print(rank);
+            print(label);
+            print("] ");
+            printLn(nth(&entries, i));
+            i := i + 1;
+        end while;
+        destroyFree(entries);
+        return nil;
+    end;
+
+    -- Starts the ranks, waits for them and shows what they wrote.  The
+    -- exit status of rank n is stored at place n of statuses, which holds a
+    -- place for every rank; 255 for a rank a signal ended.  Gives the
+    -- largest status, or startFailed.
+    generic [L: Region, H: Region, P: Region, A: Region, S: Region]
+    function runRound(launch: &[Launch, L], hosts: &[HostList, H], program: Span[Nat8, P], arguments: &[Buffer[String], A], statuses: &![Buffer[Int32], S]): Int32 is
+        case openScope() of
+            when None do
+                return startFailed();
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                var started: Buffer[Started] := noStarted();
+                var code: Int32 := 0;
+                var next: Nat32 := 0;
+                while (code = 0) and (next < (launch->ranks)) do
+                    let host: &[String, H] := nthRef(&(hosts->hosts), narrow(wide32(next)));
+                    case spawnProcess(commandFor(asSpan(host), program, arguments)) of
+                        when None do
+                            code := startFailed();
+                        when Some(value as running: Running) do
+                            let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                            var stdin: FileDescriptor := input;
+                            case descriptionLine(launch, next) of
+                                when Some(value as line: String) do
+                                    let wrote: Bool := writeAll(&!stdin, asSpan(&line));
+                                    destroyWiped(line);
+                                when None do
+                                    code := startFailed();
+                            end case;
+                            let closed: Bool := closeFile(stdin);
+                            let outReader: Either[String, Task[String]] := startReader(&!scope, output);
+                            let errReader: Either[String, Task[String]] := startReader(&!scope, errors);
+                            insertBack(&!started, Started(rank => next, process => process, out => outReader, err => errReader));
+                    end case;
+                    next := next + 1;
+                end while;
+                var worst: Int32 := code;
+                while count(&started) > 0 do
+                    let { rank: Nat32, process: Process, out: Either[String, Task[String]], err: Either[String, Task[String]] } := removeFirst(&!started);
+                    let outText: String := finishReader(out);
+                    let errText: String := finishReader(err);
+                    let status: ProcessStatus := waitProcess(process);
+                    show(rank, "", asSpan(&outText));
+                    show(rank, " errors", asSpan(&errText));
+                    destroyString(outText);
+                    destroyString(errText);
+                    var ended: Int32 := 255;
+                    if exitedNormally(status) then
+                        ended := exitCode(status);
+                    end if;
+                    let before: Int32 := swapNth(&~statuses, narrow(wide32(rank)), ended);
+                    if ended > worst then
+                        worst := ended;
+                    end if;
+                end while;
+                destroyEmpty(started);
+                closeScope(scope);
+                return worst;
+        end case;
+    end;
+
+    generic [L: Region, H: Region, P: Region, A: Region]
+    function runRanks(launch: &[Launch, L], hosts: &[HostList, H], program: Span[Nat8, P], arguments: &[Buffer[String], A]): Int32 is
+        var statuses: Buffer[Int32] := allocateEmpty();
+        var i: Nat32 := 0;
+        while i < (launch->ranks) do
+            insertBack(&!statuses, 0);
+            i := i + 1;
+        end while;
+        let worst: Int32 := runRound(launch, hosts, program, arguments, &!statuses);
+        destroyFree(statuses);
+        return worst;
+    end;
+
+    ---
+    --- Restarts
+    ---
+
+    generic [R: Region]
+    function nextIncarnation(launch: &![Launch, R]): Unit is
+        launch->incarnation := (launch->incarnation) + 1;
+        return nil;
+    end;
+
+    -- Each of these changes one field of the launch: a path taken with &!
+    -- uses the reference up, so one function takes one path.
+    generic [R: Region]
+    function portAt(launch: &![Launch, R], slot: Index): Nat16 is
+        return nthMut(&!(launch->ports), slot);
+    end;
+
+    generic [R: Region]
+    function setPort(launch: &![Launch, R], slot: Index, port: Nat16): Unit is
+        let before: Nat16 := swapNth(&!(launch->ports), slot, port);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setHost(launch: &![Launch, R], slot: Index, host: String): Unit is
+        destroyString(swapNth(&!(launch->hosts), slot, host));
+        return nil;
+    end;
+
+    generic [R: Region, H: Region]
+    function relocateRank(launch: &![Launch, R], hosts: &[HostList, H], rank: Nat32, spare: Nat32): Bool is
+        if (rank >= (launch->ranks)) or (narrow(wide32(spare)) >= count(&(hosts->hosts))) then
+            return false;
+        end if;
+        let slot: Index := narrow(wide32(rank));
+        let host: String := fromSpan(asSpan(nthRef(&(hosts->hosts), narrow(wide32(spare)))));
+        var port: Nat16 := nth(&(hosts->ports), narrow(wide32(spare)));
+        if port = 0 then
+            if isLocal(asSpan(&host)) then
+                port := portAt(&~launch, slot);
+            else
+                port := narrow16(wide16(basePort()) + wide32(spare));
+            end if;
+        end if;
+        setHost(&~launch, slot, host);
+        setPort(&~launch, slot, port);
+        return true;
+    end;
+
+    ---
+    --- hilde run
+    ---
+
+    generic [P: Region]
+    function readFileText(path: Span[Nat8, P]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function say(code: Int32): Int32 is
+        print("hilde run: H");
+        print(code);
+        print(" ");
+        printLn(describe(code));
+        return code;
+    end;
+
+    -- The host list the files of the options hold.
+    generic [H: Region, D: Region]
+    function readHosts(hostsFile: Span[Nat8, H], denyFile: Span[Nat8, D]): Either[Int32, HostList] is
+        case readFileText(hostsFile) of
+            when None do
+                let failed: Either[Int32, HostList] := Left(left => badLaunch());
+                return failed;
+            when Some(value as text: String) do
+                var deny: String := fromSpan("");
+                if spanLength(denyFile) > 0 then
+                    case readFileText(denyFile) of
+                        when Some(value as read: String) do
+                            destroyString(deny);
+                            deny := read;
+                        when None do
+                            destroyString(text);
+                            destroyString(deny);
+                            let failed: Either[Int32, HostList] := Left(left => badLaunch());
+                            return failed;
+                    end case;
+                end if;
+                let parsed: Either[Int32, HostList] := parseHostList(asSpan(&text), asSpan(&deny));
+                destroyString(text);
+                destroyString(deny);
+                return parsed;
+        end case;
+    end;
+
+    -- Runs the job; when it ends badly and checkpoints are in use, starts
+    -- it again at the next incarnation, at most restartMax times.  A rank
+    -- that did not end with 0 or restartStatus is lost and goes to the next
+    -- unused host of the list after the ranks, if there is one.
+    generic [H: Region, P: Region, A: Region]
+    function runWithRestarts(started: Launch, hosts: &[HostList, H], program: Span[Nat8, P], arguments: &[Buffer[String], A], restartMax: Nat32, checkpointed: Bool): Int32 is
+        var launch: Launch := started;
+        let ranks: Nat32 := launch.ranks;
+        var statuses: Buffer[Int32] := allocateEmpty();
+        var i: Nat32 := 0;
+        while i < ranks do
+            insertBack(&!statuses, 0);
+            i := i + 1;
+        end while;
+        var spare: Nat32 := ranks;
+        var restarts: Nat32 := 0;
+        var code: Int32 := runRound(&launch, hosts, program, arguments, &!statuses);
+        while (code /= 0) and (code /= startFailed()) and checkpointed and (restarts < restartMax) do
+            var rank: Nat32 := 0;
+            while rank < ranks do
+                let status: Int32 := nthMut(&!statuses, narrow(wide32(rank)));
+                if (status /= 0) and (status /= restartStatus()) then
+                    if relocateRank(&!launch, hosts, rank, spare) then
+                        print("hilde run: rank ");
+                        print(rank);
+                        print(" moves to ");
+                        printLn(asSpan(nthRef(&(hosts->hosts), narrow(wide32(spare)))));
+                        spare := spare + 1;
+                    end if;
+                end if;
+                let before: Int32 := swapNth(&!statuses, narrow(wide32(rank)), 0);
+                rank := rank + 1;
+            end while;
+            nextIncarnation(&!launch);
+            restarts := restarts + 1;
+            print("hilde run: restart ");
+            print(restarts);
+            print(" of at most ");
+            printLn(restartMax);
+            code := runRound(&launch, hosts, program, arguments, &!statuses);
+        end while;
+        destroyFree(statuses);
+        destroyLaunch(launch);
+        return code;
+    end;
+
+    function runJob(options: RunOptions): Int32 is
+        let { ranks: Nat32, hostsFile: String, denyFile: String, checkpointDir: String, checkpointEvery: Nat32,
+            restartMax: Nat32, resume: String, program: String, arguments: Buffer[String] } := options;
+        var code: Int32 := 0;
+        case readHosts(asSpan(&hostsFile), asSpan(&denyFile)) of
+            when Left(left as why: Int32) do
+                code := say(why);
+            when Right(right as hosts: HostList) do
+                case newLaunch(&hosts, ranks, 1, 3600) of
+                    when Left(left as why: Int32) do
+                        code := say(why);
+                    when Right(right as started: Launch) do
+                        code := runWithRestarts(started, &hosts, asSpan(&program), &arguments, restartMax, length(&checkpointDir) > 0);
+                end case;
+                destroyHostList(hosts);
+        end case;
+        destroyString(hostsFile);
+        destroyString(denyFile);
+        destroyString(checkpointDir);
+        destroyString(resume);
+        destroyString(program);
+        destroyStrings(arguments);
+        return code;
+    end;
+end module body.

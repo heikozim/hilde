@@ -1,0 +1,725 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The declarations of a module are those whose key starts with the name of
+-- the module and a blank; the module itself is the one whose key is its
+-- name.  A docstring is read as its lines: the head of a module as a
+-- sentence, lines that start with a hyphen, and the example indented by
+-- four blanks.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nth,
+    nthRef,
+    insertBack,
+    destroyFree
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    endsWith,
+    trim,
+    substring,
+    lines,
+    toUpper,
+    formatInt
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    civilAt
+);
+import Pkg.Api (
+    Declaration
+);
+
+module body Pkg.Doc is
+    function mdocDate(seconds: Int64): String is
+        let months: Span[Nat8, Static] := "January February March April May June July August September October November December ";
+        var out: StringBuilder := makeStringBuilder();
+        case civilAt(Instant(seconds => seconds, nanos => 0), 0) of
+            when Some(value as civil: Civil) do
+                -- The month is the word number month in the list.
+                var word: Nat8 := 1;
+                var i: Index := 0;
+                while i < spanLength(months) do
+                    if months[i] = ' ' then
+                        word := word + 1;
+                    else if word = civil.month then
+                        writeByte(&!out, months[i]);
+                    end if;
+                    i := i + 1;
+                end while;
+                writeByte(&!out, ' ');
+                case toInt64(civil.day) of
+                    when Some(value as day: Int64) do
+                        let d: String := formatInt(day);
+                        writeString(&!out, asSpan(&d));
+                        destroyString(d);
+                    when None do
+                        skip;
+                end case;
+                writeString(&!out, ", ");
+                case toInt64(civil.year) of
+                    when Some(value as year: Int64) do
+                        let y: String := formatInt(year);
+                        writeString(&!out, asSpan(&y));
+                        destroyString(y);
+                    when None do
+                        skip;
+                end case;
+            when None do
+                writeString(&!out, "January 1, 1970");
+        end case;
+        return finalize(out);
+    end;
+
+    generic [D: Region]
+    function keyOf(d: &[Declaration, D]): Span[Nat8, D] is
+        return asSpan(&(d->key));
+    end;
+
+    generic [D: Region]
+    function isModule(d: &[Declaration, D]): Bool is
+        return equal(asSpan(&(d->signature)), "module");
+    end;
+
+    -- Whether the declaration belongs to the module.
+    generic [D: Region, M: Region]
+    function inModule(d: &[Declaration, D], owner: Span[Nat8, M]): Bool is
+        let key: Span[Nat8, D] := keyOf(d);
+        let n: Index := spanLength(owner);
+        return ((spanLength(key) > n) and startsWith(key, owner)) and (key[n] = ' ');
+    end;
+
+    -- Where the module stands, or the length when it is not there.
+    generic [D: Region, M: Region]
+    function findModule(declarations: &[Buffer[Declaration], D], owner: Span[Nat8, M]): Index is
+        var i: Index := 0;
+        while i < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, i);
+            if isModule(d) and equal(keyOf(d), owner) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return bufferLength(declarations);
+    end;
+
+    generic [D: Region]
+    function moduleNames(declarations: &[Buffer[Declaration], D]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, i);
+            if isModule(d) then
+                insertBack(&!out, fromSpan(keyOf(d)));
+            end if;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The first line of a text.
+    generic [S: Region]
+    function firstLineOf(text: Span[Nat8, S]): Span[Nat8, S] is
+        var i: Index := 0;
+        while (i < spanLength(text)) and (text[i] /= '\n') do
+            i := i + 1;
+        end while;
+        return substring(text, 0, i);
+    end;
+
+    generic [S: Region]
+    function exampleOf(docstring: Span[Nat8, S]): String is
+        let all: Buffer[Span[Nat8, S]] := lines(docstring);
+        var out: StringBuilder := makeStringBuilder();
+        var started: Bool := false;
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let line: Span[Nat8, S] := nth(&all, i);
+            if startsWith(line, "    ") then
+                if started then
+                    writeByte(&!out, '\n');
+                end if;
+                writeString(&!out, substring(line, 4, spanLength(line)));
+                started := true;
+            else if started and (spanLength(trim(line)) = 0) then
+                writeByte(&!out, '\n');
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return finalize(out);
+    end;
+
+    -- One declaration as hilde doc and llms.txt show it: the signature,
+    -- each contract on a line of its own, indented.
+    generic [D: Region, B: Region]
+    function writeSignature(out: &![StringBuilder, B], d: &[Declaration, D]): Unit is
+        writeString(&~out, asSpan(&(d->signature)));
+        writeByte(&~out, '\n');
+        var i: Index := 0;
+        while i < bufferLength(&(d->needs)) do
+            writeString(&~out, "    requires ");
+            writeString(&~out, asSpan(nthRef(&(d->needs), i)));
+            writeByte(&~out, '\n');
+            i := i + 1;
+        end while;
+        var j: Index := 0;
+        while j < bufferLength(&(d->gives)) do
+            writeString(&~out, "    ensures ");
+            writeString(&~out, asSpan(nthRef(&(d->gives), j)));
+            writeByte(&~out, '\n');
+            j := j + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [D: Region, M: Region, B: Region]
+    function writeModule(out: &![StringBuilder, B], declarations: &[Buffer[Declaration], D], at: Index, owner: Span[Nat8, M]): Unit is
+        let m: &[Declaration, D] := nthRef(declarations, at);
+        writeString(&~out, "module ");
+        writeString(&~out, owner);
+        writeString(&~out, "\n\n");
+        if length(&(m->docstring)) > 0 then
+            writeString(&~out, asSpan(&(m->docstring)));
+            writeString(&~out, "\n\n");
+        end if;
+        var i: Index := 0;
+        while i < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, i);
+            if inModule(d, owner) then
+                writeSignature(&~out, d);
+                let first: Span[Nat8, D] := firstLineOf(asSpan(&(d->docstring)));
+                if spanLength(first) > 0 then
+                    writeString(&~out, "    -- ");
+                    writeString(&~out, first);
+                    writeByte(&~out, '\n');
+                end if;
+                writeByte(&~out, '\n');
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [D: Region, W: Region]
+    function describe(declarations: &[Buffer[Declaration], D], what: Span[Nat8, W]): Option[String] is
+        let whole: Index := findModule(declarations, what);
+        if whole < bufferLength(declarations) then
+            var out: StringBuilder := makeStringBuilder();
+            writeModule(&!out, declarations, whole, what);
+            return Some(value => finalize(out));
+        end if;
+        -- Module.name: the module is all before the last dot.
+        var dot: Index := spanLength(what);
+        var i: Index := 0;
+        while i < spanLength(what) do
+            if what[i] = '.' then
+                dot := i;
+            end if;
+            i := i + 1;
+        end while;
+        if dot >= spanLength(what) then
+            return None();
+        end if;
+        let owner: Span[Nat8, W] := substring(what, 0, dot);
+        let name: Span[Nat8, W] := substring(what, dot + 1, spanLength(what));
+        var j: Index := 0;
+        while j < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, j);
+            if inModule(d, owner) and equal(asSpan(&(d->name)), name) then
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, owner);
+                writeString(&!out, ": ");
+                writeSignature(&!out, d);
+                if length(&(d->docstring)) > 0 then
+                    writeByte(&!out, '\n');
+                    writeString(&!out, asSpan(&(d->docstring)));
+                    writeByte(&!out, '\n');
+                end if;
+                return Some(value => finalize(out));
+            end if;
+            j := j + 1;
+        end while;
+        return None();
+    end;
+
+    generic [D: Region, N: Region, V: Region]
+    function llmsText(declarations: &[Buffer[Declaration], D], name: Span[Nat8, N], version: Span[Nat8, V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "# ");
+        writeString(&!out, name);
+        writeByte(&!out, ' ');
+        writeString(&!out, version);
+        writeString(&!out, "\n\nThe interfaces of the package, written by hilde export from its .hih files.\n");
+        var i: Index := 0;
+        while i < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, i);
+            if isModule(d) then
+                writeString(&!out, "\n## ");
+                writeString(&!out, keyOf(d));
+                writeString(&!out, "\n\n");
+                writeModuleBody(&!out, declarations, keyOf(d));
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [D: Region, M: Region, B: Region]
+    function writeModuleBody(out: &![StringBuilder, B], declarations: &[Buffer[Declaration], D], owner: Span[Nat8, M]): Unit is
+        let at: Index := findModule(declarations, owner);
+        if at < bufferLength(declarations) then
+            let m: &[Declaration, D] := nthRef(declarations, at);
+            if length(&(m->docstring)) > 0 then
+                writeString(&~out, asSpan(&(m->docstring)));
+                writeString(&~out, "\n\n");
+            end if;
+        end if;
+        var i: Index := 0;
+        while i < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, i);
+            if inModule(d, owner) then
+                writeString(&~out, "    ");
+                writeSignature(&~out, d);
+                let first: Span[Nat8, D] := firstLineOf(asSpan(&(d->docstring)));
+                if spanLength(first) > 0 then
+                    writeString(&~out, "        ");
+                    writeString(&~out, first);
+                    writeByte(&~out, '\n');
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Text for mdoc: a backslash as \e, a line that starts with a dot or a
+    -- quote set off by \&, and a new line after the end of each sentence,
+    -- as mdoc asks; then no line longer than 80 bytes.
+    generic [B: Region, T: Region]
+    function writeRoff(out: &![StringBuilder, B], text: Span[Nat8, T]): Unit is
+        var split: StringBuilder := makeStringBuilder();
+        writeSentences(&!split, text);
+        let lined: String := finalize(split);
+        writeWrapped(&~out, asSpan(&lined));
+        destroyString(lined);
+        return nil;
+    end;
+
+    -- The punctuation a word ends with: commas, full stops, semicolons,
+    -- colons and closing parentheses.
+    generic [W: Region]
+    function punctuationOf(word: Span[Nat8, W]): Span[Nat8, W] is
+        var at: Index := spanLength(word);
+        while at > 0 do
+            let byte: Nat8 := word[at - 1];
+            if ((((byte = ',') or (byte = '.')) or (byte = ';')) or (byte = ':')) or (byte = ')') then
+                at := at - 1;
+            else
+                return substring(word, at, spanLength(word));
+            end if;
+        end while;
+        return substring(word, at, spanLength(word));
+    end;
+
+    -- Whether the word without its punctuation ends in an apostrophe and s.
+    generic [W: Region]
+    function possessive(word: Span[Nat8, W]): Bool is
+        let bare: Span[Nat8, W] := substring(word, 0, spanLength(word) - spanLength(punctuationOf(word)));
+        return endsWith(bare, "'s");
+    end;
+
+    -- The length of the word as writeDashes writes it.
+    generic [W: Region]
+    function escapedLength(word: Span[Nat8, W]): Index is
+        let n: Index := spanLength(word);
+        var count: Index := n;
+        var i: Index := 0;
+        while i < n do
+            if (word[i] = '-') and (((i > 0) and (word[i - 1] = '-')) or (((i + 1) < n) and (word[i + 1] = '-'))) then
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    -- The mdoc macro of a system the word names, or the empty text.
+    generic [W: Region]
+    function osMacro(word: Span[Nat8, W]): Span[Nat8, Static] is
+        let bare: Span[Nat8, W] := substring(word, 0, spanLength(word) - spanLength(punctuationOf(word)));
+        var core: Span[Nat8, W] := bare;
+        if possessive(word) then
+            core := substring(bare, 0, spanLength(bare) - 2);
+        end if;
+        if equal(core, "OpenBSD") then
+            return ".Ox";
+        else if equal(core, "FreeBSD") then
+            return ".Fx";
+        else if equal(core, "NetBSD") then
+            return ".Nx";
+        else if equal(core, "DragonFly") then
+            return ".Dx";
+        end if;
+        return "";
+    end;
+
+    -- The word with each hyphen next to another written as a minus, so that
+    -- an option such as --json is no dash of text.
+    generic [B: Region, W: Region]
+    function writeDashes(out: &![StringBuilder, B], word: Span[Nat8, W]): Unit is
+        let n: Index := spanLength(word);
+        var i: Index := 0;
+        while i < n do
+            let byte: Nat8 := word[i];
+            if (byte = '-') and (((i > 0) and (word[i - 1] = '-')) or (((i + 1) < n) and (word[i + 1] = '-'))) then
+                writeString(&~out, "\\-");
+            else
+                writeByte(&~out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Each line of text broken at blanks into lines of at most 80 bytes, as
+    -- mandoc asks of text; a word longer than that stands alone.
+    generic [B: Region, T: Region]
+    function writeWrapped(out: &![StringBuilder, B], text: Span[Nat8, T]): Unit is
+        let all: Buffer[Span[Nat8, T]] := lines(text);
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let line: Span[Nat8, T] := nth(&all, i);
+            var used: Index := 0;
+            var start: Index := 0;
+            var k: Index := 0;
+            while k <= spanLength(line) do
+                if (k = spanLength(line)) or (line[k] = ' ') then
+                    if k > start then
+                        let word: Span[Nat8, T] := substring(line, start, k);
+                        let macro: Span[Nat8, Static] := osMacro(word);
+                        if spanLength(macro) > 0 then
+                            -- The name of a system as mdoc writes it, on a
+                            -- line of its own, its punctuation an argument.
+                            if used > 0 then
+                                writeByte(&~out, '\n');
+                            end if;
+                            writeString(&~out, macro);
+                            if possessive(word) then
+                                writeString(&~out, " Ns 's");
+                            end if;
+                            let tail: Span[Nat8, T] := punctuationOf(word);
+                            if spanLength(tail) > 0 then
+                                writeByte(&~out, ' ');
+                                writeString(&~out, tail);
+                            end if;
+                            writeByte(&~out, '\n');
+                            used := 0;
+                        else
+                            let wide: Index := escapedLength(word);
+                            if (used > 0) and (((used + 1) + wide) > 80) then
+                                writeByte(&~out, '\n');
+                                used := 0;
+                            else if used > 0 then
+                                writeByte(&~out, ' ');
+                                used := used + 1;
+                            end if;
+                            -- A word that starts a line must not be read as
+                            -- a request.
+                            if (used = 0) and ((word[0] = '.') or (word[0] = '\'')) then
+                                writeString(&~out, "\\&");
+                                used := 2;
+                            end if;
+                            writeDashes(&~out, word);
+                            used := used + wide;
+                        end if;
+                    end if;
+                    start := k + 1;
+                end if;
+                k := k + 1;
+            end while;
+            if used > 0 then
+                writeByte(&~out, '\n');
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return nil;
+    end;
+
+    generic [B: Region, T: Region]
+    function writeSentences(out: &![StringBuilder, B], text: Span[Nat8, T]): Unit is
+        var atStart: Bool := true;
+        var i: Index := 0;
+        let n: Index := spanLength(text);
+        while i < n do
+            let byte: Nat8 := text[i];
+            if atStart and ((byte = '.') or (byte = '\'')) then
+                writeString(&~out, "\\&");
+            end if;
+            if byte = '\\' then
+                writeString(&~out, "\\e");
+                atStart := false;
+                i := i + 1;
+            else if (((byte = '.') or (byte = ':')) and ((i + 2) < n)) and (text[i + 1] = ' ') then
+                -- The end of a sentence: the rest goes on a new line.
+                writeByte(&~out, byte);
+                var j: Index := i + 1;
+                while (j < n) and (text[j] = ' ') do
+                    j := j + 1;
+                end while;
+                if (j < n) and (((text[j] >= 'A') and (text[j] <= 'Z')) or (byte = ':')) then
+                    writeByte(&~out, '\n');
+                    atStart := true;
+                    i := j;
+                else
+                    atStart := false;
+                    i := i + 1;
+                end if;
+            else if byte = '\n' then
+                writeByte(&~out, '\n');
+                atStart := true;
+                i := i + 1;
+            else
+                writeByte(&~out, byte);
+                atStart := false;
+                i := i + 1;
+            end if;
+        end while;
+        writeByte(&~out, '\n');
+        return nil;
+    end;
+
+    -- A docstring in mdoc: paragraphs of its text, the lines that start
+    -- with a hyphen as a list, and no example.
+    generic [B: Region, S: Region]
+    function writeDocstring(out: &![StringBuilder, B], docstring: Span[Nat8, S]): Unit is
+        let all: Buffer[Span[Nat8, S]] := lines(docstring);
+        var inList: Bool := false;
+        var paragraph: Bool := false;
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let line: Span[Nat8, S] := nth(&all, i);
+            let t: Span[Nat8, S] := trim(line);
+            if startsWith(line, "    ") then
+                skip;
+            else if startsWith(t, "- ") then
+                if not inList then
+                    writeString(&~out, ".Bl -bullet\n");
+                    inList := true;
+                end if;
+                writeString(&~out, ".It\n");
+                writeRoff(&~out, substring(t, 2, spanLength(t)));
+            else if spanLength(t) = 0 then
+                if inList then
+                    writeString(&~out, ".El\n");
+                    inList := false;
+                end if;
+                paragraph := true;
+            else
+                if inList then
+                    writeString(&~out, ".El\n");
+                    inList := false;
+                end if;
+                if paragraph then
+                    writeString(&~out, ".Pp\n");
+                    paragraph := false;
+                end if;
+                writeRoff(&~out, t);
+            end if;
+            i := i + 1;
+        end while;
+        if inList then
+            writeString(&~out, ".El\n");
+        end if;
+        destroyFree(all);
+        return nil;
+    end;
+
+    -- The first sentence of a text without its full stop, for the line Nd.
+    generic [S: Region]
+    function oneLine(text: Span[Nat8, S]): Span[Nat8, S] is
+        let line: Span[Nat8, S] := trim(firstLineOf(text));
+        var stop: Index := spanLength(line);
+        var i: Index := 0;
+        while (i + 1) < spanLength(line) do
+            if (line[i] = '.') and (line[i + 1] = ' ') then
+                stop := i + 1;
+                i := spanLength(line);
+            else
+                i := i + 1;
+            end if;
+        end while;
+        let first: Span[Nat8, S] := substring(line, 0, stop);
+        if endsWith(first, ".") then
+            return substring(first, 0, spanLength(first) - 1);
+        end if;
+        return first;
+    end;
+
+    generic [D: Region, M: Region, T: Region]
+    function manualPage(declarations: &[Buffer[Declaration], D], owner: Span[Nat8, M], date: Span[Nat8, T]): Option[String] is
+        let at: Index := findModule(declarations, owner);
+        if at >= bufferLength(declarations) then
+            return None();
+        end if;
+        let m: &[Declaration, D] := nthRef(declarations, at);
+        let head: Span[Nat8, D] := asSpan(&(m->docstring));
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, ".Dd ");
+        writeString(&!out, date);
+        writeString(&!out, "\n.Dt ");
+        let title: String := toUpper(owner);
+        writeString(&!out, asSpan(&title));
+        destroyString(title);
+        writeString(&!out, " 3\n.Os\n.Sh NAME\n.Nm ");
+        writeString(&!out, owner);
+        writeString(&!out, "\n.Nd ");
+        let summary: Span[Nat8, D] := oneLine(head);
+        if spanLength(summary) > 0 then
+            writeRoff(&!out, summary);
+        else
+            writeString(&!out, "a module of Hilde\n");
+        end if;
+        writeString(&!out, ".Sh SYNOPSIS\n.Bd -literal\n");
+        var i: Index := 0;
+        while i < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, i);
+            if inModule(d, owner) then
+                var sig: StringBuilder := makeStringBuilder();
+                writeSignature(&!sig, d);
+                let text: String := finalize(sig);
+                writeLiteral(&!out, asSpan(&text));
+                destroyString(text);
+            end if;
+            i := i + 1;
+        end while;
+        writeString(&!out, ".Ed\n.Sh DESCRIPTION\n");
+        if spanLength(head) > 0 then
+            writeDocstring(&!out, head);
+        else
+            writeString(&!out, "The module\n.Nm\nhas no head.\n");
+        end if;
+        var j: Index := 0;
+        while j < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, j);
+            if inModule(d, owner) then
+                writeString(&!out, ".Ss ");
+                writeString(&!out, asSpan(&(d->name)));
+                writeByte(&!out, '\n');
+                if length(&(d->docstring)) > 0 then
+                    writeDocstring(&!out, asSpan(&(d->docstring)));
+                end if;
+                writeContracts(&!out, d);
+            end if;
+            j := j + 1;
+        end while;
+        let example: String := exampleOf(head);
+        if length(&example) > 0 then
+            writeString(&!out, ".Sh EXAMPLES\n.Bd -literal -offset indent\n");
+            writeLiteral(&!out, asSpan(&example));
+            writeString(&!out, ".Ed\n");
+        end if;
+        destroyString(example);
+        return Some(value => finalize(out));
+    end;
+
+    -- The lines of a literal block: each escaped as text, none empty.
+    generic [B: Region, T: Region]
+    function writeLiteral(out: &![StringBuilder, B], text: Span[Nat8, T]): Unit is
+        let all: Buffer[Span[Nat8, T]] := lines(text);
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let line: Span[Nat8, T] := nth(&all, i);
+            if spanLength(trim(line)) > 0 then
+                if startsWith(line, ".") or startsWith(line, "'") then
+                    writeString(&~out, "\\&");
+                end if;
+                var k: Index := 0;
+                while k < spanLength(line) do
+                    if line[k] = '\\' then
+                        writeString(&~out, "\\e");
+                    else if (line[k] = '-') and ((((k + 1) < spanLength(line)) and (line[k + 1] = '-')) or ((k > 0) and (line[k - 1] = '-'))) then
+                        writeString(&~out, "\\-");
+                    else
+                        writeByte(&~out, line[k]);
+                    end if;
+                    k := k + 1;
+                end while;
+                writeByte(&~out, '\n');
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return nil;
+    end;
+
+    generic [B: Region, D: Region]
+    function writeContracts(out: &![StringBuilder, B], d: &[Declaration, D]): Unit is
+        let count: Index := bufferLength(&(d->needs)) + bufferLength(&(d->gives));
+        if count = 0 then
+            return nil;
+        end if;
+        writeString(&~out, ".Bl -tag -width requires\n");
+        var i: Index := 0;
+        while i < bufferLength(&(d->needs)) do
+            writeString(&~out, ".It requires\n");
+            writeLiteralLine(&~out, asSpan(nthRef(&(d->needs), i)));
+            i := i + 1;
+        end while;
+        var j: Index := 0;
+        while j < bufferLength(&(d->gives)) do
+            writeString(&~out, ".It ensures\n");
+            writeLiteralLine(&~out, asSpan(nthRef(&(d->gives), j)));
+            j := j + 1;
+        end while;
+        writeString(&~out, ".El\n");
+        return nil;
+    end;
+
+    -- A condition as one line of text, in a constant width font.
+    generic [B: Region, T: Region]
+    function writeLiteralLine(out: &![StringBuilder, B], text: Span[Nat8, T]): Unit is
+        writeString(&~out, ".Li ");
+        var k: Index := 0;
+        while k < spanLength(text) do
+            if text[k] = '\\' then
+                writeString(&~out, "\\e");
+            else if text[k] = '"' then
+                writeString(&~out, "\\(dq");
+            else if (text[k] = '-') and ((((k + 1) < spanLength(text)) and (text[k + 1] = '-')) or ((k > 0) and (text[k - 1] = '-'))) then
+                writeString(&~out, "\\-");
+            else
+                writeByte(&~out, text[k]);
+            end if;
+            k := k + 1;
+        end while;
+        writeByte(&~out, '\n');
+        return nil;
+    end;
+end module body.

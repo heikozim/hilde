@@ -1,0 +1,186 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A server and its client in one programme, over a Unix socket in the
+-- working directory: nothing goes to the network.  Standard.Poller waits
+-- until a descriptor has something to read, so neither side reads before
+-- the other has written.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    Listener,
+    listenUnix,
+    acceptConnection,
+    connectUnix,
+    closeListener,
+    readExactly,
+    writeAll,
+    closeFile,
+    removeFile
+);
+import Standard.Poller (
+    Poller,
+    backendNone,
+    backendAvailable,
+    sameBackend,
+    describeBackend,
+    createPoller,
+    destroyPoller,
+    interestRead,
+    watchFile,
+    waitFor,
+    Event,
+    nthEvent,
+    eventReadable
+);
+
+import Standard.Sandbox (
+    Report,
+    makePolicy,
+    allowPromises,
+    allowPath,
+    applyPolicy,
+    reportRefused
+);
+
+module body Example.LearnPoller is
+    -- Before anything else the programme gives up what it does not need:
+    -- of the file system only its own directory, and of the system calls
+    -- only those of the promises.  On OpenBSD that is pledge and unveil, on
+    -- Linux Landlock and seccomp, elsewhere nothing.  fattr is for the mode
+    -- listenUnix gives the socket file; without it pledge stops the
+    -- programme at that chmod.  A policy that is not valid is a mistake in
+    -- this programme, and it stops.
+    function confine(): Unit is
+        let applied: Report := applyPolicy(allowPath(allowPromises(makePolicy(), "stdio rpath wpath cpath fattr unix"), ".", "rwc"));
+        if reportRefused(applied) then
+            abort("the sandbox policy is not valid");
+        end if;
+        return nil;
+    end;
+
+    -- Watch file and wait at most a second for something to read; say how
+    -- many descriptors were ready.  A write reference passed on is used
+    -- up, so each call gets a fresh one with &~.
+    generic [R: Region, S: Region]
+    function waitReadable(who: Span[Nat8, Static], poller: &![Poller, R], file: &[FileDescriptor, S]): Unit is
+        print(who);
+        print(" watched: ");
+        printLn(watchFile(&~poller, file, interestRead));
+        case waitFor(&~poller, 1000) of
+            when Some(value as ready: Index) do
+                print(who);
+                print(" ready: ");
+                printLn(ready);
+            when None do
+                printLn("waiting failed");
+        end case;
+        return nil;
+    end;
+
+    -- Whether the first ready descriptor of the last wait can be read.
+    generic [R: Region]
+    function firstReadable(who: Span[Nat8, Static], poller: &[Poller, R]): Unit is
+        case nthEvent(poller, 0) of
+            when Some(value as event: Event) do
+                print(who);
+                print(" readable: ");
+                printLn(eventReadable(event));
+            when None do
+                printLn("no event");
+        end case;
+        return nil;
+    end;
+
+    -- Read count bytes and print them after who.
+    generic [R: Region]
+    function readAndPrint(who: Span[Nat8, Static], file: &![FileDescriptor, R], count: Index): Unit is
+        print(who);
+        case readExactly(file, count) of
+            when Some(value as got: String) do
+                print(" read: ");
+                printLn(getSpan(&got, 0, length(&got) - 1));
+                destroyString(got);
+            when None do
+                printLn(" read: nothing");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function talk(listener: &[Listener, R], path: Span[Nat8, Static]): Unit is
+        case createPoller() of
+            when Some(value as made: Poller) do
+                var poller: Poller := made;
+                case connectUnix(path) of
+                    when Some(value as connected: FileDescriptor) do
+                        var client: FileDescriptor := connected;
+                        print("client wrote: ");
+                        printLn(writeAll(&!client, "hello"));
+                        case acceptConnection(listener) of
+                            when Some(value as accepted: FileDescriptor) do
+                                var server: FileDescriptor := accepted;
+                                waitReadable("server", &!poller, &server);
+                                firstReadable("server", &poller);
+                                readAndPrint("server", &!server, 5);
+                                print("server wrote: ");
+                                printLn(writeAll(&!server, "world"));
+                                waitReadable("client", &!poller, &client);
+                                firstReadable("client", &poller);
+                                readAndPrint("client", &!client, 5);
+                                print("server closed: ");
+                                printLn(closeFile(server));
+                            when None do
+                                printLn("accept failed");
+                        end case;
+                        print("client closed: ");
+                        printLn(closeFile(client));
+                    when None do
+                        printLn("connect failed");
+                end case;
+                destroyPoller(poller);
+            when None do
+                printLn("no poller");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        confine();
+        -- The mechanism the poller of this build is made of: epoll on
+        -- Linux, kqueue on OpenBSD, FreeBSD and macOS.  Where there is
+        -- none, createPoller gives nothing, and this programme says so and
+        -- ends.
+        let backend: String := describeBackend(backendAvailable());
+        printLn(getSpan(&backend, 0, length(&backend) - 1));
+        destroyString(backend);
+        if sameBackend(backendAvailable(), backendNone) then
+            printLn("this system has no backend for Standard.Poller yet");
+            return ExitSuccess();
+        end if;
+        -- A socket left by an interrupted run, if there is one.
+        removeFile("learn-poller.sock");
+        case listenUnix("learn-poller.sock", #o600) of
+            when Some(value as opened: Listener) do
+                let listener: Listener := opened;
+                talk(&listener, "learn-poller.sock");
+                -- Closing the listener removes its path as well.
+                print("listener closed: ");
+                printLn(closeListener(listener));
+            when None do
+                printLn("listen failed");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

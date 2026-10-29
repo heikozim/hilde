@@ -1,0 +1,536 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A job of ranks that send each other messages over TLS 1.3, with the semantics of message passing and none of its interface.
+
+- Every connection is TLS 1.3 with a certificate on both sides from the CA of the job; there is no plain mode.
+- The subject of a certificate must be the job and the rank of the peer, and the host must not be one that hostRefused of Standard.SperliWire refuses.
+- Each peer shows a join token signed by the launcher, which is checked before any message is taken.
+- A message is matched by the rank it comes from and its tag, in the order sent.
+- send consumes the buffer; an open send or receive is a linear value that has to be finished.
+- barrier, bcast, reduce, allreduce, gather and scatter are the same calls, in the same order, on every rank.
+- A reduction runs over the ranks in ascending order, so a result does not depend on timing.
+- checkpoint writes the state of every rank to disk with a COMMIT file signed by the launcher key, and resume reads it back after a restart.
+- A checkpoint is refused while a send or receive is open, and a state whose type has no Checkpointable instance does not compile.
+- Every refusal is a code of Standard.SperliError; the frames are those of Standard.SperliWire and Standard.SperliCollective.
+
+    let started: Either[Int32, Comm] := init(job);
+    let sent: Int32 := send(&!comm, 1, 7, message);
+    let arrived: Int32 := barrier(&!comm);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String,
+    length
+);
+import Standard.SperliCkpt (
+    Checkpointable
+);
+
+module Standard.Sperli is
+    """
+    The most ranks of a job: 4096.
+    """
+    function maxRanks(): Index
+        ensures result = 4096;
+
+    """
+    The largest user tag: 2147483647.  Larger tags are reserved.
+    """
+    function maxTag(): Nat32
+        ensures result = 2147483647;
+
+    """
+    The time in milliseconds without a frame after which a peer is lost: 5000.
+    """
+    function defaultSilence(): Nat32
+        ensures result = 5000;
+
+    ---
+    --- The description of a job
+    ---
+
+    """
+    What a rank knows of its job: the job, its own rank, the size, the
+    incarnation, the host and port of every rank, the public key of the
+    launcher, its own join token, the CA of the job, and its certificate
+    and key.  It is linear: destroyJob gives it back.
+    """
+    type Job: Linear;
+
+    """
+    The job a launcher describes in description.  Left badJob when it is
+    cut, wrong in a count, a length or a field, or the size is not 1 to
+    4096; refusedHost when hostRefused of Standard.SperliWire refuses
+    a host.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [D: Region]
+    function readJob(description: Span[Nat8, D]): Either[Int32, Job];
+
+    """
+    The job a launcher describes in text: the description as hexadecimal
+    digits, as one line of the standard input carries it.  Left badJob
+    when the text is not hexadecimal, and the codes of readJob.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [T: Region]
+    function readJobText(text: Span[Nat8, T]): Either[Int32, Job];
+
+    """
+    The rank this job gives the process, below the size.
+    """
+    generic [R: Region]
+    function jobRank(job: &[Job, R]): Nat32
+        ensures result < 4096;
+
+    """
+    The number of ranks, 1 to 4096.
+    """
+    generic [R: Region]
+    function jobSize(job: &[Job, R]): Nat32
+        ensures (result >= 1) and (result <= 4096);
+
+    """
+    The incarnation: 1 at launch, plus 1 at every restart.
+    """
+    generic [R: Region]
+    function jobIncarnation(job: &[Job, R]): Nat32
+        ensures result >= 1;
+
+    """
+    The job id, 16 bytes.
+    """
+    generic [R: Region]
+    function jobId(job: &[Job, R]): String
+        ensures length(&result) = 16;
+
+    """
+    The public key of the launcher that signed the tokens of the job, 1344 bytes.
+    """
+    generic [R: Region]
+    function jobPublicKey(job: &[Job, R]): String
+        ensures length(&result) = 1344;
+
+    """
+    The join token of this rank.
+    """
+    generic [R: Region]
+    function jobToken(job: &[Job, R]): String
+        ensures length(&result) > 0;
+
+    """
+    The job with its own join token replaced by replacement: for a test of a
+    peer that is handed a token it should refuse.
+    """
+    generic [T: Region]
+    function withToken(job: Job, replacement: Span[Nat8, T]): Job
+        requires spanLength(replacement) <= 65535;
+
+    """
+    Gives back what the job held, the key wiped.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyJob(job: Job): Unit;
+
+    ---
+    --- One connection
+    ---
+
+    """
+    A frame taken from a peer: the type code, the tag, the epoch of a
+    checkpoint frame (0 for any other) and the payload.
+    """
+    record Frame: Linear is
+        kind: Nat8;
+        tag: Nat32;
+        epoch: Nat64;
+        payload: String;
+    end;
+
+    """
+    Gives back what the frame held.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyFrame(frame: Frame): Unit;
+
+    """
+    The files and sockets a rank needs to meet its peers: the files of its
+    credentials in a directory of its own, a server that asks every client
+    for a certificate of the job CA, and a listener.  It is linear:
+    closeEndpoint removes the files and the directory.
+    """
+    type Endpoint: Linear;
+
+    """
+    An endpoint for job, its files in the new directory directory, listening
+    at the port the job names for its rank.  Left badCertificate when the
+    credentials do not make a server, startFailed when a file, the
+    directory or the listener cannot be made.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [J: Region, D: Region]
+    function openEndpoint(job: &[Job, J], directory: Span[Nat8, D]): Either[Int32, Endpoint]
+        requires spanLength(directory) > 0;
+
+    """
+    The port the endpoint listens at.
+    """
+    generic [R: Region]
+    function endpointPort(endpoint: &[Endpoint, R]): Nat16
+        ensures result > 0;
+
+    """
+    Closes the listener and the server and removes the files.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeEndpoint(endpoint: Endpoint): Unit;
+
+    """
+    A connection to one other rank after TLS and the exchange of hellos.  It
+    is linear: closePeer gives it back.
+    """
+    type Peer: Linear;
+
+    """
+    Connects to rank target, which is above the own rank, and shows its
+    token; takes the hello of the peer and checks its certificate subject
+    and token.  Left with the code of the first thing wrong:
+    refusedHost, badCertificate, subjectMismatch, a token code, badHello,
+    peerLost or startFailed.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [E: Region, J: Region]
+    function connectPeer(endpoint: &[Endpoint, E], job: &[Job, J], target: Nat32): Either[Int32, Peer]
+        requires target < 4096;
+
+    """
+    Accepts one connection within milliseconds from a rank below the own
+    one, with the checks of connectPeer.  The rank is the one in the
+    certificate of the peer.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [E: Region, J: Region]
+    function acceptPeer(endpoint: &[Endpoint, E], job: &[Job, J], milliseconds: Nat32): Either[Int32, Peer];
+
+    """
+    The rank at the other end.
+    """
+    generic [R: Region]
+    function peerRank(peer: &[Peer, R]): Nat32
+        ensures result < 4096;
+
+    """
+    How many frames of an older incarnation the peer has dropped.
+    No contract: a count the connection keeps.
+    """
+    generic [R: Region]
+    function peerDropped(peer: &[Peer, R]): Index;
+
+    """
+    The code of the last refusal or drop on the connection, 0 when there was none.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [R: Region]
+    function peerLastCode(peer: &[Peer, R]): Int32;
+
+    """
+    Sets how long the peer may be silent while a frame is waited for.
+    """
+    generic [R: Region]
+    function setPeerSilence(peer: &![Peer, R], milliseconds: Nat32): Unit
+        requires milliseconds > 0;
+
+    """
+    Writes one frame of the type kind and the tag to the peer.  0 when it
+    was written, peerLost when the write failed.
+    No contract: the result is that of the write.
+    """
+    generic [R: Region, P: Region]
+    function sendFrame(peer: &![Peer, R], kind: Nat8, tag: Nat32, payload: Span[Nat8, P]): Int32
+        requires spanLength(payload) <= 16777216;
+
+    """
+    Writes bytes to the peer as they are, with no frame made: for a test
+    of a receiver that is handed a header it should refuse.
+    No contract: the result is that of the write.
+    """
+    generic [R: Region, B: Region]
+    function sendRaw(peer: &![Peer, R], bytes: Span[Nat8, B]): Int32;
+
+    """
+    The next frame of the peer to hand on, waiting at most milliseconds.
+    The header is checked before a payload byte is read: oversizedFrame
+    and badFrame close the matter, the payload of a frame of an older
+    incarnation is read and dropped, and the wait goes on.  Heartbeats are
+    taken and not handed on.  Left peerLost when the time runs out or the
+    peer closes, and peerAborted for an abort frame.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function receiveFrame(peer: &![Peer, R], milliseconds: Nat32): Either[Int32, Frame]
+        requires milliseconds > 0;
+
+    """
+    Sends bye, closes the connection and gives back what the peer held.
+    No contract: it only frees or closes what it is given.
+    """
+    function closePeer(peer: Peer): Unit;
+
+    ---
+    --- The job
+    ---
+
+    """
+    A rank in a job, connected to every other rank.  It is linear: finish
+    gives it back.
+    """
+    type Comm: Linear;
+
+    """
+    Joins the job: opens the endpoint, connects to the ranks above and
+    accepts those below, each checked.  The job is consumed.  Left with
+    the code of the first refusal; the files are removed then.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    function init(job: Job): Either[Int32, Comm];
+
+    """
+    The own rank.
+    """
+    generic [R: Region]
+    function rank(comm: &[Comm, R]): Nat32
+        ensures result < 4096;
+
+    """
+    The number of ranks.
+    """
+    generic [R: Region]
+    function size(comm: &[Comm, R]): Nat32
+        ensures (result >= 1) and (result <= 4096);
+
+    """
+    Sets the silence after which every peer is lost.
+    """
+    generic [R: Region]
+    function setSilence(comm: &![Comm, R], milliseconds: Nat32): Unit
+        requires milliseconds > 0;
+
+    """
+    An open send: a message handed over that the peer may not have read.  It
+    is linear: finishSend ends it.
+    """
+    type SendHandle: Linear;
+
+    """
+    An open receive of the next message from a rank with a tag.  It is
+    linear: finishRecv ends it.
+    """
+    type RecvHandle: Linear;
+
+    """
+    Sends data, which is consumed, to rank target with tag.  0 when it was
+    sent, or the code of what went wrong.
+    No contract: the result is that of the write.
+    """
+    generic [R: Region]
+    function send(comm: &![Comm, R], target: Nat32, tag: Nat32, data: String): Int32
+        requires ((target < 4096) and (tag <= 2147483647)) and (length(&data) <= 16777216);
+
+    """
+    Starts a send as send does and gives the open send.
+    """
+    generic [R: Region]
+    function startSend(comm: &![Comm, R], target: Nat32, tag: Nat32, data: String): SendHandle
+        requires ((target < 4096) and (tag <= 2147483647)) and (length(&data) <= 16777216);
+
+    """
+    Ends a send: 0 when its message was written, else the code.
+    No contract: the result is that of the write.
+    """
+    generic [R: Region]
+    function finishSend(comm: &![Comm, R], handle: SendHandle): Int32;
+
+    """
+    The next message from rank source with tag, waiting for it.  A message
+    of another tag from the same rank is kept for its own receive.  Left
+    with the code of a lost or aborting peer or of a frame that is refused.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function recv(comm: &![Comm, R], source: Nat32, tag: Nat32): Either[Int32, String]
+        requires (source < 4096) and (tag <= 2147483647);
+
+    """
+    Starts a receive of the next message from source with tag.
+    """
+    generic [R: Region]
+    function startRecv(comm: &![Comm, R], source: Nat32, tag: Nat32): RecvHandle
+        requires (source < 4096) and (tag <= 2147483647);
+
+    """
+    Ends a receive as recv does.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function finishRecv(comm: &![Comm, R], handle: RecvHandle): Either[Int32, String];
+
+    ---
+    --- Collectives
+    ---
+
+    """
+    Waits until every rank has called barrier, the same number of times.
+    0, or the code of the first wrong or lost peer.  Rank 0 collects the
+    arrivals and then releases every other rank.
+    No contract: the result is that of the writes and reads.
+    """
+    generic [R: Region]
+    function barrier(comm: &![Comm, R]): Int32;
+
+    """
+    The data of rank root on every rank.  data is consumed; the data of
+    the ranks other than root is ignored and may be empty.  Left
+    badCollective for a root outside the job, and the code of a lost or
+    wrong peer.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function bcast(comm: &![Comm, R], root: Nat32, data: String): Either[Int32, String]
+        requires (root < 4096) and (length(&data) <= 16777200);
+
+    """
+    Reduces the data of all ranks, taken as arrays of elementType, with
+    reduction, in the order of the ranks.  The result is at root; every
+    other rank gets the empty string.  data is consumed.  Left badCollective
+    when root, the type or the reduction is wrong or the data is no whole
+    number of elements, collectiveMismatch when ranks differ in length.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function reduce(comm: &![Comm, R], root: Nat32, elementType: Nat8, reduction: Nat8, data: String): Either[Int32, String]
+        requires ((root < 4096) and (elementType <= 6)) and ((reduction <= 10) and (length(&data) <= 16777200));
+
+    """
+    As reduce, with the result on every rank.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function allreduce(comm: &![Comm, R], elementType: Nat8, reduction: Nat8, data: String): Either[Int32, String]
+        requires ((elementType <= 6) and (reduction <= 10)) and (length(&data) <= 16777200);
+
+    """
+    The blocks of all ranks, joined in the order of the ranks, at root; the
+    empty string on every other rank.  All blocks must have one length.
+    data is consumed.  Left badCollective for a root outside the job,
+    collectiveMismatch for blocks of different length.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function gather(comm: &![Comm, R], root: Nat32, data: String): Either[Int32, String]
+        requires (root < 4096) and (length(&data) <= 16777200);
+
+    """
+    Cuts the data of root into one block for each rank and gives rank i
+    block i.  The data of the ranks other than root is ignored.  data is
+    consumed.  Left badCollective for a root outside the job or, at root,
+    for data that is no whole number of blocks; then every other rank is
+    told the job is over.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function scatter(comm: &![Comm, R], root: Nat32, data: String): Either[Int32, String]
+        requires root < 4096;
+
+    """
+    Sends a heartbeat to every peer.  0, or the code of the first write that failed.
+    No contract: the result is that of the writes.
+    """
+    generic [R: Region]
+    function heartbeat(comm: &![Comm, R]): Int32;
+
+    """
+    Tells every peer the job is aborted, with text.
+    No contract: its effect is on the system or on what it consumes, which a condition cannot read.
+    """
+    generic [R: Region, T: Region]
+    function abortJob(comm: &![Comm, R], text: Span[Nat8, T]): Unit;
+
+    ---
+    --- Checkpoints
+    ---
+
+    """
+    Names the directory the checkpoint files of this job go to; the
+    directory is made when it is missing.  Every rank must name one that
+    only it and the launcher can write.
+    """
+    generic [R: Region, T: Region]
+    function useCheckpoints(comm: &![Comm, R], path: Span[Nat8, T]): Unit
+        requires spanLength(path) > 0;
+
+    """
+    The epoch of the last checkpoint written or resumed; 0 when there is none.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [R: Region]
+    function checkpointEpoch(comm: &![Comm, R]): Nat64;
+
+    """
+    The collective checkpoint of payload: every rank calls it, in the same
+    order as the collectives.  Each rank writes its file to a temporary name,
+    syncs it, renames it, sends its digest to rank 0 and its file to the next
+    rank; rank 0 then writes the COMMIT file, signs it with the key of the
+    job and sends it to all.  Only the last two epochs are kept.  0 when the
+    epoch is committed on every rank; otherwise the code, and every other
+    rank is told the job is over.  openHandles while a send or receive is
+    open, checkpointFailed without a directory or when a file cannot be
+    written.
+    No contract: the result is that of the writes and reads.
+    """
+    generic [R: Region, P: Region]
+    function checkpointBytes(comm: &![Comm, R], payload: Span[Nat8, P]): Int32
+        requires spanLength(payload) <= 268435456;
+
+    """
+    As checkpointBytes, for a state of a type with a Checkpointable instance.
+    A type that holds an open send or receive, a connection or a file has
+    none, so this call does not compile for it.
+    No contract: the result is that of the writes and reads.
+    """
+    generic [S: Type(Checkpointable), R: Region, Q: Region]
+    function checkpoint(comm: &![Comm, R], state: &[S, Q]): Int32;
+
+    """
+    The collective resume: rank 0 takes the highest epoch whose COMMIT file
+    verifies on any rank, tells the others, and every rank loads its file.
+    The signature of the COMMIT file and the SHA-256 of every file are
+    checked against the header and the COMMIT file.  A file that is missing
+    or fails is fetched from the buddy.  Left badCommit, digestMismatch or
+    badCheckpointFile for a file that fails, sizeMismatch when the job has
+    another size than the checkpoint, resumeRefused when no epoch can be
+    resumed.  The payload of this rank's file on success.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function resumeBytes(comm: &![Comm, R]): Either[Int32, String];
+
+    """
+    As resumeBytes, for a state of a type with a Checkpointable instance.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [S: Type(Checkpointable), R: Region]
+    function resume(comm: &![Comm, R]): Either[Int32, S];
+
+    """
+    Leaves the job: bye to every peer, the connections closed, the files
+    removed.
+    No contract: it only frees or closes what it is given.
+    """
+    function finish(comm: Comm): Unit;
+end module.

@@ -1,0 +1,190 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    length,
+    asSpan,
+    fromSpan,
+    destroyWiped
+);
+import Standard.Libcrypto (
+    randomBytes
+);
+import Bindings.MlDsa (
+    KeyBytes,
+    keypair as bindKeypair,
+    sign as bindSign,
+    verify as bindVerify
+);
+
+module body Standard.MlDsa is
+    union ParameterSet: Free is
+        case Level44;
+        case Level65;
+        case Level87;
+    end;
+
+    -- The level is the number FIPS 204 names the set by; the strings hold
+    -- exactly the sizes of that set, which only keypairFromSeed fills.  The
+    -- two invariants on the keys also hold the level to 44, 65 or 87.
+    record MlDsaKey: Linear is
+        level: Int32;
+        seed: String;
+        public: String;
+        secret: String;
+        invariant length(&seed) = 32;
+        invariant (((level = 44) and (length(&public) = 1312)) or ((level = 65) and (length(&public) = 1952))) or ((level = 87) and (length(&public) = 2592));
+        invariant (((level = 44) and (length(&secret) = 2560)) or ((level = 65) and (length(&secret) = 4032))) or ((level = 87) and (length(&secret) = 4896));
+    end;
+
+    function levelOf(set: ParameterSet): Int32 is
+        case set of
+            when Level44 do
+                return 44;
+            when Level65 do
+                return 65;
+            when Level87 do
+                return 87;
+        end case;
+    end;
+
+    function setOfLevel(level: Int32): ParameterSet is
+        if level = 44 then
+            return Level44();
+        end if;
+        if level = 65 then
+            return Level65();
+        end if;
+        return Level87();
+    end;
+
+    function seedBytes(): Index is
+        return 32;
+    end;
+
+    function publicKeyBytes(set: ParameterSet): Index is
+        case set of
+            when Level44 do
+                return 1312;
+            when Level65 do
+                return 1952;
+            when Level87 do
+                return 2592;
+        end case;
+    end;
+
+    function secretKeyBytes(set: ParameterSet): Index is
+        case set of
+            when Level44 do
+                return 2560;
+            when Level65 do
+                return 4032;
+            when Level87 do
+                return 4896;
+        end case;
+    end;
+
+    function signatureBytes(set: ParameterSet): Index is
+        case set of
+            when Level44 do
+                return 2420;
+            when Level65 do
+                return 3309;
+            when Level87 do
+                return 4627;
+        end case;
+    end;
+
+    function contextMost(): Index is
+        return 255;
+    end;
+
+    -- A copy of the bytes of a string.
+    generic [R: Region]
+    function copyOf(text: &[String, R]): String is
+        return fromSpan(asSpan(text));
+    end;
+
+    generic [S: Region]
+    function keypairFromSeed(set: ParameterSet, seed: Span[Nat8, S]): Option[MlDsaKey] is
+        let level: Int32 := levelOf(set);
+        case bindKeypair(level, seed) of
+            when Some(value as pair: KeyBytes) do
+                let { public: String, secret: String } := pair;
+                let key: MlDsaKey := MlDsaKey(level => level, seed => fromSpan(seed), public => public, secret => secret);
+                let some: Option[MlDsaKey] := Some(value => key);
+                return some;
+            when None do
+                let none: Option[MlDsaKey] := None();
+                return none;
+        end case;
+    end;
+
+    function generateKeyPair(set: ParameterSet): Option[MlDsaKey] is
+        case randomBytes(seedBytes()) of
+            when Some(value as seed: String) do
+                let made: Option[MlDsaKey] := keypairFromSeed(set, asSpan(&seed));
+                destroyWiped(seed);
+                return made;
+            when None do
+                let none: Option[MlDsaKey] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function parameterSetOf(key: &[MlDsaKey, R]): ParameterSet is
+        return setOfLevel(key->level);
+    end;
+
+    generic [R: Region]
+    function publicKeyOf(key: &[MlDsaKey, R]): String is
+        return copyOf(&(key->public));
+    end;
+
+    generic [R: Region]
+    function seedOf(key: &[MlDsaKey, R]): String is
+        return copyOf(&(key->seed));
+    end;
+
+    generic [R: Region]
+    function expandedSecretOf(key: &[MlDsaKey, R]): String is
+        return copyOf(&(key->secret));
+    end;
+
+    generic [R: Region, M: Region, C: Region]
+    function sign(key: &[MlDsaKey, R], message: Span[Nat8, M], context: Span[Nat8, C]): Option[String] is
+        case randomBytes(32) of
+            when Some(value as randomness: String) do
+                let signed: Option[String] := bindSign(key->level, asSpan(&(key->secret)), message, context, asSpan(&randomness));
+                destroyWiped(randomness);
+                return signed;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, M: Region, C: Region, N: Region]
+    function signWithRandomness(key: &[MlDsaKey, R], message: Span[Nat8, M], context: Span[Nat8, C], randomness: Span[Nat8, N]): Option[String] is
+        return bindSign(key->level, asSpan(&(key->secret)), message, context, randomness);
+    end;
+
+    generic [P: Region, M: Region, C: Region, G: Region]
+    function verify(set: ParameterSet, publicKey: Span[Nat8, P], message: Span[Nat8, M], context: Span[Nat8, C], signature: Span[Nat8, G]): Bool is
+        return bindVerify(levelOf(set), publicKey, message, context, signature);
+    end;
+
+    function destroyMlDsaKey(key: MlDsaKey): Unit is
+        let { level: Int32, seed: String, public: String, secret: String } := key;
+        destroyWiped(seed);
+        destroyWiped(secret);
+        destroyWiped(public);
+        return nil;
+    end;
+end module body.

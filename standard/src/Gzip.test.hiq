@@ -1,0 +1,435 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The fixtures were made by Python's zlib, a second implementation, and
+-- every expected answer about them is what zlib said of them; the
+-- decompressed text is held by its length and its CRC-32 where it is
+-- long.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    hexToBytes
+);
+import Standard.Gzip (
+    GzipFailure,
+    NotGzip,
+    Truncated,
+    BadData,
+    TooLarge,
+    BadChecksum,
+    TrailingData,
+    crc32,
+    deflateRaw,
+    inflateRaw,
+    gzip,
+    gunzip
+);
+
+module body Standard.Gzip.Test is
+    constant plenty: Index := 10000000;
+
+    ---
+    --- Helpers
+    ---
+
+    function bytesOf(hex: Span[Nat8, Static]): String is
+        case hexToBytes(hex) of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                abort("Standard.Gzip.Test: a fixture is not hexadecimal");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(left: &[String, R], right: &[String, S]): Bool is
+        let size: Index := stringLength(left);
+        if size /= stringLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(left, i) /= nthByte(right, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- 0 for a result, else the failure: 1 not gzip, 2 truncated, 3 bad
+    -- data, 4 too large, 5 bad checksum, 6 trailing data.
+    function codeOf(result: Either[GzipFailure, String]): Nat8 is
+        case result of
+            when Right(right as text: String) do
+                destroyString(text);
+                return 0;
+            when Left(left as failure: GzipFailure) do
+                case failure of
+                    when NotGzip do
+                        return 1;
+                    when Truncated do
+                        return 2;
+                    when BadData do
+                        return 3;
+                    when TooLarge do
+                        return 4;
+                    when BadChecksum do
+                        return 5;
+                    when TrailingData do
+                        return 6;
+                end case;
+        end case;
+    end;
+
+    -- Whether result is text equal to expected.
+    generic [R: Region]
+    function gives(result: Either[GzipFailure, String], expected: &[String, R]): Bool is
+        case result of
+            when Right(right as text: String) do
+                let same: Bool := sameBytes(&text, expected);
+                destroyString(text);
+                return same;
+            when Left(left as failure: GzipFailure) do
+                return false;
+        end case;
+    end;
+
+    function givesText(result: Either[GzipFailure, String], expected: Span[Nat8, Static]): Bool is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, expected);
+        let wanted: String := finalize(out);
+        let same: Bool := gives(result, &wanted);
+        destroyString(wanted);
+        return same;
+    end;
+
+    -- The length and the CRC-32 of a result, or 0 and 0.
+    record Summary: Free is
+        size: Index;
+        crc: Nat32;
+    end;
+
+    function summaryOf(result: Either[GzipFailure, String]): Summary is
+        let zero: Nat32 := 0;
+        let nothing: Index := 0;
+        case result of
+            when Right(right as text: String) do
+                let made: Summary := Summary(size => stringLength(&text), crc => crc32(asSpan(&text)));
+                destroyString(text);
+                return made;
+            when Left(left as failure: GzipFailure) do
+                return Summary(size => nothing, crc => zero);
+        end case;
+    end;
+
+    -- Whether data comes back from gzip and gunzip, and from deflateRaw
+    -- and inflateRaw, unchanged.
+    generic [R: Region]
+    function roundTrip(data: &[String, R]): Bool is
+        let packed: String := gzip(asSpan(data));
+        let back: Bool := gives(gunzip(asSpan(&packed), plenty), data);
+        destroyString(packed);
+        let raw: String := deflateRaw(asSpan(data));
+        let rawBack: Bool := gives(inflateRaw(asSpan(&raw), plenty), data);
+        destroyString(raw);
+        return back and rawBack;
+    end;
+
+    -- count bytes of a linear congruential sequence, which compress badly.
+    function noise(count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var state: Nat32 := 12345;
+        let multiplier: Nat32 := 1103515245;
+        let increment: Nat32 := 12345;
+        let modulus: Nat32 := 2147483648;
+        let divisor: Nat32 := 65536;
+        let byteSpan: Nat32 := 256;
+        var i: Index := 0;
+        while i < count do
+            state := rem(modularAdd(modularMultiply(state, multiplier), increment), modulus);
+            case toNat8(rem(state / divisor, byteSpan)) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&!out, byte);
+                when None do
+                    abort("Standard.Gzip.Test: a byte did not fit");
+            end case;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- text repeated times times.
+    function repeated(text: Span[Nat8, Static], times: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < times do
+            writeString(&!out, text);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Every byte value, three times over.
+    function everyByte(): String is
+        var out: StringBuilder := makeStringBuilder();
+        var round: Index := 0;
+        while round < 3 do
+            var code: Index := 0;
+            while code < 256 do
+                case toNat8(code) of
+                    when Some(value as byte: Nat8) do
+                        writeByte(&!out, byte);
+                    when None do
+                        abort("Standard.Gzip.Test: a byte did not fit");
+                end case;
+                code := code + 1;
+            end while;
+            round := round + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The bytes of a with the bytes of b after them.
+    function joined(a: String, b: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&a));
+        writeString(&!out, b);
+        destroyString(a);
+        return finalize(out);
+    end;
+
+    -- The first count bytes of text.
+    generic [R: Region]
+    function cut(text: &[String, R], count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeByte(&!out, nthByte(text, i));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    ---
+    --- Fixtures
+    ---
+
+    function fixtureHello(): Span[Nat8, Static] is
+        return "1f8b08000000000002ffcb48cdc9c9d75128cf2fca49e10200537424f40d\
+            \000000";
+    end;
+
+    function fixtureDynamic(): Span[Nat8, Static] is
+        return "1f8b08000000000002ffa5d6dd4dc5300c05e077a6c8003c34769c9f712a\
+            \944b2b950ba291607c8472bcc0c9004771e2cf6eaff3d9c3163e1f610fa3\
+            \ff8e308e7d84effed5f7718773dcfd7a849f731ce1fed8af2bbc1dfbf3bd\
+            \dfaf617bb9fea39188c61915229a665489689bd1c4149c67d688acd8cc66\
+            \22ab38b7302f85fb56229bf1cc8dc856743732a814594695a0e848b92a08\
+            \33b28a20ccd8f22c634bfdad195cd94f667435a88e0c2ff53633be0a168f\
+            \30be22ee2c0c3043d9c2006b1865618025d0160658f375cb084b7e674658\
+            \f3b21961e67d66845564196019b4950126d823ca00ab285b1960e69f4606\
+            \98602e940156f1a5510658864ea5be8fde2a0658f49329601867a584219c\
+            \1861094812234cd1e7c4088b7e3223ccaf4c6d302ca1c400ab30921860c5\
+            \7f1a1960c54f668015bf735b08dbb650b6c5850733596895e902124bbc4e\
+            \b385b1b0bc309056165681d58525648d5b7f7f17821223390e0000";
+    end;
+
+    function fixtureStoredRaw(): Span[Nat8, Static] is
+        return "010d00f2ff68656c6c6f2c20776f726c640a";
+    end;
+
+    function fixtureNamed(): Span[Nat8, Static] is
+        return "1f8b080a0000000000ff612e74787400df89cb48cdc9c9d75128cf2fca49\
+            \e10200537424f40d000000";
+    end;
+
+    function fixtureTwoMembers(): Span[Nat8, Static] is
+        return "1f8b08000000000002ff4bcb2c2a2e510000fc7af11c060000001f8b0800\
+            \0000000002ff2b4e4dcecf4b010069111fb606000000";
+    end;
+
+    function fixtureBadCrc(): Span[Nat8, Static] is
+        return "1f8b08000000000002ffcb48cdc9c9d75128cf2fca49e10200527424f40d\
+            \000000";
+    end;
+
+    function fixtureTooFar(): Span[Nat8, Static] is
+        return "030200";
+    end;
+
+    function fixtureBlockType3(): Span[Nat8, Static] is
+        return "07";
+    end;
+
+    function fixtureMillionZeros(): Span[Nat8, Static] is
+        return "1f8b08000000000002ffedc101010000008220ffaf6e4840010000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000000000000000000000000000000000000000000000000000000000\
+            \000000af069ecb791240420f00";
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    function testCrc(): Unit is
+        let expected: Nat32 := 3421780262;
+        let zero: Nat32 := 0;
+        assertTrue(crc32("123456789") = expected, "the check value of CRC-32");
+        assertTrue(crc32("") = zero, "the CRC-32 of nothing");
+        return nil;
+    end;
+
+    function testFixtures(): Unit is
+        let hello: String := bytesOf(fixtureHello());
+        assertTrue(givesText(gunzip(asSpan(&hello), plenty), "hello, world\n"), "a member of zlib at level 9, fixed codes");
+        destroyString(hello);
+        let dynamic: String := bytesOf(fixtureDynamic());
+        let summary: Summary := summaryOf(gunzip(asSpan(&dynamic), plenty));
+        destroyString(dynamic);
+        let dynamicCrc: Nat32 := 588415511;
+        assertTrue(summary.size = 3641, "a member with dynamic codes, its length");
+        assertTrue(summary.crc = dynamicCrc, "a member with dynamic codes, its CRC-32");
+        let stored: String := bytesOf(fixtureStoredRaw());
+        assertTrue(givesText(inflateRaw(asSpan(&stored), plenty), "hello, world\n"), "a raw stream of one stored block");
+        destroyString(stored);
+        let named: String := bytesOf(fixtureNamed());
+        assertTrue(givesText(gunzip(asSpan(&named), plenty), "hello, world\n"), "a member with a name and the header's checksum");
+        destroyString(named);
+        let two: String := bytesOf(fixtureTwoMembers());
+        assertTrue(givesText(gunzip(asSpan(&two), plenty), "first second"), "two members joined");
+        destroyString(two);
+        return nil;
+    end;
+
+    function testRoundTrips(): Unit is
+        let empty: String := repeated("", 1);
+        assertTrue(roundTrip(&empty), "nothing");
+        destroyString(empty);
+        let one: String := repeated("a", 1);
+        assertTrue(roundTrip(&one), "one byte");
+        destroyString(one);
+        let text: String := repeated("hello, world\n", 1);
+        assertTrue(roundTrip(&text), "a line");
+        destroyString(text);
+        let many: String := repeated("abcabcabd", 3000);
+        assertTrue(roundTrip(&many), "a text that repeats");
+        destroyString(many);
+        let bytes: String := everyByte();
+        assertTrue(roundTrip(&bytes), "every byte value");
+        destroyString(bytes);
+        let random: String := noise(70000);
+        assertTrue(roundTrip(&random), "70000 bytes that do not compress, two stored blocks");
+        destroyString(random);
+        return nil;
+    end;
+
+    function testSizes(): Unit is
+        let many: String := repeated("abcdefgh", 12500);
+        let packed: String := gzip(asSpan(&many));
+        assertTrue(stringLength(&packed) < 10000, "100000 bytes that repeat come out below a tenth");
+        destroyString(packed);
+        destroyString(many);
+        let random: String := noise(70000);
+        let stored: String := gzip(asSpan(&random));
+        assertTrue(stringLength(&stored) <= 70028, "bytes that do not compress grow by the stored blocks' headers and the member's only");
+        destroyString(stored);
+        destroyString(random);
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        assertTrue(codeOf(gunzip("hello", plenty)) = 1, "not gzip");
+        assertTrue(codeOf(gunzip("", plenty)) = 1, "nothing is not gzip");
+        let hello: String := bytesOf(fixtureHello());
+        let short: String := cut(&hello, 20);
+        assertTrue(codeOf(gunzip(asSpan(&short), plenty)) = 2, "a member cut in its stream");
+        destroyString(short);
+        let header: String := cut(&hello, 5);
+        assertTrue(codeOf(gunzip(asSpan(&header), plenty)) = 2, "a member cut in its header");
+        destroyString(header);
+        let tail: String := joined(hello, "xyz");
+        assertTrue(codeOf(gunzip(asSpan(&tail), plenty)) = 6, "bytes after the member");
+        destroyString(tail);
+        let badCrc: String := bytesOf(fixtureBadCrc());
+        assertTrue(codeOf(gunzip(asSpan(&badCrc), plenty)) = 5, "a CRC-32 that does not match");
+        destroyString(badCrc);
+        let far: String := bytesOf(fixtureTooFar());
+        assertTrue(codeOf(inflateRaw(asSpan(&far), plenty)) = 3, "a distance before the start");
+        destroyString(far);
+        let kind: String := bytesOf(fixtureBlockType3());
+        assertTrue(codeOf(inflateRaw(asSpan(&kind), plenty)) = 3, "the block type 3");
+        destroyString(kind);
+        let stored: String := bytesOf(fixtureStoredRaw());
+        let after: String := joined(stored, "x");
+        assertTrue(codeOf(inflateRaw(asSpan(&after), plenty)) = 6, "a byte after a raw stream");
+        destroyString(after);
+        return nil;
+    end;
+
+    function testLimit(): Unit is
+        let zeros: String := bytesOf(fixtureMillionZeros());
+        let limit: Index := 1000;
+        assertTrue(codeOf(gunzip(asSpan(&zeros), limit)) = 4, "a million zeros from 1003 bytes, stopped at 1000");
+        let exact: Index := 1000000;
+        let summary: Summary := summaryOf(gunzip(asSpan(&zeros), exact));
+        let zerosCrc: Nat32 := 309971870;
+        assertTrue(summary.size = exact, "a million zeros under a limit of a million");
+        assertTrue(summary.crc = zerosCrc, "their CRC-32");
+        let under: Index := 999999;
+        assertTrue(codeOf(gunzip(asSpan(&zeros), under)) = 4, "one byte less is too little");
+        destroyString(zeros);
+        return nil;
+    end;
+end module body.

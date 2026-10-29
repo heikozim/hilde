@@ -1,0 +1,301 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The rules live in the functions; a store only keeps
+-- what they hand it.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    removeLast,
+    destroyEmpty
+);
+import Standard.Password (
+    PasswordCheck,
+    Matches,
+    MatchesStoreAgain,
+    DoesNotMatch,
+    Unreadable,
+    Failed,
+    hashPassword,
+    checkPassword
+);
+
+module body Standard.Users is
+    constant nameLimit: Index := 64;
+    constant passwordLimit: Index := 1024;
+    constant clientLimit: Index := 256;
+
+    -- A hash in the form hashPassword makes, with its costs, that no
+    -- password matches: checked when the name is unknown, so that an
+    -- unknown name costs as much time as a wrong password.
+    constant noUserHash: Span[Nat8, Static] := "$argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    function defaultAttemptLimits(): AttemptLimits is
+        return AttemptLimits(attempts => 5, windowSeconds => 900);
+    end;
+
+    generic [R: Region]
+    function isUserName(name: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(name);
+        if (size = 0) or (size > nameLimit) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := name[i];
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            let small: Bool := (byte >= 'a') and (byte <= 'z');
+            let capital: Bool := (byte >= 'A') and (byte <= 'Z');
+            let mark: Bool := (byte = '.') or (byte = '_') or (byte = '-');
+            if not (digit or small or capital) then
+                if (i = 0) or (not mark) then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function isPassword(password: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(password);
+        return (size >= 1) and (size <= passwordLimit);
+    end;
+
+    generic [R: Region]
+    function isClient(client: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(client);
+        return (size >= 1) and (size <= clientLimit);
+    end;
+
+    generic [T: Type(UserStore), R: Region, N: Region, P: Region]
+    function addUser(store: &![T, R], name: Span[Nat8, N], password: Span[Nat8, P]): Either[UserError, Bool] is
+        if not isUserName(name) then
+            let bad: Either[UserError, Bool] := Left(left => BadName());
+            return bad;
+        end if;
+        if not isPassword(password) then
+            let bad: Either[UserError, Bool] := Left(left => BadPassword());
+            return bad;
+        end if;
+        case hashPassword(password) of
+            when Some(value as hash: String) do
+                let added: Either[UserError, Bool] := insertUser(&~store, name, asSpan(&hash));
+                destroyString(hash);
+                return added;
+            when None do
+                let failed: Either[UserError, Bool] := Left(left => HashFailed());
+                return failed;
+        end case;
+    end;
+
+    generic [T: Type(UserStore), R: Region, N: Region]
+    function deleteUser(store: &![T, R], name: Span[Nat8, N]): Either[UserError, Bool] is
+        if not isUserName(name) then
+            let bad: Either[UserError, Bool] := Left(left => BadName());
+            return bad;
+        end if;
+        return removeUser(&~store, name);
+    end;
+
+    generic [T: Type(UserStore), R: Region, N: Region, P: Region]
+    function setPassword(store: &![T, R], name: Span[Nat8, N], password: Span[Nat8, P]): Either[UserError, Bool] is
+        if not isUserName(name) then
+            let bad: Either[UserError, Bool] := Left(left => BadName());
+            return bad;
+        end if;
+        if not isPassword(password) then
+            let bad: Either[UserError, Bool] := Left(left => BadPassword());
+            return bad;
+        end if;
+        case hashPassword(password) of
+            when Some(value as hash: String) do
+                let replaced: Either[UserError, Bool] := replaceHash(&~store, name, asSpan(&hash));
+                destroyString(hash);
+                return replaced;
+            when None do
+                let failed: Either[UserError, Bool] := Left(left => HashFailed());
+                return failed;
+        end case;
+    end;
+
+    generic [T: Type(UserStore), R: Region, N: Region, O: Region, P: Region, C: Region]
+    function changePassword(store: &![T, R], name: Span[Nat8, N], old: Span[Nat8, O], password: Span[Nat8, P], client: Span[Nat8, C], limits: AttemptLimits, now: Int64): Either[UserError, Verdict] is
+        if not isPassword(password) then
+            let bad: Either[UserError, Verdict] := Left(left => BadPassword());
+            return bad;
+        end if;
+        case verify(&~store, name, old, client, limits, now) of
+            when Right(right as verdict: Verdict) do
+                case verdict of
+                    when Accepted do
+                        case setPassword(&~store, name, password) of
+                            when Right(right as done: Bool) do
+                                if done then
+                                    let accepted: Either[UserError, Verdict] := Right(right => Accepted());
+                                    return accepted;
+                                end if;
+                                let gone: Either[UserError, Verdict] := Right(right => Rejected());
+                                return gone;
+                            when Left(left as error: UserError) do
+                                let failed: Either[UserError, Verdict] := Left(left => error);
+                                return failed;
+                        end case;
+                    when Rejected do
+                        let answer: Either[UserError, Verdict] := Right(right => Rejected());
+                        return answer;
+                    when Locked do
+                        let answer: Either[UserError, Verdict] := Right(right => Locked());
+                        return answer;
+                    when Throttled do
+                        let answer: Either[UserError, Verdict] := Right(right => Throttled());
+                        return answer;
+                end case;
+            when Left(left as error: UserError) do
+                let failed: Either[UserError, Verdict] := Left(left => error);
+                return failed;
+        end case;
+    end;
+
+    generic [T: Type(UserStore), R: Region]
+    function listUsers(store: &![T, R]): Either[UserError, Buffer[String]] is
+        return userNames(&~store);
+    end;
+
+    function destroyUserNames(names: Buffer[String]): Unit is
+        var left: Buffer[String] := names;
+        while length(&left) > 0 do
+            destroyString(removeLast(&!left));
+        end while;
+        destroyEmpty(left);
+        return nil;
+    end;
+
+    -- A failed attempt of client, kept for the window of limits, and the
+    -- verdict Rejected.
+    generic [T: Type(UserStore), R: Region, C: Region]
+    function rejected(store: &![T, R], client: Span[Nat8, C], limits: AttemptLimits, now: Int64): Either[UserError, Verdict] is
+        case noteFailure(&~store, client, now, now - limits.windowSeconds) of
+            when Right(right as done: Unit) do
+                let answer: Either[UserError, Verdict] := Right(right => Rejected());
+                return answer;
+            when Left(left as error: UserError) do
+                let failed: Either[UserError, Verdict] := Left(left => error);
+                return failed;
+        end case;
+    end;
+
+    -- The verdict on a right password of a user that may be locked, after
+    -- the client's failures are forgotten and, for an old hash, a new one
+    -- is stored.
+    generic [T: Type(UserStore), R: Region, N: Region, P: Region, C: Region]
+    function rightPassword(store: &![T, R], name: Span[Nat8, N], password: Span[Nat8, P], client: Span[Nat8, C], locked: Bool, again: Bool): Either[UserError, Verdict] is
+        if locked then
+            let answer: Either[UserError, Verdict] := Right(right => Locked());
+            return answer;
+        end if;
+        case forgetFailures(&~store, client) of
+            when Right(right as done: Unit) do
+                skip;
+            when Left(left as error: UserError) do
+                let failed: Either[UserError, Verdict] := Left(left => error);
+                return failed;
+        end case;
+        if again then
+            case setPassword(&~store, name, password) of
+                when Right(right as stored: Bool) do
+                    skip;
+                when Left(left as error: UserError) do
+                    let failed: Either[UserError, Verdict] := Left(left => error);
+                    return failed;
+            end case;
+        end if;
+        let accepted: Either[UserError, Verdict] := Right(right => Accepted());
+        return accepted;
+    end;
+
+    generic [T: Type(UserStore), R: Region, N: Region, P: Region, C: Region]
+    function verify(store: &![T, R], name: Span[Nat8, N], password: Span[Nat8, P], client: Span[Nat8, C], limits: AttemptLimits, now: Int64): Either[UserError, Verdict] is
+        if now < 0 then
+            let late: Either[UserError, Verdict] := Left(left => BadTime());
+            return late;
+        end if;
+        if not isClient(client) then
+            let bad: Either[UserError, Verdict] := Left(left => BadClient());
+            return bad;
+        end if;
+        case failuresSince(&~store, client, now - limits.windowSeconds) of
+            when Right(right as failures: Int64) do
+                if failures >= limits.attempts then
+                    let throttled: Either[UserError, Verdict] := Right(right => Throttled());
+                    return throttled;
+                end if;
+            when Left(left as error: UserError) do
+                let failed: Either[UserError, Verdict] := Left(left => error);
+                return failed;
+        end case;
+        if (not isUserName(name)) or (not isPassword(password)) then
+            return rejected(&~store, client, limits, now);
+        end if;
+        case readUser(&~store, name) of
+            when Right(right as found: Option[StoredUser]) do
+                case found of
+                    when Some(value as user: StoredUser) do
+                        let { hash: String, locked: Bool } := user;
+                        let check: PasswordCheck := checkPassword(password, asSpan(&hash));
+                        destroyString(hash);
+                        case check of
+                            when Matches do
+                                return rightPassword(&~store, name, password, client, locked, false);
+                            when MatchesStoreAgain do
+                                return rightPassword(&~store, name, password, client, locked, true);
+                            when DoesNotMatch do
+                                return rejected(&~store, client, limits, now);
+                            when Unreadable do
+                                return rejected(&~store, client, limits, now);
+                            when Failed do
+                                let failed: Either[UserError, Verdict] := Left(left => HashFailed());
+                                return failed;
+                        end case;
+                    when None do
+                        let spent: PasswordCheck := checkPassword(password, noUserHash);
+                        return rejected(&~store, client, limits, now);
+                end case;
+            when Left(left as error: UserError) do
+                let failed: Either[UserError, Verdict] := Left(left => error);
+                return failed;
+        end case;
+    end;
+
+    generic [T: Type(UserStore), R: Region, N: Region]
+    function lockUser(store: &![T, R], name: Span[Nat8, N]): Either[UserError, Bool] is
+        if not isUserName(name) then
+            let bad: Either[UserError, Bool] := Left(left => BadName());
+            return bad;
+        end if;
+        return setLocked(&~store, name, true);
+    end;
+
+    generic [T: Type(UserStore), R: Region, N: Region]
+    function unlockUser(store: &![T, R], name: Span[Nat8, N]): Either[UserError, Bool] is
+        if not isUserName(name) then
+            let bad: Either[UserError, Bool] := Left(left => BadName());
+            return bad;
+        end if;
+        return setLocked(&~store, name, false);
+    end;
+end module body.

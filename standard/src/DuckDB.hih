@@ -1,0 +1,407 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+DuckDB, the database for analysis that runs inside the programme over a file of its own.
+
+- Every open switches off reading and writing other files and loading or fetching extensions.
+- The configuration is locked at open, so no statement turns those on again.
+- One programme at a time opens a file for writing, and no reader opens it while a writer has it.
+- Values go to the question marks of a statement and never become part of its text.
+- Null is an Option; a timestamp is in microseconds since 1970-01-01 UTC.
+- Each column reader takes its own types only; any other type stops the programme.
+- A duplicate key and a conflict between two writers have codes of their own.
+
+    case openWriter("facts.duckdb") of
+        when Right(right as opened: Connection[Writing]) do
+            var db: Connection[Writing] := opened;
+            let values: Values := withText(withInt64(noValues(), 7), "Ada");
+            case execute(&!db, "INSERT INTO people VALUES (?, ?)", values) of
+                ...
+            end case;
+            closeDatabase(db);
+        ...
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+
+module Standard.DuckDB is
+    """
+    The mode of a connection that may write.
+    """
+    record Writing: Free is
+    end;
+
+    """
+    The mode of a connection that only reads.
+    """
+    record Reading: Free is
+    end;
+
+    """
+    An open connection.  Linear: it must be closed.
+    """
+    type Connection[M: Free]: Linear;
+
+    """
+    What went wrong: DuckDB's error type, or one of the negative codes
+    below.
+    """
+    record DuckError: Free is
+        code: Int32;
+    end;
+
+    """
+    The file could not be opened: it is not there for a reader, it is no
+    database of DuckDB, another programme holds it, or the path held a zero
+    byte.
+    """
+    constant openFailed: Int32;
+
+    """
+    migrate found more migrations in the database than this programme has.
+    """
+    constant newerDatabase: Int32;
+
+    """
+    DuckDB refused the statement before it ran: its text is not valid, it
+    names what is not there, or the values do not match its question marks.
+    lastMessage has DuckDB's words.
+    """
+    constant statementRefused: Int32;
+
+    """
+    A unique or a primary key was given a value it holds already.
+    """
+    constant duplicateKey: Int32;
+
+    """
+    Two transactions wrote the same rows, and this one lost.
+    """
+    constant writeConflict: Int32;
+
+    """
+    commit found that a statement of the transaction had failed; the
+    transaction was rolled back.  DuckDB itself would answer such a commit
+    with success and keep nothing.
+    """
+    constant failedTransaction: Int32;
+
+    """
+    A duplicate key.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isUniqueViolation(error: DuckError): Bool;
+
+    """
+    Any constraint: a duplicate key, null, a foreign key or a check.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isConstraintViolation(error: DuckError): Bool;
+
+    """
+    A conflict that may go away when tried again: a write conflict.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isBusy(error: DuckError): Bool;
+
+    """
+    A short English description of the code.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    function describe(error: DuckError): Span[Nat8, Static];
+
+    """
+    Open the database file at path for writing, creating it when it is not
+    there.
+    """
+    generic [R: Region]
+    function openWriter(path: Span[Nat8, R]): Either[DuckError, Connection[Writing]]
+        requires spanLength(path) > 0;
+
+    """
+    Open an existing database file for reading only.
+    """
+    generic [R: Region]
+    function openReader(path: Span[Nat8, R]): Either[DuckError, Connection[Reading]]
+        requires spanLength(path) > 0;
+
+    """
+    Close the connection.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [M: Free]
+    function closeDatabase(db: Connection[M]): Unit;
+
+    """
+    DuckDB's words for the last failure on this connection, for a log;
+    empty when there was none.
+    No contract: a text whose length follows its input.
+    """
+    generic [M: Free, R: Region]
+    function lastMessage(db: &[Connection[M], R]): String;
+
+    """
+    The version of libduckdb the programme runs with.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    function libraryVersion(): Span[Nat8, Static];
+
+    """
+    Apply the migrations embedded by @migrations that the database has not
+    seen.  Right carries how many were applied now.
+    The numbers of the migrations are kept in hilde_migrations, and each
+    migration runs with its number in one transaction, so one that fails
+    half way leaves nothing.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function migrate(db: &![Connection[Writing], R], migrations: Span[Nat8, Static]): Either[DuckError, Index];
+
+    """
+    A transaction that is open.  Linear: commit or rollback ends it.
+    """
+    type Transaction: Linear;
+
+    """
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function begin(db: &![Connection[M], R]): Either[DuckError, Transaction];
+
+    """
+    Commit.  When the commit fails the transaction is rolled back, so
+    either way it is over.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function commit(db: &![Connection[M], R], transaction: Transaction): Either[DuckError, Unit];
+
+    """
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [M: Free, R: Region]
+    function rollback(db: &![Connection[M], R], transaction: Transaction): Unit;
+
+    """
+    A copy of borrowed text, as a String of its own.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): String;
+
+    """
+    The values of a statement, in the order of its question marks.  Linear: a
+    text or bytes value is a copy the values own.
+    """
+    type Values: Linear;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function noValues(): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withInt64(values: Values, value: Int64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withFloat64(values: Values, value: Float64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withBool(values: Values, value: Bool): Values;
+
+    """
+    A point in time as microseconds since 1970-01-01 UTC, sent as a
+    timestamp.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withTimestamp(values: Values, value: Int64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values;
+    """
+    A null, whose type DuckDB takes from the statement.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withNull(values: Values): Values;
+
+    """
+    Give back values that will not be sent.
+    No contract: it only frees or closes what it is given.
+    """
+    function dropValues(values: Values): Unit;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withInt64OrNull(values: Values, value: Option[Int64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withFloat64OrNull(values: Values, value: Option[Float64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withBoolOrNull(values: Values, value: Option[Bool]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withTimestampOrNull(values: Values, value: Option[Int64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withTextOrNull(values: Values, value: Option[Span[Nat8, R]]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withBytesOrNull(values: Values, value: Option[Span[Nat8, R]]): Values;
+
+    """
+    How many values there are.
+    No contract: a number the system or the build gives.
+    """
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index;
+
+    """
+    A statement that was run, its rows being read.  Linear: finish ends it.
+    """
+    type Cursor: Linear;
+
+    """
+    Run a statement that reads.  A failure is kept in the cursor and
+    reported by finish.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [M: Free, R: Region, S: Region]
+    function start(db: &![Connection[M], R], sql: Span[Nat8, S], values: Values): Cursor;
+
+    """
+    Run a statement that writes and returns rows, an insert with returning.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region, S: Region]
+    function startWrite(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Cursor;
+
+    """
+    Run a statement that writes.  Right carries the number of rows it
+    changed.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function execute(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Either[DuckError, Nat64];
+
+    """
+    Go to the next row.  false at the end, and after a failure, which
+    finish then reports.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool;
+
+    """
+    The number of columns of the result; 0 after a failure.
+    """
+    generic [R: Region]
+    function columnCount(cursor: &[Cursor, R]): Int32
+        ensures result >= 0;
+
+    """
+    True when the column of the current row is null, whatever its type.
+    """
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool
+        requires index >= 0;
+
+    """
+    The column as an Int64, from bigint, integer, smallint or tinyint.
+    Another type stops the programme; a cast in the statement says what
+    is wanted.
+    """
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64
+        requires index >= 0;
+
+    """
+    The column as a Float64, from double or float.
+    Another type stops the programme; a cast in the statement says what
+    is wanted.
+    """
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64
+        requires index >= 0;
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool
+        requires index >= 0;
+
+    """
+    The column in microseconds since 1970-01-01 UTC, from timestamp or
+    timestamptz.
+    Another type stops the programme; a cast in the statement says what
+    is wanted.
+    """
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64
+        requires index >= 0;
+
+    """
+    The column as text, from varchar.
+    Another type stops the programme; a cast in the statement says what
+    is wanted.
+    """
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R]
+        requires index >= 0;
+
+    """
+    The column as bytes, from blob or varchar.
+    Another type stops the programme; a cast in the statement says what
+    is wanted.
+    """
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R]
+        requires index >= 0;
+    generic [R: Region]
+    function columnInt64OrNone(cursor: &[Cursor, R], index: Int32): Option[Int64]
+        requires index >= 0;
+    generic [R: Region]
+    function columnFloat64OrNone(cursor: &[Cursor, R], index: Int32): Option[Float64]
+        requires index >= 0;
+    generic [R: Region]
+    function columnBoolOrNone(cursor: &[Cursor, R], index: Int32): Option[Bool]
+        requires index >= 0;
+    generic [R: Region]
+    function columnTimestampOrNone(cursor: &[Cursor, R], index: Int32): Option[Int64]
+        requires index >= 0;
+    generic [R: Region]
+    function columnTextOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]]
+        requires index >= 0;
+    generic [R: Region]
+    function columnBytesOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]]
+        requires index >= 0;
+
+    """
+    End the cursor.  Some carries the failure of the statement.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function finish(db: &![Connection[M], R], cursor: Cursor): Option[DuckError];
+end module.

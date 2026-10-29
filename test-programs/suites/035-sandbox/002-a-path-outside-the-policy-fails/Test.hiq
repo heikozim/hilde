@@ -1,0 +1,139 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    closeFile,
+    readAll,
+    Command,
+    makeCommand,
+    addArgument,
+    Process,
+    Running,
+    spawnProcess,
+    waitProcess,
+    ProcessStatus,
+    exitedNormally,
+    exitCode
+);
+import Standard.Sandbox (
+    Policy,
+    Report,
+    makePolicy,
+    allowPromises,
+    allowPath,
+    applyPolicy,
+    reportApplied
+);
+
+module body Test is
+    -- Whether the file opens for reading; it is closed again.
+    function opens(path: Span[Nat8, Static]): Bool is
+        let name: String := fromLiteral(path);
+        let opened: Option[FileDescriptor] := openRead(asSpan(&name));
+        destroyString(name);
+        case opened of
+            when Some(value as file: FileDescriptor) do
+                closeFile(file);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The child: confined to reading /dev/null, it reads /dev/null and then
+    -- tries /etc/hosts, and says on its output what happened.  Not
+    -- /etc/passwd: the baseline every macOS profile imports lets any
+    -- process read it.
+    function child(): ExitCode is
+        let promises: String := fromLiteral("stdio rpath");
+        let path: String := fromLiteral("/dev/null");
+        let read: String := fromLiteral("r");
+        let policy: Policy := allowPath(allowPromises(makePolicy(), asSpan(&promises)), asSpan(&path), asSpan(&read));
+        destroyString(promises);
+        destroyString(path);
+        destroyString(read);
+        let report: Report := applyPolicy(policy);
+        if not reportApplied(report) then
+            printLn("nothing confined the child");
+            return ExitSuccess();
+        end if;
+        if not opens("/dev/null") then
+            printLn("the allowed path did not open");
+            return ExitSuccess();
+        end if;
+        if opens("/etc/hosts") then
+            printLn("the other path opened");
+        else
+            printLn("refused");
+        end if;
+        return ExitSuccess();
+    end;
+
+    generic [R: Region]
+    function saysRefused(text: &[String, R]): Bool is
+        let expected: String := fromLiteral("refused\n");
+        let size: Index := length(&expected);
+        var same: Bool := (length(text) = size);
+        if same then
+            for i from 0 to size - 1 do
+                if nthByte(text, i) /= nthByte(&expected, i) then
+                    same := false;
+                end if;
+            end for;
+        end if;
+        destroyString(expected);
+        return same;
+    end;
+
+    function main(): ExitCode is
+        if argumentCount() > 1 then
+            return child();
+        end if;
+        -- The control: unconfined, the path opens, so that a refusal in the
+        -- child is the policy's and not a missing file.
+        if not opens("/etc/hosts") then
+            printLn("the path does not open unconfined either");
+            return ExitSuccess();
+        end if;
+        -- The same programme, started again with one argument, so that the
+        -- confinement stays in the child.
+        let self: String := fromLiteral(nthArgument(0));
+        let mode: String := fromLiteral("child");
+        let command: Command := addArgument(makeCommand(asSpan(&self)), asSpan(&mode));
+        destroyString(self);
+        destroyString(mode);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                var fromChild: FileDescriptor := output;
+                var refused: Bool := false;
+                case readAll(&!fromChild) of
+                    when Some(value as said: String) do
+                        refused := saysRefused(&said);
+                        destroyString(said);
+                    when None do
+                        refused := false;
+                end case;
+                closeFile(fromChild);
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                if (refused and exitedNormally(status)) and (exitCode(status) = 0) then
+                    printLn("a path outside the policy is refused");
+                else
+                    printLn("the child was not confined as asked");
+                end if;
+            when None do
+                printLn("the child did not start");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

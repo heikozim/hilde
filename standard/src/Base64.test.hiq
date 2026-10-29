@@ -1,0 +1,197 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    constantTimeEqual
+);
+import Standard.Base64 (
+    encode,
+    encodeUnpadded,
+    decode,
+    decodeUnpadded,
+    encodeUrl,
+    decodeUrl
+);
+
+module body Standard.Base64.Test is
+    function encodesTo(input: Span[Nat8, Static], expected: Span[Nat8, Static], padded: Bool, message: Span[Nat8, Static]): Unit is
+        if padded then
+            let made: String := encode(input);
+            assertTrue(constantTimeEqual(asSpan(&made), expected), message);
+            destroyString(made);
+        else
+            let made: String := encodeUnpadded(input);
+            assertTrue(constantTimeEqual(asSpan(&made), expected), message);
+            destroyString(made);
+        end if;
+        return nil;
+    end;
+
+    function decodeAs(text: Span[Nat8, Static], padded: Bool): Option[String] is
+        if padded then
+            return decode(text);
+        else
+            return decodeUnpadded(text);
+        end if;
+    end;
+
+    function decodesTo(text: Span[Nat8, Static], expected: Span[Nat8, Static], padded: Bool, message: Span[Nat8, Static]): Unit is
+        case decodeAs(text, padded) of
+            when Some(value as bytes: String) do
+                assertTrue(constantTimeEqual(asSpan(&bytes), expected), message);
+                destroyString(bytes);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    function refused(text: Span[Nat8, Static], padded: Bool, message: Span[Nat8, Static]): Unit is
+        case decodeAs(text, padded) of
+            when Some(value as bytes: String) do
+                destroyString(bytes);
+                assertTrue(false, message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    -- The test vectors of RFC 4648, section 10, both ways.
+    function testRfc4648Vectors(): Unit is
+        encodesTo("", "", true, "encode of the empty string");
+        encodesTo("f", "Zg==", true, "encode f");
+        encodesTo("fo", "Zm8=", true, "encode fo");
+        encodesTo("foo", "Zm9v", true, "encode foo");
+        encodesTo("foob", "Zm9vYg==", true, "encode foob");
+        encodesTo("fooba", "Zm9vYmE=", true, "encode fooba");
+        encodesTo("foobar", "Zm9vYmFy", true, "encode foobar");
+        decodesTo("", "", true, "decode of the empty string");
+        decodesTo("Zg==", "f", true, "decode Zg==");
+        decodesTo("Zm8=", "fo", true, "decode Zm8=");
+        decodesTo("Zm9v", "foo", true, "decode Zm9v");
+        decodesTo("Zm9vYg==", "foob", true, "decode Zm9vYg==");
+        decodesTo("Zm9vYmE=", "fooba", true, "decode Zm9vYmE=");
+        decodesTo("Zm9vYmFy", "foobar", true, "decode Zm9vYmFy");
+        return nil;
+    end;
+
+    -- The unpadded form, as password hashes write it.
+    function testUnpadded(): Unit is
+        encodesTo("f", "Zg", false, "unpadded encode f");
+        encodesTo("fo", "Zm8", false, "unpadded encode fo");
+        encodesTo("foobar", "Zm9vYmFy", false, "unpadded encode foobar");
+        decodesTo("Zg", "f", false, "unpadded decode Zg");
+        decodesTo("Zm8", "fo", false, "unpadded decode Zm8");
+        decodesTo("Zm9vYmE", "fooba", false, "unpadded decode Zm9vYmE");
+        return nil;
+    end;
+
+    -- Every byte value survives the round trip, the ones above 127 and the
+    -- plus and the slash of the alphabet among them.
+    function testEveryByte(): Unit is
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, 251);
+        writeByte(&!builder, 255);
+        let high: String := finalize(builder);
+        let made: String := encode(asSpan(&high));
+        assertTrue(constantTimeEqual(asSpan(&made), "+/8="), "251 and 255 encode to plus and slash");
+        destroyString(made);
+        destroyString(high);
+        case decode("+/8=") of
+            when Some(value as bytes: String) do
+                assertTrue(length(&bytes) = 2, "plus and slash decode to two bytes");
+                assertTrue(nthByte(&bytes, 0) = 251, "the first is 251");
+                assertTrue(nthByte(&bytes, 1) = 255, "the second is 255");
+                destroyString(bytes);
+            when None do
+                assertTrue(false, "plus and slash decode");
+        end case;
+        var zeros: StringBuilder := makeStringBuilder();
+        writeByte(&!zeros, 0);
+        writeByte(&!zeros, 0);
+        writeByte(&!zeros, 0);
+        let three: String := finalize(zeros);
+        let encoded: String := encode(asSpan(&three));
+        assertTrue(constantTimeEqual(asSpan(&encoded), "AAAA"), "three zero bytes");
+        destroyString(encoded);
+        destroyString(three);
+        return nil;
+    end;
+
+    -- What decoding must refuse, each for one reason.
+    function testRefused(): Unit is
+        refused("Zg=", true, "a padded length that is not a multiple of four");
+        refused("Z===", true, "more padding than a group can take");
+        refused("=Zg=", true, "padding at the start");
+        refused("Zm9v!A==", true, "a byte outside the alphabet");
+        refused("Zh==", true, "bits left over that are not zero");
+        refused("Zg==", false, "padding in the unpadded form");
+        refused("Z", false, "a length one more than a multiple of four");
+        refused("Zm9vYmF", false, "bits left over in the unpadded form");
+        return nil;
+    end;
+
+    -- The URL alphabet: - and _ where the other has + and /, the padding
+    -- kept, and the other alphabet's two characters refused.
+    function testUrl(): Unit is
+        let a: String := encodeUrl("~~~");
+        assertTrue(constantTimeEqual(asSpan(&a), "fn5-"), "~~~ is fn5- and not fn5+");
+        destroyString(a);
+        let b: String := encodeUrl("???");
+        assertTrue(constantTimeEqual(asSpan(&b), "Pz8_"), "??? is Pz8_ and not Pz8/");
+        destroyString(b);
+        let c: String := encodeUrl("f");
+        assertTrue(constantTimeEqual(asSpan(&c), "Zg=="), "the padding stays");
+        destroyString(c);
+        case decodeUrl("fn5-") of
+            when Some(value as bytes: String) do
+                assertTrue(constantTimeEqual(asSpan(&bytes), "~~~"), "fn5- is ~~~");
+                destroyString(bytes);
+            when None do
+                assertTrue(false, "fn5- decodes");
+        end case;
+        case decodeUrl("Pz8_") of
+            when Some(value as bytes: String) do
+                assertTrue(constantTimeEqual(asSpan(&bytes), "???"), "Pz8_ is ???");
+                destroyString(bytes);
+            when None do
+                assertTrue(false, "Pz8_ decodes");
+        end case;
+        case decodeUrl("fn5+") of
+            when Some(value as bytes: String) do
+                destroyString(bytes);
+                assertTrue(false, "a + is refused");
+            when None do
+                assertTrue(true, "a + is refused");
+        end case;
+        case decodeUrl("Pz8/") of
+            when Some(value as bytes: String) do
+                destroyString(bytes);
+                assertTrue(false, "a / is refused");
+            when None do
+                assertTrue(true, "a / is refused");
+        end case;
+        return nil;
+    end;
+end module body.

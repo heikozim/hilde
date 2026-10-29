@@ -1,0 +1,105 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Binds the arena of the runtime.  It reaches C with @embed and makes a
+-- reference from an address, so it is an unsafe module; Standard.Arena is
+-- the safe module built on it.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Pointer,
+    Address,
+    nullCheck
+);
+
+module body Bindings.Arena is
+    record Arena: Linear is
+        -- The C side's opaque handle.  Nat8 rather than a void-shaped type
+        -- because Hilde has none, and nothing here ever loads through it.
+        handle: Pointer[Nat8];
+    end;
+
+    function createArena(capacity: ByteSize): Option[Arena] is
+        let addr: Address[Nat8] :=
+            @embed(Address[Nat8], "hilde_arena_create($1)", capacity);
+        case nullCheck(addr) of
+            when Some(value: Pointer[Nat8]) do
+                let arena: Arena := Arena(handle => value);
+                let some: Option[Arena] := Some(value => arena);
+                return some;
+            when None do
+                let none: Option[Arena] := None();
+                return none;
+        end case;
+    end;
+
+    generic [T: Free, R: Region]
+    function arenaAllocate(arena: &![Arena, R]): Option[&![T, R]] is
+        let handle: Pointer[Nat8] := arena->handle;
+        let addr: Address[T] :=
+            @embed(Address[T], "hilde_arena_alloc($1, $2)", handle, sizeof(T));
+        case nullCheck(addr) of
+            when Some(value: Pointer[T]) do
+                -- The reference carries R, the region of the borrow this was
+                -- asked through, so it cannot outlive the borrow -- and the
+                -- handle cannot be reset or freed while it is borrowed.
+                --
+                -- The @embed stands inside the Some and not behind a let:
+                -- a let of a write reference inserts a cast, and the
+                -- compiler refuses it with "Write references can only be
+                -- casted to a read reference".
+                return Some(value => @embed(&![T, R], "$1", value));
+            when None do
+                let none: Option[&![T, R]] := None();
+                return none;
+        end case;
+    end;
+
+    generic [T: Free, R: Region]
+    function arenaSpan(arena: &![Arena, R], count: Index): Option[Span![T, R]] is
+        let handle: Pointer[Nat8] := arena->handle;
+        -- The product count * sizeof(T) is formed and checked in C: a
+        -- wrap there would hand out fewer bytes than the span claims.
+        let addr: Address[T] :=
+            @embed(Address[T], "hilde_arena_alloc_array($1, $2, $3)",
+            handle, count, sizeof(T));
+        case nullCheck(addr) of
+            when Some(value: Pointer[T]) do
+                -- In the Some and not behind a let, for the reason
+                -- arenaAllocate gives.
+                return Some(value => @embed(Span![T, R], "hilde_make_span($1, $2)", value, count));
+            when None do
+                let none: Option[Span![T, R]] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function arenaUsed(arena: &[Arena, R]): ByteSize is
+        let handle: Pointer[Nat8] := arena->handle;
+        return @embed(ByteSize, "hilde_arena_used($1)", handle);
+    end;
+
+    generic [R: Region]
+    function arenaCapacity(arena: &[Arena, R]): ByteSize is
+        let handle: Pointer[Nat8] := arena->handle;
+        return @embed(ByteSize, "hilde_arena_capacity($1)", handle);
+    end;
+
+    function resetArena(arena: Arena): Arena is
+        let { handle: Pointer[Nat8] } := arena;
+        @embed(Unit, "hilde_arena_reset($1)", handle);
+        return Arena(handle => handle);
+    end;
+
+    function freeArena(arena: Arena): Unit is
+        let { handle: Pointer[Nat8] } := arena;
+        @embed(Unit, "hilde_arena_destroy($1)", handle);
+        return nil;
+    end;
+end module body.

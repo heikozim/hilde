@@ -1,0 +1,210 @@
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    insertBack,
+    remove,
+    length
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.File (
+    removeFile
+);
+import Standard.Task (
+    Scope,
+    Task,
+    tasksAvailable,
+    openScope,
+    closeScope,
+    spawn,
+    join,
+    yieldNow
+);
+import Standard.Sqlite (
+    Connection,
+    Writing,
+    Reading,
+    SqlError,
+    Transaction,
+    describe,
+    openWriter,
+    openReader,
+    closeDatabase,
+    migrate,
+    begin,
+    commit
+);
+
+module body Test is
+    record Count: Free is
+        n: Int64;
+    end;
+
+    -- What one reader saw: at the start of its read transaction, again in
+    -- the same transaction after the writer had committed, and after its
+    -- transaction had ended.
+    record Seen: Free is
+        before: Int64;
+        during: Int64;
+        after: Int64;
+    end;
+
+    constant databasePath: Span[Nat8, Static] := "/tmp/hilde-046-016.db";
+
+    function removeDatabase(): Unit is
+        let file: String := fromLiteral(databasePath);
+        let wal: String := fromLiteral("/tmp/hilde-046-016.db-wal");
+        let shm: String := fromLiteral("/tmp/hilde-046-016.db-shm");
+        let a: Bool := removeFile(asSpan(&file));
+        let b: Bool := removeFile(asSpan(&wal));
+        let c: Bool := removeFile(asSpan(&shm));
+        destroyString(file);
+        destroyString(wal);
+        destroyString(shm);
+        return nil;
+    end;
+
+    generic [M: Free, R: Region]
+    function countRows(db: &![Connection[M], R]): Int64 is
+        var n: Int64 := -1;
+        @query(&~db, "SELECT count(*) AS n FROM users") for c: Count do
+            n := c.n;
+        else error do
+            print("count failed: ");
+            printLn(describe(error));
+        end for;
+        return n;
+    end;
+
+    function nothingSeen(): Seen is
+        let none: Int64 := -1;
+        return Seen(before => none, during => none, after => none);
+    end;
+
+    -- A task: its own reading connection, one read transaction held across
+    -- a yield -- which is when the writer writes.
+    function reader(path: String): Seen is
+        var seen: Seen := nothingSeen();
+        case openReader(asSpan(&path)) of
+            when Left(left as error: SqlError) do
+                print("reader could not open: ");
+                printLn(describe(error));
+            when Right(right as opened: Connection[Reading]) do
+                var db: Connection[Reading] := opened;
+                case begin(&!db) of
+                    when Left(left as error: SqlError) do
+                        print("reader could not begin: ");
+                        printLn(describe(error));
+                    when Right(right as tx: Transaction) do
+                        let before: Int64 := countRows(&!db);
+                        yieldNow();
+                        let during: Int64 := countRows(&!db);
+                        case commit(&!db, tx) of
+                            when Left(left as error: SqlError) do
+                                print("reader could not commit: ");
+                                printLn(describe(error));
+                            when Right(right as done: Unit) do
+                                skip;
+                        end case;
+                        let after: Int64 := countRows(&!db);
+                        seen := Seen(before => before, during => during, after => after);
+                end case;
+                closeDatabase(db);
+        end case;
+        destroyString(path);
+        return seen;
+    end;
+
+    function report(what: Span[Nat8, Static], result: Either[SqlError, Nat64]): Unit is
+        print(what);
+        case result of
+            when Left(left as error: SqlError) do
+                print(": failed, code ");
+                print(error.code);
+                print(", ");
+                printLn(describe(error));
+            when Right(right as changed: Nat64) do
+                print(": ");
+                print(changed);
+                printLn(" row(s)");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function run(db: &![Connection[Writing], R]): Unit is
+        case migrate(&~db, @migrations) of
+            when Left(left as error: SqlError) do
+                print("migrate failed: ");
+                printLn(describe(error));
+            when Right(right as applied: Index) do
+                skip;
+        end case;
+        report("three users",
+            @execute(&~db, "INSERT INTO users (name) VALUES (?), (?), (?)", "ann", "ben", "cy"));
+        case openScope() of
+            when None do
+                printLn("no scope");
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                var tasks: Buffer[Task[Seen]] := allocateEmpty();
+                var k: Int64 := 0;
+                while k < 3 do
+                    case spawn(&!scope, reader, fromLiteral(databasePath)) of
+                        when Left(left as back: String) do
+                            destroyString(back);
+                            printLn("no task started");
+                        when Right(right as task: Task[Seen]) do
+                            insertBack(&!tasks, task);
+                    end case;
+                    k := k + 1;
+                end while;
+                -- Each reader opens, begins, counts, and yields.
+                yieldNow();
+                -- All three hold a read transaction now, and the writer
+                -- commits beside them: WAL.
+                report("written while three readers read",
+                    @execute(&~db, "INSERT INTO users (name) VALUES (?)", "dee"));
+                closeScope(scope);
+                while length(&tasks) > 0 do
+                    let task: Task[Seen] := remove(&!tasks, 0);
+                    let seen: Seen := join(task);
+                    print("reader saw ");
+                    print(seen.before);
+                    print(", then ");
+                    print(seen.during);
+                    print(" in the same transaction, then ");
+                    printLn(seen.after);
+                end while;
+                destroyEmpty(tasks);
+        end case;
+        print("the writer sees ");
+        printLn(countRows(&~db));
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        if not tasksAvailable() then
+            printLn("no tasks on this platform");
+            return ExitFailure();
+        end if;
+        removeDatabase();
+        case openWriter(databasePath) of
+            when Left(left as error: SqlError) do
+                print("open failed: ");
+                printLn(describe(error));
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                run(&!db);
+                closeDatabase(db);
+                removeDatabase();
+                return ExitSuccess();
+        end case;
+    end;
+end module body.

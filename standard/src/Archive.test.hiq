@@ -1,0 +1,580 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Archives written by the module are read back by it.  Hostile archives,
+-- which the module's writer refuses to make, are built here header by
+-- header, so that each test holds exactly the bytes it means.  Each test
+-- that extracts works in a directory of its own, made at its start and
+-- removed at its end; archives written by tar(1) and zip programs are
+-- measured outside these tests.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Gzip (
+    crc32,
+    gzip
+);
+import Standard.Failure (
+    Failure,
+    FailureKind,
+    Invalid,
+    Unclassified,
+    NotFound,
+    NoPermission,
+    kindOf,
+    destroyFailure
+);
+import Standard.File (
+    FileStatus,
+    FileFound,
+    FileMissing,
+    FileUnreadable,
+    kindSymlink,
+    kindRegular,
+    kindDirectory,
+    sameKind,
+    statusOf,
+    createDirectory,
+    removeDirectory,
+    removeFile,
+    Directory,
+    openDirectory,
+    nextEntry,
+    closeDirectory
+);
+import Standard.Archive (
+    ArchiveFormat,
+    Tar,
+    TarGz,
+    Zip,
+    Budget,
+    defaultBudget,
+    EntryKind,
+    ArchivedFile,
+    ArchivedDirectory,
+    ArchivedLink,
+    ArchivedHardLink,
+    ArchivedOther,
+    Archive,
+    readArchive,
+    entryCount,
+    entryName,
+    entryKind,
+    entrySize,
+    entryMode,
+    entryLinkTarget,
+    entryContent,
+    extractArchive,
+    destroyArchive,
+    ArchiveWriter,
+    makeArchiveWriter,
+    addFile,
+    addDirectory,
+    addLink,
+    finishArchive
+);
+
+module body Standard.Archive.Test is
+    ---
+    --- Helpers
+    ---
+
+    generic [R: Region]
+    function spanIs(span: Span[Nat8, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := spanLength(span);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var same: Bool := true;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if span[i] /= expected[i] then
+                    same := false;
+                end if;
+            end for;
+        end if;
+        return same;
+    end;
+
+    function kindNumber(kind: EntryKind): Int32 is
+        case kind of
+            when ArchivedFile do
+                return 0;
+            when ArchivedDirectory do
+                return 1;
+            when ArchivedLink do
+                return 2;
+            when ArchivedHardLink do
+                return 3;
+            when ArchivedOther do
+                return 4;
+        end case;
+    end;
+
+    generic [R: Region]
+    function contentIs(archive: &[Archive, R], n: Index, expected: Span[Nat8, Static]): Bool is
+        case entryContent(archive, n) of
+            when Right(right as content: String) do
+                let same: Bool := spanIs(asSpan(&content), expected);
+                destroyString(content);
+                return same;
+            when Left(left as why: Failure) do
+                destroyFailure(why);
+                return false;
+        end case;
+    end;
+
+    function number(kind: FailureKind): Int32 is
+        case kind of
+            when Unclassified do
+                return 0;
+            when NotFound do
+                return 1;
+            when NoPermission do
+                return 2;
+            when Invalid do
+                return 3;
+        end case;
+    end;
+
+    -- How many names a directory holds, -1 when it cannot be read.
+    function namesIn(dir: Span[Nat8, Static]): Int32 is
+        case openDirectory(dir) of
+            when Some(value as opened: Directory) do
+                var directory: Directory := opened;
+                var count: Int32 := 0;
+                var going: Bool := true;
+                while going do
+                    case nextEntry(&!directory) of
+                        when Some(value as name: String) do
+                            count := count + 1;
+                            destroyString(name);
+                        when None do
+                            going := false;
+                    end case;
+                end while;
+                let closed: Bool := closeDirectory(directory);
+                return count;
+            when None do
+                return -1;
+        end case;
+    end;
+
+    -- 0 when bytes read in format, else 10 plus the failure's kind.
+    generic [R: Region]
+    function readNumber(bytes: &[String, R], format: ArchiveFormat, budget: Budget): Int32 is
+        case readArchive(asSpan(bytes), format, budget) of
+            when Right(right as read: Archive) do
+                destroyArchive(read);
+                return 0;
+            when Left(left as why: Failure) do
+                let kind: Int32 := number(kindOf(&why));
+                destroyFailure(why);
+                return kind + 10;
+        end case;
+    end;
+
+    -- Reads bytes as format and extracts into dir: 0 when it was, 1 when
+    -- the archive did not read, else 10 plus the failure's kind.
+    generic [R: Region]
+    function extractNumber(bytes: &[String, R], format: ArchiveFormat, dir: Span[Nat8, Static]): Int32 is
+        case readArchive(asSpan(bytes), format, defaultBudget()) of
+            when Right(right as read: Archive) do
+                var archive: Archive := read;
+                var result: Int32 := 0;
+                case extractArchive(&archive, dir) of
+                    when Right(right: Unit) do
+                        result := 0;
+                    when Left(left as why: Failure) do
+                        result := number(kindOf(&why)) + 10;
+                        destroyFailure(why);
+                end case;
+                destroyArchive(archive);
+                return result;
+            when Left(left as why: Failure) do
+                destroyFailure(why);
+                return 1;
+        end case;
+    end;
+
+    -- 0 missing, 1 file, 2 directory, 3 link, 4 other or unreadable.
+    function kindAt(path: Span[Nat8, Static]): Int32 is
+        case statusOf(path) of
+            when FileFound(status: FileStatus) do
+                if sameKind(status.kind, kindRegular) then
+                    return 1;
+                end if;
+                if sameKind(status.kind, kindDirectory) then
+                    return 2;
+                end if;
+                if sameKind(status.kind, kindSymlink) then
+                    return 3;
+                end if;
+                return 4;
+            when FileMissing do
+                return 0;
+            when FileUnreadable do
+                return 4;
+        end case;
+    end;
+
+    function modeAt(path: Span[Nat8, Static]): Nat32 is
+        case statusOf(path) of
+            when FileFound(status: FileStatus) do
+                return status.mode;
+            when FileMissing do
+                return 65535;
+            when FileUnreadable do
+                return 65535;
+        end case;
+    end;
+
+    ---
+    --- Raw tar headers, for archives the writer would refuse
+    ---
+
+    generic [R: Region]
+    function putField(header: &![String, R], at: Index, text: Span[Nat8, Static]): Unit is
+        let count: Index := spanLength(text);
+        if count > 0 then
+            for i from 0 to count - 1 do
+                storeNth(&~header, at + i, text[i]);
+            end for;
+        end if;
+        return nil;
+    end;
+
+    -- Stores value as octal digits, a zero byte last, in count bytes at at.
+    generic [R: Region]
+    function putOctal(header: &![String, R], at: Index, count: Index, value: Nat64): Unit is
+        var rest: Nat64 := value;
+        var i: Index := count - 1;
+        storeNth(&~header, (at + count) - 1, 0);
+        while i > 0 do
+            i := i - 1;
+            let digit: Nat64 := rest - ((rest / 8) * 8);
+            case toNat8(digit) of
+                when Some(value as d: Nat8) do
+                    storeNth(&~header, at + i, (48 : Nat8) + d);
+                when None do
+                    skip;
+            end case;
+            rest := rest / 8;
+        end while;
+        return nil;
+    end;
+
+    -- A ustar header of name, flag, mode, size and link, with its checksum.
+    function rawHeader(name: Span[Nat8, Static], flag: Nat8, mode: Nat64, size: Nat64, link: Span[Nat8, Static]): String is
+        var header: String := makeString(512, 0);
+        putField(&!header, 0, name);
+        putOctal(&!header, 100, 8, mode);
+        putOctal(&!header, 108, 8, 0);
+        putOctal(&!header, 116, 8, 0);
+        putOctal(&!header, 124, 12, size);
+        putOctal(&!header, 136, 12, 0);
+        storeNth(&!header, 156, flag);
+        putField(&!header, 157, link);
+        putField(&!header, 257, "ustar");
+        putField(&!header, 263, "00");
+        putField(&!header, 148, "        ");
+        var sum: Nat64 := 0;
+        for i from 0 to 511 do
+            case toNat64(nthByte(&header, i)) of
+                when Some(value as b: Nat64) do
+                    sum := sum + b;
+                when None do
+                    skip;
+            end case;
+        end for;
+        putOctal(&!header, 148, 7, sum);
+        storeNth(&!header, 155, ' ');
+        return header;
+    end;
+
+    -- Appends a header and its content, padded to 512 bytes.
+    generic [R: Region]
+    function rawEntry(out: &![StringBuilder, R], name: Span[Nat8, Static], flag: Nat8, mode: Nat64, content: Span[Nat8, Static], link: Span[Nat8, Static]): Unit is
+        let size: Index := spanLength(content);
+        case toNat64(size) of
+            when Some(value as size64: Nat64) do
+                let header: String := rawHeader(name, flag, mode, size64, link);
+                writeString(&~out, asSpan(&header));
+                destroyString(header);
+            when None do
+                skip;
+        end case;
+        writeString(&~out, content);
+        let block: Index := 512;
+        let over: Index := size - ((size / block) * block);
+        var padding: Index := 0;
+        if over > 0 then
+            padding := block - over;
+        end if;
+        let zeros: String := makeString(padding, 0);
+        writeString(out, asSpan(&zeros));
+        destroyString(zeros);
+        return nil;
+    end;
+
+    function rawEnd(out: StringBuilder): String is
+        var all: StringBuilder := out;
+        let zeros: String := makeString(1024, 0);
+        writeString(&!all, asSpan(&zeros));
+        destroyString(zeros);
+        return finalize(all);
+    end;
+
+    -- A tar of one entry.
+    function oneEntry(name: Span[Nat8, Static], flag: Nat8, mode: Nat64, content: Span[Nat8, Static], link: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        rawEntry(&!out, name, flag, mode, content, link);
+        return rawEnd(out);
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    -- An archive in format with a directory, a file in it, a link to the
+    -- file, and a file of 100 bytes, written and read back.
+    function roundTrip(format: ArchiveFormat, compress: Bool): Bool is
+        var writer: ArchiveWriter := makeArchiveWriter(format, compress);
+        var added: Bool := addDirectory(&!writer, "docs", 493);
+        added := added and addFile(&!writer, "docs/readme.txt", "hello, archive\n", 420);
+        added := added and addLink(&!writer, "readme", "docs/readme.txt");
+        added := added and addFile(&!writer, "long.txt", "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789", 384);
+        let bytes: String := finishArchive(writer);
+        var good: Bool := added;
+        case readArchive(asSpan(&bytes), format, defaultBudget()) of
+            when Right(right as read: Archive) do
+                var archive: Archive := read;
+                good := good and (entryCount(&archive) = 4);
+                good := good and (spanIs(entryName(&archive, 0), "docs") and (kindNumber(entryKind(&archive, 0)) = 1));
+                good := good and (spanIs(entryName(&archive, 1), "docs/readme.txt") and (entrySize(&archive, 1) = 15));
+                good := good and (contentIs(&archive, 1, "hello, archive\n") and (entryMode(&archive, 1) = 420));
+                good := good and (spanIs(entryName(&archive, 2), "readme") and (kindNumber(entryKind(&archive, 2)) = 2));
+                good := good and spanIs(entryLinkTarget(&archive, 2), "docs/readme.txt");
+                good := good and (entrySize(&archive, 3) = 100);
+                destroyArchive(archive);
+            when Left(left as why: Failure) do
+                destroyFailure(why);
+                good := false;
+        end case;
+        destroyString(bytes);
+        return good;
+    end;
+
+    function testRoundTrip(): Unit is
+        assertTrue(roundTrip(Tar(), false), "a tar is read back as it was written");
+        assertTrue(roundTrip(TarGz(), false), "a tar with gzip is read back");
+        assertTrue(roundTrip(Zip(), false), "a zip with stored entries is read back");
+        assertTrue(roundTrip(Zip(), true), "a zip with compressed entries is read back");
+        return nil;
+    end;
+
+    function testWriterRefuses(): Unit is
+        var writer: ArchiveWriter := makeArchiveWriter(Tar(), false);
+        assertTrue(not addFile(&!writer, "../evil", "x", 420), "the writer refuses a name with ..");
+        assertTrue(not addFile(&!writer, "/etc/passwd", "x", 420), "the writer refuses an absolute name");
+        assertTrue(not addFile(&!writer, "a//b", "x", 420), "the writer refuses an empty part");
+        assertTrue(not addFile(&!writer, "", "x", 420), "the writer refuses an empty name");
+        assertTrue(not addLink(&!writer, "l", ""), "the writer refuses a link to nothing");
+        let bytes: String := finishArchive(writer);
+        assertTrue(length(&bytes) = 1024, "nothing was written but the end");
+        destroyString(bytes);
+        return nil;
+    end;
+
+    function testExtract(): Unit is
+        let dir: Span[Nat8, Static] := "archive-test-1.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        var writer: ArchiveWriter := makeArchiveWriter(Tar(), false);
+        var added: Bool := addDirectory(&!writer, "docs", 511);
+        added := added and addFile(&!writer, "docs/readme.txt", "hello\n", 511);
+        added := added and addLink(&!writer, "readme", "docs/readme.txt");
+        added := added and addFile(&!writer, "deep/er/file", "x", 420);
+        assertTrue(added, "the archive was written");
+        let bytes: String := finishArchive(writer);
+        assertTrue(extractNumber(&bytes, Tar(), dir) = 0, "the archive is extracted");
+        assertTrue(kindAt("archive-test-1.dir/docs") = 2, "the directory is there");
+        assertTrue(modeAt("archive-test-1.dir/docs") = 493, "the directory's 0777 was cut to 0755");
+        assertTrue(kindAt("archive-test-1.dir/docs/readme.txt") = 1, "the file is there");
+        assertTrue(modeAt("archive-test-1.dir/docs/readme.txt") = 420, "the file's 0777 was cut to 0644");
+        assertTrue(kindAt("archive-test-1.dir/readme") = 3, "the link is there");
+        assertTrue(kindAt("archive-test-1.dir/deep/er/file") = 1, "a file's missing directories were made");
+        assertTrue(extractNumber(&bytes, Tar(), dir) = 13, "a second extraction overwrites nothing and fails");
+        assertTrue(extractNumber(&bytes, Tar(), "archive-test-none.dir") = 13, "a missing target is refused");
+        destroyString(bytes);
+        assertTrue(removeFile("archive-test-1.dir/readme"), "the link was removed");
+        assertTrue(removeFile("archive-test-1.dir/docs/readme.txt"), "the file was removed");
+        assertTrue(removeFile("archive-test-1.dir/deep/er/file"), "the deep file was removed");
+        assertTrue(removeDirectory("archive-test-1.dir/deep/er"), "deep/er was removed");
+        assertTrue(removeDirectory("archive-test-1.dir/deep"), "deep was removed");
+        assertTrue(removeDirectory("archive-test-1.dir/docs"), "docs was removed");
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    -- Whether the tar of one hostile entry reads, is refused as Invalid
+    -- when extracted, and leaves the target empty.
+    function refused(bytes: String, dir: Span[Nat8, Static]): Bool is
+        let result: Int32 := extractNumber(&bytes, Tar(), dir);
+        destroyString(bytes);
+        return (result = 13) and (namesIn(dir) = 0);
+    end;
+
+    function testHostileNames(): Unit is
+        let dir: Span[Nat8, Static] := "archive-test-2.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        assertTrue(refused(oneEntry("../evil", '0', 420, "x", ""), dir), "a name with .. is refused");
+        assertTrue(refused(oneEntry("/tmp/evil", '0', 420, "x", ""), dir), "an absolute name is refused");
+        assertTrue(refused(oneEntry("a/../../evil", '0', 420, "x", ""), dir), "a .. inside a name is refused");
+        assertTrue(refused(oneEntry("a//b", '0', 420, "x", ""), dir), "an empty part is refused");
+        assertTrue(refused(oneEntry("up", '2', 511, "", "../outside"), dir), "a link that leaves the target is refused");
+        assertTrue(refused(oneEntry("abs", '2', 511, "", "/etc/passwd"), dir), "a link to an absolute path is refused");
+        assertTrue(refused(oneEntry("down/deep", '2', 511, "", "../../x"), dir), "a link that climbs past the top is refused");
+        assertTrue(refused(oneEntry("hard", '1', 420, "", "docs/readme.txt"), dir), "a hard link is refused");
+        assertTrue(refused(oneEntry("fifo", '6', 420, "", ""), dir), "a fifo is refused");
+        -- Names are judged before anything is written: a good entry before
+        -- a bad one is not written either.
+        var out: StringBuilder := makeStringBuilder();
+        rawEntry(&!out, "good", '0', 420, "x", "");
+        rawEntry(&!out, "../bad", '0', 420, "x", "");
+        assertTrue(refused(rawEnd(out), dir), "a good entry before a bad one is not written");
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testThroughLink(): Unit is
+        let dir: Span[Nat8, Static] := "archive-test-3.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        -- A link to a directory inside, then a file under the link: the
+        -- link is made, the file is refused, since writing through a link
+        -- is how a later entry leaves the target when the link is changed.
+        var out: StringBuilder := makeStringBuilder();
+        rawEntry(&!out, "real", '5', 493, "", "");
+        rawEntry(&!out, "alias", '2', 511, "", "real");
+        rawEntry(&!out, "alias/file", '0', 420, "x", "");
+        let bytes: String := rawEnd(out);
+        assertTrue(extractNumber(&bytes, Tar(), dir) = 13, "a file under a link is refused");
+        assertTrue(kindAt("archive-test-3.dir/alias") = 3, "the link inside was made");
+        assertTrue(kindAt("archive-test-3.dir/real/file") = 0, "nothing was written through the link");
+        destroyString(bytes);
+        assertTrue(removeFile("archive-test-3.dir/alias"), "the link was removed");
+        assertTrue(removeDirectory("archive-test-3.dir/real"), "real was removed");
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testBudget(): Unit is
+        var writer: ArchiveWriter := makeArchiveWriter(Tar(), false);
+        var added: Bool := addFile(&!writer, "a", "0123456789", 420);
+        added := added and addFile(&!writer, "b", "0123456789", 420);
+        added := added and addFile(&!writer, "c", "0123456789", 420);
+        assertTrue(added, "three files of ten bytes were written");
+        let bytes: String := finishArchive(writer);
+        assertTrue(readNumber(&bytes, Tar(), defaultBudget()) = 0, "the archive reads within the default budget");
+        let fewEntries: Budget := Budget(entries => 2, largestEntry => 100, total => 100);
+        assertTrue(readNumber(&bytes, Tar(), fewEntries) = 13, "three entries are refused by a budget of two");
+        let smallEntry: Budget := Budget(entries => 10, largestEntry => 9, total => 100);
+        assertTrue(readNumber(&bytes, Tar(), smallEntry) = 13, "an entry of ten bytes is refused by a budget of nine");
+        let smallTotal: Budget := Budget(entries => 10, largestEntry => 10, total => 29);
+        assertTrue(readNumber(&bytes, Tar(), smallTotal) = 13, "thirty bytes are refused by a budget of 29");
+        let exact: Budget := Budget(entries => 3, largestEntry => 10, total => 30);
+        assertTrue(readNumber(&bytes, Tar(), exact) = 0, "exactly the budget is allowed");
+        destroyString(bytes);
+        -- A small gzip that unpacks to a large tar: the budget stops it.
+        let big: String := makeString(200000, 0);
+        let bomb: String := gzip(asSpan(&big));
+        destroyString(big);
+        let tiny: Budget := Budget(entries => 1, largestEntry => 10, total => 10);
+        assertTrue(readNumber(&bomb, TarGz(), tiny) = 13, "a gzip that unpacks beyond the budget is refused");
+        destroyString(bomb);
+        -- The largest total means no limit, for a tar with gzip as for a tar.
+        var writer2: ArchiveWriter := makeArchiveWriter(TarGz(), false);
+        let added2: Bool := addFile(&!writer2, "a", "0123456789", 420);
+        assertTrue(added2, "a file was written into a tar with gzip");
+        let packed: String := finishArchive(writer2);
+        let endless: Budget := Budget(entries => 4294967295, largestEntry => maximum_nat64, total => maximum_nat64);
+        assertTrue(readNumber(&packed, TarGz(), endless) = 0, "the largest budget reads a tar with gzip");
+        destroyString(packed);
+        return nil;
+    end;
+
+    function testBroken(): Unit is
+        var good: String := oneEntry("file", '0', 420, "content", "");
+        storeNth(&!good, 148, '9');
+        assertTrue(readNumber(&good, Tar(), defaultBudget()) = 13, "a wrong checksum is refused");
+        destroyString(good);
+        let cut: String := makeString(700, 1);
+        assertTrue(readNumber(&cut, Tar(), defaultBudget()) = 13, "an archive cut short is refused");
+        destroyString(cut);
+        let empty: String := makeString(0, 0);
+        assertTrue(readNumber(&empty, Zip(), defaultBudget()) = 13, "bytes without a central directory are no zip");
+        destroyString(empty);
+        -- A zip whose content does not match its checksum: its bytes are
+        -- changed after it was written.
+        var writer: ArchiveWriter := makeArchiveWriter(Zip(), false);
+        assertTrue(addFile(&!writer, "f", "abc", 420), "a zip of one file was written");
+        var zip: String := finishArchive(writer);
+        storeNth(&!zip, 31, 'X');
+        case readArchive(asSpan(&zip), Zip(), defaultBudget()) of
+            when Right(right as read: Archive) do
+                var archive: Archive := read;
+                assertTrue(not contentIs(&archive, 0, "Xbc"), "a changed byte fails the checksum");
+                assertTrue(not contentIs(&archive, 0, "abc"), "and the old content is not claimed");
+                destroyArchive(archive);
+            when Left(left as why: Failure) do
+                destroyFailure(why);
+                assertTrue(false, "the zip reads");
+        end case;
+        -- The encrypted flag set in the central directory.
+        storeNth(&!zip, 31, 'a');
+        let central: Index := length(&zip) - (22 + 47);
+        storeNth(&!zip, central + 8, 1);
+        assertTrue(readNumber(&zip, Zip(), defaultBudget()) = 13, "an encrypted entry is refused");
+        destroyString(zip);
+        return nil;
+    end;
+
+    function testHardAndOtherListed(): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        rawEntry(&!out, "hard", '1', 420, "", "target");
+        rawEntry(&!out, "fifo", '6', 420, "", "");
+        let bytes: String := rawEnd(out);
+        case readArchive(asSpan(&bytes), Tar(), defaultBudget()) of
+            when Right(right as read: Archive) do
+                var archive: Archive := read;
+                assertTrue(kindNumber(entryKind(&archive, 0)) = 3, "a hard link is listed as one");
+                assertTrue(spanIs(entryLinkTarget(&archive, 0), "target"), "with its target");
+                assertTrue(kindNumber(entryKind(&archive, 1)) = 4, "a fifo is listed as other");
+                destroyArchive(archive);
+            when Left(left as why: Failure) do
+                destroyFailure(why);
+                assertTrue(false, "the archive reads");
+        end case;
+        destroyString(bytes);
+        return nil;
+    end;
+end module body.

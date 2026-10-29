@@ -1,0 +1,185 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Encrypted secrets in a .env file, readable only with the key in that file and a pepper in a file of its own.
+
+- Each value is sealed with XChaCha20-Poly1305 and signed with HMAC-SHA3-512, in the format of version 0xCC.
+- The cipher keys are derived from the key of the .env and the pepper; neither alone reads a value.
+- The pepper is exactly 32 bytes; a pepper file of another size is refused.
+- Every write replaces the .env atomically with mode 0600, owner and group of the old file kept.
+- An open vault holds its cipher keys in a linear value; closeVault overwrites them with zeros.
+- A secret's name is A to Z, 0 to 9 and _, not starting with a digit, at most 128 bytes.
+
+    case openVault("/etc/app/secret/.app.env", "/var/lib/app/.app.pepper", "VAULT_KEY") of
+        when Right(right as opened: Vault) do
+            var vault: Vault := opened;
+            let stored: Either[VaultError, Unit] := setSecret(&!vault, "DB_PASSWORD", "s3cret");
+            closeVault(vault);
+        when Left(left as error: VaultError) do
+            skip;
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Standard.Vault is
+    """
+    Why an operation of the vault failed.
+    """
+    union VaultError: Free is
+        """
+        The .env file could not be read.
+        """
+        case EnvUnreadable;
+        """
+        The .env has no line with the key.
+        """
+        case KeyMissing;
+        """
+        The key line is there already, so a new key would replace it.
+        """
+        case KeyExists;
+        """
+        The key is not 32 bytes in the URL alphabet of Base64.
+        """
+        case KeyInvalid;
+        """
+        The pepper file could not be read.
+        """
+        case PepperUnreadable;
+        """
+        The pepper file is not exactly 32 bytes.
+        """
+        case PepperInvalid;
+        """
+        A file is at the place of a new pepper.
+        """
+        case PepperExists;
+        """
+        A name, of a secret or of the key, outside A to Z, 0 to 9 and _.
+        """
+        case NameInvalid;
+        """
+        No secret of that name.
+        """
+        case NotFound;
+        """
+        A value that is not of this format, or whose code or tag does not
+        match: changed, or written under another key or pepper.
+        """
+        case Damaged;
+        """
+        The system gave no random bytes, or the cipher failed.
+        """
+        case CryptoFailed;
+        """
+        The .env or the pepper could not be written; nothing was replaced.
+        """
+        case WriteFailed;
+    end;
+
+    """
+    One line that says what failed, with no secret in it.
+    No contract: a text whose length follows its input.
+    """
+    function describeVaultError(error: VaultError): String;
+
+    """
+    An open vault: the paths of its two files, the name of its key and the
+    cipher keys derived from key and pepper.
+    """
+    type Vault: Linear;
+
+    """
+    Writes a new pepper, 32 random bytes with mode 0600.  Refuses with
+    PepperExists when something is at path.
+    No contract: the result is I/O.
+    """
+    generic [R: Region]
+    function createPepper(path: Span[Nat8, R]): Either[VaultError, Unit];
+
+    """
+    Writes a new key of 32 random bytes as the line keyName into the .env,
+    making the file with mode 0600 when it is not there.  The pepper must be
+    readable and 32 bytes.  Refuses with KeyExists when the line is there:
+    rotateKey changes a key.
+    No contract: the result is I/O.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function createKey(envPath: Span[Nat8, R], pepperPath: Span[Nat8, S], keyName: Span[Nat8, T]): Either[VaultError, Unit];
+
+    """
+    Opens the vault of the .env and the pepper, with the key in the line
+    keyName.  Fails when a file cannot be read, the key or the pepper is
+    not of its size, or a name is not valid.
+    No contract: the result is I/O.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function openVault(envPath: Span[Nat8, R], pepperPath: Span[Nat8, S], keyName: Span[Nat8, T]): Either[VaultError, Vault];
+
+    """
+    Overwrites the cipher keys with zeros and gives the vault back.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeVault(vault: Vault): Unit;
+
+    """
+    Seals value and stores it under name, replacing a value of that name.
+    No contract: the result is I/O.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function setSecret(vault: &![Vault, R], name: Span[Nat8, S], value: Span[Nat8, T]): Either[VaultError, Unit];
+
+    """
+    The value stored under name.  NotFound when there is none, Damaged when
+    it does not open.  The caller gives it back with destroyWiped.
+    No contract: the result is I/O.
+    """
+    generic [R: Region, S: Region]
+    function getSecret(vault: &[Vault, R], name: Span[Nat8, S]): Either[VaultError, String];
+
+    """
+    Removes the value stored under name; true when there was one.
+    No contract: the result is I/O.
+    """
+    generic [R: Region, S: Region]
+    function deleteSecret(vault: &![Vault, R], name: Span[Nat8, S]): Either[VaultError, Bool];
+
+    """
+    The names of the stored values, in the order of the file, without the
+    key's.
+    No contract: the result is I/O.
+    """
+    generic [R: Region]
+    function secretNames(vault: &[Vault, R]): Either[VaultError, Buffer[String]];
+
+    """
+    A new key: every value opened under the old one and sealed under the
+    new, the .env written once.  Gives the number of values.  On a failure
+    the .env and the vault keep the old key.
+    No contract: the result is I/O.
+    """
+    generic [R: Region]
+    function rotateKey(vault: &![Vault, R]): Either[VaultError, Index];
+
+    """
+    A new pepper at path, the pepper's own path or a new one: every value
+    sealed again under it, the .env written, and then the pepper put in
+    place; on a failure on the way the old pepper and the old .env stay
+    and still read each other.  A new path where a file is gives
+    PepperExists.  Gives the number of values.
+    No contract: the result is I/O.
+    """
+    generic [R: Region, S: Region]
+    function rotatePepper(vault: &![Vault, R], path: Span[Nat8, S]): Either[VaultError, Index];
+end module.

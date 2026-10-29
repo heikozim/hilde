@@ -1,0 +1,192 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: the calls into the runtime go through Bindings.Poller.
+import Bindings.Poller (
+    Handle,
+    backendCode,
+    createHandle,
+    destroyHandle,
+    addDescriptor,
+    modifyDescriptor,
+    dropDescriptor,
+    registeredCount,
+    waitHandle,
+    eventDescriptorAt,
+    eventFlagsAt
+);
+import Standard.File (
+    FileDescriptor,
+    fileNumber
+);
+import Standard.String (
+    String,
+    fromLiteral
+);
+
+module body Standard.Poller is
+    record Backend: Free is
+        code: Int32;
+    end;
+
+    constant codeNone: Int32 := 0;
+    constant codeEpoll: Int32 := 1;
+    constant codeKqueue: Int32 := 2;
+
+    constant backendNone: Backend := Backend(code => codeNone);
+    constant backendEpoll: Backend := Backend(code => codeEpoll);
+    constant backendKqueue: Backend := Backend(code => codeKqueue);
+
+    function backendAvailable(): Backend is
+        return Backend(code => backendCode());
+    end;
+
+    function sameBackend(left: Backend, right: Backend): Bool is
+        return left.code = right.code;
+    end;
+
+    function describeBackend(backend: Backend): String is
+        if backend.code = codeEpoll then
+            return fromLiteral("poller:      epoll");
+        end if;
+        if backend.code = codeKqueue then
+            return fromLiteral("poller:      kqueue");
+        end if;
+        return fromLiteral("poller:      none");
+    end;
+
+    ---
+    --- Interest
+    ---
+
+    record Interest: Free is
+        bits: Int32;
+    end;
+
+    -- The same three numbers the runtime uses.  They are written here
+    -- rather than fetched, because a constant fetched through a foreign
+    -- call is one nobody can fold; and they are the runtime's own, not the
+    -- platform's: the runtime translates them for the backend.
+    constant interestRead: Interest := Interest(bits => 1);
+    constant interestWrite: Interest := Interest(bits => 2);
+    constant interestReadWrite: Interest := Interest(bits => 3);
+
+    ---
+    --- The poller
+    ---
+
+    record Poller: Linear is
+        handle: Handle;
+    end;
+
+    function createPoller(): Option[Poller] is
+        case createHandle() of
+            when Some(value as handle: Handle) do
+                let poller: Poller := Poller(handle => handle);
+                let some: Option[Poller] := Some(value => poller);
+                return some;
+            when None do
+                -- Either there is no backend on this platform or the kernel
+                -- refused.  backendAvailable tells the two apart, and it can
+                -- be asked before this call.
+                let none: Option[Poller] := None();
+                return none;
+        end case;
+    end;
+
+    function destroyPoller(poller: Poller): Unit is
+        let { handle: Handle } := poller;
+        destroyHandle(handle);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function watchFile(poller: &![Poller, R],
+        file: &[FileDescriptor, S],
+        interest: Interest): Bool is
+        return addDescriptor(&!(poller->handle), fileNumber(file), interest.bits);
+    end;
+
+    generic [R: Region, S: Region]
+    function rewatchFile(poller: &![Poller, R],
+        file: &[FileDescriptor, S],
+        interest: Interest): Bool is
+        return modifyDescriptor(&!(poller->handle), fileNumber(file), interest.bits);
+    end;
+
+    generic [R: Region, S: Region]
+    function unwatchFile(poller: &![Poller, R],
+        file: &[FileDescriptor, S]): Bool is
+        return dropDescriptor(&!(poller->handle), fileNumber(file));
+    end;
+
+    generic [R: Region]
+    function watchedCount(poller: &[Poller, R]): Index is
+        return registeredCount(&(poller->handle));
+    end;
+
+    ---
+    --- Waiting
+    ---
+
+    generic [R: Region]
+    function waitFor(poller: &![Poller, R],
+        timeoutMillis: Int32): Option[Index] is
+        let ready: Int32 := waitHandle(&!(poller->handle), timeoutMillis);
+        if ready < 0 then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        -- Zero is the timeout, and it is an answer, so it goes through the
+        -- same Some the other counts do.
+        return toIndex(ready);
+    end;
+
+    record Event: Free is
+        descriptor: Int32;
+        flags: Int32;
+    end;
+
+    constant flagRead: Int32 := 1;
+    constant flagWrite: Int32 := 2;
+    constant flagError: Int32 := 4;
+
+    generic [R: Region]
+    function nthEvent(poller: &[Poller, R], index: Index): Option[Event] is
+        let descriptor: Int32 := eventDescriptorAt(&(poller->handle), index);
+        if descriptor < 0 then
+            -- Past the end of what the last wait reported, which is how a
+            -- caller walks the events without counting them twice.
+            let none: Option[Event] := None();
+            return none;
+        end if;
+        let flags: Int32 := eventFlagsAt(&(poller->handle), index);
+        let event: Event := Event(descriptor => descriptor, flags => flags);
+        let some: Option[Event] := Some(value => event);
+        return some;
+    end;
+
+    function eventDescriptor(event: Event): Int32 is
+        return event.descriptor;
+    end;
+
+    -- The three questions are asked with bitwiseAnd rather than equality:
+    -- an event can carry more than one answer at a time, and a reader that
+    -- compared the whole word would miss every one of those.
+    function eventReadable(event: Event): Bool is
+        return bitwiseAnd(event.flags, flagRead) = flagRead;
+    end;
+
+    function eventWritable(event: Event): Bool is
+        return bitwiseAnd(event.flags, flagWrite) = flagWrite;
+    end;
+
+    function eventFailed(event: Event): Bool is
+        return bitwiseAnd(event.flags, flagError) = flagError;
+    end;
+end module body.

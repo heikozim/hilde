@@ -1,0 +1,202 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The lines are checked at a fixed time through formatEntry, the function
+-- writeEntry writes with; writing to files, reopening and the system log
+-- are the end-to-end suite's.  Bytes a source file cannot hold are written
+-- in hexadecimal.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    hexToBytes
+);
+import Standard.Calendar (
+    Instant
+);
+import Standard.Log (
+    Level,
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Format,
+    TextLines,
+    JsonLines,
+    Log,
+    Entry,
+    logToNothing,
+    logsLevel,
+    closeLog,
+    makeEntry,
+    addText,
+    addInteger,
+    addBool,
+    writeEntry,
+    discardEntry,
+    formatEntry
+);
+
+module body Standard.Log.Test is
+    constant zero: Int64 := 0;
+    constant noNanos: Nat32 := 0;
+    constant fiveMillis: Nat32 := 5000000;
+    constant almostSecond: Nat32 := 999999999;
+    constant hundredTwentyMillis: Nat32 := 120000000;
+
+    ---
+    --- Helpers
+    ---
+
+    function bytesOf(hex: Span[Nat8, Static]): String is
+        case hexToBytes(hex) of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                abort("Standard.Log.Test: a test text is not hexadecimal");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(left: &[String, R], right: &[String, S]): Bool is
+        let size: Index := stringLength(left);
+        if size /= stringLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(left, i) /= nthByte(right, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The text before, the bytes of hex, and the text after, as one string.
+    function joined(before: Span[Nat8, Static], hex: Span[Nat8, Static], after: Span[Nat8, Static]): String is
+        let middle: String := bytesOf(hex);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, before);
+        writeString(&!out, asSpan(&middle));
+        writeString(&!out, after);
+        destroyString(middle);
+        return finalize(out);
+    end;
+
+    function epoch(): Instant is
+        return Instant(seconds => zero, nanos => noNanos);
+    end;
+
+    -- Whether entry gives expected in format at time at, and the entry
+    -- dropped.
+    generic [R: Region]
+    function gives(entry: Entry, at: Instant, format: Format, expected: &[String, R]): Bool is
+        let line: String := formatEntry(&entry, at, format);
+        discardEntry(entry);
+        let same: Bool := sameBytes(&line, expected);
+        destroyString(line);
+        return same;
+    end;
+
+    function givesText(entry: Entry, at: Instant, format: Format, expected: Span[Nat8, Static]): Bool is
+        let wanted: String := joined(expected, "", "");
+        let same: Bool := gives(entry, at, format, &wanted);
+        destroyString(wanted);
+        return same;
+    end;
+
+    function sample(): Entry is
+        let minus: Int64 := -42;
+        let first: Entry := addText(makeEntry(Info(), "hello world"), "user", "anna");
+        return addBool(addInteger(first, "n", minus), "ok", true);
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    function testTextLine(): Unit is
+        let at: Instant := Instant(seconds => zero, nanos => fiveMillis);
+        assertTrue(givesText(sample(), at, TextLines(), "time=1970-01-01T00:00:00.005Z level=INFO msg=\"hello world\" user=anna n=-42 ok=true"), "a text line with three fields");
+        return nil;
+    end;
+
+    function testJsonLine(): Unit is
+        let at: Instant := Instant(seconds => zero, nanos => fiveMillis);
+        assertTrue(givesText(sample(), at, JsonLines(), "{\"time\":\"1970-01-01T00:00:00.005Z\",\"level\":\"INFO\",\"msg\":\"hello world\",\"user\":\"anna\",\"n\":-42,\"ok\":true}"), "a JSON line with three fields");
+        return nil;
+    end;
+
+    function testTime(): Unit is
+        let billion: Int64 := 1000000000;
+        let late: Instant := Instant(seconds => billion, nanos => almostSecond);
+        assertTrue(givesText(makeEntry(Debug(), "x"), late, TextLines(), "time=2001-09-09T01:46:40.999Z level=DEBUG msg=x"), "milliseconds cut, not rounded");
+        let early: Instant := Instant(seconds => billion, nanos => hundredTwentyMillis);
+        assertTrue(givesText(makeEntry(Error(), "x"), early, TextLines(), "time=2001-09-09T01:46:40.120Z level=ERROR msg=x"), "a trailing zero kept");
+        assertTrue(givesText(makeEntry(Warning(), "x"), epoch(), TextLines(), "time=1970-01-01T00:00:00.000Z level=WARN msg=x"), "no milliseconds as .000");
+        return nil;
+    end;
+
+    function testControlCharacters(): Unit is
+        -- a, line feed, b, tab, c, escape and [31m, U+0085, the byte 255,
+        -- delete, e with acute, the zero byte.
+        let message: String := bytesOf("610a6209631b5b33316dc285ff7fc3a900");
+        let entry: Entry := makeEntry(Warning(), asSpan(&message));
+        destroyString(message);
+        let expected: String := joined("time=1970-01-01T00:00:00.000Z level=WARN msg=\"", "61206220632e5b33316d2e2e2ec3a92e", "\"");
+        assertTrue(gives(entry, epoch(), TextLines(), &expected), "each control and each broken byte replaced");
+        destroyString(expected);
+        return nil;
+    end;
+
+    function testQuoting(): Unit is
+        let quoted: Entry := addText(addText(addText(makeEntry(Info(), "m"), "q", "say \"hi\" \\o/"), "e", ""), "eq", "a=b");
+        assertTrue(givesText(quoted, epoch(), TextLines(), "time=1970-01-01T00:00:00.000Z level=INFO msg=m q=\"say \\\"hi\\\" \\\\o/\" e=\"\" eq=\"a=b\""), "quoted where needed, in text");
+        let again: Entry := addText(addText(makeEntry(Info(), "m"), "q", "say \"hi\" \\o/"), "e", "");
+        assertTrue(givesText(again, epoch(), JsonLines(), "{\"time\":\"1970-01-01T00:00:00.000Z\",\"level\":\"INFO\",\"msg\":\"m\",\"q\":\"say \\\"hi\\\" \\\\o/\",\"e\":\"\"}"), "escaped in JSON");
+        return nil;
+    end;
+
+    function testNames(): Unit is
+        let accent: String := bytesOf("c3a9");
+        let named: Entry := addText(addText(addText(makeEntry(Info(), "m"), "user name=", "x"), asSpan(&accent), "y"), "", "z");
+        destroyString(accent);
+        assertTrue(givesText(named, epoch(), TextLines(), "time=1970-01-01T00:00:00.000Z level=INFO msg=m user_name_=x __=y _=z"), "a name keeps letters, digits and _ . - only");
+        return nil;
+    end;
+
+    function testIntegers(): Unit is
+        let most: Int64 := 9223372036854775807;
+        let least: Int64 := (zero - most) - 1;
+        let numbers: Entry := addInteger(addInteger(addInteger(makeEntry(Info(), "m"), "min", least), "max", most), "zero", zero);
+        assertTrue(givesText(numbers, epoch(), TextLines(), "time=1970-01-01T00:00:00.000Z level=INFO msg=m min=-9223372036854775808 max=9223372036854775807 zero=0"), "the ends of Int64");
+        return nil;
+    end;
+
+    function testNothing(): Unit is
+        var log: Log := logToNothing();
+        assertFalse(logsLevel(&log, Error()), "a log to nothing writes no level");
+        assertTrue(writeEntry(&!log, sample()), "writing to it succeeds");
+        assertTrue(closeLog(log), "and it closes");
+        return nil;
+    end;
+end module body.

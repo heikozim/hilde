@@ -1,0 +1,277 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A FastCGI responder: the loop that serves the requests of a web server through a handler.
+
+- The handler maps a Request to the CGI output: header lines, an empty line and the body.
+- Each connection is served by a task of its own, at most workers of them at a time.
+- That task has 512 KiB of stack, for a handler that calls into C libraries.
+- A connection beyond workers waits until one of them is done.
+- A kept connection serves one request after another; a second one at once is refused.
+- Parameters, body and the time a request may take to arrive are held to the limits.
+- A request over a limit is answered with 431 or 413 and its connection closed.
+- A late request or one that does not parse is closed without an answer.
+- With serveUnixWith each running task has one of the given states alone.
+
+    function hello(request: Request): String is
+        destroyRequest(request);
+        return cgiResponse(200, "text/plain", "hello");
+    end;
+
+    let accepted: Option[Index] := serveUnix(&listener, hello, defaultLimits(), &!signals);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer,
+    length
+);
+import Standard.File (
+    FileDescriptor,
+    Listener,
+    TcpListener
+);
+import Standard.Signal (
+    Signals
+);
+import Standard.Context (
+    Context
+);
+
+module Standard.FcgiServer is
+    """
+    What a server holds a request and its connections to.  Free, so it
+    copies.
+    """
+    record Limits: Free is
+        -- How many connections are served at the same time, at least 1.
+        workers: Index;
+        -- After this many accepted connections the loop stops accepting and
+        -- returns when they are served; 0 for no limit.
+        connections: Index;
+        -- The most bytes of parameters one request may carry.
+        paramsBytes: Index;
+        -- The most bytes of body one request may carry.
+        bodyBytes: Index;
+        -- How long a request may take to arrive, from the first byte asked
+        -- for, waiting for the next request on a kept connection included.
+        requestMilliseconds: Nat32;
+        -- How long writing one answer may take.
+        writeMilliseconds: Nat32;
+    end;
+
+    """
+    Eight workers, no limit on connections, 64 KiB of parameters, 1 MiB
+    of body, 30 seconds to arrive and 30 to be written.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function defaultLimits(): Limits;
+
+    """
+    One request: its parameters as the web server sent them and its
+    body.  It is linear: destroyRequest gives it back.
+    """
+    type Request: Linear;
+
+    """
+    A request made of a block of parameters in the FastCGI name-value
+    encoding and a body, for a handler that is tested without a
+    connection.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function makeRequest(params: String, input: String): Request;
+
+    """
+    The value of the first parameter called name, as REQUEST_METHOD or
+    QUERY_STRING.  None when there is none.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function requestParam(request: &[Request, R], name: Span[Nat8, S]): Option[String];
+
+    """
+    The parameters in the name-value encoding, for Standard.Fcgi.pairCount
+    and its neighbours.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    generic [R: Region]
+    function requestParams(request: &[Request, R]): Span[Nat8, R];
+
+    """
+    The body of the request, empty when there is none.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    generic [R: Region]
+    function requestBody(request: &[Request, R]): Span[Nat8, R];
+
+    """
+    Frees request.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyRequest(request: Request): Unit;
+
+    """
+    True when value may stand as the value of a header line: every byte is
+    a horizontal tab, printable ASCII or a byte from 128 on.  False for a
+    carriage return, a line feed, the zero byte, any other control byte
+    and the byte 127, which would end the line or start a new header.  The empty value is
+    allowed.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isFieldValue(value: Span[Nat8, R]): Bool;
+
+    """
+    The CGI output of an answer: a Status line with the reason phrase of
+    status, a Content-Type line, an empty line and the body.  A status
+    without a known phrase gets the phrase Unknown.  contentType must be a
+    field value: a carriage return or a line feed in it would add header
+    lines the caller did not mean, so a call with one stops the programme.
+    """
+    generic [C: Region, B: Region]
+    function cgiResponse(status: Nat16, contentType: Span[Nat8, C], input: Span[Nat8, B]): String
+        requires isFieldValue(contentType);
+
+    """
+    The reason phrase of an HTTP status, such as Not Found for 404, and
+    Unknown for a status this module has no phrase for.  Never empty.
+    """
+    function reasonPhrase(status: Nat16): Span[Nat8, Static]
+        ensures spanLength(result) > 0;
+
+    """
+    True when block may stand as further header lines of an answer: empty,
+    or one line after the other, each a name, a colon, a space, a field
+    value and a carriage return with a line feed.  A name is one or more
+    token characters of RFC 9110: letters, digits and fifteen marks of
+    punctuation, but no space and no colon.  An empty line, a line without its line end and a bare
+    line feed make it false.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isHeaderBlock(block: Span[Nat8, R]): Bool;
+
+    """
+    As cgiResponse, with the lines of headers between the Content-Type line
+    and the empty line: Set-Cookie, Location, Allow and the like, written
+    as block holds them.  block must pass isHeaderBlock, so it cannot end
+    the header early or bring a line without its name.
+    """
+    generic [C: Region, H: Region, B: Region]
+    function cgiResponseWith(status: Nat16, contentType: Span[Nat8, C], headers: Span[Nat8, H], input: Span[Nat8, B]): String
+        requires isFieldValue(contentType) and isHeaderBlock(headers);
+
+    """
+    How a connection ended.
+    """
+    union Ending: Free is
+        """
+        The web server closed it between requests, or did not ask to keep
+        it after the last.
+        """
+        case Finished;
+        """
+        A request did not arrive within requestMilliseconds.
+        """
+        case TimedOut;
+        """
+        A record did not parse, the connection ended inside a request, or
+        the records came in an order the protocol does not have.
+        """
+        case Malformed;
+        """
+        The parameters or the body were over their limit; the answer was
+        431 or 413.
+        """
+        case TooLarge;
+        """
+        An answer could not be written in time, or the kernel refused it.
+        """
+        case WriteFailed;
+    end;
+
+    """
+    Serves the requests that arrive on one connection until it ends, then
+    closes it.  The loops below run this in a task for each connection; a
+    programme that accepts its connections itself can call it directly.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function serveConnection(socket: FileDescriptor, handler: Fn[Request, String], limits: Limits): Ending;
+
+    """
+    Accepts connections on a Unix domain socket and serves them, until
+    limits.connections were accepted or signals reports that a shutdown
+    was asked for (SIGTERM or SIGINT, when they are watched).  The
+    connections that are being served when it stops are served to their
+    end.  Returns how many were accepted, or None when the task runtime
+    could not be set up.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function serveUnix(listener: &[Listener, R], handler: Fn[Request, String], limits: Limits,
+        signals: &![Signals, S]): Option[Index];
+
+    """
+    As serveUnix, on a TCP listener.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function serveTcp(listener: &[TcpListener, R], handler: Fn[Request, String], limits: Limits,
+        signals: &![Signals, S]): Option[Index];
+
+    """
+    As serveUnix, stopping when context is done instead of on a signal:
+    when it is cancelled or its deadline has passed.  A programme that
+    watches signals cancels the context when one comes.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function serveUnixUntil(listener: &[Listener, R], handler: Fn[Request, String], limits: Limits,
+        context: &[Context, S]): Option[Index];
+
+    """
+    As serveTcp, stopping when context is done.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function serveTcpUntil(listener: &[TcpListener, R], handler: Fn[Request, String], limits: Limits,
+        context: &[Context, S]): Option[Index];
+
+    """
+    What a handler with a state is given: its state and one request.
+    """
+    record Turn[T: Type]: Type is
+        state: T;
+        request: Request;
+    end;
+
+    """
+    What a handler with a state gives back: the state, for the next request
+    it serves, and the CGI output of the answer.
+    """
+    record Served[T: Type]: Type is
+        state: T;
+        answer: String;
+    end;
+
+    """
+    As serveUnix, for a handler that keeps a state between requests, such
+    as an open database or keys read once.  Each running task takes one
+    state out of states and has it alone, so a state needs no lock; at
+    most as many connections as states are served at a time, and at most
+    limits.workers.  The handler is given the state with each request and
+    gives it back with the answer.  When the loop ends, every state is in
+    states again, for the caller to close.  states must not be empty.
+    """
+    generic [T: Type, R: Region, B: Region, S: Region]
+    function serveUnixWith(listener: &[Listener, R], states: &![Buffer[T], B], handler: Fn[Turn[T], Served[T]],
+        limits: Limits, signals: &![Signals, S]): Option[Index]
+        requires length(&states) > 0;
+end module.

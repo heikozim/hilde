@@ -1,0 +1,1504 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The calendar is Howard Hinnant's arithmetic of days: a
+-- year counted from March, so that the leap day is its last day, and eras
+-- of 400 years, so that every division is exact.  A zone file is read
+-- whole, checked field by field as RFC 8536 asks, and kept as its
+-- transitions, its local time types and the rule of its footer, which
+-- says the offset after the last transition.  Every number from a file is
+-- checked before it is used in arithmetic, so a hostile file is refused
+-- and never makes the arithmetic trap.
+import Standard.String (
+    String,
+    makeEmpty,
+    fromLiteral,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan,
+    getSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length as bufferLength,
+    nth,
+    insertBack
+);
+import Standard.File (
+    FileDescriptor,
+    kindRegular,
+    sameKind,
+    kindOfTarget,
+    openRead,
+    readAll,
+    closeFile,
+    FileStatus,
+    statusOfOpen,
+    environmentValue
+);
+
+module body Standard.Calendar is
+    ---
+    --- Numbers
+    ---
+    --- A literal is an Int32 unless a declaration says otherwise, and both
+    --- operands of an operator share one type, so every number the
+    --- arithmetic below uses is named.
+    ---
+
+    constant zero: Int64 := 0;
+    constant one: Int64 := 1;
+    constant two: Int64 := 2;
+    constant three: Int64 := 3;
+    constant four: Int64 := 4;
+    constant five: Int64 := 5;
+    constant six: Int64 := 6;
+    constant seven: Int64 := 7;
+    constant nine: Int64 := 9;
+    constant ten: Int64 := 10;
+    constant twelve: Int64 := 12;
+    constant twentyFour: Int64 := 24;
+    constant twentyEight: Int64 := 28;
+    constant twentyNine: Int64 := 29;
+    constant thirty: Int64 := 30;
+    constant thirtyOne: Int64 := 31;
+    constant sixty: Int64 := 60;
+    constant hundred: Int64 := 100;
+    constant oneFiftyThree: Int64 := 153;
+    constant threeSixtyFive: Int64 := 365;
+    constant threeNinetyNine: Int64 := 399;
+    constant fourHundred: Int64 := 400;
+    constant fourteenSixty: Int64 := 1460;
+    constant secondsPerHour: Int64 := 3600;
+    constant thirtySixFiveTwentyFour: Int64 := 36524;
+    constant secondsPerDay: Int64 := 86400;
+    constant daysPerEra: Int64 := 146097;
+    constant twoDays: Int64 := 172800;
+    constant epochShift: Int64 := 719468;
+    constant maximumYear: Int64 := 9999;
+    -- 0000-01-01T00:00:00Z and 9999-12-31T23:59:59Z.
+    constant firstSecond: Int64 := -62167219200;
+    constant lastSecond: Int64 := 253402300799;
+    -- The widest offset a zone file may give, RFC 8536 section 3.2.
+    constant lowestOffset: Int64 := -89999;
+    constant highestOffset: Int64 := 93599;
+    constant billion: Int64 := 1000000000;
+    constant zeroIndex: Index := 0;
+    constant zeroNat: Nat64 := 0;
+    constant byteModulus: Nat64 := 256;
+    constant twoPow31: Nat64 := 2147483648;
+    constant twoPow32: Int64 := 4294967296;
+    constant twoPow63: Nat64 := 9223372036854775808;
+    constant nanosPerSecond: Nat32 := 1000000000;
+    constant largestFile: Index := 1048576;
+    constant largestFileSize: Nat64 := 1048576;
+
+    function wideIndex(value: Index): Int64 is
+        case toInt64(value) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Standard.Calendar: an Index did not fit an Int64");
+        end case;
+    end;
+
+    function wideNat8(value: Nat8): Int64 is
+        case toInt64(value) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Standard.Calendar: a Nat8 did not fit an Int64");
+        end case;
+    end;
+
+    function wideInt32(value: Int32): Int64 is
+        case toInt64(value) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Standard.Calendar: an Int32 did not fit an Int64");
+        end case;
+    end;
+
+    function wideNat32(value: Nat32): Int64 is
+        case toInt64(value) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Standard.Calendar: a Nat32 did not fit an Int64");
+        end case;
+    end;
+
+    -- The callers below have checked the range; a value outside it is a
+    -- fault of this module.
+    function narrowNat8(value: Int64): Nat8 is
+        case toNat8(value) of
+            when Some(value as narrow: Nat8) do
+                return narrow;
+            when None do
+                abort("Standard.Calendar: a checked value did not fit a Nat8");
+        end case;
+    end;
+
+    function narrowInt32(value: Int64): Int32 is
+        case toInt32(value) of
+            when Some(value as narrow: Int32) do
+                return narrow;
+            when None do
+                abort("Standard.Calendar: a checked value did not fit an Int32");
+        end case;
+    end;
+
+    function narrowNat32(value: Int64): Nat32 is
+        case toNat32(value) of
+            when Some(value as narrow: Nat32) do
+                return narrow;
+            when None do
+                abort("Standard.Calendar: a checked value did not fit a Nat32");
+        end case;
+    end;
+
+    function narrowIndex(value: Int64): Index is
+        case toIndex(value) of
+            when Some(value as narrow: Index) do
+                return narrow;
+            when None do
+                abort("Standard.Calendar: a checked value did not fit an Index");
+        end case;
+    end;
+
+    -- The quotient rounded down, for a divisor above 0.
+    function floorDiv(value: Int64, divisor: Int64): Int64 is
+        let quotient: Int64 := value / divisor;
+        if rem(value, divisor) < zero then
+            return quotient - one;
+        end if;
+        return quotient;
+    end;
+
+    -- The remainder from 0 to divisor - 1, for a divisor above 0.
+    function floorMod(value: Int64, divisor: Int64): Int64 is
+        return value - (floorDiv(value, divisor) * divisor);
+    end;
+
+    ---
+    --- The calendar
+    ---
+
+    function isLeapYear(year: Int64): Bool is
+        return ((rem(year, four) = zero) and (rem(year, hundred) /= zero)) or (rem(year, fourHundred) = zero);
+    end;
+
+    function daysInMonth(year: Int64, month: Int64): Int64 is
+        if month = two then
+            if isLeapYear(year) then
+                return twentyNine;
+            end if;
+            return twentyEight;
+        end if;
+        if (month = four) or ((month = six) or ((month = nine) or (month = 11))) then
+            return thirty;
+        end if;
+        return thirtyOne;
+    end;
+
+    -- Days since 1970-01-01 of a date, Hinnant's days_from_civil.
+    function daysFromCivil(year: Int64, month: Int64, day: Int64): Int64 is
+        var y: Int64 := year;
+        if month <= two then
+            y := y - one;
+        end if;
+        let era: Int64 := floorDiv(y, fourHundred);
+        let yoe: Int64 := y - (era * fourHundred);
+        var shifted: Int64 := month + nine;
+        if month > two then
+            shifted := month - three;
+        end if;
+        let doy: Int64 := (((oneFiftyThree * shifted) + two) / five) + (day - one);
+        let doe: Int64 := (((yoe * threeSixtyFive) + (yoe / four)) - (yoe / hundred)) + doy;
+        return ((era * daysPerEra) + doe) - epochShift;
+    end;
+
+    -- A date as three numbers.
+    record Ymd: Free is
+        year: Int64;
+        month: Int64;
+        day: Int64;
+    end;
+
+    -- The date of a day counted from 1970-01-01, Hinnant's civil_from_days.
+    function civilFromDays(days: Int64): Ymd is
+        let z: Int64 := days + epochShift;
+        let era: Int64 := floorDiv(z, daysPerEra);
+        let doe: Int64 := z - (era * daysPerEra);
+        let yoe: Int64 := (((doe - (doe / fourteenSixty)) + (doe / thirtySixFiveTwentyFour)) - (doe / (daysPerEra - one))) / threeSixtyFive;
+        let doy: Int64 := doe - (((threeSixtyFive * yoe) + (yoe / four)) - (yoe / hundred));
+        let shifted: Int64 := ((five * doy) + two) / oneFiftyThree;
+        let day: Int64 := (doy - (((oneFiftyThree * shifted) + two) / five)) + one;
+        var month: Int64 := shifted + three;
+        if shifted >= ten then
+            month := shifted - nine;
+        end if;
+        var year: Int64 := yoe + (era * fourHundred);
+        if month <= two then
+            year := year + one;
+        end if;
+        let date: Ymd := Ymd(year => year, month => month, day => day);
+        return date;
+    end;
+
+    function validCivil(civil: Civil): Bool is
+        let year: Int64 := wideInt32(civil.year);
+        let month: Int64 := wideNat8(civil.month);
+        let day: Int64 := wideNat8(civil.day);
+        if (year < zero) or (year > maximumYear) then
+            return false;
+        end if;
+        if (month < one) or (month > twelve) then
+            return false;
+        end if;
+        if (day < one) or (day > daysInMonth(year, month)) then
+            return false;
+        end if;
+        if (wideNat8(civil.hour) >= twentyFour) or ((wideNat8(civil.minute) >= sixty) or (wideNat8(civil.second) >= sixty)) then
+            return false;
+        end if;
+        return civil.nanos < nanosPerSecond;
+    end;
+
+    -- The seconds since the epoch that civil shows at the offset 0; civil
+    -- is valid.
+    function localSeconds(civil: Civil): Int64 is
+        let days: Int64 := daysFromCivil(wideInt32(civil.year), wideNat8(civil.month), wideNat8(civil.day));
+        let clock: Int64 := ((wideNat8(civil.hour) * secondsPerHour) + (wideNat8(civil.minute) * sixty)) + wideNat8(civil.second);
+        return (days * secondsPerDay) + clock;
+    end;
+
+    function weekday(civil: Civil): Nat8 is
+        if not validCivil(civil) then
+            return 0;
+        end if;
+        let days: Int64 := daysFromCivil(wideInt32(civil.year), wideNat8(civil.month), wideNat8(civil.day));
+        -- 1970-01-01 was a Thursday, day 4 of an ISO week.
+        return narrowNat8(floorMod(days + three, seven) + one);
+    end;
+
+    function civilAt(instant: Instant, offset: Int32): Option[Civil] is
+        let seconds: Int64 := instant.seconds;
+        -- Checked before the offset is added, so that the sum cannot trap.
+        if (seconds < (firstSecond - twoPow32)) or ((seconds > (lastSecond + twoPow32)) or (instant.nanos >= nanosPerSecond)) then
+            let none: Option[Civil] := None();
+            return none;
+        end if;
+        let local: Int64 := seconds + wideInt32(offset);
+        if (local < firstSecond) or (local > lastSecond) then
+            let none: Option[Civil] := None();
+            return none;
+        end if;
+        let days: Int64 := floorDiv(local, secondsPerDay);
+        let clock: Int64 := local - (days * secondsPerDay);
+        let date: Ymd := civilFromDays(days);
+        let civil: Civil := Civil(
+            year => narrowInt32(date.year),
+            month => narrowNat8(date.month),
+            day => narrowNat8(date.day),
+            hour => narrowNat8(clock / secondsPerHour),
+            minute => narrowNat8(rem(clock, secondsPerHour) / sixty),
+            second => narrowNat8(rem(clock, sixty)),
+            nanos => instant.nanos
+        );
+        return Some(value => civil);
+    end;
+
+    function instantOf(civil: Civil, offset: Int32): Option[Instant] is
+        if not validCivil(civil) then
+            let none: Option[Instant] := None();
+            return none;
+        end if;
+        let instant: Instant := Instant(seconds => localSeconds(civil) - wideInt32(offset), nanos => civil.nanos);
+        return Some(value => instant);
+    end;
+
+    ---
+    --- The rule of a footer, the form of the variable TZ
+    ---
+
+    -- The day a rule names in a year: form 1 is Jn, the day n from 1 to 365
+    -- with February 29 never counted; form 2 is n, the day from 0 to 365
+    -- with it counted; form 3 is Mm.w.d, day d of the week (0 is Sunday)
+    -- in week w of month m, week 5 the last.
+    record DateRule: Free is
+        form: Int64;
+        first: Int64;
+        second: Int64;
+        third: Int64;
+    end;
+
+    -- The offsets east of UTC in seconds, and when daylight saving time
+    -- begins and ends, each a day and the seconds after the local midnight
+    -- of that day.  present is false for a zone without a footer rule.
+    record Rule: Free is
+        present: Bool;
+        standard: Int64;
+        hasDaylight: Bool;
+        daylight: Int64;
+        start: DateRule;
+        startTime: Int64;
+        finish: DateRule;
+        finishTime: Int64;
+        standardLength: Index;
+    end;
+
+    function noDateRule(): DateRule is
+        let rule: DateRule := DateRule(form => zero, first => zero, second => zero, third => zero);
+        return rule;
+    end;
+
+    function noRule(): Rule is
+        let rule: Rule := Rule(present => false, standard => zero, hasDaylight => false, daylight => zero,
+            start => noDateRule(), startTime => zero, finish => noDateRule(),
+            finishTime => zero, standardLength => zeroIndex);
+        return rule;
+    end;
+
+    -- What a step of reading gives: whether it worked, a number, and the
+    -- position after it.
+    record Step: Free is
+        ok: Bool;
+        value: Int64;
+        next: Index;
+    end;
+
+    function failed(at: Index): Step is
+        let step: Step := Step(ok => false, value => zero, next => at);
+        return step;
+    end;
+
+    function stepped(value: Int64, next: Index): Step is
+        let step: Step := Step(ok => true, value => value, next => next);
+        return step;
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    function isLetter(byte: Nat8): Bool is
+        return ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+    end;
+
+    function digitValue(byte: Nat8): Int64 is
+        return wideNat8(byte - '0');
+    end;
+
+    -- One to most digits from at, as a number.
+    generic [R: Region]
+    function digitsAt(text: Span[Nat8, R], at: Index, most: Index): Step is
+        let size: Index := spanLength(text);
+        var value: Int64 := zero;
+        var i: Index := at;
+        while (i < size) and (isDigit(text[i]) and ((i - at) < most)) do
+            value := (value * ten) + digitValue(text[i]);
+            i := i + 1;
+        end while;
+        if i = at then
+            return failed(at);
+        end if;
+        return stepped(value, i);
+    end;
+
+    -- A name of a zone rule: three or more letters, or, between angle
+    -- brackets, three or more letters, digits, plus and minus signs.  The
+    -- step's value is the position of the name's first byte, next the
+    -- position after it; the name ends before next, or before its closing
+    -- bracket.
+    generic [R: Region]
+    function ruleName(text: Span[Nat8, R], at: Index): Step is
+        let size: Index := spanLength(text);
+        if at >= size then
+            return failed(at);
+        end if;
+        if text[at] = '<' then
+            var i: Index := at + 1;
+            while (i < size) and (isLetter(text[i]) or (isDigit(text[i]) or ((text[i] = '+') or (text[i] = '-')))) do
+                i := i + 1;
+            end while;
+            if (i >= size) or ((text[i] /= '>') or ((i - (at + 1)) < 3)) then
+                return failed(at);
+            end if;
+            return stepped(wideIndex(at + 1), i + 1);
+        end if;
+        var j: Index := at;
+        while (j < size) and isLetter(text[j]) do
+            j := j + 1;
+        end while;
+        if (j - at) < 3 then
+            return failed(at);
+        end if;
+        return stepped(wideIndex(at), j);
+    end;
+
+    -- The end of the name a ruleName step read: next, or the closing
+    -- bracket before it.
+    generic [R: Region]
+    function nameStop(text: Span[Nat8, R], step: Step): Index is
+        if text[step.next - 1] = '>' then
+            return step.next - 1;
+        end if;
+        return step.next;
+    end;
+
+    -- A time [+|-]hh[:mm[:ss]] from at, in seconds, the hours at most
+    -- mostHours; signed says whether a sign may stand before it.
+    generic [R: Region]
+    function clockTime(text: Span[Nat8, R], at: Index, mostHours: Int64, signed: Bool): Step is
+        let size: Index := spanLength(text);
+        var i: Index := at;
+        var negative: Bool := false;
+        if signed and ((i < size) and ((text[i] = '+') or (text[i] = '-'))) then
+            negative := text[i] = '-';
+            i := i + 1;
+        end if;
+        let hours: Step := digitsAt(text, i, 3);
+        if (not hours.ok) or (hours.value > mostHours) then
+            return failed(at);
+        end if;
+        var total: Int64 := hours.value * secondsPerHour;
+        i := hours.next;
+        if (i < size) and (text[i] = ':') then
+            let minutes: Step := digitsAt(text, i + 1, 2);
+            if (not minutes.ok) or (minutes.value >= sixty) then
+                return failed(at);
+            end if;
+            total := total + (minutes.value * sixty);
+            i := minutes.next;
+            if (i < size) and (text[i] = ':') then
+                let seconds: Step := digitsAt(text, i + 1, 2);
+                if (not seconds.ok) or (seconds.value >= sixty) then
+                    return failed(at);
+                end if;
+                total := total + seconds.value;
+                i := seconds.next;
+            end if;
+        end if;
+        if negative then
+            return stepped(zero - total, i);
+        end if;
+        return stepped(total, i);
+    end;
+
+    -- A date rule from at: Jn, n or Mm.w.d.
+    record DateStep: Free is
+        ok: Bool;
+        rule: DateRule;
+        next: Index;
+    end;
+
+    function dateFailed(at: Index): DateStep is
+        let step: DateStep := DateStep(ok => false, rule => noDateRule(), next => at);
+        return step;
+    end;
+
+    generic [R: Region]
+    function dateRule(text: Span[Nat8, R], at: Index): DateStep is
+        let size: Index := spanLength(text);
+        if at >= size then
+            return dateFailed(at);
+        end if;
+        if text[at] = 'J' then
+            let day: Step := digitsAt(text, at + 1, 3);
+            if (not day.ok) or ((day.value < one) or (day.value > threeSixtyFive)) then
+                return dateFailed(at);
+            end if;
+            let rule: DateRule := DateRule(form => one, first => day.value, second => zero, third => zero);
+            let step: DateStep := DateStep(ok => true, rule => rule, next => day.next);
+            return step;
+        end if;
+        if text[at] = 'M' then
+            let month: Step := digitsAt(text, at + 1, 2);
+            if (not month.ok) or ((month.value < one) or ((month.value > twelve) or ((month.next >= size) or (text[month.next] /= '.')))) then
+                return dateFailed(at);
+            end if;
+            let week: Step := digitsAt(text, month.next + 1, 1);
+            if (not week.ok) or ((week.value < one) or ((week.value > five) or ((week.next >= size) or (text[week.next] /= '.')))) then
+                return dateFailed(at);
+            end if;
+            let day: Step := digitsAt(text, week.next + 1, 1);
+            if (not day.ok) or (day.value > six) then
+                return dateFailed(at);
+            end if;
+            let rule: DateRule := DateRule(form => three, first => month.value, second => week.value, third => day.value);
+            let step: DateStep := DateStep(ok => true, rule => rule, next => day.next);
+            return step;
+        end if;
+        let day: Step := digitsAt(text, at, 3);
+        if (not day.ok) or (day.value > threeSixtyFive) then
+            return dateFailed(at);
+        end if;
+        let rule: DateRule := DateRule(form => two, first => day.value, second => zero, third => zero);
+        let step: DateStep := DateStep(ok => true, rule => rule, next => day.next);
+        return step;
+    end;
+
+    -- A date rule and its optional /time, the time 02:00 when it is left
+    -- out.  The time may be negative and up to 167 hours, as version 3 of
+    -- RFC 8536 allows.
+    record Change: Free is
+        ok: Bool;
+        rule: DateRule;
+        time: Int64;
+        next: Index;
+    end;
+
+    generic [R: Region]
+    function change(text: Span[Nat8, R], at: Index): Change is
+        let size: Index := spanLength(text);
+        let date: DateStep := dateRule(text, at);
+        if not date.ok then
+            let bad: Change := Change(ok => false, rule => noDateRule(), time => zero, next => at);
+            return bad;
+        end if;
+        if (date.next < size) and (text[date.next] = '/') then
+            let time: Step := clockTime(text, date.next + 1, 167, true);
+            if not time.ok then
+                let bad: Change := Change(ok => false, rule => noDateRule(), time => zero, next => at);
+                return bad;
+            end if;
+            let made: Change := Change(ok => true, rule => date.rule, time => time.value, next => time.next);
+            return made;
+        end if;
+        let made: Change := Change(ok => true, rule => date.rule, time => two * secondsPerHour, next => date.next);
+        return made;
+    end;
+
+    -- A rule read, and its two names written into names: the standard one,
+    -- then the daylight one.
+    record RuleRead: Free is
+        ok: Bool;
+        rule: Rule;
+    end;
+
+    function ruleFailed(): RuleRead is
+        let read: RuleRead := RuleRead(ok => false, rule => noRule());
+        return read;
+    end;
+
+    generic [B: Region, R: Region]
+    function writeRange(out: &![StringBuilder, B], text: Span[Nat8, R], first: Index, stop: Index): Unit is
+        var i: Index := first;
+        while i < stop do
+            writeByte(&~out, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The whole of text as a rule: std offset [dst [offset] ,start,end].
+    -- A daylight name without the two changes is refused: POSIX leaves
+    -- their default to the system, and a zone file always gives them.
+    generic [R: Region, B: Region]
+    function readRule(text: Span[Nat8, R], names: &![StringBuilder, B]): RuleRead is
+        let size: Index := spanLength(text);
+        let standardName: Step := ruleName(text, zeroIndex);
+        if not standardName.ok then
+            return ruleFailed();
+        end if;
+        let standardOffset: Step := clockTime(text, standardName.next, twentyFour, true);
+        if not standardOffset.ok then
+            return ruleFailed();
+        end if;
+        let standardFirst: Index := narrowIndex(standardName.value);
+        let standardStop: Index := nameStop(text, standardName);
+        -- POSIX counts west of UTC as positive; this module counts east.
+        let standard: Int64 := zero - standardOffset.value;
+        if standardOffset.next = size then
+            writeRange(&~names, text, standardFirst, standardStop);
+            let rule: Rule := Rule(present => true, standard => standard, hasDaylight => false, daylight => standard,
+                start => noDateRule(), startTime => zero, finish => noDateRule(),
+                finishTime => zero, standardLength => standardStop - standardFirst);
+            let read: RuleRead := RuleRead(ok => true, rule => rule);
+            return read;
+        end if;
+        let daylightName: Step := ruleName(text, standardOffset.next);
+        if not daylightName.ok then
+            return ruleFailed();
+        end if;
+        var daylight: Int64 := standard + secondsPerHour;
+        var at: Index := daylightName.next;
+        if (at < size) and (text[at] /= ',') then
+            let daylightOffset: Step := clockTime(text, at, twentyFour, true);
+            if not daylightOffset.ok then
+                return ruleFailed();
+            end if;
+            daylight := zero - daylightOffset.value;
+            at := daylightOffset.next;
+        end if;
+        if (at >= size) or (text[at] /= ',') then
+            return ruleFailed();
+        end if;
+        let start: Change := change(text, at + 1);
+        if (not start.ok) or ((start.next >= size) or (text[start.next] /= ',')) then
+            return ruleFailed();
+        end if;
+        let finish: Change := change(text, start.next + 1);
+        if (not finish.ok) or (finish.next /= size) then
+            return ruleFailed();
+        end if;
+        writeRange(&~names, text, standardFirst, standardStop);
+        writeRange(&~names, text, narrowIndex(daylightName.value), nameStop(text, daylightName));
+        let rule: Rule := Rule(present => true, standard => standard, hasDaylight => true, daylight => daylight,
+            start => start.rule, startTime => start.time, finish => finish.rule,
+            finishTime => finish.time, standardLength => standardStop - standardFirst);
+        let read: RuleRead := RuleRead(ok => true, rule => rule);
+        return read;
+    end;
+
+    -- The day since 1970-01-01 that a date rule names in year.
+    function ruleDay(year: Int64, rule: DateRule): Int64 is
+        let january: Int64 := daysFromCivil(year, one, one);
+        if rule.form = one then
+            var day: Int64 := (january + rule.first) - one;
+            if isLeapYear(year) and (rule.first >= 60) then
+                day := day + one;
+            end if;
+            return day;
+        end if;
+        if rule.form = two then
+            return january + rule.first;
+        end if;
+        let firstDay: Int64 := daysFromCivil(year, rule.first, one);
+        -- 1970-01-01 was a Thursday, 4 when Sunday is 0.
+        let firstWeekday: Int64 := floorMod(firstDay + four, seven);
+        var day: Int64 := (firstDay + floorMod(rule.third - firstWeekday, seven)) + ((rule.second - one) * seven);
+        let lastDay: Int64 := (firstDay + daysInMonth(year, rule.first)) - one;
+        while day > lastDay do
+            day := day - seven;
+        end while;
+        return day;
+    end;
+
+    -- Whether daylight saving time is in force at seconds by the rule.  The
+    -- year is the one of seconds in standard time; outside the years 1 to
+    -- 9998 the rule is not asked and standard time holds.
+    function daylightByRule(rule: Rule, seconds: Int64): Bool is
+        if not rule.hasDaylight then
+            return false;
+        end if;
+        if (seconds < (firstSecond + (twoDays * 400))) or (seconds > (lastSecond - (twoDays * 400))) then
+            return false;
+        end if;
+        let date: Ymd := civilFromDays(floorDiv(seconds + rule.standard, secondsPerDay));
+        let year: Int64 := date.year;
+        let startsAt: Int64 := ((ruleDay(year, rule.start) * secondsPerDay) + rule.startTime) - rule.standard;
+        let endsAt: Int64 := ((ruleDay(year, rule.finish) * secondsPerDay) + rule.finishTime) - rule.daylight;
+        if startsAt < endsAt then
+            return (seconds >= startsAt) and (seconds < endsAt);
+        end if;
+        return not ((seconds >= endsAt) and (seconds < startsAt));
+    end;
+
+    ---
+    --- Zones
+    ---
+
+    -- A local time type of a zone file: its offset, whether it is daylight
+    -- saving time, and where its abbreviation begins in the names.
+    record Kind: Free is
+        offset: Int64;
+        daylight: Bool;
+        nameAt: Index;
+    end;
+
+    record Zone: Linear is
+        transitions: Buffer[Int64];
+        kinds: Buffer[Index];
+        types: Buffer[Kind];
+        names: String;
+        rule: Rule;
+        ruleNames: String;
+    end;
+
+    function destroyZone(zone: Zone): Unit is
+        let { transitions: Buffer[Int64], kinds: Buffer[Index], types: Buffer[Kind], names: String, rule: Rule, ruleNames: String } := zone;
+        destroyFree(transitions);
+        destroyFree(kinds);
+        destroyFree(types);
+        destroyString(names);
+        destroyString(ruleNames);
+        return nil;
+    end;
+
+    function utcZone(): Zone is
+        var types: Buffer[Kind] := allocateEmpty();
+        let utc: Kind := Kind(offset => zero, daylight => false, nameAt => zeroIndex);
+        insertBack(&!types, utc);
+        let transitions: Buffer[Int64] := allocateEmpty();
+        let kinds: Buffer[Index] := allocateEmpty();
+        let zone: Zone := Zone(transitions => transitions, kinds => kinds, types => types, names => fromLiteral("UTC"),
+            rule => noRule(), ruleNames => makeEmpty());
+        return zone;
+    end;
+
+    -- What holds at an instant: the offset, daylight saving time, and the
+    -- abbreviation -- in names from nameAt to the next zero byte when
+    -- fromRule is false, else the rule's standard or daylight name.
+    record Local: Free is
+        offset: Int64;
+        daylight: Bool;
+        fromRule: Bool;
+        nameAt: Index;
+    end;
+
+    function localOfKind(kind: Kind): Local is
+        let local: Local := Local(offset => kind.offset, daylight => kind.daylight, fromRule => false, nameAt => kind.nameAt);
+        return local;
+    end;
+
+    function localOfRule(rule: Rule, seconds: Int64): Local is
+        if daylightByRule(rule, seconds) then
+            let local: Local := Local(offset => rule.daylight, daylight => true, fromRule => true, nameAt => zeroIndex);
+            return local;
+        end if;
+        let local: Local := Local(offset => rule.standard, daylight => false, fromRule => true, nameAt => zeroIndex);
+        return local;
+    end;
+
+    generic [R: Region]
+    function lookup(zone: &[Zone, R], seconds: Int64): Local is
+        let transitions: &[Buffer[Int64], R] := &(zone->transitions);
+        let kinds: &[Buffer[Index], R] := &(zone->kinds);
+        let types: &[Buffer[Kind], R] := &(zone->types);
+        let rule: Rule := zone->rule;
+        let count: Index := bufferLength(transitions);
+        if count = zeroIndex then
+            if rule.present then
+                return localOfRule(rule, seconds);
+            end if;
+            return localOfKind(nth(types, zeroIndex));
+        end if;
+        -- Before the first transition the first type holds, RFC 8536
+        -- section 3.2.
+        if seconds < nth(transitions, zeroIndex) then
+            return localOfKind(nth(types, zeroIndex));
+        end if;
+        if (seconds >= nth(transitions, count - 1)) and rule.present then
+            return localOfRule(rule, seconds);
+        end if;
+        -- The last transition at or before seconds.
+        var low: Index := zeroIndex;
+        var high: Index := count - 1;
+        while low < high do
+            let middle: Index := ((low + high) + 1) / 2;
+            if nth(transitions, middle) <= seconds then
+                low := middle;
+            else
+                high := middle - 1;
+            end if;
+        end while;
+        return localOfKind(nth(types, nth(kinds, low)));
+    end;
+
+    generic [R: Region]
+    function offsetAt(zone: &[Zone, R], instant: Instant): Offset is
+        let local: Local := lookup(zone, instant.seconds);
+        let offset: Offset := Offset(seconds => narrowInt32(local.offset), daylight => local.daylight);
+        return offset;
+    end;
+
+    generic [R: Region]
+    function abbreviationAt(zone: &[Zone, R], instant: Instant): String is
+        let local: Local := lookup(zone, instant.seconds);
+        var out: StringBuilder := makeStringBuilder();
+        if local.fromRule then
+            let names: &[String, R] := &(zone->ruleNames);
+            let standardLength: Index := zone->rule.standardLength;
+            var i: Index := zeroIndex;
+            var stop: Index := standardLength;
+            if local.daylight then
+                i := standardLength;
+                stop := stringLength(names);
+            end if;
+            while i < stop do
+                writeByte(&!out, nthByte(names, i));
+                i := i + 1;
+            end while;
+        else
+            let names: &[String, R] := &(zone->names);
+            let size: Index := stringLength(names);
+            var i: Index := local.nameAt;
+            while (i < size) and (nthByte(names, i) /= 0) do
+                writeByte(&!out, nthByte(names, i));
+                i := i + 1;
+            end while;
+        end if;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function localAt(zone: &[Zone, R], instant: Instant): Option[Civil] is
+        let offset: Offset := offsetAt(zone, instant);
+        return civilAt(instant, offset.seconds);
+    end;
+
+    function instantAt(seconds: Int64, nanos: Nat32): Instant is
+        let instant: Instant := Instant(seconds => seconds, nanos => nanos);
+        return instant;
+    end;
+
+    generic [R: Region]
+    function resolveLocal(zone: &[Zone, R], civil: Civil): Resolved is
+        if not validCivil(civil) then
+            let none: Resolved := NotACivil();
+            return none;
+        end if;
+        let local: Int64 := localSeconds(civil);
+        -- The offsets two days before and after hold on each side of any
+        -- change near this time of day.
+        let beforeLocal: Local := lookup(zone, local - twoDays);
+        let afterLocal: Local := lookup(zone, local + twoDays);
+        let before: Int64 := beforeLocal.offset;
+        let after: Int64 := afterLocal.offset;
+        let early: Int64 := local - before;
+        let late: Int64 := local - after;
+        let earlyLocal: Local := lookup(zone, early);
+        let lateLocal: Local := lookup(zone, late);
+        let earlyHolds: Bool := earlyLocal.offset = before;
+        let lateHolds: Bool := lateLocal.offset = after;
+        if earlyHolds and lateHolds then
+            if early = late then
+                let once: Resolved := Exactly(instant => instantAt(early, civil.nanos));
+                return once;
+            end if;
+            var first: Int64 := early;
+            var second: Int64 := late;
+            if late < early then
+                first := late;
+                second := early;
+            end if;
+            let twice: Resolved := Twice(earlier => instantAt(first, civil.nanos), later => instantAt(second, civil.nanos));
+            return twice;
+        end if;
+        if earlyHolds then
+            let once: Resolved := Exactly(instant => instantAt(early, civil.nanos));
+            return once;
+        end if;
+        if lateHolds then
+            let once: Resolved := Exactly(instant => instantAt(late, civil.nanos));
+            return once;
+        end if;
+        let skipped: Resolved := Skipped(before => instantAt(late, civil.nanos), after => instantAt(early, civil.nanos));
+        return skipped;
+    end;
+
+    ---
+    --- Reading a zone file, RFC 8536
+    ---
+
+    generic [R: Region]
+    function unsignedAt(bytes: Span[Nat8, R], at: Index, count: Index): Nat64 is
+        var total: Nat64 := zeroNat;
+        var i: Index := zeroIndex;
+        while i < count do
+            case toNat64(bytes[at + i]) of
+                when Some(value as byteValue: Nat64) do
+                    total := (total * byteModulus) + byteValue;
+                when None do
+                    abort("Standard.Calendar: a byte did not fit a Nat64");
+            end case;
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    -- A count of the header: four bytes, at most largestFile.
+    generic [R: Region]
+    function countAt(bytes: Span[Nat8, R], at: Index): Option[Index] is
+        let raw: Nat64 := unsignedAt(bytes, at, 4);
+        case toIndex(raw) of
+            when Some(value as count: Index) do
+                if count > largestFile then
+                    let none: Option[Index] := None();
+                    return none;
+                end if;
+                return Some(value => count);
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    -- A signed 32-bit number of four bytes.
+    generic [R: Region]
+    function signed32At(bytes: Span[Nat8, R], at: Index): Int64 is
+        let raw: Nat64 := unsignedAt(bytes, at, 4);
+        case toInt64(raw) of
+            when Some(value as wide: Int64) do
+                if raw >= twoPow31 then
+                    return wide - twoPow32;
+                end if;
+                return wide;
+            when None do
+                abort("Standard.Calendar: four bytes did not fit an Int64");
+        end case;
+    end;
+
+    -- A signed 64-bit number of eight bytes: raw minus two to the 64 when
+    -- raw is two to the 63 or more, written so that nothing overflows.
+    generic [R: Region]
+    function signed64At(bytes: Span[Nat8, R], at: Index): Int64 is
+        let raw: Nat64 := unsignedAt(bytes, at, 8);
+        if raw < twoPow63 then
+            case toInt64(raw) of
+                when Some(value as wide: Int64) do
+                    return wide;
+                when None do
+                    abort("Standard.Calendar: a checked value did not fit an Int64");
+            end case;
+        end if;
+        case toInt64(maximum_nat64 - raw) of
+            when Some(value as below: Int64) do
+                return (zero - below) - one;
+            when None do
+                abort("Standard.Calendar: a checked value did not fit an Int64");
+        end case;
+    end;
+
+    -- The six counts of a header: isutcnt, isstdcnt, leapcnt, timecnt,
+    -- typecnt, charcnt.
+    record Counts: Free is
+        ok: Bool;
+        utc: Index;
+        standard: Index;
+        leap: Index;
+        times: Index;
+        types: Index;
+        chars: Index;
+    end;
+
+    generic [R: Region]
+    function header(bytes: Span[Nat8, R], at: Index): Counts is
+        let bad: Counts := Counts(ok => false, utc => zeroIndex, standard => zeroIndex, leap => zeroIndex,
+            times => zeroIndex, types => zeroIndex, chars => zeroIndex);
+        if (spanLength(bytes) < (at + 44)) or ((bytes[at] /= 'T') or ((bytes[at + 1] /= 'Z') or ((bytes[at + 2] /= 'i') or (bytes[at + 3] /= 'f')))) then
+            return bad;
+        end if;
+        var found: Buffer[Index] := allocateEmpty();
+        var ok: Bool := true;
+        var k: Index := zeroIndex;
+        while k < 6 do
+            case countAt(bytes, (at + 20) + (k * 4)) of
+                when Some(value as count: Index) do
+                    insertBack(&!found, count);
+                when None do
+                    ok := false;
+                    insertBack(&!found, zeroIndex);
+            end case;
+            k := k + 1;
+        end while;
+        let counts: Counts := Counts(ok => ok, utc => nth(&found, 0), standard => nth(&found, 1), leap => nth(&found, 2),
+            times => nth(&found, 3), types => nth(&found, 4), chars => nth(&found, 5));
+        destroyFree(found);
+        -- RFC 8536 section 3.1: a type and a character at least, and the
+        -- indicator counts either zero or one per type.
+        if (not counts.ok) or ((counts.types = zeroIndex) or (counts.chars = zeroIndex)) then
+            return bad;
+        end if;
+        if ((counts.utc /= zeroIndex) and (counts.utc /= counts.types)) or ((counts.standard /= zeroIndex) and (counts.standard /= counts.types)) then
+            return bad;
+        end if;
+        return counts;
+    end;
+
+    -- The size of a data block with times of width bytes.
+    function blockSize(counts: Counts, width: Index): Index is
+        return ((((((counts.times * width) + counts.times) + (counts.types * 6)) + counts.chars) + (counts.leap * (width + 4))) + counts.standard) + counts.utc;
+    end;
+
+    -- The parts of a zone file read into buffers, and whether they are
+    -- good.
+    record Parts: Linear is
+        ok: Bool;
+        transitions: Buffer[Int64];
+        kinds: Buffer[Index];
+        types: Buffer[Kind];
+        names: String;
+        rule: Rule;
+        ruleNames: String;
+    end;
+
+    -- The second data block from at and the footer after it.  Every part is
+    -- read only when the block fits, and ok says whether all of it was as
+    -- RFC 8536 asks.
+    generic [R: Region]
+    function readBlock(bytes: Span[Nat8, R], at: Index, counts: Counts): Parts is
+        let size: Index := spanLength(bytes);
+        var transitions: Buffer[Int64] := allocateEmpty();
+        var kinds: Buffer[Index] := allocateEmpty();
+        var types: Buffer[Kind] := allocateEmpty();
+        var names: StringBuilder := makeStringBuilder();
+        var ruleNames: StringBuilder := makeStringBuilder();
+        var rule: Rule := noRule();
+        let footer: Index := at + blockSize(counts, 8);
+        -- The block, then the footer: a line feed, the rule, a line feed,
+        -- and the end of the file.
+        var good: Bool := (footer + 1) < size;
+        if good then
+            let indices: Index := at + (counts.times * 8);
+            let records: Index := indices + counts.times;
+            let chars: Index := records + (counts.types * 6);
+            -- The transitions, strictly ascending, each with a type that
+            -- exists.
+            var i: Index := zeroIndex;
+            while i < counts.times do
+                let moment: Int64 := signed64At(bytes, at + (i * 8));
+                if (i > zeroIndex) and (moment <= nth(&transitions, i - 1)) then
+                    good := false;
+                end if;
+                insertBack(&!transitions, moment);
+                let kind: Index := narrowIndex(wideNat8(bytes[indices + i]));
+                if kind >= counts.types then
+                    good := false;
+                end if;
+                insertBack(&!kinds, kind);
+                i := i + 1;
+            end while;
+            -- The local time types: an offset within the range RFC 8536
+            -- recommends, a daylight flag of 0 or 1, and an abbreviation
+            -- that begins inside the names.
+            var j: Index := zeroIndex;
+            while j < counts.types do
+                let base: Index := records + (j * 6);
+                let offset: Int64 := signed32At(bytes, base);
+                let flag: Nat8 := bytes[base + 4];
+                let nameAt: Index := narrowIndex(wideNat8(bytes[base + 5]));
+                if (offset < lowestOffset) or ((offset > highestOffset) or ((flag > 1) or (nameAt >= counts.chars))) then
+                    good := false;
+                end if;
+                let kind: Kind := Kind(offset => offset, daylight => flag = 1, nameAt => nameAt);
+                insertBack(&!types, kind);
+                j := j + 1;
+            end while;
+            var c: Index := zeroIndex;
+            while c < counts.chars do
+                writeByte(&!names, bytes[chars + c]);
+                c := c + 1;
+            end while;
+            var k: Index := footer + 1;
+            while (k < (size - 1)) and (bytes[k] /= 10) do
+                k := k + 1;
+            end while;
+            if (bytes[footer] /= 10) or ((k /= (size - 1)) or (bytes[k] /= 10)) then
+                good := false;
+            else if k > (footer + 1) then
+                let ruleText: String := copyRange(bytes, footer + 1, k);
+                let read: RuleRead := readRule(asSpan(&ruleText), &!ruleNames);
+                destroyString(ruleText);
+                if read.ok then
+                    rule := read.rule;
+                else
+                    good := false;
+                end if;
+            end if;
+        end if;
+        let parts: Parts := Parts(ok => good, transitions => transitions, kinds => kinds, types => types,
+            names => finalize(names), rule => rule, ruleNames => finalize(ruleNames));
+        return parts;
+    end;
+
+    generic [R: Region]
+    function copyRange(bytes: Span[Nat8, R], first: Index, stop: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := first;
+        while i < stop do
+            writeByte(&!out, bytes[i]);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- A zone from the bytes of a zone file of version 2 or later.
+    generic [R: Region]
+    function readZone(data: Span[Nat8, R]): Either[ZoneFailure, Zone] is
+        let first: Counts := header(data, zeroIndex);
+        if not first.ok then
+            let refused: Either[ZoneFailure, Zone] := Left(left => ZoneMalformed());
+            return refused;
+        end if;
+        -- Version 2 or later, which carries the 64-bit block and the
+        -- footer; header has checked that the file holds 44 bytes.
+        if data[4] < '2' then
+            let refused: Either[ZoneFailure, Zone] := Left(left => ZoneMalformed());
+            return refused;
+        end if;
+        let second: Index := blockSize(first, 4) + 44;
+        let counts: Counts := header(data, second);
+        if not counts.ok then
+            let refused: Either[ZoneFailure, Zone] := Left(left => ZoneMalformed());
+            return refused;
+        end if;
+        let parts: Parts := readBlock(data, second + 44, counts);
+        let { ok: Bool, transitions: Buffer[Int64], kinds: Buffer[Index], types: Buffer[Kind], names: String, rule: Rule, ruleNames: String } := parts;
+        let zone: Zone := Zone(transitions => transitions, kinds => kinds, types => types, names => names, rule => rule, ruleNames => ruleNames);
+        if ok then
+            let made: Either[ZoneFailure, Zone] := Right(right => zone);
+            return made;
+        else
+            destroyZone(zone);
+            let refused: Either[ZoneFailure, Zone] := Left(left => ZoneMalformed());
+            return refused;
+        end if;
+    end;
+
+    generic [R: Region]
+    function loadZoneFile(path: Span[Nat8, R]): Either[ZoneFailure, Zone] is
+        -- An ordinary file only: a device or a fifo could be read without
+        -- end.
+        if not sameKind(kindOfTarget(path), kindRegular) then
+            let missing: Either[ZoneFailure, Zone] := Left(left => ZoneMissing());
+            return missing;
+        end if;
+        case openRead(path) of
+            when None do
+                let missing: Either[ZoneFailure, Zone] := Left(left => ZoneMissing());
+                return missing;
+            when Some(value as file: FileDescriptor) do
+                case readZoneBytes(file) of
+                    when Left(left as why: ZoneFailure) do
+                        let notLoaded: Either[ZoneFailure, Zone] := Left(left => why);
+                        return notLoaded;
+                    when Right(right as bytes: String) do
+                        if stringLength(&bytes) > largestFile then
+                            destroyString(bytes);
+                            let refused: Either[ZoneFailure, Zone] := Left(left => ZoneMalformed());
+                            return refused;
+                        else
+                            let zone: Either[ZoneFailure, Zone] := readZone(asSpan(&bytes));
+                            destroyString(bytes);
+                            return zone;
+                        end if;
+                end case;
+        end case;
+    end;
+
+    -- The bytes of an opened zone file, which is closed on every path.  The
+    -- size is asked before a byte is read: the path may come from TZ, and
+    -- reading a file of any size first would let the environment decide
+    -- how much memory this takes.  A larger file is ZoneMalformed, one that
+    -- cannot be read ZoneMissing.  loadZoneFile checks the length again
+    -- after the read, for a file that grew in between.
+    function readZoneBytes(file: FileDescriptor): Either[ZoneFailure, String] is
+        var opened: FileDescriptor := file;
+        var small: Bool := false;
+        case statusOfOpen(&opened) of
+            when Some(value as status: FileStatus) do
+                small := status.size <= largestFileSize;
+            when None do
+                small := false;
+        end case;
+        if small then
+            let content: Option[String] := readAll(&!opened);
+            let closed: Bool := closeFile(opened);
+            case content of
+                when Some(value as bytes: String) do
+                    let read: Either[ZoneFailure, String] := Right(right => bytes);
+                    return read;
+                when None do
+                    let missing: Either[ZoneFailure, String] := Left(left => ZoneMissing());
+                    return missing;
+            end case;
+        else
+            let closed: Bool := closeFile(opened);
+            let refused: Either[ZoneFailure, String] := Left(left => ZoneMalformed());
+            return refused;
+        end if;
+    end;
+
+    -- A name of the zone database: letters, digits, slash, underscore,
+    -- hyphen and plus, parts between slashes not empty, at most 255 bytes.
+    generic [R: Region]
+    function validZoneName(name: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(name);
+        if (size = zeroIndex) or (size > 255) then
+            return false;
+        end if;
+        var previous: Nat8 := '/';
+        var i: Index := zeroIndex;
+        while i < size do
+            let byte: Nat8 := name[i];
+            if byte = '/' then
+                if previous = '/' then
+                    return false;
+                end if;
+            else if not (isLetter(byte) or (isDigit(byte) or ((byte = '_') or ((byte = '-') or (byte = '+'))))) then
+                return false;
+            end if;
+            previous := byte;
+            i := i + 1;
+        end while;
+        return previous /= '/';
+    end;
+
+    generic [R: Region]
+    function loadZone(name: Span[Nat8, R]): Either[ZoneFailure, Zone] is
+        if not validZoneName(name) then
+            let refused: Either[ZoneFailure, Zone] := Left(left => NotAZoneName());
+            return refused;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/usr/share/zoneinfo/");
+        writeString(&!out, name);
+        let path: String := finalize(out);
+        let zone: Either[ZoneFailure, Zone] := loadZoneFile(asSpan(&path));
+        destroyString(path);
+        return zone;
+    end;
+
+    generic [R: Region]
+    function zoneOfRule(rule: Span[Nat8, R]): Either[ZoneFailure, Zone] is
+        var names: StringBuilder := makeStringBuilder();
+        let read: RuleRead := readRule(rule, &!names);
+        let ruleNames: String := finalize(names);
+        if not read.ok then
+            destroyString(ruleNames);
+            let refused: Either[ZoneFailure, Zone] := Left(left => ZoneMalformed());
+            return refused;
+        else
+            var types: Buffer[Kind] := allocateEmpty();
+            let standard: Kind := Kind(offset => read.rule.standard, daylight => false, nameAt => zeroIndex);
+            insertBack(&!types, standard);
+            let transitions: Buffer[Int64] := allocateEmpty();
+            let kinds: Buffer[Index] := allocateEmpty();
+            let zone: Zone := Zone(transitions => transitions, kinds => kinds, types => types, names => makeEmpty(),
+                rule => read.rule, ruleNames => ruleNames);
+            let made: Either[ZoneFailure, Zone] := Right(right => zone);
+            return made;
+        end if;
+    end;
+
+    function localZone(): Either[ZoneFailure, Zone] is
+        case environmentValue("TZ") of
+            when None do
+                return loadZoneFile("/etc/localtime");
+            when Some(value as setting: String) do
+                let zone: Either[ZoneFailure, Zone] := zoneOfSetting(&setting);
+                destroyString(setting);
+                return zone;
+        end case;
+    end;
+
+    -- The zone the value of TZ names: empty is UTC, a leading colon is
+    -- taken away, a leading slash is a path, a zone name is loaded, and
+    -- anything else is read as a rule.
+    generic [R: Region]
+    function zoneOfSetting(setting: &[String, R]): Either[ZoneFailure, Zone] is
+        let size: Index := stringLength(setting);
+        if size = zeroIndex then
+            let utc: Either[ZoneFailure, Zone] := Right(right => utcZone());
+            return utc;
+        end if;
+        let colon: Index := 1;
+        var first: Index := zeroIndex;
+        if nthByte(setting, zeroIndex) = ':' then
+            first := colon;
+        end if;
+        if first = size then
+            let utc: Either[ZoneFailure, Zone] := Right(right => utcZone());
+            return utc;
+        end if;
+        let rest: Span[Nat8, R] := getSpan(setting, first, size - 1);
+        if rest[zeroIndex] = '/' then
+            return loadZoneFile(rest);
+        end if;
+        if validZoneName(rest) then
+            case loadZone(rest) of
+                when Right(right as zone: Zone) do
+                    let found: Either[ZoneFailure, Zone] := Right(right => zone);
+                    return found;
+                when Left(left as why: ZoneFailure) do
+                    skip;
+            end case;
+        end if;
+        return zoneOfRule(rest);
+    end;
+
+    ---
+    --- RFC 3339
+    ---
+
+    generic [B: Region]
+    function writeDigits(out: &![StringBuilder, B], value: Int64, width: Int64): Unit is
+        var divisor: Int64 := one;
+        var k: Int64 := one;
+        while k < width do
+            divisor := divisor * ten;
+            k := k + one;
+        end while;
+        var rest: Int64 := value;
+        while divisor > zero do
+            writeByte(&~out, narrowNat8(rest / divisor) + '0');
+            rest := rem(rest, divisor);
+            divisor := divisor / ten;
+        end while;
+        return nil;
+    end;
+
+    function formatRfc3339(instant: Instant, offset: Int32): Option[String] is
+        let wide: Int64 := wideInt32(offset);
+        let most: Int64 := (twentyFour * secondsPerHour) - sixty;
+        if (rem(wide, sixty) /= zero) or ((wide > most) or (wide < (zero - most))) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case civilAt(instant, offset) of
+            when None do
+                let none: Option[String] := None();
+                return none;
+            when Some(value as civil: Civil) do
+                var out: StringBuilder := makeStringBuilder();
+                writeDigits(&!out, wideInt32(civil.year), four);
+                writeByte(&!out, '-');
+                writeDigits(&!out, wideNat8(civil.month), two);
+                writeByte(&!out, '-');
+                writeDigits(&!out, wideNat8(civil.day), two);
+                writeByte(&!out, 'T');
+                writeDigits(&!out, wideNat8(civil.hour), two);
+                writeByte(&!out, ':');
+                writeDigits(&!out, wideNat8(civil.minute), two);
+                writeByte(&!out, ':');
+                writeDigits(&!out, wideNat8(civil.second), two);
+                if civil.nanos > 0 then
+                    var fraction: Int64 := wideNat32(civil.nanos);
+                    var digits: Int64 := nine;
+                    while rem(fraction, ten) = zero do
+                        fraction := fraction / ten;
+                        digits := digits - one;
+                    end while;
+                    writeByte(&!out, '.');
+                    writeDigits(&!out, fraction, digits);
+                end if;
+                if wide = zero then
+                    writeByte(&!out, 'Z');
+                else
+                    var magnitude: Int64 := wide;
+                    if wide < zero then
+                        writeByte(&!out, '-');
+                        magnitude := zero - wide;
+                    else
+                        writeByte(&!out, '+');
+                    end if;
+                    writeDigits(&!out, magnitude / secondsPerHour, two);
+                    writeByte(&!out, ':');
+                    writeDigits(&!out, rem(magnitude, secondsPerHour) / sixty, two);
+                end if;
+                return Some(value => finalize(out));
+        end case;
+    end;
+
+    -- Exactly count digits at at, as a number, or -1.
+    generic [R: Region]
+    function fixedDigits(text: Span[Nat8, R], at: Index, count: Index): Int64 is
+        if (at + count) > spanLength(text) then
+            return zero - one;
+        end if;
+        var value: Int64 := zero;
+        var i: Index := zeroIndex;
+        while i < count do
+            if not isDigit(text[at + i]) then
+                return zero - one;
+            end if;
+            value := (value * ten) + digitValue(text[at + i]);
+            i := i + 1;
+        end while;
+        return value;
+    end;
+
+    generic [R: Region]
+    function parseRfc3339(text: Span[Nat8, R]): Option[Stamp] is
+        let none: Option[Stamp] := None();
+        let size: Index := spanLength(text);
+        if size < 20 then
+            return none;
+        end if;
+        let year: Int64 := fixedDigits(text, zeroIndex, 4);
+        let month: Int64 := fixedDigits(text, 5, 2);
+        let day: Int64 := fixedDigits(text, 8, 2);
+        let hour: Int64 := fixedDigits(text, 11, 2);
+        let minute: Int64 := fixedDigits(text, 14, 2);
+        let second: Int64 := fixedDigits(text, 17, 2);
+        if (year < zero) or ((month < zero) or ((day < zero) or ((hour < zero) or ((minute < zero) or (second < zero))))) then
+            return none;
+        end if;
+        if (text[4] /= '-') or ((text[7] /= '-') or (((text[10] /= 'T') and (text[10] /= 't')) or ((text[13] /= ':') or (text[16] /= ':')))) then
+            return none;
+        end if;
+        -- The date and the time must exist; a second 60 is refused.
+        if (month < one) or ((month > twelve) or ((day < one) or (day > daysInMonth(year, month)))) then
+            return none;
+        end if;
+        if (hour >= twentyFour) or ((minute >= sixty) or (second >= sixty)) then
+            return none;
+        end if;
+        var at: Index := 19;
+        var nanos: Int64 := zero;
+        if text[at] = '.' then
+            var digits: Index := zeroIndex;
+            at := at + 1;
+            while (at < size) and isDigit(text[at]) do
+                if digits >= 9 then
+                    return none;
+                end if;
+                nanos := (nanos * ten) + digitValue(text[at]);
+                digits := digits + 1;
+                at := at + 1;
+            end while;
+            if digits = zeroIndex then
+                return none;
+            end if;
+            while digits < 9 do
+                nanos := nanos * ten;
+                digits := digits + 1;
+            end while;
+        end if;
+        if at >= size then
+            return none;
+        end if;
+        var offset: Int64 := zero;
+        if (text[at] = 'Z') or (text[at] = 'z') then
+            if (at + 1) /= size then
+                return none;
+            end if;
+        else
+            if ((text[at] /= '+') and (text[at] /= '-')) or (((at + 6) /= size) or (text[at + 3] /= ':')) then
+                return none;
+            end if;
+            let offsetHours: Int64 := fixedDigits(text, at + 1, 2);
+            let offsetMinutes: Int64 := fixedDigits(text, at + 4, 2);
+            if (offsetHours < zero) or ((offsetHours >= twentyFour) or ((offsetMinutes < zero) or (offsetMinutes >= sixty))) then
+                return none;
+            end if;
+            offset := (offsetHours * secondsPerHour) + (offsetMinutes * sixty);
+            if text[at] = '-' then
+                offset := zero - offset;
+            end if;
+        end if;
+        let local: Int64 := ((daysFromCivil(year, month, day) * secondsPerDay) + ((hour * secondsPerHour) + (minute * sixty))) + second;
+        let instant: Instant := Instant(seconds => local - offset, nanos => narrowNat32(nanos));
+        let stamp: Stamp := Stamp(instant => instant, offset => narrowInt32(offset));
+        return Some(value => stamp);
+    end;
+end module body.

@@ -1,0 +1,1364 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    destroyFree,
+    length,
+    nth,
+    nthRef,
+    storeNth,
+    swapNth,
+    insertBack,
+    remove,
+    removeFirst,
+    removeLast
+);
+import Standard.String (
+    String,
+    makeEmpty,
+    fromSpan,
+    destroyString,
+    length as textLength,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+
+module body Standard.Raft is
+    -- The generator of the election timeouts, a common 64-bit linear
+    -- congruential one, and the numbers that cut its state down to a spread.
+    constant multiplier: Nat64 := 6364136223846793005;
+    constant increment: Nat64 := 1442695040888963407;
+    constant highBits: Nat64 := 8589934592;
+    constant spreadRange: Nat64 := 65536;
+    constant byteMask: Nat64 := 255;
+    constant byteBase: Nat64 := 256;
+    constant firstIndex: Nat64 := 1;
+
+    ---
+    --- Numbers
+    ---
+
+    function nat(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                abort("Standard.Raft: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function logSlot(value: Nat64): Index is
+        case toIndex(value) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.Raft: a log index did not fit an Index");
+        end case;
+    end;
+
+    function majority(count: Nat64): Nat64 is
+        return (count / 2) + 1;
+    end;
+
+    function entryCommand(): Nat8 is
+        return 0;
+    end;
+
+    function entryAddMember(): Nat8 is
+        return 1;
+    end;
+
+    function entryRemoveMember(): Nat8 is
+        return 2;
+    end;
+
+    function entryEmpty(): Nat8 is
+        return 3;
+    end;
+
+    function messageVote(): Nat8 is
+        return 1;
+    end;
+
+    function messageVoteReply(): Nat8 is
+        return 2;
+    end;
+
+    function messageAppend(): Nat8 is
+        return 3;
+    end;
+
+    function messageAppendReply(): Nat8 is
+        return 4;
+    end;
+
+    function messageSnapshot(): Nat8 is
+        return 5;
+    end;
+
+    function messageSnapshotReply(): Nat8 is
+        return 6;
+    end;
+
+    ---
+    --- Entries and messages
+    ---
+
+    function noEntries(): Buffer[Entry] is
+        return allocateEmpty();
+    end;
+
+    function noIds(): Buffer[Nat64] is
+        return allocateEmpty();
+    end;
+
+    function noMessages(): Buffer[Message] is
+        return allocateEmpty();
+    end;
+
+    function destroyEntry(entry: Entry): Unit is
+        let { term: Nat64, kind: Nat8, data: String } := entry;
+        destroyString(data);
+        return nil;
+    end;
+
+    function destroyEntries(entries: Buffer[Entry]): Unit is
+        var rest: Buffer[Entry] := entries;
+        while length(&rest) > 0 do
+            destroyEntry(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function copyEntry(entry: &[Entry, R]): Entry is
+        return Entry(term => (entry->term), kind => (entry->kind), data => fromSpan(asSpan(&(entry->data))));
+    end;
+
+    generic [R: Region]
+    function copyIds(ids: &[Buffer[Nat64], R]): Buffer[Nat64] is
+        var out: Buffer[Nat64] := allocateEmpty();
+        var i: Index := 0;
+        while i < length(ids) do
+            insertBack(&!out, nth(ids, i));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region]
+    function hasId(ids: &[Buffer[Nat64], R], id: Nat64): Bool is
+        var i: Index := 0;
+        while i < length(ids) do
+            if nth(ids, i) = id then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region]
+    function dropId(ids: &![Buffer[Nat64], R], id: Nat64): Unit is
+        var i: Index := 0;
+        while i < length(&ids) do
+            if nth(&ids, i) = id then
+                let gone: Nat64 := remove(&~ids, i);
+            else
+                i := i + 1;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function clearIds(ids: &![Buffer[Nat64], R]): Unit is
+        while length(&ids) > 0 do
+            let gone: Nat64 := removeLast(&~ids);
+        end while;
+        return nil;
+    end;
+
+    -- ids gets the elements of source, in their order, and nothing else.
+    generic [R: Region]
+    function fillIds(ids: &![Buffer[Nat64], R], source: Buffer[Nat64]): Unit is
+        clearIds(&~ids);
+        var i: Index := 0;
+        while i < length(&source) do
+            insertBack(&~ids, nth(&source, i));
+            i := i + 1;
+        end while;
+        destroyFree(source);
+        return nil;
+    end;
+
+    function encodeId(id: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        var shift: Nat64 := 72057594037927936;
+        while shift > 0 do
+            case toNat8(bitwiseAnd(id / shift, byteMask)) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&!out, byte);
+                when None do
+                    abort("Standard.Raft: a byte did not fit a Nat8");
+            end case;
+            shift := shift / 256;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function decodeId(data: Span[Nat8, R]): Nat64 is
+        if spanLength(data) /= 8 then
+            return 0;
+        end if;
+        var id: Nat64 := 0;
+        var i: Index := 0;
+        while i < 8 do
+            case toNat64(data[i]) of
+                when Some(value as wide: Nat64) do
+                    id := modularAdd(modularMultiply(id, byteBase), wide);
+                when None do
+                    abort("Standard.Raft: a byte did not fit a Nat64");
+            end case;
+            i := i + 1;
+        end while;
+        return id;
+    end;
+
+    -- A member added or removed by a change entry; other entries change
+    -- nothing.
+    generic [R: Region, E: Region]
+    function applyChange(ids: &![Buffer[Nat64], R], entry: &[Entry, E]): Unit is
+        let member: Nat64 := decodeId(asSpan(&(entry->data)));
+        if member = 0 then
+            return nil;
+        end if;
+        if (entry->kind = entryAddMember()) and (not hasId(&ids, member)) then
+            insertBack(&~ids, member);
+        else if (entry->kind) = entryRemoveMember() then
+            dropId(&~ids, member);
+        end if;
+        return nil;
+    end;
+
+    function destroyMessage(message: Message): Unit is
+        let { kind: Nat8, sender: Nat64, receiver: Nat64, term: Nat64, index: Nat64, logTerm: Nat64, commit: Nat64,
+            success: Bool, hint: Nat64, entries: Buffer[Entry], snapshot: String, members: Buffer[Nat64] } := message;
+        destroyEntries(entries);
+        destroyString(snapshot);
+        destroyFree(members);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function isWellFormed(message: &[Message, R]): Bool is
+        let kind: Nat8 := (message->kind);
+        if (kind < messageVote()) or (kind > messageSnapshotReply()) then
+            return false;
+        end if;
+        if ((message->sender = 0) or (message->receiver = 0)) or (message->sender = (message->receiver)) then
+            return false;
+        end if;
+        if (kind /= messageAppend()) and (length(&(message->entries)) > 0) then
+            return false;
+        end if;
+        if (kind /= messageSnapshot()) and ((textLength(&(message->snapshot)) > 0) or (length(&(message->members)) > 0)) then
+            return false;
+        end if;
+        return true;
+    end;
+
+    ---
+    --- The node
+    ---
+
+    -- What the leader knows of one other member: the next index to send
+    -- and the last index known to be in its log.
+    record Progress: Free is
+        id: Nat64;
+        next: Nat64;
+        matched: Nat64;
+    end;
+
+    function noProgress(): Buffer[Progress] is
+        return allocateEmpty();
+    end;
+
+    -- snapshot holds exactly one string, the state the snapshot stands
+    -- for; it is swapped, not rebuilt.  restore is set while a snapshot
+    -- installed from the leader has not been given to the state machine.
+    record Node: Linear is
+        id: Nat64;
+        electionTicks: Nat32;
+        heartbeatTicks: Nat32;
+        quorum: Fn[Nat64, Nat64];
+        random: Nat64;
+        role: Nat8;
+        term: Nat64;
+        votedFor: Nat64;
+        leader: Nat64;
+        members: Buffer[Nat64];
+        log: Buffer[Entry];
+        snapshotIndex: Nat64;
+        snapshotTerm: Nat64;
+        snapshot: Buffer[String];
+        snapshotMembers: Buffer[Nat64];
+        restore: Bool;
+        commit: Nat64;
+        applied: Nat64;
+        electionElapsed: Nat32;
+        electionTimeout: Nat32;
+        heartbeatElapsed: Nat32;
+        votes: Buffer[Nat64];
+        progress: Buffer[Progress];
+        outbox: Buffer[Message];
+        lastChange: Nat64;
+        invariant applied <= commit;
+        invariant snapshotIndex <= commit;
+        invariant restore or (snapshotIndex <= applied);
+        invariant role <= 2;
+        invariant id > 0;
+        invariant electionTicks > heartbeatTicks;
+    end;
+
+    constant noId: Nat64 := 0;
+    constant noTicks: Nat32 := 0;
+    constant follower: Nat8 := 0;
+    constant candidate: Nat8 := 1;
+    constant leading: Nat8 := 2;
+
+    -- The next number of a linear congruential generator, for the
+    -- election timeouts only; it needs to differ between nodes, not to
+    -- be unpredictable.
+    generic [R: Region]
+    function nextTimeout(node: &![Node, R]): Nat32 is
+        node->random := modularAdd(modularMultiply(node->random, multiplier), increment);
+        let spread: Nat64 := rem(node->random / highBits, spreadRange);
+        case toNat64(node->electionTicks) of
+            when Some(value as ticks: Nat64) do
+                case toNat32(ticks + rem(spread, ticks)) of
+                    when Some(value as timeout: Nat32) do
+                        return timeout;
+                    when None do
+                        abort("Standard.Raft: an election timeout did not fit a Nat32");
+                end case;
+            when None do
+                abort("Standard.Raft: a Nat32 did not fit a Nat64");
+        end case;
+    end;
+
+    function newNode(config: Config, members: Buffer[Nat64]): Node is
+        var snapshot: Buffer[String] := allocateEmpty();
+        insertBack(&!snapshot, makeEmpty());
+        let snapshotMembers: Buffer[Nat64] := copyIds(&members);
+        var node: Node := Node(
+            id => config.id,
+            electionTicks => config.electionTicks,
+            heartbeatTicks => config.heartbeatTicks,
+            quorum => config.quorum,
+            random => bitwiseXor(config.seed, config.id),
+            role => follower,
+            term => 0,
+            votedFor => 0,
+            leader => 0,
+            members => members,
+            log => noEntries(),
+            snapshotIndex => 0,
+            snapshotTerm => 0,
+            snapshot => snapshot,
+            snapshotMembers => snapshotMembers,
+            restore => false,
+            commit => 0,
+            applied => 0,
+            electionElapsed => 0,
+            electionTimeout => config.electionTicks,
+            heartbeatElapsed => 0,
+            votes => noIds(),
+            progress => noProgress(),
+            outbox => noMessages(),
+            lastChange => 0
+        );
+        let first: Nat32 := nextTimeout(&!node);
+        node.electionTimeout := first;
+        return node;
+    end;
+
+    function destroyNode(node: Node): Unit is
+        let { id: Nat64, electionTicks: Nat32, heartbeatTicks: Nat32, quorum: Fn[Nat64, Nat64], random: Nat64,
+            role: Nat8, term: Nat64, votedFor: Nat64, leader: Nat64, members: Buffer[Nat64], log: Buffer[Entry],
+            snapshotIndex: Nat64, snapshotTerm: Nat64, snapshot: Buffer[String], snapshotMembers: Buffer[Nat64],
+            restore: Bool, commit: Nat64, applied: Nat64, electionElapsed: Nat32, electionTimeout: Nat32,
+            heartbeatElapsed: Nat32, votes: Buffer[Nat64], progress: Buffer[Progress], outbox: Buffer[Message],
+            lastChange: Nat64 } := node;
+        destroyFree(members);
+        destroyEntries(log);
+        var strings: Buffer[String] := snapshot;
+        while length(&strings) > 0 do
+            destroyString(removeLast(&!strings));
+        end while;
+        destroyEmpty(strings);
+        destroyFree(snapshotMembers);
+        destroyFree(votes);
+        destroyFree(progress);
+        var messages: Buffer[Message] := outbox;
+        while length(&messages) > 0 do
+            destroyMessage(removeLast(&!messages));
+        end while;
+        destroyEmpty(messages);
+        return nil;
+    end;
+
+    ---
+    --- Reading the node
+    ---
+
+    generic [R: Region]
+    function roleOf(node: &[Node, R]): Nat8 is
+        return (node->role);
+    end;
+
+    generic [R: Region]
+    function isLeader(node: &[Node, R]): Bool is
+        return (node->role) = leading;
+    end;
+
+    generic [R: Region]
+    function nodeId(node: &[Node, R]): Nat64 is
+        return (node->id);
+    end;
+
+    generic [R: Region]
+    function currentTerm(node: &[Node, R]): Nat64 is
+        return (node->term);
+    end;
+
+    generic [R: Region]
+    function leaderOf(node: &[Node, R]): Nat64 is
+        return (node->leader);
+    end;
+
+    generic [R: Region]
+    function lastIndex(node: &[Node, R]): Nat64 is
+        return (node->snapshotIndex) + nat(length(&(node->log)));
+    end;
+
+    generic [R: Region]
+    function commitIndex(node: &[Node, R]): Nat64 is
+        return (node->commit);
+    end;
+
+    generic [R: Region]
+    function appliedIndex(node: &[Node, R]): Nat64 is
+        return (node->applied);
+    end;
+
+    generic [R: Region]
+    function snapshotIndexOf(node: &[Node, R]): Nat64 is
+        return (node->snapshotIndex);
+    end;
+
+    generic [R: Region]
+    function termAt(node: &[Node, R], index: Nat64): Nat64 is
+        if index = 0 then
+            return 0;
+        end if;
+        if index = (node->snapshotIndex) then
+            return (node->snapshotTerm);
+        end if;
+        if (index < (node->snapshotIndex)) or (index > lastIndex(node)) then
+            return 0;
+        end if;
+        let base: Nat64 := (node->snapshotIndex);
+        let entry: &[Entry, R] := nthRef(&(node->log), logSlot((index - base) - 1));
+        return (entry->term);
+    end;
+
+    generic [R: Region]
+    function memberCount(node: &[Node, R]): Index is
+        return length(&(node->members));
+    end;
+
+    generic [R: Region]
+    function memberAt(node: &[Node, R], position: Index): Nat64 is
+        return nth(&(node->members), position);
+    end;
+
+    generic [R: Region]
+    function isMember(node: &[Node, R], id: Nat64): Bool is
+        return hasId(&(node->members), id);
+    end;
+
+    generic [R: Region]
+    function quorumOf(node: &[Node, R]): Nat64 is
+        let rule: Fn[Nat64, Nat64] := (node->quorum);
+        return rule(nat(length(&(node->members))));
+    end;
+
+    ---
+    --- Reading what the node keeps
+    ---
+
+    generic [R: Region]
+    function progressCount(node: &[Node, R]): Index is
+        return length(&(node->progress));
+    end;
+
+    generic [R: Region]
+    function progressNth(node: &[Node, R], at: Index): Progress is
+        return nth(&(node->progress), at);
+    end;
+
+    generic [R: Region]
+    function progressAt(node: &[Node, R], id: Nat64): Option[Index] is
+        var i: Index := 0;
+        while i < length(&(node->progress)) do
+            let peer: Progress := nth(&(node->progress), i);
+            if peer.id = id then
+                let found: Option[Index] := Some(value => i);
+                return found;
+            end if;
+            i := i + 1;
+        end while;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function hasProgress(node: &[Node, R], id: Nat64): Bool is
+        var i: Index := 0;
+        while i < length(&(node->progress)) do
+            let peer: Progress := nth(&(node->progress), i);
+            if peer.id = id then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region]
+    function outboxCount(node: &[Node, R]): Index is
+        return length(&(node->outbox));
+    end;
+
+    generic [R: Region]
+    function pendingMessages(node: &[Node, R]): Index is
+        return length(&(node->outbox));
+    end;
+
+    generic [R: Region]
+    function snapshotCopy(node: &[Node, R]): String is
+        let state: &[String, R] := nthRef(&(node->snapshot), 0);
+        return fromSpan(asSpan(state));
+    end;
+
+    generic [R: Region]
+    function snapshotMembersCopy(node: &[Node, R]): Buffer[Nat64] is
+        return copyIds(&(node->snapshotMembers));
+    end;
+
+    -- A copy of the entry at index, which the log must hold.
+    generic [R: Region]
+    function entryCopyAt(node: &[Node, R], index: Nat64): Entry is
+        let entry: &[Entry, R] := nthRef(&(node->log), logSlot((index - (node->snapshotIndex)) - 1));
+        return copyEntry(entry);
+    end;
+
+    generic [R: Region]
+    function hasVoteFrom(node: &[Node, R], id: Nat64): Bool is
+        return hasId(&(node->votes), id);
+    end;
+
+    generic [R: Region]
+    function voteCount(node: &[Node, R]): Nat64 is
+        var count: Nat64 := 0;
+        var i: Index := 0;
+        while i < length(&(node->votes)) do
+            if hasId(&(node->members), nth(&(node->votes), i)) then
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    -- How many members hold the entry at index: the leader, when it is a
+    -- member, and each other member whose matched index reaches it.
+    generic [R: Region]
+    function holders(node: &[Node, R], index: Nat64): Nat64 is
+        var count: Nat64 := 0;
+        if hasId(&(node->members), (node->id)) then
+            count := count + 1;
+        end if;
+        var i: Index := 0;
+        while i < length(&(node->progress)) do
+            let peer: Progress := nth(&(node->progress), i);
+            if peer.matched >= index then
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    -- The members as the snapshot and the changes in the log after it make
+    -- them, and the index of the last such change, 0 when there is none.
+    generic [R: Region]
+    function membersFromLog(node: &[Node, R]): Buffer[Nat64] is
+        var ids: Buffer[Nat64] := copyIds(&(node->snapshotMembers));
+        var k: Index := 0;
+        while k < length(&(node->log)) do
+            let entry: &[Entry, R] := nthRef(&(node->log), k);
+            applyChange(&!ids, entry);
+            k := k + 1;
+        end while;
+        return ids;
+    end;
+
+    generic [R: Region]
+    function lastChangeInLog(node: &[Node, R]): Nat64 is
+        var last: Nat64 := noId;
+        var k: Index := 0;
+        while k < length(&(node->log)) do
+            let entry: &[Entry, R] := nthRef(&(node->log), k);
+            if ((entry->kind) = entryAddMember()) or ((entry->kind) = entryRemoveMember()) then
+                last := ((node->snapshotIndex) + nat(k)) + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return last;
+    end;
+
+    -- The most entries one append carries.
+    constant batch: Nat64 := 64;
+
+    -- What the leader sends to one member: the entries from its next
+    -- index on, or the snapshot when the log no longer holds them.
+    generic [R: Region]
+    function appendFor(node: &[Node, R], receiver: Nat64, next: Nat64): Message is
+        if next <= (node->snapshotIndex) then
+            let state: &[String, R] := nthRef(&(node->snapshot), 0);
+            return Message(
+                kind => messageSnapshot(),
+                sender => (node->id),
+                receiver => receiver,
+                term => (node->term),
+                index => (node->snapshotIndex),
+                logTerm => (node->snapshotTerm),
+                commit => (node->commit),
+                success => false,
+                hint => noId,
+                entries => noEntries(),
+                snapshot => fromSpan(asSpan(state)),
+                members => copyIds(&(node->snapshotMembers))
+            );
+        end if;
+        let prev: Nat64 := next - 1;
+        var entries: Buffer[Entry] := noEntries();
+        var index: Nat64 := next;
+        let last: Nat64 := lastIndex(node);
+        while (index <= last) and ((index - next) < batch) do
+            let entry: &[Entry, R] := nthRef(&(node->log), logSlot((index - (node->snapshotIndex)) - 1));
+            insertBack(&!entries, copyEntry(entry));
+            index := index + 1;
+        end while;
+        return Message(
+            kind => messageAppend(),
+            sender => (node->id),
+            receiver => receiver,
+            term => (node->term),
+            index => prev,
+            logTerm => termAt(node, prev),
+            commit => (node->commit),
+            success => false,
+            hint => noId,
+            entries => entries,
+            snapshot => makeEmpty(),
+            members => noIds()
+        );
+    end;
+
+    ---
+    --- Sending
+    ---
+
+    generic [R: Region]
+    function post(node: &![Node, R], message: Message): Unit is
+        insertBack(&!(node->outbox), message);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function popOutbox(node: &![Node, R]): Message is
+        return removeFirst(&!(node->outbox));
+    end;
+
+    generic [R: Region]
+    function takeMessages(node: &![Node, R]): Buffer[Message] is
+        var taken: Buffer[Message] := noMessages();
+        while outboxCount(&node) > 0 do
+            insertBack(&!taken, popOutbox(&~node));
+        end while;
+        return taken;
+    end;
+
+    generic [R: Region]
+    function sendAppend(node: &![Node, R], receiver: Nat64): Unit is
+        case progressAt(&node, receiver) of
+            when Some(value as at: Index) do
+                let peer: Progress := progressNth(&node, at);
+                let message: Message := appendFor(&node, receiver, peer.next);
+                post(&~node, message);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function broadcast(node: &![Node, R]): Unit is
+        var i: Index := 0;
+        while i < progressCount(&node) do
+            let peer: Progress := progressNth(&node, i);
+            sendAppend(&~node, peer.id);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function reply(node: &![Node, R], kind: Nat8, receiver: Nat64, success: Bool, hint: Nat64): Unit is
+        let message: Message := Message(
+            kind => kind,
+            sender => (node->id),
+            receiver => receiver,
+            term => (node->term),
+            index => noId,
+            logTerm => noId,
+            commit => noId,
+            success => success,
+            hint => hint,
+            entries => noEntries(),
+            snapshot => makeEmpty(),
+            members => noIds()
+        );
+        post(&~node, message);
+        return nil;
+    end;
+
+    ---
+    --- Members
+    ---
+
+    generic [R: Region]
+    function dropProgress(node: &![Node, R], at: Index): Unit is
+        let gone: Progress := remove(&!(node->progress), at);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function addProgress(node: &![Node, R], peer: Progress): Unit is
+        insertBack(&!(node->progress), peer);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function clearProgress(node: &![Node, R]): Unit is
+        while progressCount(&node) > 0 do
+            let last: Index := progressCount(&node) - 1;
+            dropProgress(&~node, last);
+        end while;
+        return nil;
+    end;
+
+    -- The leader's progress follows the members: one for each member but
+    -- itself, a new one starting after the last entry.
+    generic [R: Region]
+    function syncProgress(node: &![Node, R]): Unit is
+        if (node->role) = leading then
+            var i: Index := 0;
+            while i < progressCount(&node) do
+                let peer: Progress := progressNth(&node, i);
+                if isMember(&node, peer.id) then
+                    i := i + 1;
+                else
+                    dropProgress(&~node, i);
+                end if;
+            end while;
+            var j: Index := 0;
+            while j < memberCount(&node) do
+                let member: Nat64 := memberAt(&node, j);
+                let known: Bool := hasProgress(&node, member);
+                if (member /= (node->id)) and (not known) then
+                    let start: Nat64 := lastIndex(&node) + 1;
+                    addProgress(&~node, Progress(id => member, next => start, matched => noId));
+                end if;
+                j := j + 1;
+            end while;
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setMembers(node: &![Node, R], ids: Buffer[Nat64]): Unit is
+        fillIds(&!(node->members), ids);
+        return nil;
+    end;
+
+    -- The members from the snapshot's and the changes in the log after it.
+    generic [R: Region]
+    function rebuildMembers(node: &![Node, R]): Unit is
+        let ids: Buffer[Nat64] := membersFromLog(&node);
+        let last: Nat64 := lastChangeInLog(&node);
+        setMembers(&~node, ids);
+        node->lastChange := last;
+        syncProgress(&~node);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushEntry(node: &![Node, R], entry: Entry): Unit is
+        insertBack(&!(node->log), entry);
+        return nil;
+    end;
+
+    -- An entry at the end of the log; a change of the members takes
+    -- effect at once.
+    generic [R: Region]
+    function appendEntry(node: &![Node, R], entry: Entry): Unit is
+        let change: Bool := (entry.kind = entryAddMember()) or (entry.kind = entryRemoveMember());
+        pushEntry(&~node, entry);
+        if change then
+            rebuildMembers(&~node);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function popEntry(node: &![Node, R]): Unit is
+        destroyEntry(removeLast(&!(node->log)));
+        return nil;
+    end;
+
+    -- The entries from index on are taken away.  A committed entry is
+    -- never among them: that would break the safety of the log, and the
+    -- programme stops instead.
+    generic [R: Region]
+    function truncateFrom(node: &![Node, R], index: Nat64): Unit is
+        if index <= (node->commit) then
+            abort("Standard.Raft: a committed entry would be taken away");
+        end if;
+        while lastIndex(&node) >= index do
+            popEntry(&~node);
+        end while;
+        rebuildMembers(&~node);
+        return nil;
+    end;
+
+    ---
+    --- Roles
+    ---
+
+    generic [R: Region]
+    function becomeFollower(node: &![Node, R], term: Nat64, leader: Nat64): Unit is
+        if term > (node->term) then
+            node->term := term;
+            node->votedFor := noId;
+        end if;
+        node->role := follower;
+        node->leader := leader;
+        clearVotes(&~node);
+        clearProgress(&~node);
+        return nil;
+    end;
+
+    -- The commit index moves to the last entry of the leader's term that
+    -- quorum members hold.  A leader that is no longer a member steps
+    -- down once the change that removed it is committed.
+    generic [R: Region]
+    function advanceCommit(node: &![Node, R]): Unit is
+        var index: Nat64 := lastIndex(&node);
+        let needed: Nat64 := quorumOf(&node);
+        while index > (node->commit) do
+            let ours: Bool := termAt(&node, index) = (node->term);
+            let enough: Bool := holders(&node, index) >= needed;
+            if ours and enough then
+                node->commit := index;
+                index := noId;
+            else
+                index := index - 1;
+            end if;
+        end while;
+        let removed: Bool := not isMember(&node, (node->id));
+        if (removed and ((node->lastChange) <= (node->commit))) and ((node->role) = leading) then
+            let term: Nat64 := (node->term);
+            becomeFollower(&~node, term, noId);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function becomeLeader(node: &![Node, R]): Unit is
+        node->role := leading;
+        node->leader := (node->id);
+        node->heartbeatElapsed := noTicks;
+        clearProgress(&~node);
+        syncProgress(&~node);
+        let term: Nat64 := (node->term);
+        appendEntry(&~node, Entry(term => term, kind => entryEmpty(), data => makeEmpty()));
+        advanceCommit(&~node);
+        broadcast(&~node);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function clearVotes(node: &![Node, R]): Unit is
+        clearIds(&!(node->votes));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function addVote(node: &![Node, R], id: Nat64): Unit is
+        insertBack(&!(node->votes), id);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function campaign(node: &![Node, R]): Unit is
+        node->term := (node->term) + 1;
+        node->role := candidate;
+        node->votedFor := (node->id);
+        node->leader := noId;
+        clearVotes(&~node);
+        let me: Nat64 := (node->id);
+        addVote(&~node, me);
+        node->electionElapsed := noTicks;
+        let timeout: Nat32 := nextTimeout(&~node);
+        node->electionTimeout := timeout;
+        let alone: Bool := voteCount(&node) >= quorumOf(&node);
+        if alone then
+            becomeLeader(&~node);
+        else
+            let last: Nat64 := lastIndex(&node);
+            let lastTerm: Nat64 := termAt(&node, last);
+            var i: Index := 0;
+            while i < memberCount(&node) do
+                let member: Nat64 := memberAt(&node, i);
+                if member /= me then
+                    let message: Message := Message(
+                        kind => messageVote(),
+                        sender => me,
+                        receiver => member,
+                        term => (node->term),
+                        index => last,
+                        logTerm => lastTerm,
+                        commit => noId,
+                        success => false,
+                        hint => noId,
+                        entries => noEntries(),
+                        snapshot => makeEmpty(),
+                        members => noIds()
+                    );
+                    post(&~node, message);
+                end if;
+                i := i + 1;
+            end while;
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function tick(node: &![Node, R]): Unit is
+        if (node->role) = leading then
+            node->heartbeatElapsed := (node->heartbeatElapsed) + 1;
+            if (node->heartbeatElapsed) >= (node->heartbeatTicks) then
+                node->heartbeatElapsed := noTicks;
+                broadcast(&~node);
+            end if;
+        else
+            node->electionElapsed := (node->electionElapsed) + 1;
+            if (node->electionElapsed) >= (node->electionTimeout) then
+                node->electionElapsed := noTicks;
+                let member: Bool := isMember(&node, (node->id));
+                if member then
+                    campaign(&~node);
+                end if;
+            end if;
+        end if;
+        return nil;
+    end;
+
+    ---
+    --- Receiving
+    ---
+
+    generic [R: Region]
+    function onVote(node: &![Node, R], sender: Nat64, index: Nat64, logTerm: Nat64): Unit is
+        let last: Nat64 := lastIndex(&node);
+        let lastTerm: Nat64 := termAt(&node, last);
+        let current: Bool := (logTerm > lastTerm) or ((logTerm = lastTerm) and (index >= last));
+        let free: Bool := ((node->votedFor) = noId) or ((node->votedFor) = sender);
+        if current and free then
+            node->votedFor := sender;
+            node->electionElapsed := noTicks;
+            reply(&~node, messageVoteReply(), sender, true, noId);
+        else
+            reply(&~node, messageVoteReply(), sender, false, noId);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function onVoteReply(node: &![Node, R], sender: Nat64, granted: Bool): Unit is
+        if ((node->role) = candidate) and granted then
+            let counted: Bool := hasVoteFrom(&node, sender);
+            if not counted then
+                addVote(&~node, sender);
+            end if;
+            let won: Bool := voteCount(&node) >= quorumOf(&node);
+            if won then
+                becomeLeader(&~node);
+            end if;
+        end if;
+        return nil;
+    end;
+
+    -- The entries of an append after prev, from the first that the log does
+    -- not hold yet; one whose index the log holds with another term takes
+    -- the place of that entry and of all after it.  The index of the last
+    -- entry of the append comes back.
+    generic [R: Region]
+    function takeEntries(node: &![Node, R], prev: Nat64, entries: Buffer[Entry]): Nat64 is
+        var rest: Buffer[Entry] := entries;
+        var index: Nat64 := prev;
+        while length(&rest) > 0 do
+            let entry: Entry := removeFirst(&!rest);
+            index := index + 1;
+            let held: Nat64 := lastIndex(&node);
+            let heldTerm: Nat64 := termAt(&node, index);
+            if index <= (node->snapshotIndex) then
+                destroyEntry(entry);
+            else if index <= held then
+                if heldTerm = entry.term then
+                    destroyEntry(entry);
+                else
+                    truncateFrom(&~node, index);
+                    appendEntry(&~node, entry);
+                end if;
+            else
+                appendEntry(&~node, entry);
+            end if;
+        end while;
+        destroyEmpty(rest);
+        return index;
+    end;
+
+    generic [R: Region]
+    function onAppend(node: &![Node, R], sender: Nat64, prev: Nat64, prevTerm: Nat64, leaderCommit: Nat64, entries: Buffer[Entry]): Unit is
+        let term: Nat64 := (node->term);
+        becomeFollower(&~node, term, sender);
+        node->electionElapsed := noTicks;
+        let last: Nat64 := lastIndex(&node);
+        let conflict: Bool := (prev >= (node->snapshotIndex)) and (termAt(&node, prev) /= prevTerm);
+        if prev > last then
+            destroyEntries(entries);
+            reply(&~node, messageAppendReply(), sender, false, last);
+        else if conflict then
+            destroyEntries(entries);
+            reply(&~node, messageAppendReply(), sender, false, prev - 1);
+        else
+            let reached: Nat64 := takeEntries(&~node, prev, entries);
+            var reach: Nat64 := leaderCommit;
+            if reached < reach then
+                reach := reached;
+            end if;
+            if reach > (node->commit) then
+                node->commit := reach;
+            end if;
+            reply(&~node, messageAppendReply(), sender, true, reached);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function shiftEntry(node: &![Node, R]): Entry is
+        return removeFirst(&!(node->log));
+    end;
+
+    generic [R: Region]
+    function dropFirstEntries(node: &![Node, R], count: Nat64): Unit is
+        var drop: Nat64 := count;
+        while drop > 0 do
+            destroyEntry(shiftEntry(&~node));
+            drop := drop - 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setSnapshot(node: &![Node, R], state: String, members: Buffer[Nat64]): Unit is
+        setState(&~node, state);
+        setSnapshotMembers(&~node, members);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setState(node: &![Node, R], state: String): Unit is
+        destroyString(swapNth(&!(node->snapshot), 0, state));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setSnapshotMembers(node: &![Node, R], members: Buffer[Nat64]): Unit is
+        fillIds(&!(node->snapshotMembers), members);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function onSnapshot(node: &![Node, R], sender: Nat64, index: Nat64, logTerm: Nat64, state: String, members: Buffer[Nat64]): Unit is
+        let term: Nat64 := (node->term);
+        becomeFollower(&~node, term, sender);
+        node->electionElapsed := noTicks;
+        if index <= (node->commit) then
+            destroyString(state);
+            destroyFree(members);
+            let commit: Nat64 := (node->commit);
+            reply(&~node, messageSnapshotReply(), sender, true, commit);
+        else
+            let keep: Bool := (index <= lastIndex(&node)) and (termAt(&node, index) = logTerm);
+            var drop: Nat64 := lastIndex(&node) - (node->snapshotIndex);
+            if keep then
+                drop := index - (node->snapshotIndex);
+            end if;
+            dropFirstEntries(&~node, drop);
+            node->snapshotIndex := index;
+            node->snapshotTerm := logTerm;
+            setSnapshot(&~node, state, members);
+            node->commit := index;
+            node->restore := true;
+            rebuildMembers(&~node);
+            reply(&~node, messageSnapshotReply(), sender, true, index);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setProgress(node: &![Node, R], at: Index, peer: Progress): Unit is
+        storeNth(&!(node->progress), at, peer);
+        return nil;
+    end;
+
+    -- The answer of a member to an append or a snapshot: a success moves
+    -- its matched index up to hint, a refusal its next index down to just
+    -- after hint, never below its matched index.
+    generic [R: Region]
+    function onProgressReply(node: &![Node, R], sender: Nat64, success: Bool, hint: Nat64): Unit is
+        if (node->role) = leading then
+            case progressAt(&node, sender) of
+                when Some(value as at: Index) do
+                    var peer: Progress := progressNth(&node, at);
+                    if success then
+                        if hint > peer.matched then
+                            peer.matched := hint;
+                        end if;
+                        peer.next := peer.matched + 1;
+                        setProgress(&~node, at, peer);
+                        advanceCommit(&~node);
+                        let behind: Bool := ((node->role) = leading) and (peer.next <= lastIndex(&node));
+                        if behind then
+                            sendAppend(&~node, sender);
+                        end if;
+                    else
+                        var next: Nat64 := peer.next - 1;
+                        if (hint + 1) < next then
+                            next := hint + 1;
+                        end if;
+                        if next < firstIndex then
+                            next := firstIndex;
+                        end if;
+                        if next <= peer.matched then
+                            next := peer.matched + 1;
+                        end if;
+                        peer.next := next;
+                        setProgress(&~node, at, peer);
+                        sendAppend(&~node, sender);
+                    end if;
+                when None do
+                    skip;
+            end case;
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function dispatch(node: &![Node, R], message: Message): Unit is
+        let { kind: Nat8, sender: Nat64, receiver: Nat64, term: Nat64, index: Nat64, logTerm: Nat64, commit: Nat64,
+            success: Bool, hint: Nat64, entries: Buffer[Entry], snapshot: String, members: Buffer[Nat64] } := message;
+        -- A node that heard from a leader within the shortest election
+        -- timeout takes no vote request, whatever its term: a server that
+        -- was removed and stands for election cannot depose the leader.
+        let recent: Bool := ((node->leader) /= noId) and ((node->electionElapsed) < (node->electionTicks));
+        let ignored: Bool := ((kind = messageVote()) and recent) and (term > (node->term));
+        if (not ignored) and (term > (node->term)) then
+            var leader: Nat64 := noId;
+            if (kind = messageAppend()) or (kind = messageSnapshot()) then
+                leader := sender;
+            end if;
+            becomeFollower(&~node, term, leader);
+        end if;
+        let stale: Bool := term < (node->term);
+        if ignored or stale then
+            destroyEntries(entries);
+            destroyString(snapshot);
+            destroyFree(members);
+            if stale and (kind = messageVote()) then
+                reply(&~node, messageVoteReply(), sender, false, noId);
+            else if stale and ((kind = messageAppend()) or (kind = messageSnapshot())) then
+                let last: Nat64 := lastIndex(&node);
+                reply(&~node, messageAppendReply(), sender, false, last);
+            end if;
+        else if kind = messageAppend() then
+            destroyString(snapshot);
+            destroyFree(members);
+            onAppend(&~node, sender, index, logTerm, commit, entries);
+        else if kind = messageSnapshot() then
+            destroyEntries(entries);
+            onSnapshot(&~node, sender, index, logTerm, snapshot, members);
+        else
+            destroyEntries(entries);
+            destroyString(snapshot);
+            destroyFree(members);
+            if kind = messageVote() then
+                onVote(&~node, sender, index, logTerm);
+            else if kind = messageVoteReply() then
+                onVoteReply(&~node, sender, success);
+            else
+                onProgressReply(&~node, sender, success, hint);
+            end if;
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function step(node: &![Node, R], message: Message): Unit is
+        let fit: Bool := isWellFormed(&message) and (message.receiver = (node->id));
+        if fit then
+            dispatch(&~node, message);
+        else
+            destroyMessage(message);
+        end if;
+        return nil;
+    end;
+
+    ---
+    --- Proposals
+    ---
+
+    generic [R: Region, D: Region]
+    function propose(node: &![Node, R], command: Span[Nat8, D]): Bool is
+        if (node->role) /= leading then
+            return false;
+        end if;
+        let term: Nat64 := (node->term);
+        appendEntry(&~node, Entry(term => term, kind => entryCommand(), data => fromSpan(command)));
+        advanceCommit(&~node);
+        broadcast(&~node);
+        return true;
+    end;
+
+    generic [R: Region]
+    function proposeChange(node: &![Node, R], kind: Nat8, member: Nat64): Bool is
+        if (((node->role) /= leading) or (member = noId)) or ((node->lastChange) > (node->commit)) then
+            return false;
+        end if;
+        let term: Nat64 := (node->term);
+        appendEntry(&~node, Entry(term => term, kind => kind, data => encodeId(member)));
+        advanceCommit(&~node);
+        broadcast(&~node);
+        return true;
+    end;
+
+    generic [R: Region]
+    function proposeAddMember(node: &![Node, R], member: Nat64): Bool is
+        if isMember(&node, member) then
+            return false;
+        end if;
+        return proposeChange(&~node, entryAddMember(), member);
+    end;
+
+    generic [R: Region]
+    function proposeRemoveMember(node: &![Node, R], member: Nat64): Bool is
+        if (not isMember(&node, member)) or (memberCount(&node) < 2) then
+            return false;
+        end if;
+        return proposeChange(&~node, entryRemoveMember(), member);
+    end;
+
+    ---
+    --- The state machine
+    ---
+
+    generic [T: Type(StateMachine), R: Region, M: Region]
+    function applyCommitted(node: &![Node, R], machine: &![T, M]): Index is
+        var count: Index := 0;
+        if node->restore then
+            let state: String := snapshotCopy(&node);
+            let taken: Bool := restoreSnapshot(&~machine, asSpan(&state));
+            destroyString(state);
+            if not taken then
+                abort("Standard.Raft: the state machine refused the snapshot");
+            end if;
+            node->applied := (node->snapshotIndex);
+            node->restore := false;
+            count := count + 1;
+        end if;
+        while (node->applied) < (node->commit) do
+            let next: Nat64 := (node->applied) + 1;
+            let entry: Entry := entryCopyAt(&node, next);
+            let { term: Nat64, kind: Nat8, data: String } := entry;
+            if kind = entryCommand() then
+                applyCommand(&~machine, asSpan(&data));
+            end if;
+            destroyString(data);
+            node->applied := next;
+            count := count + 1;
+        end while;
+        return count;
+    end;
+
+    generic [T: Type(StateMachine), R: Region, M: Region]
+    function compactWith(node: &![Node, R], machine: &[T, M]): Bool is
+        if (node->restore) or ((node->applied) <= (node->snapshotIndex)) then
+            return false;
+        end if;
+        let upTo: Nat64 := (node->applied);
+        let upToTerm: Nat64 := termAt(&node, upTo);
+        let state: String := takeSnapshot(machine);
+        var ids: Buffer[Nat64] := snapshotMembersCopy(&node);
+        var drop: Nat64 := upTo - (node->snapshotIndex);
+        while drop > 0 do
+            let entry: Entry := shiftEntry(&~node);
+            applyChange(&!ids, &entry);
+            destroyEntry(entry);
+            drop := drop - 1;
+        end while;
+        node->snapshotIndex := upTo;
+        node->snapshotTerm := upToTerm;
+        setSnapshot(&~node, state, ids);
+        return true;
+    end;
+end module body.

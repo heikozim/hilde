@@ -1,0 +1,402 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as count,
+    lengthMut as countMut,
+    insertBack,
+    nthRef,
+    removeFirst,
+    destroyEmpty
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    length,
+    nthByte
+);
+import Standard.Sperli (
+    Job,
+    Comm,
+    readJobText,
+    init,
+    rank,
+    size,
+    send,
+    recv,
+    barrier,
+    bcast,
+    reduce,
+    allreduce,
+    gather,
+    scatter,
+    useCheckpoints,
+    checkpointBytes,
+    resumeBytes,
+    finish
+);
+
+module body Standard.SperliExport is
+    function maxDescription(): Index is
+        return 4194304;
+    end;
+
+    function maxMessage(): Index is
+        return 16777216;
+    end;
+
+    function maxCollective(): Index is
+        return 16777200;
+    end;
+
+    function maxState(): Index is
+        return 268435456;
+    end;
+
+    function maxPath(): Index is
+        return 4096;
+    end;
+
+    function notReady(): Int32 is
+        return -6;
+    end;
+
+    function resultPending(): Int32 is
+        return -11;
+    end;
+
+    function resultMissing(): Int32 is
+        return -10;
+    end;
+
+    record Session: Linear is
+        comms: Buffer[Comm];
+        held: Buffer[String];
+        code: Int32;
+        ownRank: Nat32;
+        ranks: Nat32;
+        invariant count(&comms) <= 1;
+        invariant count(&held) <= 1;
+        invariant ownRank < 4096;
+        invariant ranks <= 4096;
+    end;
+
+    -- The comm a join makes, or the code of the first refusal.
+    generic [R: Region]
+    function joined(description: Span[Nat8, R]): Either[Int32, Comm] is
+        case readJobText(description) of
+            when Left(left as why: Int32) do
+                let failed: Either[Int32, Comm] := Left(left => why);
+                return failed;
+            when Right(right as job: Job) do
+                return init(job);
+        end case;
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_open");
+    generic [R: Region]
+    function openSession(description: Span[Nat8, R]): Session is
+        var comms: Buffer[Comm] := allocateEmpty();
+        var code: Int32 := 0;
+        var ownRank: Nat32 := 0;
+        var ranks: Nat32 := 0;
+        case joined(description) of
+            when Left(left as why: Int32) do
+                code := why;
+            when Right(right as comm: Comm) do
+                ownRank := rank(&comm);
+                ranks := size(&comm);
+                insertBack(&!comms, comm);
+        end case;
+        let held: Buffer[String] := allocateEmpty();
+        return Session(comms => comms, held => held, code => code, ownRank => ownRank, ranks => ranks);
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_code");
+    generic [R: Region]
+    function sessionCode(session: &[Session, R]): Int32 is
+        return session->code;
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_rank");
+    generic [R: Region]
+    function sessionRank(session: &[Session, R]): Nat32 is
+        return session->ownRank;
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_size");
+    generic [R: Region]
+    function sessionSize(session: &[Session, R]): Nat32 is
+        return session->ranks;
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_result_length");
+    generic [R: Region]
+    function resultLength(session: &[Session, R]): Index is
+        if count(&(session->held)) = 0 then
+            return 0;
+        end if;
+        return heldLength(session);
+    end;
+
+    -- The length of the one result a session holds.
+    generic [R: Region]
+    function heldLength(session: &[Session, R]): Index is
+        return length(nthRef(&(session->held), 0));
+    end;
+
+    generic [R: Region]
+    function commCount(session: &![Session, R]): Index is
+        return countMut(&!(session->comms));
+    end;
+
+    generic [R: Region]
+    function heldCount(session: &![Session, R]): Index is
+        return countMut(&!(session->held));
+    end;
+
+    -- 0 when a call may go on: the session holds a comm and, for a call
+    -- that makes a result, no result is waiting.
+    generic [R: Region]
+    function gate(session: &![Session, R], makesResult: Bool): Int32 is
+        if commCount(&~session) = 0 then
+            return notReady();
+        end if;
+        return gateResult(&~session, makesResult);
+    end;
+
+    generic [R: Region]
+    function gateResult(session: &![Session, R], makesResult: Bool): Int32 is
+        if makesResult and (heldCount(&~session) > 0) then
+            return resultPending();
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region]
+    function takeComm(session: &![Session, R]): Comm is
+        return removeFirst(&!(session->comms));
+    end;
+
+    generic [R: Region]
+    function putComm(session: &![Session, R], comm: Comm): Unit is
+        insertBack(&!(session->comms), comm);
+        return nil;
+    end;
+
+    -- Keeps data as the result of the session unless it is empty.
+    generic [R: Region]
+    function keepData(session: &![Session, R], data: String): Unit is
+        if length(&data) = 0 then
+            destroyString(data);
+            return nil;
+        end if;
+        insertBack(&!(session->held), data);
+        return nil;
+    end;
+
+    -- The code of an answer; its data is kept as the result.
+    generic [R: Region]
+    function keep(session: &![Session, R], answer: Either[Int32, String]): Int32 is
+        case answer of
+            when Left(left as why: Int32) do
+                return why;
+            when Right(right as data: String) do
+                keepData(&~session, data);
+                return 0;
+        end case;
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_take_result");
+    generic [R: Region, B: Region]
+    function takeResult(session: &![Session, R], out: Span![Nat8, B]): Int32 is
+        if heldCount(&~session) = 0 then
+            return resultMissing();
+        end if;
+        return copyResult(&~session, out);
+    end;
+
+    generic [R: Region, B: Region]
+    function copyResult(session: &![Session, R], out: Span![Nat8, B]): Int32 is
+        let data: String := takeHeld(&~session);
+        var target: Span![Nat8, B] := out;
+        var i: Index := 0;
+        while i < length(&data) do
+            target[i] := nthByte(&data, i);
+            i := i + 1;
+        end while;
+        destroyString(data);
+        return 0;
+    end;
+
+    generic [R: Region]
+    function takeHeld(session: &![Session, R]): String is
+        return removeFirst(&!(session->held));
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_send");
+    generic [R: Region, D: Region]
+    function sessionSend(session: &![Session, R], target: Nat32, tag: Nat32, data: Span[Nat8, D]): Int32 is
+        let open: Int32 := gate(&~session, false);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let code: Int32 := send(&!comm, target, tag, fromSpan(data));
+        putComm(&~session, comm);
+        return code;
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_recv");
+    generic [R: Region]
+    function sessionRecv(session: &![Session, R], source: Nat32, tag: Nat32): Int32 is
+        let open: Int32 := gate(&~session, true);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let got: Either[Int32, String] := recv(&!comm, source, tag);
+        putComm(&~session, comm);
+        return keep(&~session, got);
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_barrier");
+    generic [R: Region]
+    function sessionBarrier(session: &![Session, R]): Int32 is
+        let open: Int32 := gate(&~session, false);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let code: Int32 := barrier(&!comm);
+        putComm(&~session, comm);
+        return code;
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_bcast");
+    generic [R: Region, D: Region]
+    function sessionBcast(session: &![Session, R], root: Nat32, data: Span[Nat8, D]): Int32 is
+        let open: Int32 := gate(&~session, true);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let got: Either[Int32, String] := bcast(&!comm, root, fromSpan(data));
+        putComm(&~session, comm);
+        return keep(&~session, got);
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_reduce");
+    generic [R: Region, D: Region]
+    function sessionReduce(session: &![Session, R], root: Nat32, elementType: Nat8, reduction: Nat8, data: Span[Nat8, D]): Int32 is
+        let open: Int32 := gate(&~session, true);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let got: Either[Int32, String] := reduce(&!comm, root, elementType, reduction, fromSpan(data));
+        putComm(&~session, comm);
+        return keep(&~session, got);
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_allreduce");
+    generic [R: Region, D: Region]
+    function sessionAllreduce(session: &![Session, R], elementType: Nat8, reduction: Nat8, data: Span[Nat8, D]): Int32 is
+        let open: Int32 := gate(&~session, true);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let got: Either[Int32, String] := allreduce(&!comm, elementType, reduction, fromSpan(data));
+        putComm(&~session, comm);
+        return keep(&~session, got);
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_gather");
+    generic [R: Region, D: Region]
+    function sessionGather(session: &![Session, R], root: Nat32, data: Span[Nat8, D]): Int32 is
+        let open: Int32 := gate(&~session, true);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let got: Either[Int32, String] := gather(&!comm, root, fromSpan(data));
+        putComm(&~session, comm);
+        return keep(&~session, got);
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_scatter");
+    generic [R: Region, D: Region]
+    function sessionScatter(session: &![Session, R], root: Nat32, data: Span[Nat8, D]): Int32 is
+        let open: Int32 := gate(&~session, true);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let got: Either[Int32, String] := scatter(&!comm, root, fromSpan(data));
+        putComm(&~session, comm);
+        return keep(&~session, got);
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_use_checkpoints");
+    generic [R: Region, P: Region]
+    function sessionUseCheckpoints(session: &![Session, R], path: Span[Nat8, P]): Int32 is
+        let open: Int32 := gate(&~session, false);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        useCheckpoints(&!comm, path);
+        putComm(&~session, comm);
+        return 0;
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_checkpoint");
+    generic [R: Region, P: Region]
+    function sessionCheckpoint(session: &![Session, R], payload: Span[Nat8, P]): Int32 is
+        let open: Int32 := gate(&~session, false);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let code: Int32 := checkpointBytes(&!comm, payload);
+        putComm(&~session, comm);
+        return code;
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_resume");
+    generic [R: Region]
+    function sessionResume(session: &![Session, R]): Int32 is
+        let open: Int32 := gate(&~session, true);
+        if open /= 0 then
+            return open;
+        end if;
+        var comm: Comm := takeComm(&~session);
+        let got: Either[Int32, String] := resumeBytes(&!comm);
+        putComm(&~session, comm);
+        return keep(&~session, got);
+    end;
+
+    pragma Foreign_Export(External_Name => "sperli_core_close");
+    function closeSession(session: Session): Unit is
+        let { comms: Buffer[Comm], held: Buffer[String], code: Int32, ownRank: Nat32, ranks: Nat32 } := session;
+        var rest: Buffer[Comm] := comms;
+        while count(&rest) > 0 do
+            finish(removeFirst(&!rest));
+        end while;
+        destroyEmpty(rest);
+        var data: Buffer[String] := held;
+        while count(&data) > 0 do
+            destroyString(removeFirst(&!data));
+        end while;
+        destroyEmpty(data);
+        return nil;
+    end;
+end module body.

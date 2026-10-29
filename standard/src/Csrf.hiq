@@ -1,0 +1,142 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The message of the HMAC is a fixed label, a zero byte
+-- and the session token, so that a token of this module is not the HMAC
+-- of anything else the same key might sign.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex,
+    constantTimeEqual
+);
+import Standard.Libcrypto (
+    hmacSha256
+);
+
+module body Standard.Csrf is
+    constant keyBytes: Index := 32;
+
+    function nothing(): Option[String] is
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    function csrfKeyBytes(): Index is
+        return keyBytes;
+    end;
+
+    generic [K: Region, S: Region]
+    function csrfToken(key: Span[Nat8, K], sessionToken: Span[Nat8, S]): Option[String] is
+        if spanLength(key) < keyBytes then
+            return nothing();
+        end if;
+        var message: StringBuilder := makeStringBuilder();
+        writeString(&!message, "hilde-csrf-v1");
+        writeByte(&!message, 0);
+        writeString(&!message, sessionToken);
+        let text: String := finalize(message);
+        case hmacSha256(key, asSpan(&text)) of
+            when Some(value as raw: String) do
+                destroyString(text);
+                let hex: String := bytesToHex(asSpan(&raw));
+                destroyString(raw);
+                let some: Option[String] := Some(value => hex);
+                return some;
+            when None do
+                destroyString(text);
+                return nothing();
+        end case;
+    end;
+
+    generic [K: Region, S: Region, T: Region]
+    function csrfValid(key: Span[Nat8, K], sessionToken: Span[Nat8, S], submitted: Span[Nat8, T]): Bool is
+        if spanLength(sessionToken) = 0 then
+            return false;
+        end if;
+        case csrfToken(key, sessionToken) of
+            when Some(value as expected: String) do
+                let same: Bool := constantTimeEqual(asSpan(&expected), submitted);
+                destroyString(expected);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether word is the name of a method, in capitals as RFC 9110 has
+    -- them.
+    generic [R: Region]
+    function sameWord(text: Span[Nat8, R], word: Span[Nat8, Static]): Bool is
+        if spanLength(text) /= spanLength(word) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if text[i] /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function changingMethod(verb: Span[Nat8, R]): Bool is
+        if sameWord(verb, "GET") or sameWord(verb, "HEAD") then
+            return false;
+        end if;
+        if sameWord(verb, "OPTIONS") or sameWord(verb, "TRACE") then
+            return false;
+        end if;
+        return true;
+    end;
+
+    function lower(byte: Nat8): Nat8 is
+        if (byte >= 'A') and (byte <= 'Z') then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameIgnoringCase(left: Span[Nat8, R], right: Span[Nat8, S]): Bool is
+        if spanLength(left) /= spanLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(left) do
+            if lower(left[i]) /= lower(right[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [F: Region, O: Region, E: Region]
+    function sameOriginRequest(fetchSite: Span[Nat8, F], origin: Span[Nat8, O], expectedOrigin: Span[Nat8, E]): Bool is
+        if spanLength(fetchSite) > 0 then
+            return sameWord(fetchSite, "same-origin") or sameWord(fetchSite, "none");
+        end if;
+        if spanLength(origin) > 0 then
+            return (spanLength(expectedOrigin) > 0) and sameIgnoringCase(origin, expectedOrigin);
+        end if;
+        return true;
+    end;
+end module body.

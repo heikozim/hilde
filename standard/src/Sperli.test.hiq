@@ -1,0 +1,924 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Sperli over TLS on the loopback address, every rank a task: a
+-- mesh of three ranks that trades messages, and pairs of ranks in which
+-- one side is made wrong -- a certificate of another CA, none at all, a
+-- certificate of another rank, tokens that are expired, of another job or
+-- of another rank, a frame that is too large and a frame of an older
+-- incarnation -- each checked for its code.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    nth,
+    insertBack,
+    destroyFree
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    length as textLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    equal,
+    formatNat
+);
+import Standard.File (
+    FileDescriptor,
+    ConnectFailure,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFile,
+    connectTcp
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScopeWithStack,
+    closeScope,
+    spawn,
+    join,
+    sleepFor
+);
+import Standard.Tls (
+    Client,
+    connectOver,
+    send as tlsSend,
+    receiveWithin,
+    closeClient
+);
+import Standard.SperliError (
+    badCertificate,
+    subjectMismatch,
+    refusedHost,
+    tokenExpired,
+    tokenForeignJob,
+    tokenWrongRank,
+    oversizedFrame,
+    staleIncarnation,
+    badFrame,
+    peerLost
+);
+import Standard.SperliWire (
+    dataKind,
+    frameHeader
+);
+import Standard.SperliCollective (
+    collectiveKind
+);
+import Standard.SperliLaunch (
+    HostList,
+    Launch,
+    parseHostList,
+    destroyHostList,
+    newLaunch,
+    launchId,
+    launchPort,
+    launchPublicKey,
+    launchRanks,
+    launchCaPem,
+    launchExpiry,
+    describeRank,
+    tokenWith,
+    destroyLaunch
+);
+import Standard.SperliWire (
+    verifyJoinToken
+);
+import Standard.Sperli (
+    Job,
+    Endpoint,
+    Peer,
+    Frame,
+    Comm,
+    SendHandle,
+    RecvHandle,
+    readJob,
+    jobId,
+    jobIncarnation,
+    jobPublicKey,
+    jobToken,
+    withToken,
+    destroyJob,
+    openEndpoint,
+    endpointPort,
+    closeEndpoint,
+    connectPeer,
+    acceptPeer,
+    closePeer,
+    sendFrame,
+    sendRaw,
+    receiveFrame,
+    destroyFrame,
+    peerDropped,
+    peerLastCode,
+    init,
+    rank,
+    size,
+    send,
+    recv,
+    startSend,
+    finishSend,
+    startRecv,
+    finishRecv,
+    heartbeat,
+    finish
+);
+
+module body Standard.Sperli.Test is
+    -- What one side of a pair does: the job it is given and the part it
+    -- plays.
+    record Role: Linear is
+        job: Job;
+        mode: Nat32;
+    end;
+
+    function hostsOf(ports: Span[Nat8, Static]): Either[Int32, HostList] is
+        return parseHostList(ports, "");
+    end;
+
+    -- A launch of ranks ranks on localhost at incarnation.
+    function launchOf(ranks: Nat32, incarnation: Nat32): Launch is
+        case hostsOf("localhost\nlocalhost\nlocalhost\n") of
+            when Right(right as hosts: HostList) do
+                case newLaunch(&hosts, ranks, incarnation, 600) of
+                    when Right(right as launch: Launch) do
+                        destroyHostList(hosts);
+                        return launch;
+                    when Left(left as code: Int32) do
+                        destroyHostList(hosts);
+                        abort("no launch");
+                end case;
+            when Left(left as code: Int32) do
+                abort("no host list");
+        end case;
+    end;
+
+    -- The text of a host list for the ports of launch, one line a rank,
+    -- except that rank two names the port of rank one: a server that is
+    -- rank one answers where rank two is expected.
+    generic [R: Region]
+    function crossedHosts(launch: &[Launch, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Nat32 := 0;
+        while i < 3 do
+            var named: Nat32 := i;
+            if i = 2 then
+                named := 1;
+            end if;
+            writeString(&!out, "localhost ");
+            let port: String := formatNat(portNumber(launch, named));
+            writeString(&!out, asSpan(&port));
+            destroyString(port);
+            writeString(&!out, "\n");
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function portNumber(launch: &[Launch, R], at: Nat32): Nat64 is
+        case toNat64(launchPort(launch, at)) of
+            when Some(value as port: Nat64) do
+                return port;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region]
+    function jobOf(launch: &[Launch, R], at: Nat32): Job is
+        case describeRank(launch, at) of
+            when Some(value as description: String) do
+                case readJob(asSpan(&description)) of
+                    when Right(right as job: Job) do
+                        destroyString(description);
+                        return job;
+                    when Left(left as code: Int32) do
+                        destroyString(description);
+                        abort("the description was refused");
+                end case;
+            when None do
+                abort("no description");
+        end case;
+    end;
+
+    ---
+    --- A mesh of three ranks
+    ---
+
+    function tagName(): Nat32 is
+        return 7;
+    end;
+
+    -- The text that rank source sends to rank target.
+    function note(source: Nat32, target: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "hello from ");
+        let a: String := formatNat(widen(source));
+        writeString(&!out, asSpan(&a));
+        writeString(&!out, " to ");
+        let b: String := formatNat(widen(target));
+        writeString(&!out, asSpan(&b));
+        destroyString(a);
+        destroyString(b);
+        return finalize(out);
+    end;
+
+    function widen(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Joins the job, trades one message with every other rank in both
+    -- directions, receives two tags out of order, and says whether it all
+    -- went as it should.
+    function meshRank(job: Job): Nat32 is
+        case init(job) of
+            when Left(left as code: Int32) do
+                print("init failed with ");
+                printLn(code);
+                return 1;
+            when Right(right as opened: Comm) do
+                var comm: Comm := opened;
+                var good: Bool := true;
+                let me: Nat32 := rank(&comm);
+                var other: Nat32 := 0;
+                while other < size(&comm) do
+                    if other /= me then
+                        if send(&!comm, other, tagName(), note(me, other)) /= 0 then
+                            good := false;
+                        end if;
+                    end if;
+                    other := other + 1;
+                end while;
+                other := 0;
+                while other < size(&comm) do
+                    if other /= me then
+                        case recv(&!comm, other, tagName()) of
+                            when Right(right as text: String) do
+                                let wanted: String := note(other, me);
+                                if not equal(asSpan(&text), asSpan(&wanted)) then
+                                    good := false;
+                                end if;
+                                destroyString(wanted);
+                                destroyString(text);
+                            when Left(left as code: Int32) do
+                                good := false;
+                        end case;
+                    end if;
+                    other := other + 1;
+                end while;
+                -- Tag 2 is sent before tag 1 and received after it.
+                if me = 0 then
+                    if send(&!comm, 1, 2, fromLiteral("second")) /= 0 then
+                        good := false;
+                    end if;
+                    let handle: SendHandle := startSend(&!comm, 1, 1, fromLiteral("first"));
+                    if finishSend(&!comm, handle) /= 0 then
+                        good := false;
+                    end if;
+                    if heartbeat(&!comm) /= 0 then
+                        good := false;
+                    end if;
+                end if;
+                if me = 1 then
+                    case recv(&!comm, 0, 1) of
+                        when Right(right as text: String) do
+                            if not equal(asSpan(&text), "first") then
+                                good := false;
+                            end if;
+                            destroyString(text);
+                        when Left(left as code: Int32) do
+                            good := false;
+                    end case;
+                    let waiting: RecvHandle := startRecv(&!comm, 0, 2);
+                    case finishRecv(&!comm, waiting) of
+                        when Right(right as text: String) do
+                            if not equal(asSpan(&text), "second") then
+                                good := false;
+                            end if;
+                            destroyString(text);
+                        when Left(left as code: Int32) do
+                            good := false;
+                    end case;
+                end if;
+                finish(comm);
+                if good then
+                    return 0;
+                end if;
+                return 2;
+        end case;
+    end;
+
+    generic [K: Region, L: Region]
+    function startRank(scope: &![Scope, K], launch: &[Launch, L], at: Nat32): Task[Nat32] is
+        case spawn(&~scope, meshRank, jobOf(launch, at)) of
+            when Right(right as task: Task[Nat32]) do
+                return task;
+            when Left(left as back: Job) do
+                destroyJob(back);
+                abort("a rank did not start");
+        end case;
+    end;
+
+    function testLaunchToken(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let id: String := launchId(&launch);
+        let key: String := launchPublicKey(&launch);
+        case tokenWith(&launch, asSpan(&id), 1, launchExpiry(&launch), "localhost") of
+            when Some(value as token: String) do
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&key), asSpan(&id), 1, 3, 1, "localhost", 1000) = 0, "a token of the launch holds");
+                destroyString(token);
+            when None do
+                assertTrue(false, "a token was made");
+        end case;
+        destroyString(key);
+        destroyString(id);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testJobToken(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let job: Job := jobOf(&launch, 1);
+        let id: String := jobId(&job);
+        let key: String := jobPublicKey(&job);
+        let token: String := jobToken(&job);
+        let launchKey: String := launchPublicKey(&launch);
+        assertTrue(equal(asSpan(&key), asSpan(&launchKey)), "the key of the job is the key of the launch");
+        assertTrue(verifyJoinToken(asSpan(&token), asSpan(&key), asSpan(&id), 1, 3, 1, "localhost", 1000) = 0, "the token of the job holds");
+        destroyString(launchKey);
+        destroyString(token);
+        destroyString(key);
+        destroyString(id);
+        destroyJob(job);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testMeshOfThree(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        case openScopeWithStack(8388608) of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                let first: Task[Nat32] := startRank(&!scope, &launch, 0);
+                let second: Task[Nat32] := startRank(&!scope, &launch, 1);
+                let third: Task[Nat32] := startRank(&!scope, &launch, 2);
+                assertTrue(join(first) = 0, "rank 0 traded its messages");
+                assertTrue(join(second) = 0, "rank 1 traded its messages");
+                assertTrue(join(third) = 0, "rank 2 traded its messages");
+                closeScope(scope);
+            when None do
+                assertTrue(false, "a scope");
+        end case;
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    ---
+    --- Pairs of ranks in which one side is wrong
+    ---
+
+    function loopback(): String is
+        var address: String := makeString(4, 0);
+        let first: Nat8 := 127;
+        let last: Nat8 := 1;
+        storeNth(&!address, 0, first);
+        storeNth(&!address, 3, last);
+        return address;
+    end;
+
+    -- What the server side, rank one, does once a peer is accepted: mode 1
+    -- waits for a frame and gives the code of the refusal; mode 2 takes the
+    -- frame after a stale one and checks what was dropped.
+    generic [R: Region]
+    function afterAccept(peer: &![Peer, R], mode: Nat32): Int32 is
+        if (mode = 1) or (mode >= 4) then
+            case receiveFrame(&~peer, 5000) of
+                when Left(left as code: Int32) do
+                    return code;
+                when Right(right as frame: Frame) do
+                    destroyFrame(frame);
+                    return 0;
+            end case;
+        end if;
+        if mode = 2 then
+            case receiveFrame(&~peer, 5000) of
+                when Left(left as code: Int32) do
+                    return code;
+                when Right(right as frame: Frame) do
+                    let { kind: Nat8, tag: Nat32, epoch: Nat64, payload: String } := frame;
+                    let same: Bool := equal(asSpan(&payload), "new");
+                    destroyString(payload);
+                    if not same then
+                        return 98;
+                    end if;
+                    if (peerDropped(&peer) /= 1) or (peerLastCode(&peer) /= staleIncarnation()) then
+                        return 99;
+                    end if;
+                    return 0;
+            end case;
+        end if;
+        return 0;
+    end;
+
+    function serverMain(role: Role): Int32 is
+        let { job: Job, mode: Nat32 } := role;
+        var code: Int32 := peerLost();
+        case openEndpoint(&job, "sperli-test-s") of
+            when Left(left as why: Int32) do
+                code := why;
+            when Right(right as endpoint: Endpoint) do
+                case acceptPeer(&endpoint, &job, 15000) of
+                    when Left(left as why: Int32) do
+                        code := why;
+                    when Right(right as peer: Peer) do
+                        var open: Peer := peer;
+                        code := afterAccept(&!open, mode);
+                        closePeer(open);
+                end case;
+                closeEndpoint(endpoint);
+        end case;
+        destroyJob(job);
+        return code;
+    end;
+
+    -- The header of a frame of a number of bytes to rank one with the
+    -- length field of oversized frames.
+    generic [R: Region]
+    function oversizedHeader(job: &[Job, R]): String is
+        let id: String := jobId(job);
+        var header: String := frameHeader(dataKind(), 0, asSpan(&id), jobIncarnation(job), 0, 0, 1, 7);
+        let low: Nat8 := 1;
+        let zero: Nat8 := 0;
+        storeNth(&!header, 0, low);
+        storeNth(&!header, 1, zero);
+        storeNth(&!header, 2, zero);
+        storeNth(&!header, 3, low);
+        destroyString(id);
+        return header;
+    end;
+
+    generic [R: Region]
+    function staleHeader(job: &[Job, R]): String is
+        let id: String := jobId(job);
+        let header: String := frameHeader(dataKind(), 3, asSpan(&id), 1, 0, 0, 1, 7);
+        destroyString(id);
+        return header;
+    end;
+
+    generic [R: Region, E: Region]
+    function clientAct(peer: &![Peer, R], job: &[Job, E], mode: Nat32): Int32 is
+        if mode = 1 then
+            let header: String := oversizedHeader(job);
+            let code: Int32 := sendRaw(&~peer, asSpan(&header));
+            destroyString(header);
+            return code;
+        end if;
+        if mode = 2 then
+            let header: String := staleHeader(job);
+            var code: Int32 := sendRaw(&~peer, asSpan(&header));
+            destroyString(header);
+            if code = 0 then
+                code := sendRaw(&~peer, "old");
+            end if;
+            if code = 0 then
+                code := sendFrame(&~peer, dataKind(), 7, "new");
+            end if;
+            return code;
+        end if;
+        if mode = 4 then
+            return sendFrame(&~peer, dataKind(), 2147483648, "x");
+        end if;
+        if mode = 5 then
+            return sendFrame(&~peer, collectiveKind(), 7, "");
+        end if;
+        if mode = 6 then
+            return sendFrame(&~peer, collectiveKind(), 0, "0123456789abcdef");
+        end if;
+        if mode = 8 then
+            return sendFrame(&~peer, collectiveKind(), 0, "abc");
+        end if;
+        if mode = 7 then
+            return sendFrame(&~peer, dataKind(), 2147483647, "x");
+        end if;
+        return 0;
+    end;
+
+    function clientMain(role: Role): Int32 is
+        let { job: Job, mode: Nat32 } := role;
+        var code: Int32 := peerLost();
+        var target: Nat32 := 1;
+        if mode = 3 then
+            target := 2;
+        end if;
+        case openEndpoint(&job, "sperli-test-c") of
+            when Left(left as why: Int32) do
+                code := why;
+            when Right(right as endpoint: Endpoint) do
+                case connectPeer(&endpoint, &job, target) of
+                    when Left(left as why: Int32) do
+                        code := why;
+                    when Right(right as peer: Peer) do
+                        var open: Peer := peer;
+                        code := clientAct(&!open, &job, mode);
+                        sleepFor(600);
+                        closePeer(open);
+                end case;
+                closeEndpoint(endpoint);
+        end case;
+        destroyJob(job);
+        return code;
+    end;
+
+    -- A client with no certificate at all, to the port, trusting the CA in
+    -- the file sperli-test-ca.pem.
+    function bareClient(port: Nat16): Int32 is
+        let address: String := loopback();
+        var tries: Index := 0;
+        var done: Bool := false;
+        while (not done) and (tries < 100) do
+            case connectTcp(asSpan(&address), port, 5000) of
+                when Right(right as socket: FileDescriptor) do
+                    done := true;
+                    talkBare(socket);
+                when Left(left as failure: ConnectFailure) do
+                    sleepFor(100);
+            end case;
+            tries := tries + 1;
+        end while;
+        destroyString(address);
+        return 0;
+    end;
+
+    function talkBare(socket: FileDescriptor): Unit is
+        case connectOver(socket, "localhost", "sperli-test-ca.pem", 5000) of
+            when Right(right as opened: Client) do
+                var client: Client := opened;
+                case tlsSend(&!client, "x") of
+                    when Right(right as sent: Unit) do
+                        skip;
+                    when Left(left as message: String) do
+                        destroyString(message);
+                end case;
+                case receiveWithin(&!client, 10, 3000) of
+                    when Right(right as got: String) do
+                        destroyString(got);
+                    when Left(left as message: String) do
+                        destroyString(message);
+                end case;
+                closeClient(client);
+            when Left(left as message: String) do
+                destroyString(message);
+        end case;
+        return nil;
+    end;
+
+    generic [K: Region]
+    function startBare(scope: &![Scope, K], port: Nat16): Task[Int32] is
+        case spawn(&~scope, bareClient, port) of
+            when Right(right as task: Task[Int32]) do
+                return task;
+            when Left(left as back: Nat16) do
+                abort("the bare client did not start");
+        end case;
+    end;
+
+    generic [K: Region]
+    function startServer(scope: &![Scope, K], given: Job, way: Nat32): Task[Int32] is
+        case spawn(&~scope, serverMain, Role(job => given, mode => way)) of
+            when Right(right as task: Task[Int32]) do
+                return task;
+            when Left(left as back: Role) do
+                let { job: Job, mode: Nat32 } := back;
+                destroyJob(job);
+                abort("the server did not start");
+        end case;
+    end;
+
+    generic [K: Region]
+    function startClient(scope: &![Scope, K], given: Job, way: Nat32): Task[Int32] is
+        case spawn(&~scope, clientMain, Role(job => given, mode => way)) of
+            when Right(right as task: Task[Int32]) do
+                return task;
+            when Left(left as back: Role) do
+                let { job: Job, mode: Nat32 } := back;
+                destroyJob(job);
+                abort("the client did not start");
+        end case;
+    end;
+
+    -- The text of a host list for the ports of launch, one line a rank.
+    -- When crossed is true rank two names the port of rank one: a server
+    -- that is rank one then answers where rank two is expected.
+    generic [R: Region]
+    function portsText(launch: &[Launch, R], crossed: Bool): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Nat32 := 0;
+        while i < 3 do
+            var named: Nat32 := i;
+            if crossed and (i = 2) then
+                named := 1;
+            end if;
+            writeString(&!out, "localhost ");
+            let port: String := formatNat(portNumber(launch, named));
+            writeString(&!out, asSpan(&port));
+            destroyString(port);
+            writeString(&!out, "\n");
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- A launch of three ranks on the ports of another launch.
+    generic [R: Region]
+    function launchOnPortsOf(other: &[Launch, R], crossed: Bool, incarnation: Nat32): Launch is
+        let text: String := portsText(other, crossed);
+        case parseHostList(asSpan(&text), "") of
+            when Right(right as hosts: HostList) do
+                destroyString(text);
+                case newLaunch(&hosts, 3, incarnation, 600) of
+                    when Right(right as launch: Launch) do
+                        destroyHostList(hosts);
+                        return launch;
+                    when Left(left as code: Int32) do
+                        destroyHostList(hosts);
+                        abort("no launch on those ports");
+                end case;
+            when Left(left as code: Int32) do
+                destroyString(text);
+                abort("no host list of those ports");
+        end case;
+    end;
+
+    -- Runs a server (rank one of serverLaunch, in serverMode) against a
+    -- client (rank zero of clientJob) and gives the two codes, server first.
+    function runPair(serverJob: Job, serverMode: Nat32, clientJob: Job, clientMode: Nat32): Buffer[Int32] is
+        var codes: Buffer[Int32] := allocateEmpty();
+        case openScopeWithStack(8388608) of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                let server: Task[Int32] := startServer(&!scope, serverJob, serverMode);
+                let client: Task[Int32] := startClient(&!scope, clientJob, clientMode);
+                insertBack(&!codes, join(server));
+                insertBack(&!codes, join(client));
+                closeScope(scope);
+            when None do
+                destroyJob(serverJob);
+                destroyJob(clientJob);
+                insertBack(&!codes, 0 - 1);
+                insertBack(&!codes, 0 - 1);
+        end case;
+        return codes;
+    end;
+
+    generic [R: Region]
+    function firstOf(codes: &[Buffer[Int32], R]): Int32 is
+        return nth(codes, 0);
+    end;
+
+    generic [R: Region]
+    function secondOf(codes: &[Buffer[Int32], R]): Int32 is
+        return nth(codes, 1);
+    end;
+
+    function testGoodPair(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 0, jobOf(&launch, 0), 0);
+        assertTrue(firstOf(&codes) = 0, "the server accepted the client");
+        assertTrue(secondOf(&codes) = 0, "the client connected to the server");
+        destroyFree(codes);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testCertificateOfAnotherCa(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let other: Launch := launchOnPortsOf(&launch, false, 1);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 0, jobOf(&other, 0), 0);
+        assertTrue(firstOf(&codes) = badCertificate(), "a certificate of another CA is refused with H1601");
+        assertTrue(secondOf(&codes) /= 0, "the client did not get in");
+        destroyFree(codes);
+        destroyLaunch(other);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testNoCertificate(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let ca: String := launchCaPem(&launch);
+        case openWrite("sperli-test-ca.pem") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, asSpan(&ca));
+                let closed: Bool := closeFile(file);
+            when None do
+                assertTrue(false, "the CA file was written");
+        end case;
+        case openScopeWithStack(8388608) of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                let server: Task[Int32] := startServer(&!scope, jobOf(&launch, 1), 0);
+                let client: Task[Int32] := startBare(&!scope, launchPort(&launch, 1));
+                assertTrue(join(server) = badCertificate(), "a client with no certificate is refused with H1601");
+                assertTrue(join(client) = 0, "the bare client ended");
+                closeScope(scope);
+            when None do
+                assertTrue(false, "a scope");
+        end case;
+        assertTrue(removeFile("sperli-test-ca.pem"), "the CA file was removed");
+        destroyString(ca);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testCertificateOfAnotherRank(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let crossed: Launch := launchOnPortsOf(&launch, true, 1);
+        let codes: Buffer[Int32] := runPair(jobOf(&crossed, 1), 0, jobOf(&crossed, 0), 3);
+        assertTrue(secondOf(&codes) = subjectMismatch(), "a certificate of another rank is refused with H1602");
+        destroyFree(codes);
+        destroyLaunch(crossed);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    -- The client of rank zero holds a token made as the launcher would for
+    -- the given job id, rank and expiry.
+    generic [R: Region, J: Region]
+    function withMadeToken(launch: &[Launch, R], id: Span[Nat8, J], rank: Nat32, expiry: Nat64): Job is
+        let job: Job := jobOf(launch, 0);
+        case tokenWith(launch, id, rank, expiry, "localhost") of
+            when Some(value as token: String) do
+                let changed: Job := withToken(job, asSpan(&token));
+                destroyString(token);
+                return changed;
+            when None do
+                destroyJob(job);
+                abort("no token");
+        end case;
+    end;
+
+    function testExpiredToken(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let id: String := launchId(&launch);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 0, withMadeToken(&launch, asSpan(&id), 0, 1), 0);
+        assertTrue(firstOf(&codes) = tokenExpired(), "an expired token is refused with H1604");
+        destroyFree(codes);
+        destroyString(id);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testTokenOfAnotherJob(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let foreign: String := makeString(16, 9);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 0, withMadeToken(&launch, asSpan(&foreign), 0, launchExpiry(&launch)), 0);
+        assertTrue(firstOf(&codes) = tokenForeignJob(), "a token of another job is refused with H1605");
+        destroyFree(codes);
+        destroyString(foreign);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testTokenOfAnotherRank(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let id: String := launchId(&launch);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 0, withMadeToken(&launch, asSpan(&id), 2, launchExpiry(&launch)), 0);
+        assertTrue(firstOf(&codes) = tokenWrongRank(), "a token of another rank is refused with H1606");
+        destroyFree(codes);
+        destroyString(id);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testOversizedFrame(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 1, jobOf(&launch, 0), 1);
+        assertTrue(firstOf(&codes) = oversizedFrame(), "a frame over the limit is refused with H1608 before its payload is read");
+        destroyFree(codes);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testStaleIncarnation(): Unit is
+        let launch: Launch := launchOf(3, 2);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 2, jobOf(&launch, 0), 2);
+        assertTrue(firstOf(&codes) = 0, "a frame of an older incarnation is dropped (H1609) and the next one taken");
+        destroyFree(codes);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testReservedTag(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 4, jobOf(&launch, 0), 4);
+        assertTrue(firstOf(&codes) = badFrame(), "a data frame with a reserved tag is refused");
+        destroyFree(codes);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testCollectiveWithTag(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 5, jobOf(&launch, 0), 5);
+        assertTrue(firstOf(&codes) = badFrame(), "a collective frame with a tag is refused");
+        destroyFree(codes);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testShortCollectiveFrame(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 8, jobOf(&launch, 0), 8);
+        assertTrue(firstOf(&codes) = badFrame(), "a collective frame shorter than its header is refused");
+        destroyFree(codes);
+        destroyLaunch(launch);
+        return nil;
+    end;
+
+    function testCollectiveFrameTaken(): Unit is
+        let launch: Launch := launchOf(3, 1);
+        let codes: Buffer[Int32] := runPair(jobOf(&launch, 1), 6, jobOf(&launch, 0), 6);
+        assertTrue(firstOf(&codes) = 0, "a collective frame with tag 0 is taken");
+        destroyFree(codes);
+        destroyLaunch(launch);
+        let again: Launch := launchOf(3, 1);
+        let last: Buffer[Int32] := runPair(jobOf(&again, 1), 7, jobOf(&again, 0), 7);
+        assertTrue(firstOf(&last) = 0, "a data frame with the largest user tag is taken");
+        destroyFree(last);
+        destroyLaunch(again);
+        return nil;
+    end;
+
+    -- A description whose host is host-a.invalid, changed by one letter
+    -- from host-c.invalid in the bytes, as a launcher would never write
+    -- it: the rank refuses it.
+    function testRefusedHostInDescription(): Unit is
+        case parseHostList("host-c.invalid\nhost-c.invalid\n", "") of
+            when Right(right as hosts: HostList) do
+                case newLaunch(&hosts, 2, 1, 600) of
+                    when Right(right as launch: Launch) do
+                        case describeRank(&launch, 0) of
+                            when Some(value as description: String) do
+                                var bytes: String := description;
+                                var at: Index := 0;
+                                var hits: Index := 0;
+                                while at < textLength(&bytes) do
+                                    if (nthByte(&bytes, at) = 99) and (at > 2) and (nthByte(&bytes, at - 1) = 45) and (nthByte(&bytes, at - 2) = 116) then
+                                        let letter: Nat8 := 97;
+                                        storeNth(&!bytes, at, letter);
+                                        hits := hits + 1;
+                                    end if;
+                                    at := at + 1;
+                                end while;
+                                assertTrue(hits >= 2, "the host was found in the bytes");
+                                case readJob(asSpan(&bytes)) of
+                                    when Left(left as code: Int32) do
+                                        assertTrue(code = refusedHost(), "a host of host-a.invalid is refused with H1603");
+                                    when Right(right as job: Job) do
+                                        destroyJob(job);
+                                        assertTrue(false, "the job was refused");
+                                end case;
+                                destroyString(bytes);
+                            when None do
+                                assertTrue(false, "a description was made");
+                        end case;
+                        destroyLaunch(launch);
+                    when Left(left as code: Int32) do
+                        assertTrue(false, "a launch of oceb");
+                end case;
+                destroyHostList(hosts);
+            when Left(left as code: Int32) do
+                assertTrue(false, "a host list of oceb");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,369 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.HashMap.
+import Standard.Tuples (
+    Pair
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString
+);
+import Standard.Order (
+    Ordering,
+    LessThan,
+    Equal,
+    GreaterThan,
+    TotalOrder,
+    compare,
+    equal
+);
+import Standard.Hash (
+    Hashable,
+    hashOf
+);
+import Standard.HashMap (
+    HashMap,
+    makeHashMap,
+    makeHashMapKeyed,
+    destroyEmpty,
+    destroyFree,
+    size,
+    contains,
+    get,
+    getRef,
+    put,
+    remove,
+    keyAt,
+    valueAt,
+    removeAt
+);
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+
+module body Standard.HashMap.Test is
+    constant zeroNat: Nat64 := 0;
+
+    function wholeIs(found: Option[Nat64], want: Nat64): Bool is
+        case found of
+            when Some(value as v: Nat64) do
+                return v = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNone(found: Option[Nat64]): Bool is
+        case found of
+            when Some(value as v: Nat64) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function dropOld(old: Option[Pair[Nat64, Nat64]]): Bool is
+        case old of
+            when Some(value as p: Pair[Nat64, Nat64]) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- A key whose hash is the same for every value, so that every key of a
+    -- map falls on one chain of slots: the map must tell keys apart by
+    -- their order, and a probe must go on past a removed key.
+    record Collide: Free is
+        n: Nat64;
+    end;
+
+    instance Hashable(Collide) is
+        generic [R: Region]
+        method hashOf(value: &[Collide, R], key0: Nat64, key1: Nat64): Nat64 is
+            return 42;
+        end;
+    end;
+
+    instance TotalOrder(Collide) is
+        generic [R: Region, S: Region]
+        method compare(a: &[Collide, R], b: &[Collide, S]): Ordering is
+            let x: Nat64 := a->n;
+            let y: Nat64 := b->n;
+            if x < y then
+                return LessThan();
+            else if x > y then
+                return GreaterThan();
+            else
+                return Equal();
+            end if;
+        end;
+    end;
+
+    function collideOld(old: Option[Pair[Collide, Nat64]]): Bool is
+        case old of
+            when Some(value as p: Pair[Collide, Nat64]) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function collideIs(found: Option[Nat64], want: Nat64): Bool is
+        return wholeIs(found, want);
+    end;
+
+    -- twenty keys of one hash: each found with its own value; every other
+    -- removed, and each of the rest still found behind the tombstones.
+    function testCollisions(): Unit is
+        var m: HashMap[Collide, Nat64] := makeHashMapKeyed(5, 6);
+        let twenty: Nat64 := 20;
+        var i: Nat64 := zeroNat;
+        while i < twenty do
+            let dropped: Bool := collideOld(put(&!m, Collide(n => i), i * 10));
+            i := i + 1;
+        end while;
+        assertTrue(size(&m) = 20, "twenty keys of one hash");
+        var right: Nat64 := 0;
+        i := zeroNat;
+        while i < twenty do
+            let key: Collide := Collide(n => i);
+            if collideIs(get(&m, &key), i * 10) then
+                right := right + 1;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue(right = twenty, "each key found with its own value, not its neighbour's");
+        i := zeroNat;
+        let two: Nat64 := 2;
+        while i < twenty do
+            let key: Collide := Collide(n => i);
+            case remove(&!m, &key) of
+                when Some(value as p: Pair[Collide, Nat64]) do
+                    skip;
+                when None do
+                    skip;
+            end case;
+            i := i + two;
+        end while;
+        assertTrue(size(&m) = 10, "ten removed");
+        var odd: Nat64 := 0;
+        var even: Nat64 := 0;
+        i := zeroNat;
+        while i < twenty do
+            let key: Collide := Collide(n => i);
+            if contains(&m, &key) then
+                if rem(i, two) = zeroNat then
+                    even := even + 1;
+                else
+                    odd := odd + 1;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue(odd = 10, "every odd key found past the tombstones of the even ones");
+        assertTrue(even = 0, "no even key found");
+        destroyFree(m);
+        return nil;
+    end;
+
+    -- The keys added up by position, keyAt from 0 until it says None.
+    generic [R: Region]
+    function sumOfKeys(m: &[HashMap[Nat64, Nat64], R]): Nat64 is
+        var sum: Nat64 := 0;
+        var pos: Index := 0;
+        var going: Bool := true;
+        while going do
+            case keyAt(m, pos) of
+                when Some(value as k: &[Nat64, R]) do
+                    sum := sum + !k;
+                    pos := pos + 1;
+                when None do
+                    going := false;
+            end case;
+        end while;
+        return sum;
+    end;
+
+    -- remove and removeAt; a key put, removed and put again many times
+    -- leaves the table usable, the tombstones cleared when it is rebuilt.
+    function testRemove(): Unit is
+        var m: HashMap[Nat64, Nat64] := makeHashMapKeyed(3, 4);
+        var i: Nat64 := 0;
+        let hundred: Nat64 := 100;
+        while i < hundred do
+            let dropped: Bool := dropOld(put(&!m, i, i));
+            i := i + 1;
+        end while;
+        let seven: Nat64 := 7;
+        case remove(&!m, &seven) of
+            when Some(value as p: Pair[Nat64, Nat64]) do
+                let { first: Nat64, second: Nat64 } := p;
+                assertTrue(first = seven, "remove gives the key back");
+            when None do
+                assertTrue(false, "7 was there");
+        end case;
+        assertFalse(contains(&m, &seven), "7 gone");
+        assertTrue(size(&m) = 99, "99 left");
+        case remove(&!m, &seven) of
+            when Some(value as p: Pair[Nat64, Nat64]) do
+                assertTrue(false, "7 is gone");
+            when None do
+                assertTrue(true, "removing 7 again: None");
+        end case;
+        case removeAt(&!m, 0) of
+            when Some(value as p: Pair[Nat64, Nat64]) do
+                assertTrue(size(&m) = 98, "removeAt takes one");
+            when None do
+                assertTrue(false, "position 0 is there");
+        end case;
+        case removeAt(&!m, 98) of
+            when Some(value as p: Pair[Nat64, Nat64]) do
+                assertTrue(false, "position 98 is past the last");
+            when None do
+                assertTrue(true, "removeAt past the last: None");
+        end case;
+        var left: Nat64 := 0;
+        i := zeroNat;
+        while i < hundred do
+            if contains(&m, &i) then
+                left := left + 1;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue(left = 98, "every other key still found");
+        let key: Nat64 := 1000;
+        var round: Index := 0;
+        while round < 5000 do
+            let added: Bool := dropOld(put(&!m, key, key));
+            case remove(&!m, &key) of
+                when Some(value as p: Pair[Nat64, Nat64]) do
+                    skip;
+                when None do
+                    skip;
+            end case;
+            round := round + 1;
+        end while;
+        assertTrue(size(&m) = 98, "5000 rounds of put and remove leave 98");
+        assertFalse(contains(&m, &key), "1000 removed at the end of each round");
+        destroyFree(m);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function stringValueIs(m: &[HashMap[String, String], R], key: Span[Nat8, Static], want: Span[Nat8, Static]): Bool is
+        let k: String := fromLiteral(key);
+        let w: String := fromLiteral(want);
+        var same: Bool := false;
+        case getRef(m, &k) of
+            when Some(value as v: &[String, R]) do
+                same := equal(v, &w);
+            when None do
+                skip;
+        end case;
+        destroyString(k);
+        destroyString(w);
+        return same;
+    end;
+
+    -- strings as keys and values, which are linear: every entry taken out
+    -- and destroyed, then the empty map.
+    function testStrings(): Unit is
+        var m: HashMap[String, String] := makeHashMap();
+        case put(&!m, fromLiteral("apple"), fromLiteral("red")) of
+            when Some(value as p: Pair[String, String]) do
+                let { first: String, second: String } := p;
+                destroyString(first);
+                destroyString(second);
+            when None do
+                skip;
+        end case;
+        case put(&!m, fromLiteral("pear"), fromLiteral("green")) of
+            when Some(value as p: Pair[String, String]) do
+                let { first: String, second: String } := p;
+                destroyString(first);
+                destroyString(second);
+            when None do
+                skip;
+        end case;
+        assertTrue(stringValueIs(&m, "apple", "red"), "apple -> red");
+        assertTrue(stringValueIs(&m, "pear", "green"), "pear -> green");
+        while size(&m) > 0 do
+            case removeAt(&!m, 0) of
+                when Some(value as p: Pair[String, String]) do
+                    let { first: String, second: String } := p;
+                    destroyString(first);
+                    destroyString(second);
+                when None do
+                    skip;
+            end case;
+        end while;
+        destroyEmpty(m);
+        return nil;
+    end;
+
+    -- put, get, contains and size; a second put replaces and gives the old
+    -- entry back.
+    function testPutAndGet(): Unit is
+        var m: HashMap[Nat64, Nat64] := makeHashMap();
+        let one: Nat64 := 1;
+        let two: Nat64 := 2;
+        let ten: Nat64 := 10;
+        let twenty: Nat64 := 20;
+        assertFalse(dropOld(put(&!m, one, ten)), "a new key: None");
+        assertFalse(dropOld(put(&!m, two, twenty)), "another new key: None");
+        assertTrue(size(&m) = 2, "two entries");
+        assertTrue(wholeIs(get(&m, &one), 10), "1 -> 10");
+        assertTrue(wholeIs(get(&m, &two), 20), "2 -> 20");
+        assertTrue(contains(&m, &one), "holds 1");
+        let three: Nat64 := 3;
+        assertFalse(contains(&m, &three), "does not hold 3");
+        assertTrue(isNone(get(&m, &three)), "get 3: None");
+        case put(&!m, one, twenty) of
+            when Some(value as old: Pair[Nat64, Nat64]) do
+                let { first: Nat64, second: Nat64 } := old;
+                assertTrue(second = ten, "the old value comes back");
+            when None do
+                assertTrue(false, "a key held: the old entry");
+        end case;
+        assertTrue(wholeIs(get(&m, &one), 20), "1 -> 20 now");
+        assertTrue(size(&m) = 2, "still two entries");
+        destroyFree(m);
+        return nil;
+    end;
+
+    -- ten thousand keys: every one found after the table grew many times,
+    -- and every position reached once.
+    function testMany(): Unit is
+        var m: HashMap[Nat64, Nat64] := makeHashMapKeyed(1, 2);
+        let count: Nat64 := 10000;
+        var i: Nat64 := 0;
+        while i < count do
+            let dropped: Bool := dropOld(put(&!m, i, i * 3));
+            i := i + 1;
+        end while;
+        assertTrue(size(&m) = 10000, "ten thousand entries");
+        var found: Nat64 := 0;
+        i := zeroNat;
+        while i < count do
+            if wholeIs(get(&m, &i), i * 3) then
+                found := found + 1;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue(found = count, "every key found with its value");
+        let sum: Nat64 := sumOfKeys(&m);
+        let want: Nat64 := 49995000;
+        assertTrue(sum = want, "the keys by position add up to 0 + 1 + ... + 9999");
+        assertTrue(isNone(get(&m, &count)), "10000 is not a key");
+        destroyFree(m);
+        return nil;
+    end;
+end module body.

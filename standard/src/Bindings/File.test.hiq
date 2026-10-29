@@ -1,0 +1,201 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Tests for Bindings.File: each function checks what it hands to C, even
+-- when the caller is not Standard.File.  Every refusal is asked for with an
+-- input the kernel would have taken, so a binding that lost its check
+-- answers something else than -1 or None and the assertion fails.  Every
+-- group also has a call that must go through, so a binding that refuses
+-- everything fails as well.
+--
+-- The file read is /dev/null, which answers the end of the file at once:
+-- a read that should have been refused writes nothing even when it is not.
+-- The programme started is /usr/bin/true, which both platforms have.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth
+);
+import Bindings.File (
+    Spawned,
+    openRead,
+    closeNumber,
+    readInto,
+    spawnPacked,
+    waitPid,
+    environmentInto
+);
+
+module body Standard.Bindings.File.Test is
+    ---
+    --- Helpers
+    ---
+
+    -- The bytes of text and one zero byte after them.
+    function withZero(text: Span[Nat8, Static]): String is
+        let source: String := fromLiteral(text);
+        let size: Index := length(&source);
+        var copy: String := makeString(size + 1, 0);
+        if size > 0 then
+            for i from 0 to size - 1 do
+                storeNth(&!copy, i, nthByte(&source, i));
+            end for;
+        end if;
+        destroyString(source);
+        return copy;
+    end;
+
+    -- first, a zero byte, second, a zero byte.
+    function twoWithZeros(first: Span[Nat8, Static], second: Span[Nat8, Static]): String is
+        let a: String := withZero(first);
+        let b: String := withZero(second);
+        let sizeA: Index := length(&a);
+        let sizeB: Index := length(&b);
+        var joined: String := makeString(sizeA + sizeB, 0);
+        for i from 0 to sizeA - 1 do
+            storeNth(&!joined, i, nthByte(&a, i));
+        end for;
+        for i from 0 to sizeB - 1 do
+            storeNth(&!joined, sizeA + i, nthByte(&b, i));
+        end for;
+        destroyString(a);
+        destroyString(b);
+        return joined;
+    end;
+
+    ---
+    --- Paths
+    ---
+
+    -- a path is checked before it reaches the kernel.
+    function testPath(): Unit is
+        let bare: String := fromLiteral("/dev/null");
+        assertTrue(openRead(&bare) = -1, "a path without its zero byte is refused");
+        destroyString(bare);
+        let empty: String := makeString(0, 0);
+        assertTrue(openRead(&empty) = -1, "an empty path is refused");
+        destroyString(empty);
+        -- The kernel would open /dev/null here, the name before the first
+        -- zero byte, which is not the name that was handed in.
+        let inner: String := twoWithZeros("/dev/null", "x");
+        assertTrue(openRead(&inner) = -1, "a path with a zero byte inside is refused");
+        destroyString(inner);
+        let good: String := withZero("/dev/null");
+        let number: Int32 := openRead(&good);
+        destroyString(good);
+        assertTrue(number >= 0, "the same path with its zero byte opens");
+        assertTrue(closeNumber(number), "and closes");
+        return nil;
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    -- a read never reaches past its buffer.
+    function testRead(): Unit is
+        let path: String := withZero("/dev/null");
+        let number: Int32 := openRead(&path);
+        destroyString(path);
+        assertTrue(number >= 0, "/dev/null opens");
+        var buffer: String := makeString(8, 0);
+        assertTrue(readInto(number, &!buffer, 4, 5) = -1, "at 4, 5 bytes into 8 is refused");
+        assertTrue(readInto(number, &!buffer, 0, 9) = -1, "9 bytes into 8 is refused");
+        assertTrue(readInto(number, &!buffer, 8, 1) = -1, "a read at the end of the buffer is refused");
+        assertTrue(readInto(number, &!buffer, 0, 0) = -1, "a read of nothing is refused");
+        -- The largest count there is: at plus count would not fit in an
+        -- Index, and the check must not compute that sum.
+        let largest: Index := maximum_index;
+        assertTrue(readInto(number, &!buffer, 1, largest) = -1, "a count past every buffer is refused");
+        assertTrue(readInto(number, &!buffer, 4, 4) = 0, "4 bytes at 4 into 8 reach the kernel, which says end of file");
+        destroyString(buffer);
+        assertTrue(closeNumber(number), "/dev/null closes");
+        return nil;
+    end;
+
+    ---
+    --- Starting a programme
+    ---
+
+    -- True when the programme started and ended with exit code 0; its three
+    -- descriptors are closed.
+    function ranAndEnded(started: Option[Spawned]): Bool is
+        case started of
+            when Some(value as spawned: Spawned) do
+                let closedInput: Bool := closeNumber(spawned.input);
+                let closedOutput: Bool := closeNumber(spawned.output);
+                let closedErrors: Bool := closeNumber(spawned.errors);
+                let status: Int32 := waitPid(spawned.pid);
+                return (closedInput and closedOutput) and (closedErrors and (status = 0));
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refused(started: Option[Spawned]): Bool is
+        case started of
+            when Some(value as spawned: Spawned) do
+                -- Started although it should not have been: cleaned up, and
+                -- false.
+                let closedInput: Bool := closeNumber(spawned.input);
+                let closedOutput: Bool := closeNumber(spawned.output);
+                let closedErrors: Bool := closeNumber(spawned.errors);
+                let status: Int32 := waitPid(spawned.pid);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- a count never reaches past the arguments.
+    function testSpawn(): Unit is
+        -- Two zero bytes and a count of one: the runtime would take the
+        -- first argument only.  This one comes first because it is the
+        -- refusal whose loss is harmless to watch.
+        let two: String := twoWithZeros("/usr/bin/true", "x");
+        assertTrue(refused(spawnPacked(&two, 1)), "a count below the zero bytes is refused");
+        destroyString(two);
+        let one: String := withZero("/usr/bin/true");
+        assertTrue(refused(spawnPacked(&one, 2)), "a count above the zero bytes is refused");
+        assertTrue(refused(spawnPacked(&one, 0)), "a count of 0 is refused");
+        assertTrue(ranAndEnded(spawnPacked(&one, 1)), "the count of the zero bytes starts the programme");
+        destroyString(one);
+        let bare: String := fromLiteral("/usr/bin/true");
+        assertTrue(refused(spawnPacked(&bare, 1)), "arguments without a zero byte at the end are refused");
+        destroyString(bare);
+        return nil;
+    end;
+
+    ---
+    --- The environment
+    ---
+
+    -- a name and a buffer are checked before the environment is read.
+    function testEnvironment(): Unit is
+        var buffer: String := makeString(16, 0);
+        let bare: String := fromLiteral("PATH");
+        assertTrue(environmentInto(&bare, &!buffer) = -1, "a name without its zero byte is refused");
+        destroyString(bare);
+        let name: String := withZero("PATH");
+        var none: String := makeString(0, 0);
+        assertTrue(environmentInto(&name, &!none) = -1, "an empty buffer is refused");
+        destroyString(none);
+        assertFalse(environmentInto(&name, &!buffer) = -1, "PATH is read with its zero byte and a buffer");
+        destroyString(name);
+        destroyString(buffer);
+        return nil;
+    end;
+end module body.

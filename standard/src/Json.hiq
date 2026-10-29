@@ -1,0 +1,1603 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: it reads bytes through spans, writes them through a
+-- StringBuilder and binds no C.  Reading is a loop with a stack of its own
+-- and no recursion, so that the depth of the input decides nothing but the
+-- refusal.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString as appendText,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    destroyEmpty,
+    length as bufferLength,
+    lengthMut,
+    nth,
+    nthMut,
+    nthRef,
+    storeNth,
+    insertBack,
+    removeLast
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Sort (
+    sort
+);
+import Standard.Text (
+    hexDigitValue,
+    parseNat,
+    substring,
+    constantTimeEqual
+);
+import Standard.Utf8 (
+    CodePoint,
+    Decoded,
+    makeCodePoint,
+    decodeAt,
+    decodedWidth,
+    appendCodePoint,
+    isValid
+);
+import Bindings.Serial (
+    nextSerial
+);
+
+module body Standard.Json is
+    constant mostDepth: Index := 128;
+
+    -- serial is the document's own number, which no other document of the
+    -- process has; a cursor carries it, so that a cursor of another document
+    -- is told apart without a pointer.
+    record Json: Linear is
+        text: String;
+        serial: Nat64;
+    end;
+
+    -- A child of a container: the place of its value, and for a member of an
+    -- object the place of its name before it.  An element of an array has
+    -- name at value.
+    record JsonCursor: Free is
+        serial: Nat64;
+        name: Index;
+        value: Index;
+        named: Bool;
+        invariant name <= value;
+        invariant named or (name = value);
+    end;
+
+    -- What the reading loop expects next.
+    constant needValue: Nat8 := 1;
+    constant needValueOrEnd: Nat8 := 2;
+    constant needName: Nat8 := 3;
+    constant needNameOrEnd: Nat8 := 4;
+    constant needColon: Nat8 := 5;
+    constant needCommaOrEnd: Nat8 := 6;
+
+    -- The kind of an open container on the reading stack.
+    constant kindArray: Nat8 := 1;
+    constant kindObject: Nat8 := 2;
+
+    -- The state of an open container on the writing stack.
+    constant arrayEmpty: Nat8 := 1;
+    constant arrayFull: Nat8 := 2;
+    constant objectEmpty: Nat8 := 3;
+    constant objectFull: Nat8 := 4;
+
+    ---
+    --- Small pieces
+    ---
+
+    function refusal(fault: JsonFault, at: Index): Option[JsonError] is
+        return Some(value => JsonError(fault => fault, offset => at));
+    end;
+
+    function stop(fault: JsonFault, at: Index): Either[JsonError, Index] is
+        return Left(left => JsonError(fault => fault, offset => at));
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    function isSpace(byte: Nat8): Bool is
+        return ((byte = ' ') or (byte = '\t')) or ((byte = '\n') or (byte = '\r'));
+    end;
+
+    -- The first place from at on that is not white space, or the length.
+    generic [R: Region]
+    function skipSpace(text: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(text);
+        var i: Index := at;
+        while (i < size) and isSpace(text[i]) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- The first place from at on that is not a digit, or the length.
+    generic [R: Region]
+    function digitsEnd(text: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(text);
+        var i: Index := at;
+        while (i < size) and isDigit(text[i]) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- A hexadecimal digit as a Nat32; 16 for any other byte.
+    function hexValue(byte: Nat8): Nat32 is
+        case hexDigitValue(byte) of
+            when Some(value as digit: Nat8) do
+                case toNat32(digit) of
+                    when Some(value as wide: Nat32) do
+                        return wide;
+                    when None do
+                        return 16;
+                end case;
+            when None do
+                return 16;
+        end case;
+    end;
+
+    -- The four hexadecimal digits from at on as one number, or None when
+    -- the text ends before them or one of them is not a digit.
+    generic [R: Region]
+    function hexUnit(text: Span[Nat8, R], at: Index): Option[Nat32] is
+        if (at + 4) > spanLength(text) then
+            return None();
+        end if;
+        var unit: Nat32 := 0;
+        var i: Index := 0;
+        var good: Bool := true;
+        while good and (i < 4) do
+            let digit: Nat32 := hexValue(text[at + i]);
+            if digit = 16 then
+                good := false;
+            else
+                unit := (unit * 16) + digit;
+                i := i + 1;
+            end if;
+        end while;
+        if good then
+            return Some(value => unit);
+        else
+            return None();
+        end if;
+    end;
+
+    -- Whether every byte from at to the end is a hexadecimal digit: an
+    -- escape the text ends inside is cut short, one with another byte in
+    -- it is bad.
+    generic [R: Region]
+    function allHex(text: Span[Nat8, R], at: Index): Bool is
+        let size: Index := spanLength(text);
+        var i: Index := at;
+        while (i < size) and (hexValue(text[i]) /= 16) do
+            i := i + 1;
+        end while;
+        return i >= size;
+    end;
+
+    -- The same for a text already checked, where the digits are there.
+    generic [R: Region]
+    function checkedUnit(text: Span[Nat8, R], at: Index): Nat32 is
+        case hexUnit(text, at) of
+            when Some(value as unit: Nat32) do
+                return unit;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function isHighSurrogate(unit: Nat32): Bool is
+        return (unit >= #xD800) and (unit <= #xDBFF);
+    end;
+
+    function isLowSurrogate(unit: Nat32): Bool is
+        return (unit >= #xDC00) and (unit <= #xDFFF);
+    end;
+
+    ---
+    --- Checking a text
+    ---
+
+    -- A number from at on, as RFC 8259 writes one: an optional minus, 0 or
+    -- a digit from 1 to 9 followed by digits, then an optional fraction and
+    -- an optional exponent, each with at least one digit.  The place after
+    -- it.
+    generic [R: Region]
+    function scanNumber(text: Span[Nat8, R], at: Index): Either[JsonError, Index] is
+        let size: Index := spanLength(text);
+        var i: Index := at;
+        if (i < size) and (text[i] = '-') then
+            i := i + 1;
+        end if;
+        if i >= size then
+            return stop(CutShort(), i);
+        end if;
+        if text[i] = '0' then
+            i := i + 1;
+            if (i < size) and isDigit(text[i]) then
+                return stop(BadNumber(), i);
+            end if;
+        else if isDigit(text[i]) then
+            i := digitsEnd(text, i);
+        else
+            return stop(BadNumber(), i);
+        end if;
+        if (i < size) and (text[i] = '.') then
+            i := i + 1;
+            if (i >= size) or (not isDigit(text[i])) then
+                return stop(BadNumber(), i);
+            end if;
+            i := digitsEnd(text, i);
+        end if;
+        if (i < size) and ((text[i] = 'e') or (text[i] = 'E')) then
+            i := i + 1;
+            if (i < size) and ((text[i] = '+') or (text[i] = '-')) then
+                i := i + 1;
+            end if;
+            if (i >= size) or (not isDigit(text[i])) then
+                return stop(BadNumber(), i);
+            end if;
+            i := digitsEnd(text, i);
+        end if;
+        return Right(right => i);
+    end;
+
+    function isSimpleEscape(byte: Nat8): Bool is
+        if ((byte = '"') or (byte = '\\')) or ((byte = '/') or (byte = 'b')) then
+            return true;
+        end if;
+        return ((byte = 'f') or (byte = 'n')) or ((byte = 'r') or (byte = 't'));
+    end;
+
+    -- The string whose opening quote is at at: every escape one of the
+    -- nine, a surrogate only as one half of a pair, no byte below 32, and
+    -- UTF-8 throughout.  The place after its closing quote.
+    generic [R: Region]
+    function scanString(text: Span[Nat8, R], at: Index): Either[JsonError, Index] is
+        let size: Index := spanLength(text);
+        var i: Index := at + 1;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if byte = '"' then
+                return Right(right => i + 1);
+            end if;
+            if byte < 32 then
+                return stop(ControlInString(), i);
+            end if;
+            if byte = '\\' then
+                if (i + 1) >= size then
+                    return stop(CutShort(), size);
+                end if;
+                let escape: Nat8 := text[i + 1];
+                if escape = 'u' then
+                    if (i + 6) > size then
+                        if allHex(text, i + 2) then
+                            return stop(CutShort(), size);
+                        end if;
+                        return stop(BadEscape(), i);
+                    end if;
+                    case hexUnit(text, i + 2) of
+                        when Some(value as unit: Nat32) do
+                            if isHighSurrogate(unit) then
+                                if (i + 12) > size then
+                                    return stop(LoneSurrogate(), i);
+                                end if;
+                                if (text[i + 6] /= '\\') or (text[i + 7] /= 'u') then
+                                    return stop(LoneSurrogate(), i);
+                                end if;
+                                case hexUnit(text, i + 8) of
+                                    when Some(value as low: Nat32) do
+                                        if not isLowSurrogate(low) then
+                                            return stop(LoneSurrogate(), i);
+                                        end if;
+                                        i := i + 12;
+                                    when None do
+                                        return stop(BadEscape(), i + 6);
+                                end case;
+                            else if isLowSurrogate(unit) then
+                                return stop(LoneSurrogate(), i);
+                            else
+                                i := i + 6;
+                            end if;
+                        when None do
+                            return stop(BadEscape(), i);
+                    end case;
+                else if isSimpleEscape(escape) then
+                    i := i + 2;
+                else
+                    return stop(BadEscape(), i);
+                end if;
+            else if byte < 128 then
+                i := i + 1;
+            else
+                case decodeAt(text, i) of
+                    when Some(value as decoded: Decoded) do
+                        i := i + decodedWidth(decoded);
+                    when None do
+                        return stop(NotUtf8(), i);
+                end case;
+            end if;
+        end while;
+        return stop(CutShort(), size);
+    end;
+
+    -- One of the three words from at on.  A word the text ends inside is
+    -- cut short; any other difference is a byte out of place.
+    generic [R: Region]
+    function scanWord(text: Span[Nat8, R], at: Index, word: Span[Nat8, Static]): Either[JsonError, Index] is
+        let size: Index := spanLength(text);
+        let want: Index := spanLength(word);
+        var i: Index := 0;
+        while i < want do
+            if (at + i) >= size then
+                return stop(CutShort(), size);
+            end if;
+            if text[at + i] /= word[i] then
+                return stop(ByteOutOfPlace(), at + i);
+            end if;
+            i := i + 1;
+        end while;
+        return Right(right => at + want);
+    end;
+
+    -- A value that is not an array or an object, from at on.
+    generic [R: Region]
+    function scanScalar(text: Span[Nat8, R], at: Index): Either[JsonError, Index] is
+        let byte: Nat8 := text[at];
+        if byte = '"' then
+            return scanString(text, at);
+        end if;
+        if (byte = '-') or isDigit(byte) then
+            return scanNumber(text, at);
+        end if;
+        if byte = 't' then
+            return scanWord(text, at, "true");
+        end if;
+        if byte = 'f' then
+            return scanWord(text, at, "false");
+        end if;
+        if byte = 'n' then
+            return scanWord(text, at, "null");
+        end if;
+        return stop(ByteOutOfPlace(), at);
+    end;
+
+    function destroyNames(names: Buffer[String]): Unit is
+        var rest: Buffer[String] := names;
+        while bufferLength(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- Whether two of the names from mark on are the same.  They are taken
+    -- off the stack, sorted and compared with the one beside them, so an
+    -- object of n members costs n log n comparisons and not n times n.
+    generic [N: Region]
+    function duplicateAmong(names: &![Buffer[String], N], mark: Index): Bool is
+        var group: Buffer[String] := allocateEmpty();
+        while lengthMut(&~names) > mark do
+            insertBack(&!group, removeLast(&~names));
+        end while;
+        var sorted: Buffer[String] := sort(group);
+        let count: Index := bufferLength(&sorted);
+        var twice: Bool := false;
+        var i: Index := 1;
+        while (not twice) and (i < count) do
+            twice := constantTimeEqual(asSpan(nthRef(&sorted, i - 1)), asSpan(nthRef(&sorted, i)));
+            i := i + 1;
+        end while;
+        destroyNames(sorted);
+        return twice;
+    end;
+
+    -- Close the innermost container, an object.  True when it held a name
+    -- twice.
+    generic [K: Region, N: Region, M: Region]
+    function closeObject(kinds: &![Buffer[Nat8], K], names: &![Buffer[String], N], marks: &![Buffer[Index], M]): Bool is
+        let kind: Nat8 := removeLast(kinds);
+        let mark: Index := removeLast(marks);
+        return duplicateAmong(names, mark);
+    end;
+
+    -- The whole text, token by token.  None when it is one value as RFC
+    -- 8259 writes one, with white space around it and nothing else.
+    generic [R: Region]
+    function check(text: Span[Nat8, R]): Option[JsonError] is
+        let size: Index := spanLength(text);
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        var names: Buffer[String] := allocateEmpty();
+        var marks: Buffer[Index] := allocateEmpty();
+        var found: Option[JsonError] := None();
+        var at: Index := skipSpace(text, 0);
+        var need: Nat8 := needValue;
+        var going: Bool := true;
+        while going do
+            var ended: Bool := false;
+            if at >= size then
+                found := refusal(CutShort(), at);
+                going := false;
+            else
+                let byte: Nat8 := text[at];
+                let depth: Index := bufferLength(&kinds);
+                if (need = needValueOrEnd) and (byte = ']') then
+                    let closed: Nat8 := removeLast(&!kinds);
+                    at := at + 1;
+                    ended := true;
+                else if (need = needNameOrEnd) and (byte = '}') then
+                    if closeObject(&!kinds, &!names, &!marks) then
+                        found := refusal(DuplicateName(), at);
+                        going := false;
+                    else
+                        at := at + 1;
+                        ended := true;
+                    end if;
+                else if (need = needValue) or (need = needValueOrEnd) then
+                    if (byte = '{') or (byte = '[') then
+                        if depth = mostDepth then
+                            found := refusal(NestedTooDeep(), at);
+                            going := false;
+                        else if byte = '{' then
+                            insertBack(&!kinds, kindObject);
+                            insertBack(&!marks, bufferLength(&names));
+                            need := needNameOrEnd;
+                            at := at + 1;
+                        else
+                            insertBack(&!kinds, kindArray);
+                            need := needValueOrEnd;
+                            at := at + 1;
+                        end if;
+                    else
+                        case scanScalar(text, at) of
+                            when Left(left as error: JsonError) do
+                                found := Some(value => error);
+                                going := false;
+                            when Right(right as after: Index) do
+                                at := after;
+                                ended := true;
+                        end case;
+                    end if;
+                else if (need = needName) or (need = needNameOrEnd) then
+                    if byte = '"' then
+                        case scanString(text, at) of
+                            when Left(left as error: JsonError) do
+                                found := Some(value => error);
+                                going := false;
+                            when Right(right as after: Index) do
+                                insertBack(&!names, decodeString(text, at));
+                                at := after;
+                                need := needColon;
+                        end case;
+                    else
+                        found := refusal(ByteOutOfPlace(), at);
+                        going := false;
+                    end if;
+                else if need = needColon then
+                    if byte = ':' then
+                        at := at + 1;
+                        need := needValue;
+                    else
+                        found := refusal(ByteOutOfPlace(), at);
+                        going := false;
+                    end if;
+                else
+                    let top: Nat8 := nth(&kinds, depth - 1);
+                    if byte = ',' then
+                        at := at + 1;
+                        need := if top = kindObject then needName else needValue;
+                    else if (byte = ']') and (top = kindArray) then
+                        let closed: Nat8 := removeLast(&!kinds);
+                        at := at + 1;
+                        ended := true;
+                    else if (byte = '}') and (top = kindObject) then
+                        if closeObject(&!kinds, &!names, &!marks) then
+                            found := refusal(DuplicateName(), at);
+                            going := false;
+                        else
+                            at := at + 1;
+                            ended := true;
+                        end if;
+                    else
+                        found := refusal(ByteOutOfPlace(), at);
+                        going := false;
+                    end if;
+                end if;
+            end if;
+            if going and ended then
+                if bufferLength(&kinds) = 0 then
+                    at := skipSpace(text, at);
+                    if at < size then
+                        found := refusal(TextAfterValue(), at);
+                    end if;
+                    going := false;
+                else
+                    need := needCommaOrEnd;
+                end if;
+            end if;
+            if going then
+                at := skipSpace(text, at);
+            end if;
+        end while;
+        destroyNames(names);
+        destroyFree(kinds);
+        destroyFree(marks);
+        return found;
+    end;
+
+    generic [R: Region]
+    function readJson(text: Span[Nat8, R]): Either[JsonError, Json] is
+        case check(text) of
+            when Some(value as error: JsonError) do
+                return Left(left => error);
+            when None do
+                -- A serial of 0 means that the count of the process wrapped
+                -- round and could repeat the number of an earlier document.
+                let serial: Nat64 := nextSerial();
+                if serial = 0 then
+                    abort("Standard.Json: the process has used up the numbers of its documents");
+                end if;
+                return Right(right => Json(text => fromSpan(text), serial => serial));
+        end case;
+    end;
+
+    function destroyJson(document: Json): Unit is
+        let { text: String, serial: Nat64 } := document;
+        destroyString(text);
+        return nil;
+    end;
+
+    ---
+    --- Walking a checked text
+    ---
+
+    -- Everything below reads a text check has taken, and relies on it: a
+    -- string ends, an array closes, a number is followed by something.
+
+    -- The place after the string whose opening quote is at at.
+    generic [R: Region]
+    function stringEnd(text: Span[Nat8, R], at: Index): Index is
+        var i: Index := at + 1;
+        while text[i] /= '"' do
+            if text[i] = '\\' then
+                i := i + 2;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        return i + 1;
+    end;
+
+    function endsScalar(byte: Nat8): Bool is
+        if isSpace(byte) or (byte = ',') then
+            return true;
+        end if;
+        return (byte = ']') or (byte = '}');
+    end;
+
+    -- The place after the value that starts at at.
+    generic [R: Region]
+    function valueEnd(text: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(text);
+        let first: Nat8 := text[at];
+        if first = '"' then
+            return stringEnd(text, at);
+        end if;
+        if (first = '{') or (first = '[') then
+            var depth: Index := 0;
+            var i: Index := at;
+            var going: Bool := true;
+            while going do
+                let byte: Nat8 := text[i];
+                if byte = '"' then
+                    i := stringEnd(text, i);
+                else
+                    if (byte = '{') or (byte = '[') then
+                        depth := depth + 1;
+                    else if (byte = '}') or (byte = ']') then
+                        depth := depth - 1;
+                    end if;
+                    i := i + 1;
+                    going := depth > 0;
+                end if;
+            end while;
+            return i;
+        end if;
+        var i: Index := at;
+        while (i < size) and (not endsScalar(text[i])) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- The escape after a backslash as the byte it stands for.
+    function escaped(byte: Nat8): Nat8 is
+        if byte = 'b' then
+            return 8;
+        end if;
+        if byte = 'f' then
+            return 12;
+        end if;
+        if byte = 'n' then
+            return 10;
+        end if;
+        if byte = 'r' then
+            return 13;
+        end if;
+        if byte = 't' then
+            return 9;
+        end if;
+        return byte;
+    end;
+
+    generic [R: Region]
+    function appendScalar(builder: &![StringBuilder, R], scalar: Nat32): Unit is
+        case makeCodePoint(scalar) of
+            when Some(value as point: CodePoint) do
+                appendCodePoint(&~builder, point);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The string whose opening quote is at at, with its escapes read.
+    generic [R: Region]
+    function decodeString(text: Span[Nat8, R], at: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := at + 1;
+        while text[i] /= '"' do
+            let byte: Nat8 := text[i];
+            if byte = '\\' then
+                let escape: Nat8 := text[i + 1];
+                if escape = 'u' then
+                    let unit: Nat32 := checkedUnit(text, i + 2);
+                    if isHighSurrogate(unit) then
+                        let low: Nat32 := checkedUnit(text, i + 8);
+                        appendScalar(&!builder, (((unit - #xD800) * 1024) + (low - #xDC00)) + #x10000);
+                        i := i + 12;
+                    else
+                        appendScalar(&!builder, unit);
+                        i := i + 6;
+                    end if;
+                else
+                    writeByte(&!builder, escaped(escape));
+                    i := i + 2;
+                end if;
+            else
+                writeByte(&!builder, byte);
+                i := i + 1;
+            end if;
+        end while;
+        return finalize(builder);
+    end;
+
+    -- The place of the value of the member named name in the object at at.
+    -- Names are unique in a checked text, so the first is the only one.
+    generic [R: Region, T: Region]
+    function member(text: Span[Nat8, R], at: Index, name: Span[Nat8, T]): Option[Index] is
+        var i: Index := skipSpace(text, at + 1);
+        if text[i] = '}' then
+            return None();
+        end if;
+        while true do
+            let found: String := decodeString(text, i);
+            let same: Bool := constantTimeEqual(asSpan(&found), name);
+            destroyString(found);
+            i := skipSpace(text, stringEnd(text, i));
+            i := skipSpace(text, i + 1);
+            if same then
+                return Some(value => i);
+            end if;
+            i := skipSpace(text, valueEnd(text, i));
+            if text[i] = '}' then
+                return None();
+            end if;
+            i := skipSpace(text, i + 1);
+        end while;
+        return None();
+    end;
+
+    -- The place of element n of the array at at.
+    generic [R: Region]
+    function element(text: Span[Nat8, R], at: Index, n: Index): Option[Index] is
+        var i: Index := skipSpace(text, at + 1);
+        if text[i] = ']' then
+            return None();
+        end if;
+        var k: Index := 0;
+        while k < n do
+            i := skipSpace(text, valueEnd(text, i));
+            if text[i] = ']' then
+                return None();
+            end if;
+            i := skipSpace(text, i + 1);
+            k := k + 1;
+        end while;
+        return Some(value => i);
+    end;
+
+    -- A token of a pointer as an array index, as RFC 6901 writes one: 0,
+    -- or digits without a leading zero.
+    generic [T: Region]
+    function arrayIndex(token: Span[Nat8, T]): Option[Index] is
+        let size: Index := spanLength(token);
+        if (size = 0) or (size > 19) then
+            return None();
+        end if;
+        if (token[0] = '0') and (size > 1) then
+            return None();
+        end if;
+        if digitsEnd(token, 0) /= size then
+            return None();
+        end if;
+        let number: Nat64 := parseNat(token)?;
+        return toIndex(number);
+    end;
+
+    -- One step down from the value at at, by one token of a pointer.
+    generic [R: Region, T: Region]
+    function step(text: Span[Nat8, R], at: Index, token: Span[Nat8, T]): Option[Index] is
+        let first: Nat8 := text[at];
+        if first = '{' then
+            return member(text, at, token);
+        end if;
+        if first = '[' then
+            let n: Index := arrayIndex(token)?;
+            return element(text, at, n);
+        end if;
+        return None();
+    end;
+
+    -- The place of the next slash from start on, or the length.
+    generic [P: Region]
+    function tokenEnd(pointer: Span[Nat8, P], start: Index): Index is
+        let size: Index := spanLength(pointer);
+        var i: Index := start;
+        while (i < size) and (pointer[i] /= '/') do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- The token from start up to final with ~0 read as a tilde and ~1 as a
+    -- slash; None for a tilde followed by anything else.
+    generic [P: Region]
+    function unescapeToken(pointer: Span[Nat8, P], start: Index, final: Index): Option[String] is
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := start;
+        var good: Bool := true;
+        while good and (i < final) do
+            let byte: Nat8 := pointer[i];
+            if byte = '~' then
+                if ((i + 1) < final) and (pointer[i + 1] = '0') then
+                    writeByte(&!builder, '~');
+                    i := i + 2;
+                else if ((i + 1) < final) and (pointer[i + 1] = '1') then
+                    writeByte(&!builder, '/');
+                    i := i + 2;
+                else
+                    good := false;
+                end if;
+            else
+                writeByte(&!builder, byte);
+                i := i + 1;
+            end if;
+        end while;
+        let token: String := finalize(builder);
+        if good then
+            return Some(value => token);
+        else
+            destroyString(token);
+            return None();
+        end if;
+    end;
+
+    -- The place of the value the pointer leads to.
+    generic [R: Region, P: Region]
+    function locate(text: Span[Nat8, R], pointer: Span[Nat8, P]): Option[Index] is
+        let size: Index := spanLength(pointer);
+        var at: Index := skipSpace(text, 0);
+        if size = 0 then
+            return Some(value => at);
+        end if;
+        if pointer[0] /= '/' then
+            return None();
+        end if;
+        var start: Index := 1;
+        var found: Bool := true;
+        var going: Bool := true;
+        while going do
+            let final: Index := tokenEnd(pointer, start);
+            case unescapeToken(pointer, start, final) of
+                when Some(value as token: String) do
+                    case step(text, at, asSpan(&token)) of
+                        when Some(value as next: Index) do
+                            at := next;
+                        when None do
+                            found := false;
+                            going := false;
+                    end case;
+                    destroyString(token);
+                when None do
+                    found := false;
+                    going := false;
+            end case;
+            if going then
+                if final >= size then
+                    going := false;
+                else
+                    start := final + 1;
+                end if;
+            end if;
+        end while;
+        if found then
+            return Some(value => at);
+        else
+            return None();
+        end if;
+    end;
+
+    function kindOf(first: Nat8): JsonKind is
+        if first = '{' then
+            return JsonObject();
+        end if;
+        if first = '[' then
+            return JsonArray();
+        end if;
+        if first = '"' then
+            return JsonString();
+        end if;
+        if (first = 't') or (first = 'f') then
+            return JsonBoolean();
+        end if;
+        if first = 'n' then
+            return JsonNull();
+        end if;
+        return JsonNumber();
+    end;
+
+    function isNumberStart(first: Nat8): Bool is
+        return (first = '-') or isDigit(first);
+    end;
+
+    -- The number text as an Int64: digits only after an optional minus,
+    -- within Int64.  The smallest Int64 has no positive counterpart, so a
+    -- negative number is built from its magnitude less one.
+    generic [R: Region]
+    function integerOf(number: Span[Nat8, R]): Option[Int64] is
+        let size: Index := spanLength(number);
+        var start: Index := 0;
+        let negative: Bool := (size > 0) and (number[0] = '-');
+        if negative then
+            start := start + 1;
+        end if;
+        if (size - start) > 19 then
+            return None();
+        end if;
+        if digitsEnd(number, start) /= size then
+            return None();
+        end if;
+        let magnitude: Option[Nat64] := parseNat(substring(number, start, size));
+        let m: Nat64 := magnitude?;
+        if not negative then
+            return toInt64(m);
+        end if;
+        if m = 0 then
+            let zero: Int64 := 0;
+            return Some(value => zero);
+        end if;
+        let below: Int64 := toInt64(m - 1)?;
+        return Some(value => (-below) - 1);
+    end;
+
+    -- How many elements or members the container at at holds.
+    generic [R: Region]
+    function countIn(text: Span[Nat8, R], at: Index): Index is
+        let open: Nat8 := text[at];
+        var i: Index := skipSpace(text, at + 1);
+        if (text[i] = ']') or (text[i] = '}') then
+            return 0;
+        end if;
+        var count: Index := 1;
+        var going: Bool := true;
+        while going do
+            if open = '{' then
+                i := skipSpace(text, stringEnd(text, i));
+                i := skipSpace(text, i + 1);
+            end if;
+            i := skipSpace(text, valueEnd(text, i));
+            if text[i] = ',' then
+                count := count + 1;
+                i := skipSpace(text, i + 1);
+            else
+                going := false;
+            end if;
+        end while;
+        return count;
+    end;
+
+    ---
+    --- Asking a document
+    ---
+
+    generic [R: Region, P: Region]
+    function kindAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[JsonKind] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := locate(text, pointer)?;
+        return Some(value => kindOf(text[at]));
+    end;
+
+    generic [R: Region, P: Region]
+    function stringAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[String] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := locate(text, pointer)?;
+        if text[at] = '"' then
+            return Some(value => decodeString(text, at));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region, P: Region]
+    function numberAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[String] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := locate(text, pointer)?;
+        if isNumberStart(text[at]) then
+            return Some(value => fromSpan(substring(text, at, valueEnd(text, at))));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region, P: Region]
+    function integerAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[Int64] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := locate(text, pointer)?;
+        if isNumberStart(text[at]) then
+            let result: Option[Int64] := integerOf(substring(text, at, valueEnd(text, at)));
+            return result;
+        end if;
+        return None();
+    end;
+
+    generic [R: Region, P: Region]
+    function boolAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[Bool] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := locate(text, pointer)?;
+        if text[at] = 't' then
+            return Some(value => true);
+        end if;
+        if text[at] = 'f' then
+            return Some(value => false);
+        end if;
+        return None();
+    end;
+
+    generic [R: Region, P: Region]
+    function isNullAt(document: &[Json, R], pointer: Span[Nat8, P]): Bool is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        case locate(text, pointer) of
+            when Some(value as at: Index) do
+                return text[at] = 'n';
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, P: Region]
+    function countAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[Index] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := locate(text, pointer)?;
+        if (text[at] = '[') or (text[at] = '{') then
+            return Some(value => countIn(text, at));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region, P: Region]
+    function nameAt(document: &[Json, R], pointer: Span[Nat8, P], n: Index): Option[String] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := locate(text, pointer)?;
+        if text[at] /= '{' then
+            return None();
+        end if;
+        var i: Index := skipSpace(text, at + 1);
+        if text[i] = '}' then
+            return None();
+        end if;
+        var k: Index := 0;
+        while k < n do
+            i := skipSpace(text, stringEnd(text, i));
+            i := skipSpace(text, i + 1);
+            i := skipSpace(text, valueEnd(text, i));
+            if text[i] = '}' then
+                return None();
+            end if;
+            i := skipSpace(text, i + 1);
+            k := k + 1;
+        end while;
+        return Some(value => decodeString(text, i));
+    end;
+
+    generic [R: Region, P: Region]
+    function valueTextAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[String] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := locate(text, pointer)?;
+        return Some(value => fromSpan(substring(text, at, valueEnd(text, at))));
+    end;
+
+    ---
+    --- Walking the children of a container
+    ---
+
+    -- The child whose name, in an object, or value, in an array, starts at
+    -- i.  A member's value follows its name and a colon.
+    generic [R: Region]
+    function childFrom(text: Span[Nat8, R], serial: Nat64, i: Index, named: Bool): JsonCursor is
+        if named then
+            let value: Index := skipSpace(text, skipSpace(text, stringEnd(text, i)) + 1);
+            return JsonCursor(serial => serial, name => i, value => value, named => true);
+        end if;
+        return JsonCursor(serial => serial, name => i, value => i, named => false);
+    end;
+
+    -- The first child of the container whose bracket is at at; None for a
+    -- value that is no container, and for an empty one.
+    generic [R: Region]
+    function firstIn(text: Span[Nat8, R], serial: Nat64, at: Index): Option[JsonCursor] is
+        let open: Nat8 := text[at];
+        if (open /= '[') and (open /= '{') then
+            return None();
+        end if;
+        let i: Index := skipSpace(text, at + 1);
+        if (text[i] = ']') or (text[i] = '}') then
+            return None();
+        end if;
+        return Some(value => childFrom(text, serial, i, open = '{'));
+    end;
+
+    -- The place of the value at the cursor, when the cursor is of this
+    -- document.  Every cursor of a document was made by the functions here
+    -- over its own text, so its places are places of that text.
+    generic [R: Region]
+    function placeOf(document: &[Json, R], cursor: JsonCursor): Option[Index] is
+        if cursor.serial = document->serial then
+            return Some(value => cursor.value);
+        end if;
+        return None();
+    end;
+
+    generic [R: Region, P: Region]
+    function firstChildAt(document: &[Json, R], pointer: Span[Nat8, P]): Option[JsonCursor] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := locate(text, pointer)?;
+        return firstIn(text, document->serial, at);
+    end;
+
+    generic [R: Region]
+    function firstChildOf(document: &[Json, R], cursor: JsonCursor): Option[JsonCursor] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        return firstIn(text, document->serial, at);
+    end;
+
+    generic [R: Region]
+    function nextChild(document: &[Json, R], cursor: JsonCursor): Option[JsonCursor] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        let after: Index := skipSpace(text, valueEnd(text, at));
+        if text[after] /= ',' then
+            return None();
+        end if;
+        return Some(value => childFrom(text, document->serial, skipSpace(text, after + 1), cursor.named));
+    end;
+
+    generic [R: Region]
+    function childKind(document: &[Json, R], cursor: JsonCursor): Option[JsonKind] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        return Some(value => kindOf(text[at]));
+    end;
+
+    generic [R: Region]
+    function childName(document: &[Json, R], cursor: JsonCursor): Option[String] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        if cursor.named then
+            return Some(value => decodeString(text, cursor.name));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region]
+    function childString(document: &[Json, R], cursor: JsonCursor): Option[String] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        if text[at] = '"' then
+            return Some(value => decodeString(text, at));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region]
+    function childNumber(document: &[Json, R], cursor: JsonCursor): Option[String] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        if isNumberStart(text[at]) then
+            return Some(value => fromSpan(substring(text, at, valueEnd(text, at))));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region]
+    function childInteger(document: &[Json, R], cursor: JsonCursor): Option[Int64] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        if isNumberStart(text[at]) then
+            let result: Option[Int64] := integerOf(substring(text, at, valueEnd(text, at)));
+            return result;
+        end if;
+        return None();
+    end;
+
+    generic [R: Region]
+    function childBool(document: &[Json, R], cursor: JsonCursor): Option[Bool] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        if text[at] = 't' then
+            return Some(value => true);
+        end if;
+        if text[at] = 'f' then
+            return Some(value => false);
+        end if;
+        return None();
+    end;
+
+    generic [R: Region]
+    function childIsNull(document: &[Json, R], cursor: JsonCursor): Bool is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        case placeOf(document, cursor) of
+            when Some(value as at: Index) do
+                return text[at] = 'n';
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function childCount(document: &[Json, R], cursor: JsonCursor): Option[Index] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        if (text[at] = '[') or (text[at] = '{') then
+            return Some(value => countIn(text, at));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region]
+    function childText(document: &[Json, R], cursor: JsonCursor): Option[String] is
+        let text: Span[Nat8, R] := asSpan(&(document->text));
+        let at: Index := placeOf(document, cursor)?;
+        return Some(value => fromSpan(substring(text, at, valueEnd(text, at))));
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    record JsonWriter: Linear is
+        out: StringBuilder;
+        levels: Buffer[Nat8];
+        pretty: Bool;
+        awaitingValue: Bool;
+        complete: Bool;
+        spoiled: Bool;
+    end;
+
+    function makeJsonWriter(): JsonWriter is
+        let levels: Buffer[Nat8] := allocateEmpty();
+        return JsonWriter(out => makeStringBuilder(), levels => levels, pretty => false, awaitingValue => false, complete => false, spoiled => false);
+    end;
+
+    function makePrettyJsonWriter(): JsonWriter is
+        let levels: Buffer[Nat8] := allocateEmpty();
+        return JsonWriter(out => makeStringBuilder(), levels => levels, pretty => true, awaitingValue => false, complete => false, spoiled => false);
+    end;
+
+    -- Each of these takes the writer and uses it up for one part of it;
+    -- the callers pass it on with a reborrow and keep it.
+
+    generic [R: Region]
+    function emitByte(writer: &![JsonWriter, R], byte: Nat8): Unit is
+        writeByte(&!(writer->out), byte);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function emitText(writer: &![JsonWriter, R], text: Span[Nat8, S]): Unit is
+        appendText(&!(writer->out), text);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function levelCount(writer: &![JsonWriter, R]): Index is
+        return lengthMut(&!(writer->levels));
+    end;
+
+    generic [L: Region]
+    function topOf(levels: &![Buffer[Nat8], L]): Nat8 is
+        let count: Index := lengthMut(&~levels);
+        return nthMut(levels, count - 1);
+    end;
+
+    generic [R: Region]
+    function topLevel(writer: &![JsonWriter, R]): Nat8 is
+        return topOf(&!(writer->levels));
+    end;
+
+    generic [L: Region]
+    function storeTop(levels: &![Buffer[Nat8], L], state: Nat8): Unit is
+        let count: Index := lengthMut(&~levels);
+        storeNth(levels, count - 1, state);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setTop(writer: &![JsonWriter, R], state: Nat8): Unit is
+        storeTop(&!(writer->levels), state);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushLevel(writer: &![JsonWriter, R], state: Nat8): Unit is
+        insertBack(&!(writer->levels), state);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function popLevel(writer: &![JsonWriter, R]): Unit is
+        let dropped: Nat8 := removeLast(&!(writer->levels));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function spoil(writer: &![JsonWriter, R]): Unit is
+        writer->spoiled := true;
+        return nil;
+    end;
+
+    -- In the pretty form, a line end and two spaces for each of depth
+    -- levels.
+    generic [R: Region]
+    function newLine(writer: &![JsonWriter, R], depth: Index): Unit is
+        if writer->pretty then
+            emitByte(&~writer, '\n');
+            var i: Index := 0;
+            while i < depth do
+                emitText(&~writer, "  ");
+                i := i + 1;
+            end while;
+        end if;
+        return nil;
+    end;
+
+    function hexChar(nibble: Nat8): Nat8 is
+        if nibble < 10 then
+            return nibble + '0';
+        end if;
+        return (nibble - 10) + 'a';
+    end;
+
+    -- A string between quotes, with a quote, a backslash and every byte
+    -- below 32 escaped; all other bytes as they are.
+    generic [R: Region, S: Region]
+    function emitQuoted(writer: &![JsonWriter, R], value: Span[Nat8, S]): Unit is
+        emitByte(&~writer, '"');
+        let size: Index := spanLength(value);
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := value[i];
+            if (byte = '"') or (byte = '\\') then
+                emitByte(&~writer, '\\');
+                emitByte(&~writer, byte);
+            else if byte = '\n' then
+                emitText(&~writer, "\\n");
+            else if byte = '\r' then
+                emitText(&~writer, "\\r");
+            else if byte = '\t' then
+                emitText(&~writer, "\\t");
+            else if byte < 32 then
+                emitText(&~writer, "\\u00");
+                emitByte(&~writer, hexChar(byte / 16));
+                emitByte(&~writer, hexChar(byte - ((byte / 16) * 16)));
+            else
+                emitByte(&~writer, byte);
+            end if;
+            i := i + 1;
+        end while;
+        emitByte(&~writer, '"');
+        return nil;
+    end;
+
+    -- Whether a value may stand here, with the comma and the line in front
+    -- of it written; a value that may not spoils the writer.
+    generic [R: Region]
+    function beforeValue(writer: &![JsonWriter, R]): Bool is
+        if writer->spoiled then
+            return false;
+        end if;
+        let depth: Index := levelCount(&~writer);
+        if depth = 0 then
+            if writer->complete then
+                spoil(&~writer);
+                return false;
+            end if;
+            return true;
+        end if;
+        let top: Nat8 := topLevel(&~writer);
+        if (top = objectEmpty) or (top = objectFull) then
+            if not writer->awaitingValue then
+                spoil(&~writer);
+                return false;
+            end if;
+            writer->awaitingValue := false;
+            return true;
+        end if;
+        if top = arrayFull then
+            emitByte(&~writer, ',');
+        else
+            setTop(&~writer, arrayFull);
+        end if;
+        newLine(&~writer, depth);
+        return true;
+    end;
+
+    generic [R: Region]
+    function afterValue(writer: &![JsonWriter, R]): Unit is
+        if levelCount(&~writer) = 0 then
+            writer->complete := true;
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function beginContainer(writer: &![JsonWriter, R], open: Nat8, state: Nat8): Unit is
+        if not beforeValue(&~writer) then
+            return nil;
+        end if;
+        if levelCount(&~writer) = mostDepth then
+            spoil(&~writer);
+            return nil;
+        end if;
+        emitByte(&~writer, open);
+        pushLevel(&~writer, state);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function endContainer(writer: &![JsonWriter, R], close: Nat8, empty: Nat8, full: Nat8): Unit is
+        if writer->spoiled then
+            return nil;
+        end if;
+        let depth: Index := levelCount(&~writer);
+        if depth = 0 then
+            spoil(&~writer);
+            return nil;
+        end if;
+        let top: Nat8 := topLevel(&~writer);
+        if ((top /= empty) and (top /= full)) or writer->awaitingValue then
+            spoil(&~writer);
+            return nil;
+        end if;
+        if top = full then
+            newLine(&~writer, depth - 1);
+        end if;
+        emitByte(&~writer, close);
+        popLevel(&~writer);
+        afterValue(&~writer);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function beginObject(writer: &![JsonWriter, R]): Unit is
+        beginContainer(&~writer, '{', objectEmpty);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function endObject(writer: &![JsonWriter, R]): Unit is
+        endContainer(&~writer, '}', objectEmpty, objectFull);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function beginArray(writer: &![JsonWriter, R]): Unit is
+        beginContainer(&~writer, '[', arrayEmpty);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function endArray(writer: &![JsonWriter, R]): Unit is
+        endContainer(&~writer, ']', arrayEmpty, arrayFull);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeName(writer: &![JsonWriter, R], name: Span[Nat8, S]): Unit is
+        if writer->spoiled then
+            return nil;
+        end if;
+        let depth: Index := levelCount(&~writer);
+        if (depth = 0) or (writer->awaitingValue or (not isValid(name))) then
+            spoil(&~writer);
+            return nil;
+        end if;
+        let top: Nat8 := topLevel(&~writer);
+        if top = objectFull then
+            emitByte(&~writer, ',');
+        else if top = objectEmpty then
+            setTop(&~writer, objectFull);
+        else
+            spoil(&~writer);
+            return nil;
+        end if;
+        newLine(&~writer, depth);
+        emitQuoted(&~writer, name);
+        emitByte(&~writer, ':');
+        if writer->pretty then
+            emitByte(&~writer, ' ');
+        end if;
+        writer->awaitingValue := true;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeString(writer: &![JsonWriter, R], value: Span[Nat8, S]): Unit is
+        if not isValid(value) then
+            spoil(&~writer);
+            return nil;
+        end if;
+        if beforeValue(&~writer) then
+            emitQuoted(&~writer, value);
+            afterValue(&~writer);
+        end if;
+        return nil;
+    end;
+
+    function digitOf(value: Nat64): Nat8 is
+        case toNat8(value) of
+            when Some(value as small: Nat8) do
+                return small + '0';
+            when None do
+                return '0';
+        end case;
+    end;
+
+    generic [R: Region]
+    function emitNat(writer: &![JsonWriter, R], value: Nat64): Unit is
+        if value >= 10 then
+            emitNat(&~writer, value / 10);
+        end if;
+        emitByte(&~writer, digitOf(value - ((value / 10) * 10)));
+        return nil;
+    end;
+
+    -- The magnitude of value, with the smallest Int64 taken care of: its
+    -- negation does not fit, the negation of one more than it does.
+    function magnitudeOf(value: Int64): Nat64 is
+        if value >= 0 then
+            case toNat64(value) of
+                when Some(value as m: Nat64) do
+                    return m;
+                when None do
+                    return 0;
+            end case;
+        end if;
+        case toNat64(-(value + 1)) of
+            when Some(value as m: Nat64) do
+                return m + 1;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region]
+    function writeInteger(writer: &![JsonWriter, R], value: Int64): Unit is
+        if beforeValue(&~writer) then
+            if value < 0 then
+                emitByte(&~writer, '-');
+            end if;
+            emitNat(&~writer, magnitudeOf(value));
+            afterValue(&~writer);
+        end if;
+        return nil;
+    end;
+
+    generic [S: Region]
+    function isNumberText(text: Span[Nat8, S]): Bool is
+        case scanNumber(text, 0) of
+            when Left(left: JsonError) do
+                return false;
+            when Right(right as after: Index) do
+                return after = spanLength(text);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeNumber(writer: &![JsonWriter, R], text: Span[Nat8, S]): Unit is
+        if not isNumberText(text) then
+            spoil(&~writer);
+            return nil;
+        end if;
+        if beforeValue(&~writer) then
+            emitText(&~writer, text);
+            afterValue(&~writer);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function writeBool(writer: &![JsonWriter, R], value: Bool): Unit is
+        if beforeValue(&~writer) then
+            if value then
+                emitText(&~writer, "true");
+            else
+                emitText(&~writer, "false");
+            end if;
+            afterValue(&~writer);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function writeNull(writer: &![JsonWriter, R]): Unit is
+        if beforeValue(&~writer) then
+            emitText(&~writer, "null");
+            afterValue(&~writer);
+        end if;
+        return nil;
+    end;
+
+    function finishJson(writer: JsonWriter): Option[String] is
+        let { out: StringBuilder, levels: Buffer[Nat8], pretty: Bool, awaitingValue: Bool, complete: Bool, spoiled: Bool } := writer;
+        destroyFree(levels);
+        let text: String := finalize(out);
+        if spoiled or (not complete) then
+            destroyString(text);
+            return None();
+        else
+            let verdict: Either[JsonError, Json] := readJson(asSpan(&text));
+            case verdict of
+                when Left(left: JsonError) do
+                    destroyString(text);
+                    return None();
+                when Right(right as document: Json) do
+                    destroyJson(document);
+                    return Some(value => text);
+            end case;
+        end if;
+    end;
+end module body.

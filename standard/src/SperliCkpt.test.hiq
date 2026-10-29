@@ -1,0 +1,506 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.SperliCkpt: rank files with a bad SHA-256, a bad header or a
+-- wrong place are refused with their code; a COMMIT file with a bad
+-- signature, a changed digest, another job, epoch or size is refused; the
+-- payload encodings; the files on disk, the choice of the highest valid
+-- epoch and the deletion of old epochs.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromSpan,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal
+);
+import Standard.File (
+    removeDirectory
+);
+import Standard.CompositeSig (
+    CompositeKey,
+    generateKeyPair,
+    publicKeyOf,
+    destroyCompositeKey
+);
+import Standard.SperliError (
+    badCheckpointFile,
+    digestMismatch,
+    badCommit,
+    resumeRefused,
+    sizeMismatch
+);
+import Standard.SperliCkpt (
+    Checkpointable,
+    fileHeaderBytes,
+    digestBytes,
+    maxStateBytes,
+    chunkBytes,
+    commitContext,
+    encodeState,
+    decodeState,
+    rankFile,
+    checkRankFile,
+    rankFilePayload,
+    digestOf,
+    commitBody,
+    signCommit,
+    checkCommit,
+    commitEpoch,
+    commitDigest,
+    beginPayload,
+    beginIs,
+    dataPayload,
+    dataIs,
+    dataKindOf,
+    dataOwner,
+    dataOffset,
+    dataTotal,
+    dataChunk,
+    resumePayload,
+    resumeIs,
+    resumeSize,
+    resumeStatus,
+    resumeCommit,
+    jobDirectory,
+    epochDirectory,
+    rankPath,
+    commitPath,
+    prepareEpoch,
+    storeFile,
+    loadFile,
+    removeCommit,
+    bestCommit,
+    pruneEpochs
+);
+
+module body Standard.SperliCkpt.Test is
+    function jobId(): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Nat8 := 0;
+        while i < 16 do
+            writeByte(&!out, i);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- bytes with the byte at place changed by one bit.
+    generic [R: Region]
+    function flipped(bytes: Span[Nat8, R], place: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(bytes) do
+            if i = place then
+                writeByte(&!out, bitwiseXor(bytes[i], 1));
+            else
+                writeByte(&!out, bytes[i]);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function aKey(): CompositeKey is
+        case generateKeyPair() of
+            when Some(value as key: CompositeKey) do
+                return key;
+            when None do
+                abort("no key could be made");
+        end case;
+    end;
+
+    function aFile(epoch: Nat64, rank: Nat32, size: Nat32): String is
+        let job: String := jobId();
+        case rankFile(asSpan(&job), epoch, rank, size, "state of a rank") of
+            when Some(value as file: String) do
+                destroyString(job);
+                return file;
+            when None do
+                destroyString(job);
+                abort("no rank file could be made");
+        end case;
+    end;
+
+    -- The digests of the rank files of size ranks, 32 bytes each.
+    function digestsOf(epoch: Nat64, size: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        var rank: Nat32 := 0;
+        while rank < size do
+            let file: String := aFile(epoch, rank, size);
+            case digestOf(asSpan(&file)) of
+                when Some(value as digest: String) do
+                    writeString(&!out, asSpan(&digest));
+                    destroyString(digest);
+                when None do
+                    abort("no digest could be made");
+            end case;
+            destroyString(file);
+            rank := rank + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [K: Region]
+    function aCommit(key: &[CompositeKey, K], epoch: Nat64, size: Nat32): String is
+        let job: String := jobId();
+        let digests: String := digestsOf(epoch, size);
+        let content: String := commitBody(asSpan(&job), epoch, asSpan(&digests));
+        destroyString(digests);
+        destroyString(job);
+        case signCommit(key, asSpan(&content)) of
+            when Some(value as commit: String) do
+                destroyString(content);
+                return commit;
+            when None do
+                destroyString(content);
+                abort("no commit could be signed");
+        end case;
+    end;
+
+    function testConstants(): Unit is
+        assertTrue(fileHeaderBytes() = 80, "the header of a rank file");
+        assertTrue(digestBytes() = 32, "a digest");
+        assertTrue(maxStateBytes() = 268435456, "the largest state");
+        assertTrue(chunkBytes() = 1048576, "a chunk");
+        assertTrue(spanLength(commitContext()) = 15, "the context of a commit");
+        return nil;
+    end;
+
+    function testRankFile(): Unit is
+        let job: String := jobId();
+        let other: String := makeString(16, 9);
+        let file: String := aFile(3, 1, 4);
+        assertTrue(length(&file) = (80 + 15), "the file is the header and the payload");
+        assertTrue(nthByte(&file, 0) = 83, "it starts with SPCK");
+        assertTrue(checkRankFile(asSpan(&file), asSpan(&job), 3, 1, 4) = 0, "a file that holds");
+        let payload: String := rankFilePayload(asSpan(&file));
+        assertTrue(equal(asSpan(&payload), "state of a rank"), "the payload comes back");
+        destroyString(payload);
+        let badPayload: String := flipped(asSpan(&file), 90);
+        assertTrue(checkRankFile(asSpan(&badPayload), asSpan(&job), 3, 1, 4) = digestMismatch(), "a changed payload gives H1620");
+        let badDigest: String := flipped(asSpan(&file), 50);
+        assertTrue(checkRankFile(asSpan(&badDigest), asSpan(&job), 3, 1, 4) = digestMismatch(), "a changed digest in the header gives H1620");
+        let badMagic: String := flipped(asSpan(&file), 0);
+        assertTrue(checkRankFile(asSpan(&badMagic), asSpan(&job), 3, 1, 4) = badCheckpointFile(), "another magic gives H1619");
+        let badVersion: String := flipped(asSpan(&file), 4);
+        assertTrue(checkRankFile(asSpan(&badVersion), asSpan(&job), 3, 1, 4) = badCheckpointFile(), "another version gives H1619");
+        let badLength: String := flipped(asSpan(&file), 40);
+        assertTrue(checkRankFile(asSpan(&badLength), asSpan(&job), 3, 1, 4) = badCheckpointFile(), "another length gives H1619");
+        assertTrue(checkRankFile(getSpan(&file, 0, 93), asSpan(&job), 3, 1, 4) = badCheckpointFile(), "a cut file gives H1619");
+        assertTrue(checkRankFile(getSpan(&file, 0, 79), asSpan(&job), 3, 1, 4) = badCheckpointFile(), "a file shorter than its header gives H1619");
+        assertTrue(checkRankFile("", asSpan(&job), 3, 1, 4) = badCheckpointFile(), "an empty file gives H1619");
+        let longer: String := fromSpan(asSpan(&file));
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, asSpan(&longer));
+        writeString(&!builder, "x");
+        let extra: String := finalize(builder);
+        assertTrue(checkRankFile(asSpan(&extra), asSpan(&job), 3, 1, 4) = badCheckpointFile(), "a longer file gives H1619");
+        assertTrue(checkRankFile(asSpan(&file), asSpan(&other), 3, 1, 4) = badCheckpointFile(), "another job gives H1619");
+        assertTrue(checkRankFile(asSpan(&file), asSpan(&job), 4, 1, 4) = badCheckpointFile(), "another epoch gives H1619");
+        assertTrue(checkRankFile(asSpan(&file), asSpan(&job), 3, 2, 4) = badCheckpointFile(), "another rank gives H1619");
+        assertTrue(checkRankFile(asSpan(&file), asSpan(&job), 3, 1, 5) = badCheckpointFile(), "another size gives H1619");
+        destroyString(extra);
+        destroyString(longer);
+        destroyString(badLength);
+        destroyString(badVersion);
+        destroyString(badMagic);
+        destroyString(badDigest);
+        destroyString(badPayload);
+        destroyString(file);
+        destroyString(other);
+        destroyString(job);
+        return nil;
+    end;
+
+    function testEmptyState(): Unit is
+        let job: String := jobId();
+        case rankFile(asSpan(&job), 1, 0, 1, "") of
+            when Some(value as file: String) do
+                assertTrue(length(&file) = 80, "a state of no bytes is the header");
+                assertTrue(checkRankFile(asSpan(&file), asSpan(&job), 1, 0, 1) = 0, "and holds");
+                let payload: String := rankFilePayload(asSpan(&file));
+                assertTrue(length(&payload) = 0, "with no payload");
+                destroyString(payload);
+                destroyString(file);
+            when None do
+                assertTrue(false, "the file was made");
+        end case;
+        destroyString(job);
+        return nil;
+    end;
+
+    function testCommit(): Unit is
+        let job: String := jobId();
+        let other: String := makeString(16, 9);
+        let key: CompositeKey := aKey();
+        let stranger: CompositeKey := aKey();
+        let publicKey: String := publicKeyOf(&key);
+        let strangerKey: String := publicKeyOf(&stranger);
+        let commit: String := aCommit(&key, 5, 3);
+        assertTrue(length(&commit) = (36 + 96 + 2 + 2484), "the commit is the content and the signature");
+        assertTrue(checkCommit(asSpan(&commit), asSpan(&publicKey), asSpan(&job), 5, 3) = 0, "a commit that holds");
+        assertTrue(commitEpoch(asSpan(&commit)) = 5, "its epoch");
+        let expected: String := digestsOf(5, 3);
+        let second: String := commitDigest(asSpan(&commit), 1);
+        assertTrue(equal(asSpan(&second), getSpan(&expected, 32, 63)), "the digest of rank 1");
+        let missing: String := commitDigest(asSpan(&commit), 3);
+        assertTrue(length(&missing) = 0, "no digest for a rank the commit lacks");
+        destroyString(missing);
+        destroyString(second);
+        destroyString(expected);
+        let badSignature: String := flipped(asSpan(&commit), length(&commit) - 10);
+        assertTrue(checkCommit(asSpan(&badSignature), asSpan(&publicKey), asSpan(&job), 5, 3) = badCommit(), "a changed signature gives H1621");
+        let badEd: String := flipped(asSpan(&commit), length(&commit) - 1);
+        assertTrue(checkCommit(asSpan(&badEd), asSpan(&publicKey), asSpan(&job), 5, 3) = badCommit(), "a changed Ed25519 part gives H1621");
+        let badMl: String := flipped(asSpan(&commit), 36 + 96 + 2 + 5);
+        assertTrue(checkCommit(asSpan(&badMl), asSpan(&publicKey), asSpan(&job), 5, 3) = badCommit(), "a changed ML-DSA part gives H1621");
+        let badDigest: String := flipped(asSpan(&commit), 40);
+        assertTrue(checkCommit(asSpan(&badDigest), asSpan(&publicKey), asSpan(&job), 5, 3) = badCommit(), "a changed digest breaks the signature");
+        let badEpoch: String := flipped(asSpan(&commit), 24);
+        assertTrue(checkCommit(asSpan(&badEpoch), asSpan(&publicKey), asSpan(&job), 4, 3) = badCommit(), "a changed epoch gives H1621");
+        let badMagic: String := flipped(asSpan(&commit), 1);
+        assertTrue(checkCommit(asSpan(&badMagic), asSpan(&publicKey), asSpan(&job), 5, 3) = badCommit(), "another magic gives H1621");
+        assertTrue(checkCommit(asSpan(&commit), asSpan(&strangerKey), asSpan(&job), 5, 3) = badCommit(), "the key of another launcher gives H1621");
+        assertTrue(checkCommit(asSpan(&commit), asSpan(&publicKey), asSpan(&other), 5, 3) = badCommit(), "another job gives H1621");
+        assertTrue(checkCommit(asSpan(&commit), asSpan(&publicKey), asSpan(&job), 6, 3) = badCommit(), "another epoch gives H1621");
+        assertTrue(checkCommit(asSpan(&commit), asSpan(&publicKey), asSpan(&job), 5, 4) = sizeMismatch(), "a signed commit of another size gives H1623");
+        assertTrue(checkCommit(getSpan(&commit, 0, length(&commit) - 2), asSpan(&publicKey), asSpan(&job), 5, 3) = badCommit(), "a cut commit gives H1621");
+        assertTrue(checkCommit(getSpan(&commit, 0, 40), asSpan(&publicKey), asSpan(&job), 5, 3) = badCommit(), "a commit without its signature gives H1621");
+        assertTrue(checkCommit("", asSpan(&publicKey), asSpan(&job), 5, 3) = badCommit(), "no commit gives H1621");
+        assertTrue(commitEpoch("") = 0, "no epoch in nothing");
+        destroyString(badMagic);
+        destroyString(badEpoch);
+        destroyString(badDigest);
+        destroyString(badMl);
+        destroyString(badEd);
+        destroyString(badSignature);
+        destroyString(commit);
+        destroyString(strangerKey);
+        destroyString(publicKey);
+        destroyCompositeKey(stranger);
+        destroyCompositeKey(key);
+        destroyString(other);
+        destroyString(job);
+        return nil;
+    end;
+
+    function testPayloads(): Unit is
+        let opening: String := beginPayload(4);
+        assertTrue(beginIs(asSpan(&opening), 4), "a opening payload");
+        assertFalse(beginIs(asSpan(&opening), 5), "a opening payload of another size");
+        assertFalse(beginIs("", 4), "no opening payload");
+        destroyString(opening);
+        let data: String := dataPayload(2, 3, 100, 500, "chunk");
+        assertTrue(length(&data) = 29, "a data payload");
+        assertTrue(dataIs(asSpan(&data)), "it is one");
+        assertTrue((dataKindOf(asSpan(&data)) = 2) and (dataOwner(asSpan(&data)) = 3), "its kind and owner");
+        assertTrue((dataOffset(asSpan(&data)) = 100) and (dataTotal(asSpan(&data)) = 500), "its place");
+        let chunk: String := dataChunk(asSpan(&data));
+        assertTrue(equal(asSpan(&chunk), "chunk"), "its chunk");
+        destroyString(chunk);
+        destroyString(data);
+        let request: String := dataPayload(1, 3, 0, 0, "");
+        assertTrue(dataIs(asSpan(&request)), "a fetch request");
+        destroyString(request);
+        let wrong: String := dataPayload(1, 3, 0, 0, "x");
+        assertFalse(dataIs(asSpan(&wrong)), "a fetch request with a chunk");
+        destroyString(wrong);
+        assertFalse(dataIs("short"), "a short data payload");
+        let unknown: String := dataPayload(4, 0, 0, 0, "");
+        let forged: String := flipped(asSpan(&unknown), 0);
+        assertFalse(dataIs(asSpan(&forged)), "a kind above 4");
+        destroyString(forged);
+        destroyString(unknown);
+        let digest: String := makeString(32, 7);
+        let resume: String := resumePayload(4, 3, asSpan(&digest), "commit");
+        assertTrue(resumeIs(asSpan(&resume)), "a resume payload");
+        assertTrue((resumeSize(asSpan(&resume)) = 4) and (resumeStatus(asSpan(&resume)) = 3), "its size and status");
+        let commit: String := resumeCommit(asSpan(&resume));
+        assertTrue(equal(asSpan(&commit), "commit"), "its commit");
+        destroyString(commit);
+        destroyString(resume);
+        destroyString(digest);
+        assertFalse(resumeIs("short"), "a short resume payload");
+        return nil;
+    end;
+
+    function testState(): Unit is
+        let text: String := makeString(3, 65);
+        let bytes: String := encodeState(&text);
+        assertTrue(equal(asSpan(&bytes), "AAA"), "a string is its own state");
+        let back: Option[String] := decodeState(asSpan(&bytes));
+        case back of
+            when Some(value as again: String) do
+                assertTrue(equal(asSpan(&again), "AAA"), "and comes back");
+                destroyString(again);
+            when None do
+                assertTrue(false, "the state was read");
+        end case;
+        destroyString(bytes);
+        destroyString(text);
+        return nil;
+    end;
+
+    function testPaths(): Unit is
+        let job: String := jobId();
+        let base: String := jobDirectory("ck", asSpan(&job));
+        assertTrue(equal(asSpan(&base), "ck/000102030405060708090a0b0c0d0e0f"), "the directory of a job");
+        let epoch: String := epochDirectory("ck", asSpan(&job), 12);
+        assertTrue(equal(asSpan(&epoch), "ck/000102030405060708090a0b0c0d0e0f/12"), "the directory of an epoch");
+        let rank: String := rankPath("ck", asSpan(&job), 12, 3, false);
+        assertTrue(equal(asSpan(&rank), "ck/000102030405060708090a0b0c0d0e0f/12/rank-3.ckpt"), "the file of a rank");
+        let buddy: String := rankPath("ck", asSpan(&job), 12, 3, true);
+        assertTrue(equal(asSpan(&buddy), "ck/000102030405060708090a0b0c0d0e0f/12/rank-3.ckpt.buddy"), "the copy at the buddy");
+        let commit: String := commitPath("ck", asSpan(&job), 12);
+        assertTrue(equal(asSpan(&commit), "ck/000102030405060708090a0b0c0d0e0f/12/COMMIT"), "the commit");
+        destroyString(commit);
+        destroyString(buddy);
+        destroyString(rank);
+        destroyString(epoch);
+        destroyString(base);
+        destroyString(job);
+        return nil;
+    end;
+
+    generic [K: Region, P: Region]
+    function putEpoch(key: &[CompositeKey, K], directory: Span[Nat8, Static], job: &[String, P], epoch: Nat64, size: Nat32): Bool is
+        var good: Bool := prepareEpoch(directory, asSpan(job), epoch);
+        let file: String := aFile(epoch, 0, size);
+        let filePath: String := rankPath(directory, asSpan(job), epoch, 0, false);
+        good := storeFile(asSpan(&filePath), asSpan(&file)) and good;
+        let commit: String := aCommit(key, epoch, size);
+        let commitAt: String := commitPath(directory, asSpan(job), epoch);
+        good := storeFile(asSpan(&commitAt), asSpan(&commit)) and good;
+        destroyString(commitAt);
+        destroyString(commit);
+        destroyString(filePath);
+        destroyString(file);
+        return good;
+    end;
+
+    function testDisk(): Unit is
+        let directory: Span[Nat8, Static] := "sperli-ckpt-unit";
+        let job: String := jobId();
+        let key: CompositeKey := aKey();
+        let publicKey: String := publicKeyOf(&key);
+        case bestCommit(directory, asSpan(&job), asSpan(&publicKey), 3) of
+            when Right(right as commit: String) do
+                destroyString(commit);
+                assertTrue(false, "a directory with nothing has no commit");
+            when Left(left as code: Int32) do
+                assertTrue(code = resumeRefused(), "no commit gives H1622");
+        end case;
+        assertTrue(putEpoch(&key, directory, &job, 1, 3), "epoch 1 is written");
+        assertTrue(putEpoch(&key, directory, &job, 2, 3), "epoch 2 is written");
+        assertTrue(putEpoch(&key, directory, &job, 3, 3), "epoch 3 is written");
+        let stored: String := rankPath(directory, asSpan(&job), 2, 0, false);
+        case loadFile(asSpan(&stored), 1000) of
+            when Some(value as file: String) do
+                assertTrue(checkRankFile(asSpan(&file), asSpan(&job), 2, 0, 3) = 0, "a stored file reads back whole");
+                destroyString(file);
+            when None do
+                assertTrue(false, "the file was read");
+        end case;
+        case loadFile(asSpan(&stored), 10) of
+            when Some(value as file: String) do
+                destroyString(file);
+                assertTrue(false, "a file over the limit is not read");
+            when None do
+                assertTrue(true, "a file over the limit is not read");
+        end case;
+        destroyString(stored);
+        case bestCommit(directory, asSpan(&job), asSpan(&publicKey), 3) of
+            when Right(right as commit: String) do
+                assertTrue(commitEpoch(asSpan(&commit)) = 3, "the highest epoch is chosen");
+                destroyString(commit);
+            when Left(left as code: Int32) do
+                assertTrue(false, "a commit was found");
+        end case;
+        case bestCommit(directory, asSpan(&job), asSpan(&publicKey), 4) of
+            when Right(right as commit: String) do
+                destroyString(commit);
+                assertTrue(false, "a commit of another size is not taken");
+            when Left(left as code: Int32) do
+                assertTrue(code = sizeMismatch(), "another size gives H1623");
+        end case;
+        let otherKey: CompositeKey := aKey();
+        let otherPublic: String := publicKeyOf(&otherKey);
+        case bestCommit(directory, asSpan(&job), asSpan(&otherPublic), 3) of
+            when Right(right as commit: String) do
+                destroyString(commit);
+                assertTrue(false, "a commit signed by another key is not taken");
+            when Left(left as code: Int32) do
+                assertTrue(code = badCommit(), "another key gives H1621");
+        end case;
+        destroyString(otherPublic);
+        destroyCompositeKey(otherKey);
+        let third: String := commitPath(directory, asSpan(&job), 3);
+        case loadFile(asSpan(&third), 200000) of
+            when Some(value as commit: String) do
+                let broken: String := flipped(asSpan(&commit), length(&commit) - 5);
+                assertTrue(storeFile(asSpan(&third), asSpan(&broken)), "the commit of epoch 3 is broken");
+                destroyString(broken);
+                destroyString(commit);
+            when None do
+                assertTrue(false, "the commit was read");
+        end case;
+        case bestCommit(directory, asSpan(&job), asSpan(&publicKey), 3) of
+            when Right(right as commit: String) do
+                assertTrue(commitEpoch(asSpan(&commit)) = 2, "a broken commit does not count, the epoch before does");
+                destroyString(commit);
+            when Left(left as code: Int32) do
+                assertTrue(false, "epoch 2 was found");
+        end case;
+        removeCommit(directory, asSpan(&job), 3);
+        pruneEpochs(directory, asSpan(&job), 3);
+        let first: String := commitPath(directory, asSpan(&job), 1);
+        case loadFile(asSpan(&first), 200000) of
+            when Some(value as commit: String) do
+                destroyString(commit);
+                assertTrue(false, "epoch 1 is deleted");
+            when None do
+                assertTrue(true, "epoch 1 is deleted");
+        end case;
+        destroyString(first);
+        let second: String := commitPath(directory, asSpan(&job), 2);
+        case loadFile(asSpan(&second), 200000) of
+            when Some(value as commit: String) do
+                destroyString(commit);
+                assertTrue(true, "epoch 2 is kept");
+            when None do
+                assertTrue(false, "epoch 2 is kept");
+        end case;
+        destroyString(second);
+        pruneEpochs(directory, asSpan(&job), 100);
+        let jobPath: String := jobDirectory(directory, asSpan(&job));
+        assertTrue(removeDirectory(asSpan(&jobPath)), "every epoch is gone and the job directory is empty");
+        assertTrue(removeDirectory(directory), "so is the directory");
+        destroyString(jobPath);
+        destroyString(third);
+        destroyString(publicKey);
+        destroyCompositeKey(key);
+        destroyString(job);
+        return nil;
+    end;
+end module body.

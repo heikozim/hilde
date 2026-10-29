@@ -1,0 +1,265 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+
+module body Standard.Base64 is
+    constant byteUpperA: Nat8 := 65;
+    constant byteLowerA: Nat8 := 97;
+    constant byteZero: Nat8 := 48;
+    constant bytePlus: Nat8 := 43;
+    constant byteSlash: Nat8 := 47;
+    constant byteMinus: Nat8 := 45;
+    constant byteUnderscore: Nat8 := 95;
+    constant byteEquals: Nat8 := 61;
+    constant lowTwoBits: Nat8 := 3;
+    constant lowFourBits: Nat8 := 15;
+    constant lowSixBits: Nat8 := 63;
+
+    -- The character of a six-bit value.
+    function letter(value: Nat8): Nat8 is
+        if value < 26 then
+            return byteUpperA + value;
+        end if;
+        if value < 52 then
+            return byteLowerA + (value - 26);
+        end if;
+        if value < 62 then
+            return byteZero + (value - 52);
+        end if;
+        if value = 62 then
+            return bytePlus;
+        end if;
+        return byteSlash;
+    end;
+
+    -- The six-bit value of a character of the alphabet, None for any other
+    -- byte, the padding character among them.
+    function valueOf(byte: Nat8): Option[Nat8] is
+        if (byte >= byteUpperA) and (byte < (byteUpperA + 26)) then
+            return Some(value => byte - byteUpperA);
+        end if;
+        if (byte >= byteLowerA) and (byte < (byteLowerA + 26)) then
+            return Some(value => (byte - byteLowerA) + 26);
+        end if;
+        if (byte >= byteZero) and (byte < (byteZero + 10)) then
+            return Some(value => (byte - byteZero) + 52);
+        end if;
+        if byte = bytePlus then
+            let plus: Nat8 := 62;
+            return Some(value => plus);
+        end if;
+        if byte = byteSlash then
+            let slash: Nat8 := 63;
+            return Some(value => slash);
+        end if;
+        return None();
+    end;
+
+    -- The value of the character at the given place, or 64 when it is not
+    -- in the alphabet.  A private shorthand: every caller checks for 64
+    -- before it uses the value, and nothing outside this module sees it.
+    generic [R: Region]
+    function sixBits(text: Span[Nat8, R], at: Index): Nat8 is
+        case valueOf(text[at]) of
+            when Some(value as v: Nat8) do
+                return v;
+            when None do
+                return 64;
+        end case;
+    end;
+
+    generic [R: Region]
+    function encodeWith(bytes: Span[Nat8, R], padded: Bool): String is
+        let size: Index := spanLength(bytes);
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while (i + 3) <= size do
+            let a: Nat8 := bytes[i];
+            let b: Nat8 := bytes[i + 1];
+            let c: Nat8 := bytes[i + 2];
+            writeByte(&!builder, letter(a / 4));
+            writeByte(&!builder, letter((bitwiseAnd(a, lowTwoBits) * 16) + (b / 16)));
+            writeByte(&!builder, letter((bitwiseAnd(b, lowFourBits) * 4) + (c / 64)));
+            writeByte(&!builder, letter(bitwiseAnd(c, lowSixBits)));
+            i := i + 3;
+        end while;
+        let rest: Index := size - i;
+        if rest = 1 then
+            let a: Nat8 := bytes[i];
+            writeByte(&!builder, letter(a / 4));
+            writeByte(&!builder, letter(bitwiseAnd(a, lowTwoBits) * 16));
+            if padded then
+                writeByte(&!builder, byteEquals);
+                writeByte(&!builder, byteEquals);
+            end if;
+        end if;
+        if rest = 2 then
+            let a: Nat8 := bytes[i];
+            let b: Nat8 := bytes[i + 1];
+            writeByte(&!builder, letter(a / 4));
+            writeByte(&!builder, letter((bitwiseAnd(a, lowTwoBits) * 16) + (b / 16)));
+            writeByte(&!builder, letter(bitwiseAnd(b, lowFourBits) * 4));
+            if padded then
+                writeByte(&!builder, byteEquals);
+            end if;
+        end if;
+        return finalize(builder);
+    end;
+
+    generic [R: Region]
+    function encode(bytes: Span[Nat8, R]): String is
+        return encodeWith(bytes, true);
+    end;
+
+    generic [R: Region]
+    function encodeUnpadded(bytes: Span[Nat8, R]): String is
+        return encodeWith(bytes, false);
+    end;
+
+    -- Decode the first count characters of text, which hold no padding.
+    -- None when a character is not in the alphabet, when count is one more
+    -- than a multiple of four, or when the last character carries bits
+    -- the bytes do not use.
+    generic [R: Region]
+    function decodeBody(text: Span[Nat8, R], count: Index): Option[String] is
+        let groups: Index := count / 4;
+        let rest: Index := count - (groups * 4);
+        if rest = 1 then
+            return None();
+        end if;
+        var good: Bool := true;
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while good and ((i + 4) <= count) do
+            let a: Nat8 := sixBits(text, i);
+            let b: Nat8 := sixBits(text, i + 1);
+            let c: Nat8 := sixBits(text, i + 2);
+            let d: Nat8 := sixBits(text, i + 3);
+            if ((a = 64) or (b = 64)) or ((c = 64) or (d = 64)) then
+                good := false;
+            else
+                writeByte(&!builder, (a * 4) + (b / 16));
+                writeByte(&!builder, (bitwiseAnd(b, lowFourBits) * 16) + (c / 4));
+                writeByte(&!builder, (bitwiseAnd(c, lowTwoBits) * 64) + d);
+            end if;
+            i := i + 4;
+        end while;
+        if good and (rest = 2) then
+            let a: Nat8 := sixBits(text, i);
+            let b: Nat8 := sixBits(text, i + 1);
+            if ((a = 64) or (b = 64)) or (bitwiseAnd(b, lowFourBits) /= 0) then
+                good := false;
+            else
+                writeByte(&!builder, (a * 4) + (b / 16));
+            end if;
+        end if;
+        if good and (rest = 3) then
+            let a: Nat8 := sixBits(text, i);
+            let b: Nat8 := sixBits(text, i + 1);
+            let c: Nat8 := sixBits(text, i + 2);
+            if ((a = 64) or (b = 64)) or ((c = 64) or (bitwiseAnd(c, lowTwoBits) /= 0)) then
+                good := false;
+            else
+                writeByte(&!builder, (a * 4) + (b / 16));
+                writeByte(&!builder, (bitwiseAnd(b, lowFourBits) * 16) + (c / 4));
+            end if;
+        end if;
+        let made: String := finalize(builder);
+        if good then
+            return Some(value => made);
+        else
+            destroyString(made);
+            return None();
+        end if;
+    end;
+
+    generic [R: Region]
+    function decode(text: Span[Nat8, R]): Option[String] is
+        let size: Index := spanLength(text);
+        if (size - ((size / 4) * 4)) /= 0 then
+            return None();
+        end if;
+        var pads: Index := 0;
+        if (size >= 1) and (text[size - 1] = byteEquals) then
+            pads := pads + 1;
+            if (size >= 2) and (text[size - 2] = byteEquals) then
+                pads := pads + 1;
+            end if;
+        end if;
+        -- With the padding taken off, what is left must not be a multiple
+        -- of four unless there was none: = stands only where it fills a
+        -- group.
+        let content: Index := size - pads;
+        let rest: Index := content - ((content / 4) * 4);
+        if (pads = 1) and (rest /= 3) then
+            return None();
+        end if;
+        if (pads = 2) and (rest /= 2) then
+            return None();
+        end if;
+        return decodeBody(text, content);
+    end;
+
+    generic [R: Region]
+    function decodeUnpadded(text: Span[Nat8, R]): Option[String] is
+        return decodeBody(text, spanLength(text));
+    end;
+
+    -- The text with each from byte replaced by to, and every other as it is.
+    generic [R: Region]
+    function swapped(text: Span[Nat8, R], fromA: Nat8, toA: Nat8, fromB: Nat8, toB: Nat8): String is
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if byte = fromA then
+                writeByte(&!builder, toA);
+            else if byte = fromB then
+                writeByte(&!builder, toB);
+            else
+                writeByte(&!builder, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    generic [R: Region]
+    function encodeUrl(bytes: Span[Nat8, R]): String is
+        let plain: String := encodeWith(bytes, true);
+        let url: String := swapped(asSpan(&plain), bytePlus, byteMinus, byteSlash, byteUnderscore);
+        destroyString(plain);
+        return url;
+    end;
+
+    generic [R: Region]
+    function decodeUrl(text: Span[Nat8, R]): Option[String] is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if (text[i] = bytePlus) or (text[i] = byteSlash) then
+                let none: Option[String] := None();
+                return none;
+            end if;
+            i := i + 1;
+        end while;
+        let plain: String := swapped(text, byteMinus, bytePlus, byteUnderscore, byteSlash);
+        let bytes: Option[String] := decode(asSpan(&plain));
+        destroyString(plain);
+        return bytes;
+    end;
+end module body.

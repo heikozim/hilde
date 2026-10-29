@@ -1,0 +1,907 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Selection walks a queue of requirements, the main package's first.  Each
+-- prefix and version is fetched once into the cache and its own manifest
+-- read; its requirements join the queue.  A choice per prefix keeps the
+-- greatest version seen.  Only when the queue is empty and every choice is
+-- checked are vendor/, hilde.sum and hilde.toml written.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nthRef,
+    insertBack,
+    removeFirst,
+    removeLast,
+    swapNth,
+    destroyEmpty
+);
+import Standard.Text (
+    equal,
+    indexOfByte,
+    substring,
+    formatNat
+);
+import Standard.Order (
+    Ordering,
+    LessThan,
+    Equal,
+    GreaterThan,
+    compare
+);
+import Standard.Semver (
+    Version,
+    parseVersion,
+    formatVersion,
+    sameMajor
+);
+import Standard.Signify (
+    verifyMessage,
+    publicKeyLine
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf,
+    destroyProblem
+);
+import Pkg.Manifest (
+    Manifest,
+    Requirement,
+    isPrefix,
+    makeRequirement,
+    readManifest,
+    formatManifest,
+    findRequirement,
+    setRequirement,
+    destroyManifest
+);
+import Pkg.Sum (
+    SumEntry,
+    makeEntry,
+    readSum,
+    formatSum,
+    findEntry,
+    destroyEntries
+);
+import Pkg.Tree (
+    treeSum,
+    copyTree,
+    removeTree
+);
+import Pkg.Files (
+    readText,
+    writeText,
+    isThere,
+    isDirectory,
+    joinPath,
+    makeDirectories,
+    directoryNames
+);
+import Pkg.Process (
+    findProgram
+);
+import Pkg.Git (
+    cloneTag
+);
+
+module body Pkg.Get is
+    -- A requirement on its way through the queue.
+    record Pending: Linear is
+        prefix: String;
+        version: Version;
+        git: String;
+        key: String;
+        by: String;
+    end;
+
+    -- The choice for one prefix: the greatest version seen, where it came
+    -- from, the key a requirement named, and the clone in the cache.
+    record Choice: Linear is
+        prefix: String;
+        version: Version;
+        git: String;
+        key: String;
+        by: String;
+        clone: String;
+    end;
+
+    -- The choices after one more was recorded, and what was wrong with it.
+    record Chosen: Linear is
+        choices: Buffer[Choice];
+        problem: Option[Problem];
+    end;
+
+    function destroyGot(got: Got): Unit is
+        let { count: Index, summary: String, problems: Buffer[Problem] } := got;
+        destroyString(summary);
+        var rest: Buffer[Problem] := problems;
+        while bufferLength(&rest) > 0 do
+            destroyProblem(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyPending(p: Pending): Unit is
+        let { prefix: String, version: Version, git: String, key: String, by: String } := p;
+        destroyString(prefix);
+        destroyString(git);
+        destroyString(key);
+        destroyString(by);
+        return nil;
+    end;
+
+    function destroyChoice(c: Choice): Unit is
+        let { prefix: String, version: Version, git: String, key: String, by: String, clone: String } := c;
+        destroyString(prefix);
+        destroyString(git);
+        destroyString(key);
+        destroyString(by);
+        destroyString(clone);
+        return nil;
+    end;
+
+    function destroyQueue(queue: Buffer[Pending]): Unit is
+        var rest: Buffer[Pending] := queue;
+        while bufferLength(&rest) > 0 do
+            destroyPending(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyChoices(choices: Buffer[Choice]): Unit is
+        var rest: Buffer[Choice] := choices;
+        while bufferLength(&rest) > 0 do
+            destroyChoice(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyWanted(w: Wanted): Unit is
+        let { prefix: String, version: Version, git: String } := w;
+        destroyString(prefix);
+        destroyString(git);
+        return nil;
+    end;
+
+    function gotWith(problem: Problem): Got is
+        var problems: Buffer[Problem] := allocateEmpty();
+        insertBack(&!problems, problem);
+        return Got(count => 0, summary => makeEmpty(), problems => problems);
+    end;
+
+    generic [A: Region, B: Region, C: Region]
+    function said(a: Span[Nat8, A], b: Span[Nat8, B], c: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        writeString(&!out, c);
+        return finalize(out);
+    end;
+
+    function versionText(v: Version): String is
+        return formatVersion(v);
+    end;
+
+    generic [T: Region, G: Region]
+    function readWanted(text: Span[Nat8, T], git: Span[Nat8, G]): Either[Problem, Wanted] is
+        case indexOfByte(text, '@') of
+            when Some(value as at: Index) do
+                let prefix: Span[Nat8, T] := substring(text, 0, at);
+                case parseVersion(substring(text, at + 1, spanLength(text))) of
+                    when Some(value as v: Version) do
+                        if isPrefix(prefix) then
+                            return Right(right => Wanted(prefix => fromSpan(prefix), version => v, git => fromSpan(git)));
+                        end if;
+                    when None do
+                        skip;
+                end case;
+            when None do
+                skip;
+        end case;
+        return Left(left => problemOf(1505, said("hilde get takes Prefix@vX.Y.Z, not ", text, ""), fromLiteral("such as hilde get Acme.Json@v1.2.0")));
+    end;
+
+    generic [R: Region]
+    function pendingPrefix(p: &[Pending, R]): Span[Nat8, R] is
+        return asSpan(&(p->prefix));
+    end;
+
+    generic [R: Region]
+    function choicePrefix(c: &[Choice, R]): Span[Nat8, R] is
+        return asSpan(&(c->prefix));
+    end;
+
+    -- The requirements of a manifest, as pending entries required by by.
+    generic [M: Region, B: Region, Q: Region]
+    function pushNeeds(manifest: &[Manifest, M], by: Span[Nat8, B], queue: &![Buffer[Pending], Q]): Unit is
+        let needs: &[Buffer[Requirement], M] := &(manifest->needs);
+        var i: Index := 0;
+        while i < bufferLength(needs) do
+            let r: &[Requirement, M] := nthRef(needs, i);
+            insertBack(&~queue, Pending(
+                prefix => fromSpan(asSpan(&(r->prefix))),
+                version => r->version,
+                git => fromSpan(asSpan(&(r->git))),
+                key => fromSpan(asSpan(&(r->key))),
+                by => fromSpan(by)
+            ));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Whether the text is one of the texts.
+    generic [V: Region, K: Region]
+    function seen(visited: &[Buffer[String], V], key: Span[Nat8, K]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(visited) do
+            if equal(asSpan(nthRef(visited, i)), key) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The directory of the clone of a prefix and version in the cache.
+    generic [R: Region, P: Region]
+    function cloneDir(root: Span[Nat8, R], prefix: Span[Nat8, P], version: Version): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, root);
+        writeString(&!out, "/.hilde-cache/");
+        writeString(&!out, prefix);
+        writeByte(&!out, '@');
+        let v: String := versionText(version);
+        writeString(&!out, asSpan(&v));
+        destroyString(v);
+        return finalize(out);
+    end;
+
+    -- Fetches the pending package into the cache when it is not there and
+    -- reads its manifest.
+    generic [G: Region, P: Region, D: Region]
+    function fetchInto(git: Span[Nat8, G], pending: &[Pending, P], clone: Span[Nat8, D]): Either[Problem, Manifest] is
+        if not isDirectory(clone) then
+            case cloneTag(git, asSpan(&(pending->git)), pending->version, clone) of
+                when Right(right as done: Unit) do
+                    skip;
+                when Left(left as p: Problem) do
+                    return Left(left => p);
+            end case;
+        end if;
+        let tomlPath: String := joinPath(clone, "hilde.toml");
+        let text: Option[String] := readText(asSpan(&tomlPath));
+        destroyString(tomlPath);
+        case text of
+            when Some(value as toml: String) do
+                let read: Either[Problem, Manifest] := readManifest(asSpan(&toml));
+                destroyString(toml);
+                case read of
+                    when Right(right as m: Manifest) do
+                        return Right(right => m);
+                    when Left(left as p: Problem) do
+                        return Left(left => p);
+                end case;
+            when None do
+                return Left(left => problemOf(1501, said("the release of ", asSpan(&(pending->prefix)), " has no hilde.toml"), fromLiteral("a package carries hilde.toml at the root of its tree")));
+        end case;
+    end;
+
+    -- H1506 when the manifest of the release does not name it by its prefix,
+    -- H1505 when its version is not the tag.
+    generic [M: Region, P: Region]
+    function wrongRelease(manifest: &[Manifest, M], pending: &[Pending, P]): Option[Problem] is
+        if not equal(asSpan(&(manifest->name)), asSpan(&(pending->prefix))) then
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, "the package at ");
+            writeString(&!out, asSpan(&(pending->git)));
+            writeString(&!out, " is named ");
+            writeString(&!out, asSpan(&(manifest->name)));
+            writeString(&!out, ", and ");
+            writeString(&!out, asSpan(&(pending->by)));
+            writeString(&!out, " requires it as ");
+            writeString(&!out, asSpan(&(pending->prefix)));
+            return Some(value => problemOf(1506, finalize(out), fromLiteral("require it by the name in its own hilde.toml")));
+        end if;
+        case compare(&(manifest->version), &(pending->version)) of
+            when Equal do
+                return None();
+            when LessThan do
+                skip;
+            when GreaterThan do
+                skip;
+        end case;
+        let tag: String := versionText(pending->version);
+        let own: String := versionText(manifest->version);
+        let p: Problem := problemOf(1505, said(asSpan(&(pending->prefix)), " at the tag ", asSpan(&tag)), said("its hilde.toml says version ", asSpan(&own), "; the tag and the version must be the same"));
+        destroyString(tag);
+        destroyString(own);
+        return Some(value => p);
+    end;
+
+    -- H1516 when two versions of a prefix have another major, H1506 when
+    -- they come from two git URLs; None when they may stand together.
+    generic [P: Region, OG: Region, NG: Region, OB: Region, NB: Region]
+    function conflictOf(prefix: Span[Nat8, P], oldVersion: Version, version: Version, oldGit: Span[Nat8, OG], git: Span[Nat8, NG], oldBy: Span[Nat8, OB], by: Span[Nat8, NB]): Option[Problem] is
+        if not sameMajor(oldVersion, version) then
+            let a: String := versionText(oldVersion);
+            let b: String := versionText(version);
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, prefix);
+            writeString(&!out, " is required as ");
+            writeString(&!out, asSpan(&a));
+            writeString(&!out, " by ");
+            writeString(&!out, oldBy);
+            writeString(&!out, " and as ");
+            writeString(&!out, asSpan(&b));
+            writeString(&!out, " by ");
+            writeString(&!out, by);
+            destroyString(a);
+            destroyString(b);
+            return Some(value => problemOf(1516, finalize(out), fromLiteral("two majors of one package cannot be in one build; a new major takes a new prefix, such as Acme.Json2")));
+        end if;
+        if not equal(oldGit, git) then
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, prefix);
+            writeString(&!out, " is required from ");
+            writeString(&!out, oldGit);
+            writeString(&!out, " by ");
+            writeString(&!out, oldBy);
+            writeString(&!out, " and from ");
+            writeString(&!out, git);
+            writeString(&!out, " by ");
+            writeString(&!out, by);
+            return Some(value => problemOf(1506, finalize(out), fromLiteral("one prefix comes from one repository; use the same git URL in both")));
+        end if;
+        return None();
+    end;
+
+    -- Records the pending package among the choices: a new prefix is added,
+    -- a greater version of a known one replaces it.  H1516 for another
+    -- major, H1506 for another git URL.
+    function choose(choices: Buffer[Choice], pending: Pending, clone: String): Chosen is
+        var cs: Buffer[Choice] := choices;
+        let { prefix: String, version: Version, git: String, key: String, by: String } := pending;
+        var at: Index := bufferLength(&cs);
+        var i: Index := 0;
+        while i < bufferLength(&cs) do
+            if equal(choicePrefix(nthRef(&cs, i)), asSpan(&prefix)) then
+                at := i;
+            end if;
+            i := i + 1;
+        end while;
+        if at = bufferLength(&cs) then
+            insertBack(&!cs, Choice(prefix => prefix, version => version, git => git, key => key, by => by, clone => clone));
+            return Chosen(choices => cs, problem => None());
+        end if;
+        let old: Choice := swapNth(&!cs, at, Choice(prefix => fromLiteral(""), version => version, git => fromLiteral(""), key => fromLiteral(""), by => fromLiteral(""), clone => fromLiteral("")));
+        let { prefix as oldPrefix: String, version as oldVersion: Version, git as oldGit: String, key as oldKey: String, by as oldBy: String, clone as oldClone: String } := old;
+        let problem: Option[Problem] := conflictOf(asSpan(&prefix), oldVersion, version, asSpan(&oldGit), asSpan(&git), asSpan(&oldBy), asSpan(&by));
+        -- Keep the greater version; a key named anywhere is kept.
+        var keepNew: Bool := false;
+        case compare(&oldVersion, &version) of
+            when LessThan do
+                keepNew := true;
+            when Equal do
+                skip;
+            when GreaterThan do
+                skip;
+        end case;
+        var finalKey: String := oldKey;
+        if length(&finalKey) = 0 then
+            destroyString(finalKey);
+            finalKey := key;
+        else
+            destroyString(key);
+        end if;
+        if keepNew then
+            let replaced: Choice := swapNth(&!cs, at, Choice(prefix => prefix, version => version, git => git, key => finalKey, by => by, clone => clone));
+            destroyChoice(replaced);
+            destroyString(oldPrefix);
+            destroyString(oldGit);
+            destroyString(oldBy);
+            destroyString(oldClone);
+        else
+            let replaced: Choice := swapNth(&!cs, at, Choice(prefix => oldPrefix, version => oldVersion, git => oldGit, key => finalKey, by => oldBy, clone => oldClone));
+            destroyChoice(replaced);
+            destroyString(prefix);
+            destroyString(git);
+            destroyString(by);
+            destroyString(clone);
+        end if;
+        return Chosen(choices => cs, problem => problem);
+    end;
+
+    -- Selects the versions: walks the queue until it is empty or a problem
+    -- stops it.
+    generic [G: Region, R: Region, M: Region]
+    function select(git: Span[Nat8, G], root: Span[Nat8, R], main: &[Manifest, M]): Either[Problem, Buffer[Choice]] is
+        var queue: Buffer[Pending] := allocateEmpty();
+        pushNeeds(main, asSpan(&(main->name)), &!queue);
+        var visited: Buffer[String] := allocateEmpty();
+        var choices: Buffer[Choice] := allocateEmpty();
+        while bufferLength(&queue) > 0 do
+            let pending: Pending := removeFirst(&!queue);
+            let clone: String := cloneDir(root, pendingPrefix(&pending), pending.version);
+            if equal(pendingPrefix(&pending), asSpan(&(main->name))) or seen(&visited, asSpan(&clone)) then
+                destroyString(clone);
+                destroyPending(pending);
+            else
+                insertBack(&!visited, fromSpan(asSpan(&clone)));
+                case fetchInto(git, &pending, asSpan(&clone)) of
+                    when Right(right as dep: Manifest) do
+                        case wrongRelease(&dep, &pending) of
+                            when Some(value as p: Problem) do
+                                destroyManifest(dep);
+                                destroyString(clone);
+                                destroyPending(pending);
+                                destroyQueue(queue);
+                                destroyArguments(visited);
+                                destroyChoices(choices);
+                                return Left(left => p);
+                            when None do
+                                skip;
+                        end case;
+                        pushNeeds(&dep, pendingPrefix(&pending), &!queue);
+                        destroyManifest(dep);
+                        let chosen: Chosen := choose(choices, pending, clone);
+                        let { choices as now: Buffer[Choice], problem: Option[Problem] } := chosen;
+                        choices := now;
+                        case problem of
+                            when Some(value as p: Problem) do
+                                destroyQueue(queue);
+                                destroyArguments(visited);
+                                destroyChoices(choices);
+                                return Left(left => p);
+                            when None do
+                                skip;
+                        end case;
+                    when Left(left as p: Problem) do
+                        destroyString(clone);
+                        destroyPending(pending);
+                        destroyQueue(queue);
+                        destroyArguments(visited);
+                        destroyChoices(choices);
+                        return Left(left => p);
+                end case;
+            end if;
+        end while;
+        destroyEmpty(queue);
+        destroyArguments(visited);
+        return Right(right => choices);
+    end;
+
+    -- The base64 line of a key text, or the empty text.
+    generic [K: Region]
+    function keyLine(key: Span[Nat8, K]): String is
+        case publicKeyLine(key) of
+            when Some(value as line: String) do
+                return line;
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    -- The own signify key of the release in the clone, or the empty text.
+    generic [D: Region]
+    function ownKey(clone: Span[Nat8, D]): String is
+        let tomlPath: String := joinPath(clone, "hilde.toml");
+        let text: Option[String] := readText(asSpan(&tomlPath));
+        destroyString(tomlPath);
+        case text of
+            when Some(value as toml: String) do
+                let read: Either[Problem, Manifest] := readManifest(asSpan(&toml));
+                destroyString(toml);
+                case read of
+                    when Right(right as m: Manifest) do
+                        let key: String := manifestKey(&m);
+                        destroyManifest(m);
+                        return key;
+                    when Left(left as p: Problem) do
+                        destroyProblem(p);
+                        return makeEmpty();
+                end case;
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    -- The line of hilde.sum of one choice: its checksum, and the key its
+    -- signature was checked with, or no key for a release without one.
+    generic [C: Region, E: Region]
+    function entryOf(choice: &[Choice, C], pinned: &[Buffer[SumEntry], E], strict: Bool): Either[Problem, SumEntry] is
+        let prefix: Span[Nat8, C] := asSpan(&(choice->prefix));
+        case treeSum(asSpan(&(choice->clone))) of
+            when Right(right as sum: String) do
+                -- The key: pinned in hilde.sum, else named, else the package's own.
+                let pinnedKey: String := pinnedKeyOf(pinned, prefix);
+                let wasSigned: Bool := length(&pinnedKey) > 0;
+                let named: String := keyLine(asSpan(&(choice->key)));
+                let own: String := ownKey(asSpan(&(choice->clone)));
+                if ((length(&pinnedKey) > 0) and (length(&named) > 0)) and (not equal(asSpan(&pinnedKey), asSpan(&named))) then
+                    destroyString(sum);
+                    destroyString(pinnedKey);
+                    destroyString(named);
+                    destroyString(own);
+                    return Left(left => problemOf(1512, said("the key hilde.toml names for ", prefix, " is not the one hilde.sum took on first use"), fromLiteral("if the author changed the key, check the new one with them, then remove the line of the prefix from hilde.sum")));
+                end if;
+                var key: String := pinnedKey;
+                if length(&key) = 0 then
+                    destroyString(key);
+                    key := named;
+                    if length(&key) = 0 then
+                        destroyString(key);
+                        key := own;
+                    else
+                        destroyString(own);
+                    end if;
+                else
+                    destroyString(named);
+                    destroyString(own);
+                end if;
+                let v: String := versionText(choice->version);
+                var sigPath: StringBuilder := makeStringBuilder();
+                writeString(&!sigPath, asSpan(&(choice->clone)));
+                writeString(&!sigPath, "/signatures/");
+                writeString(&!sigPath, asSpan(&v));
+                writeString(&!sigPath, ".sig");
+                let sigFile: String := finalize(sigPath);
+                destroyString(v);
+                let signature: Option[String] := readText(asSpan(&sigFile));
+                destroyString(sigFile);
+                case signature of
+                    when Some(value as sig: String) do
+                        if length(&key) = 0 then
+                            destroyString(sig);
+                            destroyString(sum);
+                            destroyString(key);
+                            return Left(left => problemOf(1512, said("the release of ", prefix, " is signed, and no key is known to check it"), fromLiteral("name its key as signify-key in the requirement")));
+                        end if;
+                        let message: String := said(asSpan(&sum), "\n", "");
+                        let good: Bool := verifyMessage(asSpan(&key), asSpan(&message), asSpan(&sig));
+                        destroyString(message);
+                        destroyString(sig);
+                        if not good then
+                            destroyString(sum);
+                            destroyString(key);
+                            return Left(left => problemOf(1512, said("the signature of ", prefix, " does not hold for its tree and its key"), fromLiteral("the release was changed or signed with another key; ask its author")));
+                        end if;
+                        let entry: SumEntry := makeEntry(prefix, choice->version, asSpan(&sum), asSpan(&key));
+                        destroyString(sum);
+                        destroyString(key);
+                        return Right(right => entry);
+                    when None do
+                        destroyString(key);
+                        if wasSigned then
+                            destroyString(sum);
+                            return Left(left => problemOf(1512, said("the release of ", prefix, " has no signature, and an earlier one was signed"), fromLiteral("ask its author to sign the release")));
+                        end if;
+                        if strict then
+                            destroyString(sum);
+                            return Left(left => problemOf(1511, said("the release of ", prefix, " has no signature, and policy.require-signatures is true"), fromLiteral("ask its author to sign the release, or set require-signatures to false")));
+                        end if;
+                        let entry: SumEntry := makeEntry(prefix, choice->version, asSpan(&sum), "");
+                        destroyString(sum);
+                        return Right(right => entry);
+                end case;
+            when Left(left as p: Problem) do
+                return Left(left => p);
+        end case;
+    end;
+
+    generic [E: Region, P: Region]
+    function pinnedKeyOf(pinned: &[Buffer[SumEntry], E], prefix: Span[Nat8, P]): String is
+        case findEntry(pinned, prefix) of
+            when Some(value as at: Index) do
+                let e: &[SumEntry, E] := nthRef(pinned, at);
+                return fromSpan(asSpan(&(e->key)));
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    -- The lines of hilde.sum for every choice, or the first problem.
+    generic [C: Region, E: Region]
+    function entriesOf(choices: &[Buffer[Choice], C], pinned: &[Buffer[SumEntry], E], strict: Bool): Either[Problem, Buffer[SumEntry]] is
+        var out: Buffer[SumEntry] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(choices) do
+            case entryOf(nthRef(choices, i), pinned, strict) of
+                when Right(right as e: SumEntry) do
+                    insertBack(&!out, e);
+                when Left(left as p: Problem) do
+                    destroyEntries(out);
+                    return Left(left => p);
+            end case;
+            i := i + 1;
+        end while;
+        return Right(right => out);
+    end;
+
+    -- vendor/ made to hold exactly the trees of the choices.
+    generic [R: Region, C: Region]
+    function writeVendor(root: Span[Nat8, R], choices: &[Buffer[Choice], C]): Option[Problem] is
+        let vendor: String := joinPath(root, "vendor");
+        if not makeDirectories(asSpan(&vendor)) then
+            let p: Problem := problemOf(1519, said("vendor/ cannot be made in ", root, ""), fromLiteral("check that the package may be written"));
+            destroyString(vendor);
+            return Some(value => p);
+        end if;
+        -- Trees no choice names are removed.
+        case directoryNames(asSpan(&vendor)) of
+            when Some(value as names: Buffer[String]) do
+                let stray: Option[Problem] := removeStrays(asSpan(&vendor), &names, choices);
+                destroyArguments(names);
+                case stray of
+                    when Some(value as p: Problem) do
+                        destroyString(vendor);
+                        return Some(value => p);
+                    when None do
+                        skip;
+                end case;
+            when None do
+                skip;
+        end case;
+        var i: Index := 0;
+        while i < bufferLength(choices) do
+            let c: &[Choice, C] := nthRef(choices, i);
+            let target: String := joinPath(asSpan(&vendor), asSpan(&(c->prefix)));
+            case removeTree(asSpan(&target)) of
+                when Right(right as done: Unit) do
+                    skip;
+                when Left(left as p: Problem) do
+                    destroyString(target);
+                    destroyString(vendor);
+                    return Some(value => p);
+            end case;
+            case copyTree(asSpan(&(c->clone)), asSpan(&target)) of
+                when Right(right as done: Unit) do
+                    skip;
+                when Left(left as p: Problem) do
+                    destroyString(target);
+                    destroyString(vendor);
+                    return Some(value => p);
+            end case;
+            destroyString(target);
+            i := i + 1;
+        end while;
+        destroyString(vendor);
+        return None();
+    end;
+
+    generic [V: Region, N: Region, C: Region]
+    function removeStrays(vendor: Span[Nat8, V], names: &[Buffer[String], N], choices: &[Buffer[Choice], C]): Option[Problem] is
+        var i: Index := 0;
+        while i < bufferLength(names) do
+            let name: Span[Nat8, N] := asSpan(nthRef(names, i));
+            var named: Bool := false;
+            var j: Index := 0;
+            while j < bufferLength(choices) do
+                if equal(choicePrefix(nthRef(choices, j)), name) then
+                    named := true;
+                end if;
+                j := j + 1;
+            end while;
+            if not named then
+                let path: String := joinPath(vendor, name);
+                let removed: Either[Problem, Unit] := removeTree(asSpan(&path));
+                destroyString(path);
+                case removed of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as p: Problem) do
+                        return Some(value => p);
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    generic [R: Region]
+    function readPinned(root: Span[Nat8, R]): Either[Problem, Buffer[SumEntry]] is
+        let path: String := joinPath(root, "hilde.sum");
+        let text: Option[String] := readText(asSpan(&path));
+        destroyString(path);
+        case text of
+            when Some(value as t: String) do
+                let read: Either[Problem, Buffer[SumEntry]] := readSum(asSpan(&t));
+                destroyString(t);
+                return read;
+            when None do
+                return Right(right => allocateEmpty());
+        end case;
+    end;
+
+    -- The manifest with the wanted package set in it.
+    function withWanted(manifest: Manifest, wanted: Wanted): Either[Problem, Manifest] is
+        let { prefix: String, version: Version, git: String } := wanted;
+        var m: Manifest := manifest;
+        var url: String := git;
+        case findRequirement(&m, asSpan(&prefix)) of
+            when Some(value as at: Index) do
+                if length(&url) = 0 then
+                    destroyString(url);
+                    url := gitAt(&m, at);
+                end if;
+            when None do
+                if length(&url) = 0 then
+                    let p: Problem := problemOf(1505, said(asSpan(&prefix), " is not required yet, and no git URL is given", ""), said("hilde get ", asSpan(&prefix), "@vX.Y.Z --git=<url>"));
+                    destroyString(prefix);
+                    destroyString(url);
+                    destroyManifest(m);
+                    return Left(left => p);
+                end if;
+        end case;
+        m := setRequirement(m, makeRequirement(asSpan(&prefix), asSpan(&url), version, ""));
+        destroyString(prefix);
+        destroyString(url);
+        return Right(right => m);
+    end;
+
+    generic [M: Region]
+    function manifestKey(manifest: &[Manifest, M]): String is
+        return keyLine(asSpan(&(manifest->key)));
+    end;
+
+    generic [M: Region]
+    function gitAt(manifest: &[Manifest, M], at: Index): String is
+        let r: &[Requirement, M] := nthRef(&(manifest->needs), at);
+        return fromSpan(asSpan(&(r->git)));
+    end;
+
+    generic [M: Region]
+    function strictOf(manifest: &[Manifest, M]): Bool is
+        return manifest->requireSignatures;
+    end;
+
+    -- The manifest at root, or H1501, or what readManifest refused.
+    generic [R: Region]
+    function readMain(root: Span[Nat8, R]): Either[Problem, Manifest] is
+        let path: String := joinPath(root, "hilde.toml");
+        let text: Option[String] := readText(asSpan(&path));
+        destroyString(path);
+        case text of
+            when Some(value as toml: String) do
+                let read: Either[Problem, Manifest] := readManifest(asSpan(&toml));
+                destroyString(toml);
+                return read;
+            when None do
+                return Left(left => problemOf(1501, said("no hilde.toml in ", root, ""), fromLiteral("run the command in the directory of the package, or make one with hilde new Name")));
+        end case;
+    end;
+
+    function countText(n: Index): String is
+        case toNat64(n) of
+            when Some(value as wide: Nat64) do
+                return formatNat(wide);
+            when None do
+                abort("Pkg.Get: a count did not fit a Nat64");
+        end case;
+    end;
+
+    -- Selection, checking and writing, for a manifest that is read; the
+    -- manifest is written back when changed is true.
+    generic [R: Region, G: Region, M: Region]
+    function getWith(root: Span[Nat8, R], git: Span[Nat8, G], main: &[Manifest, M], changed: Bool): Got is
+        case readPinned(root) of
+            when Right(right as pinned: Buffer[SumEntry]) do
+                case select(git, root, main) of
+                    when Right(right as choices: Buffer[Choice]) do
+                        case entriesOf(&choices, &pinned, strictOf(main)) of
+                            when Right(right as entries: Buffer[SumEntry]) do
+                                destroyEntries(pinned);
+                                case writeVendor(root, &choices) of
+                                    when Some(value as p: Problem) do
+                                        destroyEntries(entries);
+                                        destroyChoices(choices);
+                                        return gotWith(p);
+                                    when None do
+                                        skip;
+                                end case;
+                                let sumText: String := formatSum(&entries);
+                                let sumPath: String := joinPath(root, "hilde.sum");
+                                var good: Bool := writeText(asSpan(&sumPath), asSpan(&sumText));
+                                destroyString(sumPath);
+                                destroyString(sumText);
+                                if changed then
+                                    let tomlText: String := formatManifest(main);
+                                    let tomlPath: String := joinPath(root, "hilde.toml");
+                                    good := good and writeText(asSpan(&tomlPath), asSpan(&tomlText));
+                                    destroyString(tomlPath);
+                                    destroyString(tomlText);
+                                end if;
+                                let count: Index := bufferLength(&choices);
+                                destroyEntries(entries);
+                                destroyChoices(choices);
+                                if not good then
+                                    return gotWith(problemOf(1519, said("hilde.sum or hilde.toml cannot be written in ", root, ""), fromLiteral("check that the package may be written")));
+                                end if;
+                                let n: String := countText(count);
+                                let summary: String := said("hilde get: ", asSpan(&n), " packages in vendor/, hilde.sum written");
+                                destroyString(n);
+                                return Got(count => count, summary => summary, problems => allocateEmpty());
+                            when Left(left as p: Problem) do
+                                destroyEntries(pinned);
+                                destroyChoices(choices);
+                                return gotWith(p);
+                        end case;
+                    when Left(left as p: Problem) do
+                        destroyEntries(pinned);
+                        return gotWith(p);
+                end case;
+            when Left(left as p: Problem) do
+                return gotWith(p);
+        end case;
+    end;
+
+    generic [R: Region]
+    function getPackages(root: Span[Nat8, R], wanted: Option[Wanted]): Got is
+        var changed: Bool := false;
+        var read: Either[Problem, Manifest] := readMain(root);
+        case wanted of
+            when Some(value as w: Wanted) do
+                case read of
+                    when Right(right as m: Manifest) do
+                        read := withWanted(m, w);
+                        changed := true;
+                    when Left(left as p: Problem) do
+                        destroyWanted(w);
+                        read := Left(left => p);
+                end case;
+            when None do
+                skip;
+        end case;
+        case read of
+            when Right(right as main: Manifest) do
+                case findProgram("git") of
+                    when Some(value as git: String) do
+                        let got: Got := getWith(root, asSpan(&git), &main, changed);
+                        destroyString(git);
+                        destroyManifest(main);
+                        let cache: String := joinPath(root, ".hilde-cache");
+                        case removeTree(asSpan(&cache)) of
+                            when Right(right as done: Unit) do
+                                skip;
+                            when Left(left as p: Problem) do
+                                destroyProblem(p);
+                        end case;
+                        destroyString(cache);
+                        return got;
+                    when None do
+                        destroyManifest(main);
+                        return gotWith(problemOf(1507, fromLiteral("git is not on PATH, and hilde get fetches packages with git"), fromLiteral("install git")));
+                end case;
+            when Left(left as p: Problem) do
+                return gotWith(p);
+        end case;
+    end;
+end module body.

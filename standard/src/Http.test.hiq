@@ -1,0 +1,298 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    nthByte,
+    length,
+    fromLiteral,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Http (
+    headerCount,
+    nthHeaderName,
+    nthHeaderValue,
+    headerValue,
+    valueHasToken
+);
+
+module body Standard.Http.Test is
+    -- A string literal carries no escapes -- the lexer knows \" and
+    -- nothing else -- so a header block is built byte by byte.
+    constant byteReturn: Nat8 := 13;
+    constant byteLineFeed: Nat8 := 10;
+
+    ---
+    --- Counting
+    ---
+
+    -- headerCount.
+    function testCount(): Unit is
+        let block: String := crlfBlock();
+        assertTrue(headerCount(asSpan(&block)) = 3, "three headers before the empty line");
+        destroyString(block);
+
+        let bare: String := lfBlock();
+        assertTrue(headerCount(asSpan(&bare)) = 2, "a block with bare line feeds");
+        destroyString(bare);
+
+        let empty: String := fromLiteral("");
+        assertTrue(headerCount(asSpan(&empty)) = 0, "the empty string");
+        destroyString(empty);
+
+        let noEnd: String := fromLiteral("Host: example.com");
+        assertTrue(headerCount(asSpan(&noEnd)) = 1, "one header and no line break at all");
+        destroyString(noEnd);
+        return nil;
+    end;
+
+    ---
+    --- Names and values by position
+    ---
+
+    -- nthHeaderName, nthHeaderValue.
+    function testNameAndValue(): Unit is
+        let block: String := crlfBlock();
+        assertName(&block, 0, "Host", "the first name");
+        assertValue(&block, 0, "example.com", "the first value");
+        assertName(&block, 1, "Connection", "the second name");
+        assertValue(&block, 1, "keep-alive, Upgrade", "the second value");
+        assertName(&block, 2, "Content-Length", "the third name");
+        assertValue(&block, 2, "42", "the third value");
+        assertNoName(&block, 3, "past the last header");
+        destroyString(block);
+
+        -- Whitespace round the name and the value is not part of either.
+        let spaced: String := oneLine("  Host  :   example.com   ");
+        assertName(&spaced, 0, "Host", "a name with spaces round it");
+        assertValue(&spaced, 0, "example.com", "a value with spaces round it");
+        destroyString(spaced);
+
+        -- A line with no colon is not a header.
+        let broken: String := oneLine("this line has no colon");
+        assertNoName(&broken, 0, "a line with no colon");
+        destroyString(broken);
+        return nil;
+    end;
+
+    ---
+    --- Looking up by name
+    ---
+
+    -- headerValue.
+    function testLookup(): Unit is
+        let block: String := crlfBlock();
+        assertLookup(&block, "Host", "example.com", "the exact name");
+        assertLookup(&block, "host", "example.com", "all lower case");
+        assertLookup(&block, "HOST", "example.com", "all upper case");
+        assertLookup(&block, "Content-Length", "42", "a name with a hyphen");
+        assertNoLookup(&block, "Referer", "a header that is not there");
+        assertNoLookup(&block, "Hos", "a prefix of a name is not the name");
+        assertNoLookup(&block, "", "the empty name");
+        destroyString(block);
+        return nil;
+    end;
+
+    ---
+    --- A token in a comma-separated value
+    ---
+
+    -- valueHasToken.
+    function testToken(): Unit is
+        assertToken("keep-alive, Upgrade", "Upgrade", true, "a second item");
+        assertToken("keep-alive, Upgrade", "upgrade", true, "and the case is ignored");
+        assertToken("keep-alive, Upgrade", "keep-alive", true, "the first item");
+        assertToken("Upgrade", "Upgrade", true, "a value of one item");
+        assertToken("  Upgrade  ", "Upgrade", true, "whitespace round the item");
+        assertToken("keep-alive,Upgrade", "Upgrade", true, "no space after the comma");
+        -- The reason this function exists: a whole-value compare answers a
+        -- question about spelling and not about content.
+        assertToken("websocket, foo", "websocket", true, "the header value has more");
+        assertToken("keep-alive, Upgrade", "grade", false, "a suffix is not a token");
+        assertToken("keep-alive, Upgrade", "Upgraded", false, "a longer word is not");
+        assertToken("", "Upgrade", false, "an empty value");
+        assertToken("a,,b", "b", true, "an empty item in the middle");
+        assertToken("a,,b", "", false, "an empty token is in no list");
+        assertToken("a,", "a", true, "a trailing comma");
+        return nil;
+    end;
+
+    ---
+    --- Building blocks to test against
+    ---
+
+    function writeText(builder: StringBuilder, text: Span[Nat8, Static]): StringBuilder is
+        var b: StringBuilder := builder;
+        let piece: String := fromLiteral(text);
+        writeString(&!b, asSpan(&piece));
+        destroyString(piece);
+        return b;
+    end;
+
+    function writeCrlf(builder: StringBuilder): StringBuilder is
+        var b: StringBuilder := builder;
+        writeByte(&!b, byteReturn);
+        writeByte(&!b, byteLineFeed);
+        return b;
+    end;
+
+    function writeLf(builder: StringBuilder): StringBuilder is
+        var b: StringBuilder := builder;
+        writeByte(&!b, byteLineFeed);
+        return b;
+    end;
+
+    function crlfBlock(): String is
+        var b: StringBuilder := makeStringBuilder();
+        b := writeText(b, "Host: example.com");
+        b := writeCrlf(b);
+        b := writeText(b, "Connection: keep-alive, Upgrade");
+        b := writeCrlf(b);
+        b := writeText(b, "Content-Length: 42");
+        b := writeCrlf(b);
+        b := writeCrlf(b);
+        b := writeText(b, "a body, which is not a header");
+        return finalize(b);
+    end;
+
+    function lfBlock(): String is
+        var b: StringBuilder := makeStringBuilder();
+        b := writeText(b, "Host: example.com");
+        b := writeLf(b);
+        b := writeText(b, "Accept: */*");
+        b := writeLf(b);
+        b := writeLf(b);
+        b := writeText(b, "body");
+        return finalize(b);
+    end;
+
+    function oneLine(text: Span[Nat8, Static]): String is
+        var b: StringBuilder := makeStringBuilder();
+        b := writeText(b, text);
+        b := writeCrlf(b);
+        b := writeCrlf(b);
+        return finalize(b);
+    end;
+
+    ---
+    --- Utilities
+    ---
+
+    generic [R: Region, S: Region]
+    function sameBytes(left: &[String, R], right: &[String, S]): Bool is
+        let size: Index := length(left);
+        if size /= length(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        var same: Bool := true;
+        while i < size do
+            if nthByte(left, i) /= nthByte(right, i) then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    function assertText(produced: String, expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        var made: String := produced;
+        let want: String := fromLiteral(expected);
+        assertTrue(sameBytes(&made, &want), message);
+        destroyString(want);
+        destroyString(made);
+        return nil;
+    end;
+
+    function assertSome(got: Option[String], expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case got of
+            when Some(value: String) do
+                assertText(value, expected, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function assertNone(got: Option[String], message: Span[Nat8, Static]): Unit is
+        case got of
+            when Some(value: String) do
+                destroyString(value);
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertName(block: &[String, R], n: Index,
+        expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        assertSome(nthHeaderName(asSpan(block), n), expected, message);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertValue(block: &[String, R], n: Index,
+        expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        assertSome(nthHeaderValue(asSpan(block), n), expected, message);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertNoName(block: &[String, R], n: Index,
+        message: Span[Nat8, Static]): Unit is
+        assertNone(nthHeaderName(asSpan(block), n), message);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertLookup(block: &[String, R], name: Span[Nat8, Static],
+        expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        let wanted: String := fromLiteral(name);
+        assertSome(headerValue(asSpan(block), asSpan(&wanted)), expected, message);
+        destroyString(wanted);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertNoLookup(block: &[String, R], name: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        let wanted: String := fromLiteral(name);
+        assertNone(headerValue(asSpan(block), asSpan(&wanted)), message);
+        destroyString(wanted);
+        return nil;
+    end;
+
+    function assertToken(value: Span[Nat8, Static], token: Span[Nat8, Static],
+        want: Bool, message: Span[Nat8, Static]): Unit is
+        let haystack: String := fromLiteral(value);
+        let needle: String := fromLiteral(token);
+        assertTrue(valueHasToken(asSpan(&haystack), asSpan(&needle)) = want, message);
+        destroyString(haystack);
+        destroyString(needle);
+        return nil;
+    end;
+end module body.

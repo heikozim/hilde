@@ -1,0 +1,212 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Doctor.  The checks run on files the test makes in the working
+-- directory and removes again; the commands are asked for named systems.
+-- init runs for real only for a user tool in the working directory; for a
+-- service it is asked to list its steps, which changes nothing.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    finalize
+);
+import Standard.Text (
+    contains,
+    startsWith,
+    equal,
+    substring
+);
+import Standard.File (
+    FileDescriptor,
+    createNewFile,
+    closeFile,
+    createDirectory,
+    removeDirectory,
+    removeFileIfThere,
+    kindOf,
+    sameKind,
+    kindDirectory
+);
+import Standard.Paths (
+    Service,
+    UserTool,
+    ConfigFile,
+    EnvFile,
+    DataDirectory,
+    LogDirectory,
+    SocketFile
+);
+import Standard.Doctor (
+    Checkup,
+    makeCheckup,
+    expectPath,
+    destroyCheckup,
+    runCheckupOn,
+    runInitOn,
+    serviceFile,
+    hiawathaBlock
+);
+
+module body Standard.Doctor.Test is
+    -- A new empty file at path with mode; false when it could not be made.
+    function makeFile(path: Span[Nat8, Static], mode: Nat32): Bool is
+        case createNewFile(path, mode) of
+            when Some(value as file: FileDescriptor) do
+                return closeFile(file);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The text of a checkup on system, its count of missing ones checked.
+    generic [R: Region]
+    function textOn(system: Span[Nat8, Static], superuser: Bool, checkup: &[Checkup, R], json: Bool, missing: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        let found: Index := runCheckupOn(system, superuser, checkup, json, &!out);
+        assertTrue(found = missing, "the count of missing ones");
+        return finalize(out);
+    end;
+
+    -- The text of init on system, its count of steps not done checked.
+    generic [R: Region]
+    function initOn(system: Span[Nat8, Static], superuser: Bool, checkup: &[Checkup, R], dryRun: Bool, left: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        let found: Index := runInitOn(system, superuser, checkup, "/usr/local/bin/hildenotthere", dryRun, &!out);
+        assertTrue(found = left, "the count of steps not done");
+        return finalize(out);
+    end;
+
+    function testUserTool(): Unit is
+        let removedBefore: Bool := removeFileIfThere("doctor-test.conf");
+        assertTrue(makeFile("doctor-test.conf", 416), "the config is made, 0640");
+        assertTrue(createDirectory("doctor-test-data"), "the data directory is made, 0700");
+        var checkup: Checkup := makeCheckup("doctortest", UserTool());
+        expectPath(&!checkup, ConfigFile(), "doctor-test.conf");
+        expectPath(&!checkup, DataDirectory(), "doctor-test-data");
+        expectPath(&!checkup, LogDirectory(), "doctor-test-log dir");
+        expectPath(&!checkup, EnvFile(), "doctor-test-data");
+        expectPath(&!checkup, SocketFile(), "doctor-test.sock");
+        let text: String := textOn("linux", false, &checkup, false, 4);
+        assertTrue(startsWith(asSpan(&text), "ok       config   doctor-test.conf\n"), "the config is right");
+        assertTrue(contains(asSpan(&text), "missing  data     doctor-test-data: mode 0700, wants 0750; fix: /bin/chmod 0750 doctor-test-data\n"), "the mode of the data directory");
+        assertTrue(contains(asSpan(&text), "missing  log      doctor-test-log dir: not there; fix: /usr/bin/install -d -m 0750 'doctor-test-log dir'\n"), "a missing directory, its path quoted");
+        assertTrue(contains(asSpan(&text), "missing  env      doctor-test-data: a directory, not a regular file\n"), "a directory where a file should be");
+        assertTrue(contains(asSpan(&text), "missing  socket   doctor-test.sock: not there; fix: doctortest\n"), "no socket: start the tool");
+        destroyString(text);
+        let json: String := textOn("linux", false, &checkup, true, 4);
+        assertTrue(startsWith(asSpan(&json), "[{\"what\":\"config\",\"path\":\"doctor-test.conf\",\"ok\":true,\"reason\":\"\",\"fix\":\"\"},"), "json, one object per check");
+        assertTrue(contains(asSpan(&json), "\"fix\":\"/usr/bin/install -d -m 0750 'doctor-test-log dir'\"}"), "json, the fix");
+        destroyString(json);
+        destroyCheckup(checkup);
+        assertTrue(removeFileIfThere("doctor-test.conf"), "the config is removed");
+        assertTrue(removeDirectory("doctor-test-data"), "the data directory is removed");
+        return nil;
+    end;
+
+    function testService(): Unit is
+        var checkup: Checkup := makeCheckup("hildenotthere", Service());
+        expectPath(&!checkup, DataDirectory(), "/nonexistent/hildenotthere");
+        let openbsd: String := textOn("openbsd", false, &checkup, false, 2);
+        assertTrue(startsWith(asSpan(&openbsd), "missing  account  _hildenotthere: no such account; fix: doas /usr/sbin/useradd -L daemon -s /sbin/nologin -d /var/empty _hildenotthere\n"), "openbsd, the account first, with doas");
+        assertTrue(contains(asSpan(&openbsd), "missing  data     /nonexistent/hildenotthere: not there; fix: doas /usr/bin/install -d -o _hildenotthere -g _hildenotthere -m 0750 /nonexistent/hildenotthere\n"), "openbsd, the directory");
+        destroyString(openbsd);
+        let freebsd: String := textOn("freebsd", true, &checkup, false, 2);
+        assertTrue(startsWith(asSpan(&freebsd), "missing  account  _hildenotthere: no such account; fix: /usr/sbin/pw useradd _hildenotthere -s /usr/sbin/nologin -d /nonexistent\n"), "freebsd as the superuser, no prefix");
+        destroyString(freebsd);
+        let linux: String := textOn("linux", false, &checkup, false, 2);
+        assertTrue(startsWith(asSpan(&linux), "missing  account  _hildenotthere: no such account; fix: sudo /usr/sbin/useradd --system --shell /usr/sbin/nologin --no-create-home _hildenotthere\n"), "linux, with sudo");
+        destroyString(linux);
+        destroyCheckup(checkup);
+        var root: Checkup := makeCheckup("hildenotthere", Service());
+        expectPath(&!root, ConfigFile(), "it's.conf");
+        let quoted: String := textOn("linux", true, &root, false, 2);
+        assertTrue(contains(asSpan(&quoted), "fix: /usr/bin/install -o _hildenotthere -g _hildenotthere -m 0640 /dev/null 'it'\\''s.conf'\n"), "a quote in a path");
+        destroyString(quoted);
+        destroyCheckup(root);
+        return nil;
+    end;
+
+    function testInit(): Unit is
+        var checkup: Checkup := makeCheckup("hildenotthere", Service());
+        expectPath(&!checkup, DataDirectory(), "/nonexistent/hildenotthere");
+        expectPath(&!checkup, SocketFile(), "/nonexistent/hildenotthere.sock");
+        let want: Span[Nat8, Static] := "would    account  /usr/sbin/useradd -L daemon -s /sbin/nologin -d /var/empty _hildenotthere\nwould    data     /usr/bin/install -d -o _hildenotthere -g _hildenotthere -m 0750 /nonexistent/hildenotthere\nwould    service  write /etc/rc.d/hildenotthere mode 0555\nwould    enable   /usr/sbin/rcctl enable hildenotthere\n";
+        let block: Span[Nat8, Static] := "for hiawatha.conf:\nFastCGIserver {\n    FastCGIid = hildenotthere\n    ConnectTo = /nonexistent/hildenotthere.sock\n    SessionTimeout = 30\n}\nUrlToolkit {\n    ToolkitID = hildenotthere\n    Match .* UseFastCGI hildenotthere\n}\n# and in the VirtualHost of the site:\n#     UseToolkit = hildenotthere\n";
+        let dry: String := initOn("openbsd", true, &checkup, true, 4);
+        assertTrue(startsWith(asSpan(&dry), want), "openbsd, a dry run: the four steps, the socket left to the service");
+        assertTrue(equal(substring(asSpan(&dry), spanLength(want), length(&dry)), block), "and then the blocks for Hiawatha");
+        destroyString(dry);
+        let user: String := initOn("openbsd", false, &checkup, false, 4);
+        assertTrue(startsWith(asSpan(&user), want), "not the superuser: the same steps, nothing done");
+        assertTrue(contains(asSpan(&user), "\ninit needs the superuser; run: doas /usr/local/bin/hildenotthere init\n"), "and the command that does it");
+        destroyString(user);
+        let linux: String := initOn("linux", true, &checkup, true, 4);
+        assertTrue(contains(asSpan(&linux), "would    service  write /etc/systemd/system/hildenotthere.service mode 0644\nwould    enable   /usr/bin/systemctl enable hildenotthere\n"), "linux, a systemd unit");
+        destroyString(linux);
+        let freebsd: String := initOn("freebsd", true, &checkup, true, 4);
+        assertTrue(contains(asSpan(&freebsd), "would    enable   /usr/sbin/sysrc hildenotthere_enable=YES\n"), "freebsd, sysrc");
+        destroyString(freebsd);
+        let macos: String := initOn("macos", true, &checkup, true, 4);
+        assertTrue(contains(asSpan(&macos), "would    service  write /Library/LaunchDaemons/hildenotthere.plist mode 0644\nwould    enable   /bin/launchctl bootstrap system /Library/LaunchDaemons/hildenotthere.plist\n"), "macos, a launchd daemon");
+        destroyString(macos);
+        destroyCheckup(checkup);
+        let removedBefore: Bool := removeDirectory("doctor-init-dir");
+        var tool: Checkup := makeCheckup("doctortest", UserTool());
+        expectPath(&!tool, DataDirectory(), "doctor-init-dir");
+        let made: String := initOn("linux", false, &tool, false, 0);
+        assertTrue(equal(asSpan(&made), "made     data     /usr/bin/install -d -m 0750 doctor-init-dir\n"), "a user tool: the directory is made, no blocks for Hiawatha");
+        destroyString(made);
+        assertTrue(sameKind(kindOf("doctor-init-dir"), kindDirectory), "and it is there");
+        let again: String := initOn("linux", false, &tool, false, 0);
+        assertTrue(equal(asSpan(&again), "nothing to do\n"), "a second run does nothing");
+        destroyString(again);
+        let checked: String := textOn("linux", false, &tool, false, 0);
+        assertTrue(equal(asSpan(&checked), "ok       data     doctor-init-dir\n"), "and doctor finds it right");
+        destroyString(checked);
+        destroyCheckup(tool);
+        assertTrue(removeDirectory("doctor-init-dir"), "the directory is removed");
+        return nil;
+    end;
+
+    function testServiceFile(): Unit is
+        var checkup: Checkup := makeCheckup("my-app", Service());
+        expectPath(&!checkup, ConfigFile(), "/etc/my-app/my-app.yaml");
+        expectPath(&!checkup, DataDirectory(), "/var/lib/my-app");
+        expectPath(&!checkup, LogDirectory(), "/var/log/my-app");
+        let openbsd: String := serviceFile("openbsd", &checkup, "/usr/local/bin/my-app");
+        assertTrue(equal(asSpan(&openbsd), "#!/bin/ksh\n\ndaemon=/usr/local/bin/my-app\ndaemon_user=_my-app\n\n. /etc/rc.d/rc.subr\n\nrc_bg=YES\nrc_reload=NO\n\nrc_cmd $1\n"), "openbsd, rc.d");
+        destroyString(openbsd);
+        let freebsd: String := serviceFile("freebsd", &checkup, "/usr/local/bin/my-app");
+        assertTrue(contains(asSpan(&freebsd), "\nname=my_app\nrcvar=my_app_enable\ncommand=/usr/sbin/daemon\ncommand_args=\"-f -u _my-app /usr/local/bin/my-app\"\n"), "freebsd, a variable name without the hyphen");
+        destroyString(freebsd);
+        let linux: String := serviceFile("linux", &checkup, "/usr/local/bin/my-app");
+        assertTrue(contains(asSpan(&linux), "\nUser=_my-app\nGroup=_my-app\nExecStart=/usr/local/bin/my-app\n"), "linux, the account and the binary");
+        assertTrue(contains(asSpan(&linux), "\nExecStart=/usr/local/bin/my-app\nReadWritePaths=/var/lib/my-app /var/log/my-app\nRestart="), "linux, writes only in its directories");
+        assertTrue(contains(asSpan(&linux), "\nNoNewPrivileges=yes\nProtectSystem=strict\n"), "linux, hardened");
+        destroyString(linux);
+        let macos: String := serviceFile("macos", &checkup, "/usr/local/bin/my-app");
+        assertTrue(contains(asSpan(&macos), "\t<key>Label</key>\n\t<string>my-app</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>/usr/local/bin/my-app</string>\n\t</array>\n\t<key>UserName</key>\n\t<string>_my-app</string>\n"), "macos, a launchd daemon as the account");
+        destroyString(macos);
+        let odd: String := serviceFile("macos", &checkup, "/opt/a&b/<my-app>");
+        assertTrue(contains(asSpan(&odd), "<string>/opt/a&amp;b/&lt;my-app&gt;</string>"), "macos, markup in a path written as entities");
+        destroyString(odd);
+        let none: String := hiawathaBlock(&checkup);
+        assertTrue(length(&none) = 0, "no socket, no blocks for Hiawatha");
+        destroyString(none);
+        destroyCheckup(checkup);
+        return nil;
+    end;
+end module body.

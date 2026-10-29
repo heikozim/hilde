@@ -1,0 +1,229 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The sum of a table of 3000000 rows over the ranks of a Sperli job.  Row i
+-- holds the number i + 1, so every rank can work out its rows without a
+-- table in memory, and the total is known in closed form.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal
+);
+import Standard.IO.Terminal (
+    StandardInput,
+    acquireInput,
+    releaseInput,
+    readLine
+);
+import Standard.SperliCollective (
+    int64Type,
+    sumReduction
+);
+import Standard.Sperli (
+    Job,
+    Comm,
+    readJobText,
+    init,
+    rank,
+    size,
+    reduce,
+    finish
+);
+
+module body Example.SperliSum is
+    function tableRows(): Nat64 is
+        return 3000000;
+    end;
+
+    -- The part of rows that is not a whole number for each rank.
+    function extraRows(rows: Nat64, size: Nat32): Nat64 is
+        case toNat64(size) of
+            when Some(value as ranks: Nat64) do
+                return rows - ((rows / ranks) * ranks);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function shareFirst(rows: Nat64, size: Nat32, rank: Nat32): Nat64 is
+        case toNat64(size) of
+            when Some(value as ranks: Nat64) do
+                case toNat64(rank) of
+                    when Some(value as me: Nat64) do
+                        let extra: Nat64 := extraRows(rows, size);
+                        var before: Nat64 := me;
+                        if extra < me then
+                            before := extra;
+                        end if;
+                        return ((rows / ranks) * me) + before;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function shareCount(rows: Nat64, size: Nat32, rank: Nat32): Nat64 is
+        case toNat64(size) of
+            when Some(value as ranks: Nat64) do
+                case toNat64(rank) of
+                    when Some(value as me: Nat64) do
+                        if me < extraRows(rows, size) then
+                            return (rows / ranks) + 1;
+                        end if;
+                        return rows / ranks;
+                    when None do
+                        return 0;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function rowSum(first: Nat64, count: Nat64): Nat64 is
+        var total: Nat64 := 0;
+        var number: Nat64 := first + 1;
+        let last: Nat64 := first + count;
+        while number <= last do
+            total := total + number;
+            number := number + 1;
+        end while;
+        return total;
+    end;
+
+    function expectedTotal(rows: Nat64): Nat64 is
+        return (rows * (rows + 1)) / 2;
+    end;
+
+    -- The number as eight bytes, least significant first.
+    function eightBytes(value: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        var rest: Nat64 := value;
+        var i: Nat64 := 0;
+        while i < 8 do
+            let low: Nat64 := rest - ((rest / 256) * 256);
+            case toNat8(low) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&!out, byte);
+                when None do
+                    writeByte(&!out, 0);
+            end case;
+            rest := rest / 256;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The number in the first eight bytes of text, least significant first.
+    generic [R: Region]
+    function numberOf(text: &[String, R]): Nat64 is
+        var total: Nat64 := 0;
+        var scale: Nat64 := 1;
+        var i: Index := 0;
+        while (i < 8) and (i < length(text)) do
+            case toNat64(nthByte(text, i)) of
+                when Some(value as byte: Nat64) do
+                    total := total + (byte * scale);
+                when None do
+                    total := total;
+            end case;
+            if i < 7 then
+                scale := scale * 256;
+            end if;
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    -- Takes part in the reduction with the share of this rank.  Rank 0
+    -- prints the line and says whether the total is the expected one.
+    function sumOver(opened: Comm): Int32 is
+        var comm: Comm := opened;
+        let rows: Nat64 := tableRows();
+        let me: Nat32 := rank(&comm);
+        let ranks: Nat32 := size(&comm);
+        let part: Nat64 := rowSum(shareFirst(rows, ranks, me), shareCount(rows, ranks, me));
+        var status: Int32 := 0;
+        case reduce(&!comm, 0, int64Type(), sumReduction(), eightBytes(part)) of
+            when Right(right as text: String) do
+                if me = 0 then
+                    let total: Nat64 := numberOf(&text);
+                    print("rows=");
+                    print(rows);
+                    print(" total=");
+                    print(total);
+                    print(" expected=");
+                    print(expectedTotal(rows));
+                    if total = expectedTotal(rows) then
+                        printLn(" ok");
+                    else
+                        printLn(" WRONG");
+                        status := 1;
+                    end if;
+                end if;
+                destroyString(text);
+            when Left(left as code: Int32) do
+                print("reduce failed with ");
+                printLn(code);
+                status := 1;
+        end case;
+        finish(comm);
+        return status;
+    end;
+
+    function joinAndSum(line: String): Int32 is
+        case readJobText(asSpan(&line)) of
+            when Left(left as why: Int32) do
+                destroyString(line);
+                print("the job was refused with ");
+                printLn(why);
+                return 4;
+            when Right(right as given: Job) do
+                destroyString(line);
+                case init(given) of
+                    when Left(left as why: Int32) do
+                        print("init failed with ");
+                        printLn(why);
+                        return 5;
+                    when Right(right as comm: Comm) do
+                        return sumOver(comm);
+                end case;
+        end case;
+    end;
+
+    function readJobLine(root: RootCapability): String is
+        var mutRoot: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!mutRoot);
+        var input: StandardInput := acquireInput(&!terminal);
+        let line: String := readLine(&!input);
+        releaseInput(input);
+        releaseTerminal(terminal);
+        surrenderRoot(mutRoot);
+        return line;
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        if joinAndSum(readJobLine(root)) = 0 then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+end module body.

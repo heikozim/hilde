@@ -1,0 +1,161 @@
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    fileNumber,
+    Pipe,
+    openPipe,
+    closePipe,
+    readEnd,
+    writeEndMut,
+    writeAll
+);
+import Standard.Poller (
+    Backend,
+    backendNone,
+    backendAvailable,
+    sameBackend,
+    Poller,
+    createPoller,
+    destroyPoller,
+    interestRead,
+    watchFile,
+    unwatchFile,
+    watchedCount,
+    waitFor,
+    Event,
+    nthEvent,
+    eventDescriptor,
+    eventReadable
+);
+
+module body Test is
+    function widen(value: Bool): Int32 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    function hasBackend(): Bool is
+        return not sameBackend(backendAvailable(), backendNone);
+    end;
+
+    ---
+    --- The checks that need a poller
+    ---
+
+    generic [R: Region]
+    function readyOr(poller: &![Poller, R], timeout: Int32,
+        fallback: Index): Index is
+        case waitFor(poller, timeout) of
+            when Some(value as ready: Index) do
+                return ready;
+            when None do
+                return fallback;
+        end case;
+    end;
+
+    -- The expected descriptor comes in as a number rather than as the pipe.
+    -- readEnd is generic in its region, and under a second generic call
+    -- there is nothing to infer that region from: "readEnd is generic but
+    -- unconstrained, so its type is ambiguous".  At
+    -- the call site the borrow is a concrete one and the question does not
+    -- arise.
+    generic [R: Region]
+    function eventIsFor(poller: &[Poller, R], number: Int32): Bool is
+        let first: Index := 0;
+        case nthEvent(poller, first) of
+            when Some(value as event: Event) do
+                if eventDescriptor(event) /= number then
+                    return false;
+                end if;
+                return eventReadable(event);
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function noSecondEvent(poller: &[Poller, R]): Bool is
+        let second: Index := 1;
+        case nthEvent(poller, second) of
+            when Some(value as event: Event) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function main(): ExitCode is
+        -- Every platform the gates run on has a backend: epoll on Linux,
+        -- kqueue on OpenBSD.  Without one the test fails at its first line;
+        -- it does not print lines for checks it could not make.
+        if not hasBackend() then
+            printLn(0);
+            return ExitSuccess();
+        end if;
+
+        var payload: String := fromLiteral("x");
+        let zero: Index := 0;
+        let one: Index := 1;
+        let unreachable: Index := 99;
+
+        -- 1. There is a backend, and it is not none.
+        printLn(1);
+
+        case createPoller() of
+            when Some(value as made: Poller) do
+                var poller: Poller := made;
+                -- 2. A backend that says it exists builds a poller.
+                printLn(1);
+                -- 3. A fresh poller watches nothing.
+                printLn(widen(watchedCount(&poller) = zero));
+
+                case openPipe() of
+                    when Some(value as opened: Pipe) do
+                        var pipe: Pipe := opened;
+                        -- 4. A pipe, which is the thing that can be waited
+                        --    on: epoll refuses a regular file outright.
+                        printLn(1);
+                        -- 5. Watching the reading end is accepted.
+                        printLn(widen(watchFile(&!poller, readEnd(&pipe),
+                            interestRead)));
+                        -- 6. And it is counted.
+                        printLn(widen(watchedCount(&poller) = one));
+                        -- 7. Nothing has been written, so a wait with a zero
+                        --    timeout comes back with nothing ready.  This is
+                        --    the control for line 9: without it, a poller
+                        --    that reported everything as ready would pass.
+                        printLn(widen(readyOr(&!poller, 0, unreachable) = zero));
+                        -- 8. One byte into the other end.
+                        printLn(widen(writeAll(writeEndMut(&!pipe), asSpan(&payload))));
+                        -- 9. Now exactly one descriptor is ready.
+                        printLn(widen(readyOr(&!poller, 0, unreachable) = one));
+                        -- 10. And it is the one that was registered, ready
+                        --     to be read from.
+                        printLn(widen(eventIsFor(&poller, fileNumber(readEnd(&pipe)))));
+                        -- 11. There is no second event, which is how a
+                        --     caller walks them without counting twice.
+                        printLn(widen(noSecondEvent(&poller)));
+                        -- 12. Unwatching is accepted,
+                        printLn(widen(unwatchFile(&!poller, readEnd(&pipe))));
+                        -- 13. and the count goes back down.
+                        printLn(widen(watchedCount(&poller) = zero));
+                        -- 14. Both ends close.
+                        printLn(widen(closePipe(pipe)));
+                    when None do
+                        printLn(0);
+                end case;
+                destroyPoller(poller);
+            when None do
+                printLn(0);
+        end case;
+        destroyString(payload);
+        return ExitSuccess();
+    end;
+end module body.

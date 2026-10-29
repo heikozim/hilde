@@ -1,0 +1,2982 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as count,
+    nth,
+    nthMut,
+    lengthMut,
+    nthRef,
+    insertBack,
+    removeLast,
+    swapNth,
+    remove,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    destroyWiped,
+    makeEmpty,
+    makeString,
+    length,
+    nthByte,
+    asSpan,
+    getSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize as build
+);
+import Standard.File (
+    FileDescriptor,
+    TcpListener,
+    ConnectFailure,
+    createDirectory,
+    removeDirectory,
+    createNewFile,
+    removeFile,
+    writeAll,
+    closeFile,
+    listenTcp,
+    tcpListenerPort,
+    acceptTcpWithin,
+    closeTcpListener,
+    connectTcp
+);
+import Standard.Text (
+    hexToBytes,
+    equal
+);
+import Standard.Ip (
+    IpAddress,
+    ipToBytes
+);
+import Standard.Resolve (
+    ResolveFailure,
+    OnlyIpv4,
+    resolveHost
+);
+import Standard.Task (
+    sleepFor
+);
+import Standard.Time (
+    wallNanos,
+    monotonicNanos
+);
+import Standard.Tls (
+    Client,
+    Server,
+    connectOverAsTls13,
+    peerSubject,
+    send as tlsSend,
+    sendWithin,
+    receiveWithin,
+    closeClient,
+    makeVerifyingServerTls13,
+    acceptOver,
+    closeServer
+);
+import Standard.CompositeSig (
+    CompositeKey,
+    keypairFromSeeds,
+    destroyCompositeKey
+);
+import Standard.SperliError (
+    badCertificate,
+    subjectMismatch,
+    refusedHost,
+    oversizedFrame,
+    staleIncarnation,
+    badFrame,
+    peerLost,
+    peerAborted,
+    badHello,
+    startFailed,
+    badJob,
+    collectiveMismatch,
+    badCollective,
+    badCheckpointFile,
+    digestMismatch,
+    badCommit,
+    resumeRefused,
+    sizeMismatch,
+    openHandles,
+    checkpointFailed
+);
+import Standard.SperliWire (
+    headerBytes,
+    maxPayload,
+    helloKind,
+    dataKind,
+    heartbeatKind,
+    abortKind,
+    byeKind,
+    ckptBeginKind,
+    ckptDataKind,
+    ckptAckKind,
+    ckptCommitKind,
+    resumeKind,
+    frameHeader,
+    headerLength,
+    headerKind,
+    headerTag,
+    checkHeader,
+    helloPayload,
+    checkHello,
+    helloToken,
+    abortPayload,
+    abortReason,
+    verifyJoinToken,
+    hostRefused,
+    certificateName,
+    subjectIs
+);
+
+import Standard.SperliCollective (
+    collectiveKind,
+    collectiveTag,
+    maxCollectiveData,
+    barrierOperation,
+    bcastOperation,
+    reduceOperation,
+    allreduceOperation,
+    gatherOperation,
+    scatterOperation,
+    bytesType,
+    noReduction,
+    contributionPhase,
+    resultPhase,
+    elementWidth,
+    reductionFits,
+    collectivePayload,
+    checkCollective,
+    collectiveData,
+    combine
+);
+
+import Standard.SperliCkpt (
+    Checkpointable,
+    encodeState,
+    decodeState,
+    maxStateBytes,
+    chunkBytes,
+    rankFile,
+    checkRankFile,
+    rankFilePayload,
+    digestOf,
+    commitBody,
+    signCommit,
+    checkCommit,
+    commitEpoch,
+    commitDigest,
+    beginPayload,
+    beginIs,
+    dataPayload,
+    dataIs,
+    dataKindOf,
+    dataOwner,
+    dataOffset,
+    dataTotal,
+    dataChunk,
+    resumePayload,
+    resumeIs,
+    resumeSize,
+    resumeStatus,
+    resumeCommit,
+    rankPath,
+    commitPath,
+    prepareEpoch,
+    storeFile,
+    loadFile,
+    removeCommit,
+    bestCommit,
+    pruneEpochs
+);
+
+module body Standard.Sperli is
+    constant byteBase: Nat64 := 256;
+    constant byteMask: Nat64 := 255;
+    constant connectWindow: Nat64 := 30000;
+    constant handshakeLimit: Nat32 := 10000;
+    constant sendLimit: Nat32 := 60000;
+
+    function maxRanks(): Index is
+        return 4096;
+    end;
+
+    function maxTag(): Nat32 is
+        return 2147483647;
+    end;
+
+    function defaultSilence(): Nat32 is
+        return 5000;
+    end;
+
+    ---
+    --- Numbers
+    ---
+
+    function wide(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.Sperli: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function wide32(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.Sperli: a Nat32 did not fit a Nat64");
+        end case;
+    end;
+
+    function narrow(value: Nat64): Index is
+        case toIndex(value) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.Sperli: a length did not fit an Index");
+        end case;
+    end;
+
+    function narrow32(value: Nat64): Nat32 is
+        case toNat32(value) of
+            when Some(value as at: Nat32) do
+                return at;
+            when None do
+                abort("Standard.Sperli: a number did not fit a Nat32");
+        end case;
+    end;
+
+    function narrow16(value: Nat64): Nat16 is
+        case toNat16(value) of
+            when Some(value as at: Nat16) do
+                return at;
+            when None do
+                abort("Standard.Sperli: a number did not fit a Nat16");
+        end case;
+    end;
+
+    function indexOf32(value: Nat32): Index is
+        return narrow(wide32(value));
+    end;
+
+    function byteValue(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.Sperli: a byte did not fit a Nat64");
+        end case;
+    end;
+
+    -- Milliseconds of a clock that does not go backwards.
+    function nowMillis(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as nanos: Nat64) do
+                return nanos / 1000000;
+            when None do
+                abort("Standard.Sperli: no monotonic clock");
+        end case;
+    end;
+
+    -- Seconds since 1970 by the wall clock.
+    function nowSeconds(): Nat64 is
+        return wallNanos() / 1000000000;
+    end;
+
+    ---
+    --- Reading the description of a job
+    ---
+
+    -- Where the reader stands in the bytes, and whether every read so far
+    -- found its bytes.  A read that does not gives 0 and clears good.
+    record Cursor: Free is
+        at: Index;
+        good: Bool;
+    end;
+
+    generic [R: Region, C: Region]
+    function takeNumber(bytes: Span[Nat8, R], cursor: &![Cursor, C], width: Index): Nat64 is
+        if (not (cursor->good)) or ((spanLength(bytes) - (cursor->at)) < width) then
+            cursor->good := false;
+            return 0;
+        end if;
+        var value: Nat64 := 0;
+        var i: Index := width;
+        while i > 0 do
+            i := i - 1;
+            value := modularAdd(modularMultiply(value, byteBase), byteValue(bytes[(cursor->at) + i]));
+        end while;
+        cursor->at := (cursor->at) + width;
+        return value;
+    end;
+
+    -- A length of width bytes and as many bytes after it.
+    generic [R: Region, C: Region]
+    function takeText(bytes: Span[Nat8, R], cursor: &![Cursor, C], width: Index): String is
+        let wanted: Nat64 := takeNumber(bytes, &~cursor, width);
+        if (not (cursor->good)) or (wanted > wide(spanLength(bytes) - (cursor->at))) then
+            cursor->good := false;
+            return fromSpan("");
+        end if;
+        let taken: Index := narrow(wanted);
+        let text: String := fromSpan(spanPart(bytes, (cursor->at), taken));
+        cursor->at := (cursor->at) + taken;
+        return text;
+    end;
+
+    record Job: Linear is
+        id: String;
+        ranks: Nat32;
+        ownRank: Nat32;
+        incarnation: Nat32;
+        hosts: Buffer[String];
+        ports: Buffer[Nat16];
+        publicKey: String;
+        token: String;
+        ca: String;
+        certificate: String;
+        key: String;
+        seeds: String;
+        invariant length(&id) = 16;
+        invariant (ranks >= 1) and (ranks <= 4096);
+        invariant ownRank < ranks;
+        invariant incarnation >= 1;
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var rest: Buffer[String] := strings;
+        while count(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyJob(job: Job): Unit is
+        let { id: String, ranks: Nat32, ownRank: Nat32, incarnation: Nat32, hosts: Buffer[String], ports: Buffer[Nat16],
+            publicKey: String, token: String, ca: String, certificate: String, key: String, seeds: String } := job;
+        destroyString(id);
+        destroyStrings(hosts);
+        destroyFree(ports);
+        destroyString(publicKey);
+        destroyString(token);
+        destroyString(ca);
+        destroyString(certificate);
+        destroyWiped(key);
+        destroyWiped(seeds);
+        return nil;
+    end;
+
+    function noHosts(): Buffer[String] is
+        return allocateEmpty();
+    end;
+
+    function noPorts(): Buffer[Nat16] is
+        return allocateEmpty();
+    end;
+
+    -- Whether one of the hosts is a host that never runs a rank.
+    generic [R: Region]
+    function anyRefused(hosts: &[Buffer[String], R]): Bool is
+        var i: Index := 0;
+        while i < count(hosts) do
+            if hostRefused(asSpan(nthRef(hosts, i))) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [D: Region]
+    function readJob(description: Span[Nat8, D]): Either[Int32, Job] is
+        var cursor: Cursor := Cursor(at => 0, good => true);
+        let magic: Nat64 := takeNumber(description, &!cursor, 4);
+        let version: Nat64 := takeNumber(description, &!cursor, 2);
+        let reserved: Nat64 := takeNumber(description, &!cursor, 2);
+        var id: String := fromSpan("");
+        if cursor.good and (spanLength(description) >= 28) then
+            destroyString(id);
+            id := fromSpan(spanPart(description, 8, 16));
+            let afterId: Index := 24;
+            cursor.at := afterId;
+        else
+            cursor.good := false;
+        end if;
+        let ranks: Nat64 := takeNumber(description, &!cursor, 4);
+        let ownRank: Nat64 := takeNumber(description, &!cursor, 4);
+        let incarnation: Nat64 := takeNumber(description, &!cursor, 4);
+        if (ranks < 1) or (ranks > 4096) or (ownRank >= ranks) or (incarnation < 1) or (incarnation > 4294967295) then
+            cursor.good := false;
+        end if;
+        var hosts: Buffer[String] := noHosts();
+        var ports: Buffer[Nat16] := noPorts();
+        var k: Nat64 := 0;
+        while cursor.good and (k < ranks) do
+            let port: Nat64 := takeNumber(description, &!cursor, 2);
+            let host: String := takeText(description, &!cursor, 2);
+            if (port = 0) or (length(&host) = 0) then
+                cursor.good := false;
+            end if;
+            insertBack(&!hosts, host);
+            insertBack(&!ports, narrow16(port));
+            k := k + 1;
+        end while;
+        let publicKey: String := takeText(description, &!cursor, 2);
+        let token: String := takeText(description, &!cursor, 2);
+        let ca: String := takeText(description, &!cursor, 4);
+        let certificate: String := takeText(description, &!cursor, 4);
+        let key: String := takeText(description, &!cursor, 4);
+        let seeds: String := takeText(description, &!cursor, 2);
+        let seedsFit: Bool := (length(&seeds) = 0) or ((length(&seeds) = 64) and (ownRank = 0));
+        let whole: Bool := (((cursor.good and (cursor.at = spanLength(description))) and ((magic = 1145720915) and (version = 1))) and ((reserved = 0) and (length(&publicKey) = 1344))) and seedsFit;
+        let refused: Bool := anyRefused(&hosts);
+        if whole and (not refused) and (length(&token) > 0) and (length(&ca) > 0) and (length(&certificate) > 0) and (length(&key) > 0) then
+            let job: Job := Job(id => id, ranks => narrow32(ranks), ownRank => narrow32(ownRank), incarnation => narrow32(incarnation),
+                hosts => hosts, ports => ports, publicKey => publicKey, token => token, ca => ca, certificate => certificate, key => key, seeds => seeds);
+            let made: Either[Int32, Job] := Right(right => job);
+            return made;
+        end if;
+        destroyString(id);
+        destroyStrings(hosts);
+        destroyFree(ports);
+        destroyString(publicKey);
+        destroyString(token);
+        destroyString(ca);
+        destroyString(certificate);
+        destroyWiped(key);
+        destroyWiped(seeds);
+        var code: Int32 := badJob();
+        if refused and whole then
+            code := refusedHost();
+        end if;
+        let failed: Either[Int32, Job] := Left(left => code);
+        return failed;
+    end;
+
+    generic [T: Region]
+    function readJobText(text: Span[Nat8, T]): Either[Int32, Job] is
+        case hexToBytes(text) of
+            when Some(value as bytes: String) do
+                let job: Either[Int32, Job] := readJob(asSpan(&bytes));
+                destroyString(bytes);
+                return job;
+            when None do
+                let failed: Either[Int32, Job] := Left(left => badJob());
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region]
+    function jobRank(job: &[Job, R]): Nat32 is
+        return job->ownRank;
+    end;
+
+    generic [R: Region]
+    function jobSize(job: &[Job, R]): Nat32 is
+        return job->ranks;
+    end;
+
+    generic [R: Region]
+    function jobIncarnation(job: &[Job, R]): Nat32 is
+        return job->incarnation;
+    end;
+
+    generic [R: Region]
+    function jobId(job: &[Job, R]): String is
+        return fromSpan(asSpan(&(job->id)));
+    end;
+
+    generic [R: Region]
+    function jobPublicKey(job: &[Job, R]): String is
+        return fromSpan(asSpan(&(job->publicKey)));
+    end;
+
+    generic [R: Region]
+    function jobToken(job: &[Job, R]): String is
+        return fromSpan(asSpan(&(job->token)));
+    end;
+
+    generic [T: Region]
+    function withToken(job: Job, replacement: Span[Nat8, T]): Job is
+        let { id: String, ranks: Nat32, ownRank: Nat32, incarnation: Nat32, hosts: Buffer[String], ports: Buffer[Nat16],
+            publicKey: String, token: String, ca: String, certificate: String, key: String, seeds: String } := job;
+        destroyString(token);
+        return Job(id => id, ranks => ranks, ownRank => ownRank, incarnation => incarnation, hosts => hosts, ports => ports,
+            publicKey => publicKey, token => fromSpan(replacement), ca => ca, certificate => certificate, key => key, seeds => seeds);
+    end;
+
+    ---
+    --- Frames
+    ---
+
+    function destroyFrame(frame: Frame): Unit is
+        let { kind: Nat8, tag: Nat32, epoch: Nat64, payload: String } := frame;
+        destroyString(payload);
+        return nil;
+    end;
+
+    function noTags(): Buffer[Nat32] is
+        return allocateEmpty();
+    end;
+
+    ---
+    --- The endpoint
+    ---
+
+    record Endpoint: Linear is
+        directory: String;
+        caPath: String;
+        certificatePath: String;
+        keyPath: String;
+        server: Server;
+        listener: TcpListener;
+        port: Nat16;
+        invariant length(&directory) > 0;
+        invariant port > 0;
+    end;
+
+    generic [D: Region]
+    function joined(directory: Span[Nat8, D], name: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, directory);
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        return build(out);
+    end;
+
+    -- A new file with only the owner's access, holding content.
+    generic [P: Region, C: Region]
+    function writeSecret(path: Span[Nat8, P], content: Span[Nat8, C]): Bool is
+        case createNewFile(path, 384) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, content);
+                let closed: Bool := closeFile(file);
+                return written and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [D: Region]
+    function removeCredentials(directory: Span[Nat8, D]): Unit is
+        let ca: String := joined(directory, "ca.pem");
+        let certificate: String := joined(directory, "certificate.pem");
+        let key: String := joined(directory, "key.pem");
+        let a: Bool := removeFile(asSpan(&ca));
+        let b: Bool := removeFile(asSpan(&certificate));
+        let c: Bool := removeFile(asSpan(&key));
+        let d: Bool := removeDirectory(directory);
+        destroyString(ca);
+        destroyString(certificate);
+        destroyString(key);
+        return nil;
+    end;
+
+    -- 127.0.0.1 for a host on this machine, 0.0.0.0 for any other.
+    generic [H: Region]
+    function bindAddress(host: Span[Nat8, H]): String is
+        var local: Bool := false;
+        if spanLength(host) >= 4 then
+            local := (host[0] = 49) and (host[1] = 50) and (host[2] = 55) and (host[3] = 46);
+        end if;
+        if spanLength(host) = 9 then
+            local := local or ((host[0] = 108) and (host[1] = 111) and (host[2] = 99) and (host[8] = 116));
+        end if;
+        var address: StringBuilder := makeStringBuilder();
+        if local then
+            writeByte(&!address, 127);
+            writeByte(&!address, 0);
+            writeByte(&!address, 0);
+            writeByte(&!address, 1);
+        else
+            writeByte(&!address, 0);
+            writeByte(&!address, 0);
+            writeByte(&!address, 0);
+            writeByte(&!address, 0);
+        end if;
+        return build(address);
+    end;
+
+    generic [J: Region, D: Region]
+    function openEndpoint(job: &[Job, J], directory: Span[Nat8, D]): Either[Int32, Endpoint] is
+        if not createDirectory(directory) then
+            let failed: Either[Int32, Endpoint] := Left(left => startFailed());
+            return failed;
+        end if;
+        let caPath: String := joined(directory, "ca.pem");
+        let certificatePath: String := joined(directory, "certificate.pem");
+        let keyPath: String := joined(directory, "key.pem");
+        let wroteCa: Bool := writeSecret(asSpan(&caPath), asSpan(&(job->ca)));
+        let wroteCertificate: Bool := writeSecret(asSpan(&certificatePath), asSpan(&(job->certificate)));
+        let wroteKey: Bool := writeSecret(asSpan(&keyPath), asSpan(&(job->key)));
+        var code: Int32 := startFailed();
+        if (wroteCa and wroteCertificate) and wroteKey then
+            case makeVerifyingServerTls13(asSpan(&certificatePath), asSpan(&keyPath), asSpan(&caPath)) of
+                when Right(right as server: Server) do
+                    let slot: Index := indexOf32(job->ownRank);
+                    let address: String := bindAddress(asSpan(nthRef(&(job->hosts), slot)));
+                    case listenTcp(asSpan(&address), nth(&(job->ports), slot)) of
+                        when Some(value as listener: TcpListener) do
+                            destroyString(address);
+                            let port: Nat16 := tcpListenerPort(&listener);
+                            let made: Either[Int32, Endpoint] := Right(right => Endpoint(directory => fromSpan(directory),
+                                caPath => caPath, certificatePath => certificatePath, keyPath => keyPath,
+                                server => server, listener => listener, port => port));
+                            return made;
+                        when None do
+                            destroyString(address);
+                            closeServer(server);
+                    end case;
+                when Left(left as message: String) do
+                    destroyString(message);
+                    code := badCertificate();
+            end case;
+        end if;
+        removeCredentials(directory);
+        destroyString(caPath);
+        destroyString(certificatePath);
+        destroyString(keyPath);
+        let failed: Either[Int32, Endpoint] := Left(left => code);
+        return failed;
+    end;
+
+    generic [R: Region]
+    function endpointPort(endpoint: &[Endpoint, R]): Nat16 is
+        return endpoint->port;
+    end;
+
+    function closeEndpoint(endpoint: Endpoint): Unit is
+        let { directory: String, caPath: String, certificatePath: String, keyPath: String, server: Server,
+            listener: TcpListener, port: Nat16 } := endpoint;
+        let closed: Bool := closeTcpListener(listener);
+        closeServer(server);
+        removeCredentials(asSpan(&directory));
+        destroyString(directory);
+        destroyString(caPath);
+        destroyString(certificatePath);
+        destroyString(keyPath);
+        return nil;
+    end;
+
+    ---
+    --- One connection
+    ---
+
+    record Peer: Linear is
+        client: Client;
+        idHigh: Nat64;
+        idLow: Nat64;
+        own: Nat32;
+        remote: Nat32;
+        incarnation: Nat32;
+        silence: Nat32;
+        dropped: Index;
+        last: Int32;
+        pendingTags: Buffer[Nat32];
+        pendingData: Buffer[String];
+        invariant own /= remote;
+    end;
+
+    -- Eight bytes of a job id from start on, as a number.
+    generic [I: Region]
+    function idPart(id: Span[Nat8, I], start: Index): Nat64 is
+        var cursor: Cursor := Cursor(at => start, good => true);
+        return takeNumber(id, &!cursor, 8);
+    end;
+
+    -- The bytes of a job id from the two halves a peer keeps, least
+    -- significant byte first.
+    function idString(high: Nat64, low: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        putLe(&!out, high, 8);
+        putLe(&!out, low, 8);
+        return build(out);
+    end;
+
+    generic [R: Region]
+    function putLe(out: &![StringBuilder, R], value: Nat64, width: Index): Unit is
+        var rest: Nat64 := value;
+        var i: Index := 0;
+        while i < width do
+            case toNat8(bitwiseAnd(rest, byteMask)) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&~out, byte);
+                when None do
+                    skip;
+            end case;
+            rest := rest / byteBase;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Each of these reads or changes one field of the peer: a path taken
+    -- with &! uses the reference up, so one function takes one path.
+    generic [R: Region]
+    function pendingCount(peer: &![Peer, R]): Index is
+        return lengthMut(&!(peer->pendingTags));
+    end;
+
+    generic [R: Region]
+    function pendingTagAt(peer: &![Peer, R], at: Index): Nat32 is
+        return nthMut(&!(peer->pendingTags), at);
+    end;
+
+    generic [R: Region]
+    function pushTag(peer: &![Peer, R], tag: Nat32): Unit is
+        insertBack(&!(peer->pendingTags), tag);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushData(peer: &![Peer, R], data: String): Unit is
+        insertBack(&!(peer->pendingData), data);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function removeTag(peer: &![Peer, R], at: Index): Nat32 is
+        return remove(&!(peer->pendingTags), at);
+    end;
+
+    generic [R: Region]
+    function removeData(peer: &![Peer, R], at: Index): String is
+        return remove(&!(peer->pendingData), at);
+    end;
+
+    generic [R: Region]
+    function peerRank(peer: &[Peer, R]): Nat32 is
+        return peer->remote;
+    end;
+
+    generic [R: Region]
+    function peerDropped(peer: &[Peer, R]): Index is
+        return peer->dropped;
+    end;
+
+    generic [R: Region]
+    function peerLastCode(peer: &[Peer, R]): Int32 is
+        return peer->last;
+    end;
+
+    generic [R: Region]
+    function setPeerSilence(peer: &![Peer, R], milliseconds: Nat32): Unit is
+        peer->silence := milliseconds;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function receiveOn(peer: &![Peer, R], most: Index, milliseconds: Nat32): Either[String, String] is
+        return receiveWithin(&!(peer->client), most, milliseconds);
+    end;
+
+    -- Exactly n bytes from the peer before deadline, a time of nowMillis.
+    generic [R: Region]
+    function readN(peer: &![Peer, R], n: Index, deadline: Nat64): Either[Int32, String] is
+        var out: StringBuilder := makeStringBuilder();
+        var got: Index := 0;
+        while got < n do
+            let now: Nat64 := nowMillis();
+            if now >= deadline then
+                destroyString(build(out));
+                let lost: Either[Int32, String] := Left(left => peerLost());
+                return lost;
+            end if;
+            var wait: Nat64 := deadline - now;
+            if wait > 4294967295 then
+                wait := 4294967295;
+            end if;
+            case receiveOn(&~peer, n - got, narrow32(wait)) of
+                when Right(right as chunk: String) do
+                    if length(&chunk) = 0 then
+                        destroyString(chunk);
+                        destroyString(build(out));
+                        let closed: Either[Int32, String] := Left(left => peerLost());
+                        return closed;
+                    end if;
+                    writeString(&!out, asSpan(&chunk));
+                    got := got + length(&chunk);
+                    destroyString(chunk);
+                when Left(left as message: String) do
+                    destroyString(message);
+                    destroyString(build(out));
+                    let lost: Either[Int32, String] := Left(left => peerLost());
+                    return lost;
+            end case;
+        end while;
+        let whole: Either[Int32, String] := Right(right => build(out));
+        return whole;
+    end;
+
+    -- One frame, whatever its kind: kind 0 stands for a frame of an older
+    -- incarnation whose payload was read and dropped.
+    generic [R: Region]
+    function readOne(peer: &![Peer, R]): Either[Int32, Frame] is
+        let deadline: Nat64 := nowMillis() + wide32(peer->silence);
+        case readN(&~peer, headerBytes(), deadline) of
+            when Left(left as code: Int32) do
+                let failed: Either[Int32, Frame] := Left(left => code);
+                return failed;
+            when Right(right as header: String) do
+                let incarnation: Nat32 := peer->incarnation;
+                let own: Nat32 := peer->own;
+                let remote: Nat32 := peer->remote;
+                let id: String := idString(peer->idHigh, peer->idLow);
+                let verdict: Int32 := checkHeader(asSpan(&header), asSpan(&id), incarnation, own, remote);
+                destroyString(id);
+                if (verdict /= 0) and (verdict /= staleIncarnation()) then
+                    peer->last := verdict;
+                    destroyString(header);
+                    let refused: Either[Int32, Frame] := Left(left => verdict);
+                    return refused;
+                end if;
+                let announced: Index := headerLength(asSpan(&header));
+                case readN(&~peer, announced, deadline) of
+                    when Left(left as code: Int32) do
+                        destroyString(header);
+                        let failed: Either[Int32, Frame] := Left(left => code);
+                        return failed;
+                    when Right(right as payload: String) do
+                        var kind: Nat8 := headerKind(asSpan(&header));
+                        var tag: Nat32 := headerTag(asSpan(&header));
+                        var epoch: Nat64 := idPart(asSpan(&header), 32);
+                        if verdict = staleIncarnation() then
+                            peer->dropped := (peer->dropped) + 1;
+                            peer->last := verdict;
+                            kind := 0;
+                            tag := 0;
+                            epoch := 0;
+                        end if;
+                        destroyString(header);
+                        let taken: Either[Int32, Frame] := Right(right => Frame(kind => kind, tag => tag, epoch => epoch, payload => payload));
+                        return taken;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region]
+    function receiveFrame(peer: &![Peer, R], milliseconds: Nat32): Either[Int32, Frame] is
+        peer->silence := milliseconds;
+        while true do
+            case readOne(&~peer) of
+                when Left(left as code: Int32) do
+                    let failed: Either[Int32, Frame] := Left(left => code);
+                    return failed;
+                when Right(right as frame: Frame) do
+                    let { kind: Nat8, tag: Nat32, epoch: Nat64, payload: String } := frame;
+                    if kind = abortKind() then
+                        let reason: Nat32 := abortReason(asSpan(&payload));
+                        peer->last := peerAborted();
+                        destroyString(payload);
+                        let aborted: Either[Int32, Frame] := Left(left => peerAborted());
+                        return aborted;
+                    end if;
+                    if kind = byeKind() then
+                        peer->last := peerLost();
+                        destroyString(payload);
+                        let gone: Either[Int32, Frame] := Left(left => peerLost());
+                        return gone;
+                    end if;
+                    if (kind = 0) or (kind = heartbeatKind()) then
+                        destroyString(payload);
+                    else
+                        if (((kind = helloKind()) or (kind = dataKind())) or (kind = collectiveKind())) or ((kind >= ckptBeginKind()) and (kind <= resumeKind())) then
+                            let taken: Either[Int32, Frame] := Right(right => Frame(kind => kind, tag => tag, epoch => epoch, payload => payload));
+                            return taken;
+                        end if;
+                        peer->last := badFrame();
+                        destroyString(payload);
+                        let refused: Either[Int32, Frame] := Left(left => badFrame());
+                        return refused;
+                    end if;
+            end case;
+        end while;
+    end;
+
+    -- All of bytes to the client within the send limit; 0, or peerLost.
+    generic [R: Region, B: Region]
+    function writeClient(client: &![Client, R], bytes: Span[Nat8, B]): Int32 is
+        case sendWithin(&~client, bytes, sendLimit) of
+            when Right(right as sent: Unit) do
+                return 0;
+            when Left(left as message: String) do
+                destroyString(message);
+                return peerLost();
+        end case;
+    end;
+
+    generic [R: Region, B: Region]
+    function sendBytes(peer: &![Peer, R], bytes: Span[Nat8, B]): Int32 is
+        return writeClient(&!(peer->client), bytes);
+    end;
+
+    generic [R: Region, P: Region]
+    function sendFrame(peer: &![Peer, R], kind: Nat8, tag: Nat32, payload: Span[Nat8, P]): Int32 is
+        return sendFrameAt(&~peer, kind, tag, 0, payload);
+    end;
+
+    -- As sendFrame, with the epoch in the header: for the checkpoint frames.
+    generic [R: Region, P: Region]
+    function sendFrameAt(peer: &![Peer, R], kind: Nat8, tag: Nat32, epoch: Nat64, payload: Span[Nat8, P]): Int32 is
+        let incarnation: Nat32 := peer->incarnation;
+        let own: Nat32 := peer->own;
+        let remote: Nat32 := peer->remote;
+        let id: String := idString(peer->idHigh, peer->idLow);
+        let header: String := frameHeader(kind, spanLength(payload), asSpan(&id), incarnation, epoch, own, remote, tag);
+        destroyString(id);
+        var whole: StringBuilder := makeStringBuilder();
+        writeString(&!whole, asSpan(&header));
+        writeString(&!whole, payload);
+        destroyString(header);
+        let bytes: String := build(whole);
+        let code: Int32 := sendBytes(&~peer, asSpan(&bytes));
+        destroyString(bytes);
+        return code;
+    end;
+
+    generic [R: Region, B: Region]
+    function sendRaw(peer: &![Peer, R], bytes: Span[Nat8, B]): Int32 is
+        return sendBytes(&~peer, bytes);
+    end;
+
+    function closePeer(peer: Peer): Unit is
+        var open: Peer := peer;
+        let bye: Int32 := sendFrame(&!open, byeKind(), 0, "");
+        let { client: Client, idHigh: Nat64, idLow: Nat64, own: Nat32, remote: Nat32, incarnation: Nat32, silence: Nat32,
+            dropped: Index, last: Int32, pendingTags: Buffer[Nat32], pendingData: Buffer[String] } := open;
+        closeClient(client);
+        destroyFree(pendingTags);
+        destroyStrings(pendingData);
+        return nil;
+    end;
+
+    -- The rank in a subject whose common name is sperli, the job and the rank, or None.
+    generic [S: Region, J: Region]
+    function rankOfSubject(subject: Span[Nat8, S], id: Span[Nat8, J]): Option[Nat32] is
+        let zero: String := certificateName(id, 0);
+        let prefix: Index := length(&zero) + 3;
+        destroyString(zero);
+        if spanLength(subject) <= prefix then
+            let none: Option[Nat32] := None();
+            return none;
+        end if;
+        var found: Nat64 := 0;
+        var i: Index := prefix;
+        while i < spanLength(subject) do
+            let digit: Nat8 := subject[i];
+            if (digit < 48) or (digit > 57) or ((i - prefix) >= 4) then
+                let none: Option[Nat32] := None();
+                return none;
+            end if;
+            found := (found * 10) + (byteValue(digit) - 48);
+            i := i + 1;
+        end while;
+        let result: Option[Nat32] := Some(value => narrow32(found));
+        return result;
+    end;
+
+    -- The checks of a connection once TLS is up: the subject of the
+    -- certificate is that of rank expected (when expected is a rank), the
+    -- hellos are traded and the token of the peer holds.
+    generic [J: Region]
+    function meet(client: Client, job: &[Job, J], remote: Nat32): Either[Int32, Peer] is
+        let high: Nat64 := idPart(asSpan(&(job->id)), 0);
+        let low: Nat64 := idPart(asSpan(&(job->id)), 8);
+        var peer: Peer := Peer(client => client, idHigh => high, idLow => low, own => job->ownRank, remote => remote,
+            incarnation => job->incarnation, silence => handshakeLimit, dropped => 0, last => 0, pendingTags => noTags(), pendingData => noHosts());
+        let hello: String := helloPayload(0, 3, asSpan(&(job->token)));
+        var code: Int32 := sendFrame(&!peer, helloKind(), 0, asSpan(&hello));
+        destroyString(hello);
+        if code = 0 then
+            case receiveFrame(&!peer, handshakeLimit) of
+                when Left(left as why: Int32) do
+                    code := why;
+                when Right(right as frame: Frame) do
+                    let { kind: Nat8, tag: Nat32, epoch: Nat64, payload: String } := frame;
+                    if kind /= helloKind() then
+                        code := badHello();
+                    else
+                        code := checkHello(asSpan(&payload));
+                        if code = 0 then
+                            let token: String := helloToken(asSpan(&payload));
+                            code := verifyJoinToken(asSpan(&token), asSpan(&(job->publicKey)), asSpan(&(job->id)), remote, job->ranks,
+                                job->incarnation, asSpan(nthRef(&(job->hosts), indexOf32(remote))), nowSeconds());
+                            destroyString(token);
+                        end if;
+                    end if;
+                    destroyString(payload);
+            end case;
+        end if;
+        peer.silence := defaultSilence();
+        if code = 0 then
+            let made: Either[Int32, Peer] := Right(right => peer);
+            return made;
+        end if;
+        closePeer(peer);
+        let failed: Either[Int32, Peer] := Left(left => code);
+        return failed;
+    end;
+
+    -- The first IPv4 address of host as 4 bytes.
+    generic [H: Region]
+    function addressOf(host: Span[Nat8, H]): Option[String] is
+        case resolveHost(host, OnlyIpv4()) of
+            when Right(right as addresses: Buffer[IpAddress]) do
+                if count(&addresses) = 0 then
+                    destroyFree(addresses);
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+                let bytes: String := ipToBytes(nth(&addresses, 0));
+                destroyFree(addresses);
+                let found: Option[String] := Some(value => bytes);
+                return found;
+            when Left(left as failure: ResolveFailure) do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- A connection to address and port, tried again every 100 ms until the
+    -- window has passed: the peer may not listen yet.
+    generic [A: Region]
+    function connectSocket(address: Span[Nat8, A], port: Nat16): Option[FileDescriptor] is
+        let deadline: Nat64 := nowMillis() + connectWindow;
+        while true do
+            case connectTcp(address, port, 5000) of
+                when Right(right as socket: FileDescriptor) do
+                    let found: Option[FileDescriptor] := Some(value => socket);
+                    return found;
+                when Left(left as failure: ConnectFailure) do
+                    if nowMillis() >= deadline then
+                        let none: Option[FileDescriptor] := None();
+                        return none;
+                    end if;
+                    sleepFor(100);
+            end case;
+        end while;
+    end;
+
+    generic [E: Region, J: Region]
+    function connectPeer(endpoint: &[Endpoint, E], job: &[Job, J], target: Nat32): Either[Int32, Peer] is
+        if (target <= (job->ownRank)) or (target >= (job->ranks)) then
+            let failed: Either[Int32, Peer] := Left(left => startFailed());
+            return failed;
+        end if;
+        let host: &[String, J] := nthRef(&(job->hosts), indexOf32(target));
+        if hostRefused(asSpan(host)) then
+            let refused: Either[Int32, Peer] := Left(left => refusedHost());
+            return refused;
+        end if;
+        case addressOf(asSpan(host)) of
+            when None do
+                let failed: Either[Int32, Peer] := Left(left => startFailed());
+                return failed;
+            when Some(value as address: String) do
+                case connectSocket(asSpan(&address), nth(&(job->ports), indexOf32(target))) of
+                    when None do
+                        destroyString(address);
+                        let lost: Either[Int32, Peer] := Left(left => peerLost());
+                        return lost;
+                    when Some(value as socket: FileDescriptor) do
+                        destroyString(address);
+                        case connectOverAsTls13(socket, asSpan(host), asSpan(&(endpoint->caPath)), asSpan(&(endpoint->certificatePath)),
+                            asSpan(&(endpoint->keyPath)), handshakeLimit) of
+                            when Left(left as message: String) do
+                                destroyString(message);
+                                let refused: Either[Int32, Peer] := Left(left => badCertificate());
+                                return refused;
+                            when Right(right as client: Client) do
+                                return checkSubject(client, job, target);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- The certificate of the peer must be the one of rank target in this job.
+    generic [J: Region]
+    function checkSubject(client: Client, job: &[Job, J], target: Nat32): Either[Int32, Peer] is
+        case peerSubject(&client) of
+            when None do
+                closeClient(client);
+                let refused: Either[Int32, Peer] := Left(left => badCertificate());
+                return refused;
+            when Some(value as subject: String) do
+                let right: Bool := subjectIs(asSpan(&subject), asSpan(&(job->id)), target);
+                destroyString(subject);
+                if right then
+                    return meet(client, job, target);
+                end if;
+                closeClient(client);
+                let mismatch: Either[Int32, Peer] := Left(left => subjectMismatch());
+                return mismatch;
+        end case;
+    end;
+
+    generic [E: Region, J: Region]
+    function acceptPeer(endpoint: &[Endpoint, E], job: &[Job, J], milliseconds: Nat32): Either[Int32, Peer] is
+        case acceptTcpWithin(&(endpoint->listener), milliseconds) of
+            when None do
+                let lost: Either[Int32, Peer] := Left(left => peerLost());
+                return lost;
+            when Some(value as socket: FileDescriptor) do
+                case acceptOver(&(endpoint->server), socket, handshakeLimit) of
+                    when Left(left as message: String) do
+                        destroyString(message);
+                        let refused: Either[Int32, Peer] := Left(left => badCertificate());
+                        return refused;
+                    when Right(right as client: Client) do
+                        case peerSubject(&client) of
+                            when None do
+                                closeClient(client);
+                                let refused: Either[Int32, Peer] := Left(left => badCertificate());
+                                return refused;
+                            when Some(value as subject: String) do
+                                case rankOfSubject(asSpan(&subject), asSpan(&(job->id))) of
+                                    when Some(value as remote: Nat32) do
+                                        let right: Bool := subjectIs(asSpan(&subject), asSpan(&(job->id)), remote) and (remote < (job->ownRank));
+                                        destroyString(subject);
+                                        if right then
+                                            return meet(client, job, remote);
+                                        end if;
+                                    when None do
+                                        destroyString(subject);
+                                end case;
+                                closeClient(client);
+                                let mismatch: Either[Int32, Peer] := Left(left => subjectMismatch());
+                                return mismatch;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    ---
+    --- The job
+    ---
+
+    -- What a checkpoint needs of the job: its id, the public key that
+    -- verifies a COMMIT file, the key that signs it (at rank 0 only), the
+    -- directory the files go to (empty for none) and the last epoch.
+    record Ckpt: Linear is
+        id: String;
+        publicKey: String;
+        signers: Buffer[CompositeKey];
+        place: String;
+        epoch: Nat64;
+    end;
+
+    record Comm: Linear is
+        ownRank: Nat32;
+        ranks: Nat32;
+        peers: Buffer[Option[Peer]];
+        beat: Nat64;
+        calls: Nat64;
+        ck: Buffer[Ckpt];
+        open: Nat64;
+        invariant (ranks >= 1) and (ranks <= 4096);
+        invariant ownRank < ranks;
+    end;
+
+    function noPeers(): Buffer[Option[Peer]] is
+        return allocateEmpty();
+    end;
+
+    -- The key rank 0 signs COMMIT files with, made from the two seeds of
+    -- the job description; none for another rank or when the seeds fail.
+    function signersFrom(seeds: String): Buffer[CompositeKey] is
+        var keys: Buffer[CompositeKey] := allocateEmpty();
+        if length(&seeds) = 64 then
+            case keypairFromSeeds(getSpan(&seeds, 0, 31), getSpan(&seeds, 32, 63)) of
+                when Some(value as key: CompositeKey) do
+                    insertBack(&!keys, key);
+                when None do
+                    skip;
+            end case;
+        end if;
+        destroyWiped(seeds);
+        return keys;
+    end;
+
+    function destroySigners(signers: Buffer[CompositeKey]): Unit is
+        var rest: Buffer[CompositeKey] := signers;
+        while count(&rest) > 0 do
+            destroyCompositeKey(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function closePeers(peers: Buffer[Option[Peer]]): Unit is
+        var rest: Buffer[Option[Peer]] := peers;
+        while count(&rest) > 0 do
+            case removeLast(&!rest) of
+                when Some(value as peer: Peer) do
+                    closePeer(peer);
+                when None do
+                    skip;
+            end case;
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- The directory of the credentials of a rank: sperli-<job>-<rank>.
+    generic [J: Region]
+    function directoryOf(job: &[Job, J]): String is
+        let name: String := certificateName(asSpan(&(job->id)), job->ownRank);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "sperli-");
+        var i: Index := 7;
+        while i < length(&name) do
+            var byte: Nat8 := nthByte(&name, i);
+            if byte = 47 then
+                byte := 45;
+            end if;
+            writeByte(&!out, byte);
+            i := i + 1;
+        end while;
+        destroyString(name);
+        return build(out);
+    end;
+
+    function init(job: Job): Either[Int32, Comm] is
+        let directory: String := directoryOf(&job);
+        case openEndpoint(&job, asSpan(&directory)) of
+            when Left(left as code: Int32) do
+                destroyString(directory);
+                destroyJob(job);
+                let failed: Either[Int32, Comm] := Left(left => code);
+                return failed;
+            when Right(right as endpoint: Endpoint) do
+                destroyString(directory);
+                return meshWith(endpoint, job);
+        end case;
+    end;
+
+    -- Connects to the ranks above, accepts the ranks below, and consumes
+    -- the endpoint and the job.
+    function meshWith(endpoint: Endpoint, job: Job): Either[Int32, Comm] is
+        var peers: Buffer[Option[Peer]] := noPeers();
+        var t: Nat32 := 0;
+        while t < job.ranks do
+            let none: Option[Peer] := None();
+            insertBack(&!peers, none);
+            t := t + 1;
+        end while;
+        var code: Int32 := 0;
+        var up: Nat32 := job.ownRank + 1;
+        while (code = 0) and (up < job.ranks) do
+            case connectPeer(&endpoint, &job, up) of
+                when Left(left as why: Int32) do
+                    code := why;
+                when Right(right as peer: Peer) do
+                    let slot: Option[Peer] := Some(value => peer);
+                    case swapNth(&!peers, indexOf32(up), slot) of
+                        when Some(value as extra: Peer) do
+                            closePeer(extra);
+                        when None do
+                            skip;
+                    end case;
+            end case;
+            up := up + 1;
+        end while;
+        var down: Nat32 := 0;
+        while (code = 0) and (down < job.ownRank) do
+            case acceptPeer(&endpoint, &job, 30000) of
+                when Left(left as why: Int32) do
+                    code := why;
+                when Right(right as peer: Peer) do
+                    let at: Index := indexOf32(peerRank(&peer));
+                    let slot: Option[Peer] := Some(value => peer);
+                    case swapNth(&!peers, at, slot) of
+                        when Some(value as extra: Peer) do
+                            closePeer(extra);
+                            code := subjectMismatch();
+                        when None do
+                            skip;
+                    end case;
+            end case;
+            down := down + 1;
+        end while;
+        closeEndpoint(endpoint);
+        let { id: String, ranks: Nat32, ownRank: Nat32, incarnation: Nat32, hosts: Buffer[String], ports: Buffer[Nat16],
+            publicKey: String, token: String, ca: String, certificate: String, key: String, seeds: String } := job;
+        destroyStrings(hosts);
+        destroyFree(ports);
+        destroyString(token);
+        destroyString(ca);
+        destroyString(certificate);
+        destroyWiped(key);
+        let signers: Buffer[CompositeKey] := signersFrom(seeds);
+        if code = 0 then
+            var ck: Buffer[Ckpt] := allocateEmpty();
+            insertBack(&!ck, Ckpt(id => id, publicKey => publicKey, signers => signers, place => fromSpan(""), epoch => 0));
+            let ready: Either[Int32, Comm] := Right(right => Comm(ownRank => ownRank, ranks => ranks, peers => peers, beat => 0, calls => 0,
+                ck => ck, open => 0));
+            return ready;
+        end if;
+        destroyString(id);
+        destroyString(publicKey);
+        destroySigners(signers);
+        closePeers(peers);
+        let failed: Either[Int32, Comm] := Left(left => code);
+        return failed;
+    end;
+
+    generic [R: Region]
+    function rank(comm: &[Comm, R]): Nat32 is
+        return comm->ownRank;
+    end;
+
+    generic [R: Region]
+    function size(comm: &[Comm, R]): Nat32 is
+        return comm->ranks;
+    end;
+
+    -- The peer of rank, taken out of its place; putPeer returns it.
+    generic [R: Region]
+    function takePeer(comm: &![Comm, R], at: Nat32): Option[Peer] is
+        let none: Option[Peer] := None();
+        return swapNth(&!(comm->peers), indexOf32(at), none);
+    end;
+
+    generic [R: Region]
+    function putPeer(comm: &![Comm, R], at: Nat32, peer: Peer): Unit is
+        let slot: Option[Peer] := Some(value => peer);
+        case swapNth(&!(comm->peers), indexOf32(at), slot) of
+            when Some(value as extra: Peer) do
+                closePeer(extra);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setSilence(comm: &![Comm, R], milliseconds: Nat32): Unit is
+        var i: Nat32 := 0;
+        while i < (comm->ranks) do
+            case takePeer(&~comm, i) of
+                when Some(value as peer: Peer) do
+                    var open: Peer := peer;
+                    setPeerSilence(&!open, milliseconds);
+                    putPeer(&~comm, i, open);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    record SendHandle: Linear is
+        code: Int32;
+    end;
+
+    record RecvHandle: Linear is
+        source: Nat32;
+        tag: Nat32;
+    end;
+
+    generic [R: Region]
+    function send(comm: &![Comm, R], target: Nat32, tag: Nat32, data: String): Int32 is
+        var code: Int32 := startFailed();
+        case takePeer(&~comm, target) of
+            when Some(value as peer: Peer) do
+                var open: Peer := peer;
+                code := sendFrame(&!open, dataKind(), tag, asSpan(&data));
+                putPeer(&~comm, target, open);
+            when None do
+                skip;
+        end case;
+        destroyString(data);
+        return code;
+    end;
+
+    generic [R: Region]
+    function startSend(comm: &![Comm, R], target: Nat32, tag: Nat32, data: String): SendHandle is
+        comm->open := (comm->open) + 1;
+        return SendHandle(code => send(&~comm, target, tag, data));
+    end;
+
+    generic [R: Region]
+    function finishSend(comm: &![Comm, R], handle: SendHandle): Int32 is
+        let { code: Int32 } := handle;
+        comm->open := (comm->open) - 1;
+        return code;
+    end;
+
+    -- The first pending message of the peer with wantedTag, taken out; None
+    -- when there is none.
+    generic [R: Region]
+    function takePending(peer: &![Peer, R], wantedTag: Nat32): Option[String] is
+        var i: Index := 0;
+        while i < pendingCount(&~peer) do
+            if pendingTagAt(&~peer, i) = wantedTag then
+                let gone: Nat32 := removeTag(&~peer, i);
+                let found: Option[String] := Some(value => removeData(&~peer, i));
+                return found;
+            end if;
+            i := i + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    -- The tag under which a checkpoint frame of the type kind is kept: the
+    -- reserved tags continue after the collective one.
+    function ckptTag(kind: Nat8): Nat32 is
+        return narrow32(2147483648 + byteValue(kind));
+    end;
+
+    -- The payload with its epoch, 8 bytes, in front.
+    generic [P: Region]
+    function epochPrefix(epoch: Nat64, payload: Span[Nat8, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        putLe(&!out, epoch, 8);
+        writeString(&!out, payload);
+        return build(out);
+    end;
+
+    -- The next data message with wantedTag from the peer; others are kept.
+    generic [R: Region]
+    function awaitData(peer: &![Peer, R], wantedTag: Nat32): Either[Int32, String] is
+        case takePending(&~peer, wantedTag) of
+            when Some(value as payload: String) do
+                let found: Either[Int32, String] := Right(right => payload);
+                return found;
+            when None do
+                skip;
+        end case;
+        while true do
+            let silence: Nat32 := peer->silence;
+            case receiveFrame(&~peer, silence) of
+                when Left(left as code: Int32) do
+                    let failed: Either[Int32, String] := Left(left => code);
+                    return failed;
+                when Right(right as frame: Frame) do
+                    let { kind: Nat8, tag: Nat32, epoch: Nat64, payload: String } := frame;
+                    let checkpointFrame: Bool := (kind >= ckptBeginKind()) and (kind <= resumeKind());
+                    if ((kind /= dataKind()) and (kind /= collectiveKind())) and (not checkpointFrame) then
+                        peer->last := badHello();
+                        destroyString(payload);
+                        let refused: Either[Int32, String] := Left(left => badHello());
+                        return refused;
+                    end if;
+                    -- The reserved tags belong to the collective frames and
+                    -- to the checkpoint frames, which keep their epoch in
+                    -- front of the payload.
+                    var kept: Nat32 := tag;
+                    var held: String := payload;
+                    if kind = collectiveKind() then
+                        kept := collectiveTag();
+                    end if;
+                    if checkpointFrame then
+                        kept := ckptTag(kind);
+                        let prefixed: String := epochPrefix(epoch, asSpan(&held));
+                        destroyString(held);
+                        held := prefixed;
+                    end if;
+                    if kept = wantedTag then
+                        let found: Either[Int32, String] := Right(right => held);
+                        return found;
+                    end if;
+                    pushTag(&~peer, kept);
+                    pushData(&~peer, held);
+            end case;
+        end while;
+    end;
+
+    generic [R: Region]
+    function recv(comm: &![Comm, R], source: Nat32, tag: Nat32): Either[Int32, String] is
+        case takePeer(&~comm, source) of
+            when Some(value as peer: Peer) do
+                var open: Peer := peer;
+                let got: Either[Int32, String] := awaitData(&!open, tag);
+                putPeer(&~comm, source, open);
+                return got;
+            when None do
+                let failed: Either[Int32, String] := Left(left => startFailed());
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region]
+    function startRecv(comm: &![Comm, R], source: Nat32, tag: Nat32): RecvHandle is
+        comm->open := (comm->open) + 1;
+        return RecvHandle(source => source, tag => tag);
+    end;
+
+    generic [R: Region]
+    function finishRecv(comm: &![Comm, R], handle: RecvHandle): Either[Int32, String] is
+        let { source: Nat32, tag: Nat32 } := handle;
+        comm->open := (comm->open) - 1;
+        return recv(&~comm, source, tag);
+    end;
+
+    -- Sends the same frame to every peer; 0, or the first code that is not 0.
+    generic [R: Region, P: Region]
+    function sendAll(comm: &![Comm, R], kind: Nat8, payload: Span[Nat8, P]): Int32 is
+        return sendAllAt(&~comm, kind, 0, payload);
+    end;
+
+    -- As sendAll, with the epoch in the header of every frame.
+    generic [R: Region, P: Region]
+    function sendAllAt(comm: &![Comm, R], kind: Nat8, epoch: Nat64, payload: Span[Nat8, P]): Int32 is
+        var code: Int32 := 0;
+        var i: Nat32 := 0;
+        while i < (comm->ranks) do
+            case takePeer(&~comm, i) of
+                when Some(value as peer: Peer) do
+                    var open: Peer := peer;
+                    let sent: Int32 := sendFrameAt(&!open, kind, 0, epoch, payload);
+                    if code = 0 then
+                        code := sent;
+                    end if;
+                    putPeer(&~comm, i, open);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return code;
+    end;
+
+    generic [R: Region]
+    function heartbeat(comm: &![Comm, R]): Int32 is
+        comm->beat := (comm->beat) + 1;
+        var out: StringBuilder := makeStringBuilder();
+        var rest: Nat64 := comm->beat;
+        var i: Index := 0;
+        while i < 8 do
+            case toNat8(rest - ((rest / byteBase) * byteBase)) of
+                when Some(value as byte: Nat8) do
+                    writeByte(&!out, byte);
+                when None do
+                    skip;
+            end case;
+            rest := rest / byteBase;
+            i := i + 1;
+        end while;
+        let payload: String := build(out);
+        let code: Int32 := sendAll(&~comm, heartbeatKind(), asSpan(&payload));
+        destroyString(payload);
+        return code;
+    end;
+
+    generic [R: Region, T: Region]
+    function abortJob(comm: &![Comm, R], text: Span[Nat8, T]): Unit is
+        let payload: String := abortPayload(4, text);
+        let code: Int32 := sendAll(&~comm, abortKind(), asSpan(&payload));
+        destroyString(payload);
+        return nil;
+    end;
+
+    ---
+    --- Collectives
+    ---
+
+    -- The number of the call that starts now; the first call is 1.
+    generic [R: Region]
+    function nextSequence(comm: &![Comm, R]): Nat64 is
+        comm->calls := (comm->calls) + 1;
+        return comm->calls;
+    end;
+
+    -- Tells every peer the job is over for the reason, with text.
+    generic [R: Region, T: Region]
+    function refuseJob(comm: &![Comm, R], reason: Nat32, text: Span[Nat8, T]): Unit is
+        let payload: String := abortPayload(reason, text);
+        let code: Int32 := sendAll(&~comm, abortKind(), asSpan(&payload));
+        destroyString(payload);
+        return nil;
+    end;
+
+    -- One collective payload to rank target; 0, or the code of the write.
+    generic [R: Region, P: Region]
+    function sendCollective(comm: &![Comm, R], target: Nat32, payload: Span[Nat8, P]): Int32 is
+        var code: Int32 := startFailed();
+        case takePeer(&~comm, target) of
+            when Some(value as peer: Peer) do
+                var open: Peer := peer;
+                code := sendFrame(&!open, collectiveKind(), 0, payload);
+                putPeer(&~comm, target, open);
+            when None do
+                skip;
+        end case;
+        return code;
+    end;
+
+    -- The data of the next collective frame from rank source, which has to
+    -- be the one the call expects.  A frame that is not makes the job end.
+    generic [R: Region]
+    function awaitCollective(comm: &![Comm, R], source: Nat32, operation: Nat8, elementType: Nat8, reduction: Nat8, phase: Nat8, root: Nat32, sequence: Nat64): Either[Int32, String] is
+        case takePeer(&~comm, source) of
+            when Some(value as peer: Peer) do
+                var open: Peer := peer;
+                let got: Either[Int32, String] := awaitData(&!open, collectiveTag());
+                putPeer(&~comm, source, open);
+                case got of
+                    when Left(left as code: Int32) do
+                        let failed: Either[Int32, String] := Left(left => code);
+                        return failed;
+                    when Right(right as payload: String) do
+                        let verdict: Int32 := checkCollective(asSpan(&payload), operation, elementType, reduction, phase, root, sequence);
+                        if verdict /= 0 then
+                            destroyString(payload);
+                            refuseJob(&~comm, 3, "collective frame does not match the call");
+                            let refused: Either[Int32, String] := Left(left => verdict);
+                            return refused;
+                        end if;
+                        let data: String := collectiveData(asSpan(&payload));
+                        destroyString(payload);
+                        let taken: Either[Int32, String] := Right(right => data);
+                        return taken;
+                end case;
+            when None do
+                let failed: Either[Int32, String] := Left(left => startFailed());
+                return failed;
+        end case;
+    end;
+
+    -- The bytes of data from start on, amount of them, as a new string.
+    generic [R: Region]
+    function blockOf(data: &[String, R], start: Index, amount: Index): String is
+        if amount = 0 then
+            return makeEmpty();
+        end if;
+        return fromSpan(getSpan(data, start, (start + amount) - 1));
+    end;
+
+    function failedWith(code: Int32): Either[Int32, String] is
+        let failed: Either[Int32, String] := Left(left => code);
+        return failed;
+    end;
+
+    generic [R: Region]
+    function barrier(comm: &![Comm, R]): Int32 is
+        let sequence: Nat64 := nextSequence(&~comm);
+        let ranks: Nat32 := comm->ranks;
+        let me: Nat32 := comm->ownRank;
+        if ranks = 1 then
+            return 0;
+        end if;
+        if me = 0 then
+            var source: Nat32 := 1;
+            while source < ranks do
+                case awaitCollective(&~comm, source, barrierOperation(), bytesType(), noReduction(), contributionPhase(), 0, sequence) of
+                    when Left(left as code: Int32) do
+                        return code;
+                    when Right(right as data: String) do
+                        destroyString(data);
+                end case;
+                source := source + 1;
+            end while;
+            let release: String := collectivePayload(barrierOperation(), bytesType(), noReduction(), resultPhase(), 0, sequence, "");
+            let code: Int32 := sendAll(&~comm, collectiveKind(), asSpan(&release));
+            destroyString(release);
+            return code;
+        end if;
+        let arrive: String := collectivePayload(barrierOperation(), bytesType(), noReduction(), contributionPhase(), 0, sequence, "");
+        let sent: Int32 := sendCollective(&~comm, 0, asSpan(&arrive));
+        destroyString(arrive);
+        if sent /= 0 then
+            return sent;
+        end if;
+        case awaitCollective(&~comm, 0, barrierOperation(), bytesType(), noReduction(), resultPhase(), 0, sequence) of
+            when Left(left as code: Int32) do
+                return code;
+            when Right(right as data: String) do
+                destroyString(data);
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region]
+    function bcast(comm: &![Comm, R], root: Nat32, data: String): Either[Int32, String] is
+        let sequence: Nat64 := nextSequence(&~comm);
+        if root >= (comm->ranks) then
+            destroyString(data);
+            return failedWith(badCollective());
+        end if;
+        if (comm->ranks) = 1 then
+            let alone: Either[Int32, String] := Right(right => data);
+            return alone;
+        end if;
+        if (comm->ownRank) /= root then
+            destroyString(data);
+            return awaitCollective(&~comm, root, bcastOperation(), bytesType(), noReduction(), resultPhase(), root, sequence);
+        end if;
+        let payload: String := collectivePayload(bcastOperation(), bytesType(), noReduction(), resultPhase(), root, sequence, asSpan(&data));
+        let code: Int32 := sendAll(&~comm, collectiveKind(), asSpan(&payload));
+        destroyString(payload);
+        if code /= 0 then
+            destroyString(data);
+            return failedWith(code);
+        end if;
+        let sent: Either[Int32, String] := Right(right => data);
+        return sent;
+    end;
+
+    -- The contribution of rank source to a call whose root is the own rank:
+    -- a copy of data for the own rank, else what the rank sent.
+    generic [R: Region, D: Region]
+    function contributionOf(comm: &![Comm, R], source: Nat32, operation: Nat8, elementType: Nat8, reduction: Nat8, root: Nat32, sequence: Nat64, data: &[String, D]): Either[Int32, String] is
+        if source = (comm->ownRank) then
+            let own: Either[Int32, String] := Right(right => fromSpan(asSpan(data)));
+            return own;
+        end if;
+        return awaitCollective(&~comm, source, operation, elementType, reduction, contributionPhase(), root, sequence);
+    end;
+
+    -- Reduces the contributions of all ranks at root in the order of the
+    -- ranks.  Gives the result at root and an empty string elsewhere.
+    generic [R: Region]
+    function reduceAt(comm: &![Comm, R], root: Nat32, operation: Nat8, elementType: Nat8, reduction: Nat8, sequence: Nat64, data: String): Either[Int32, String] is
+        if (comm->ownRank) /= root then
+            let payload: String := collectivePayload(operation, elementType, reduction, contributionPhase(), root, sequence, asSpan(&data));
+            destroyString(data);
+            let code: Int32 := sendCollective(&~comm, root, asSpan(&payload));
+            destroyString(payload);
+            if code /= 0 then
+                return failedWith(code);
+            end if;
+            let nothing: Either[Int32, String] := Right(right => makeEmpty());
+            return nothing;
+        end if;
+        var acc: String := makeEmpty();
+        var source: Nat32 := 0;
+        while source < (comm->ranks) do
+            case contributionOf(&~comm, source, operation, elementType, reduction, root, sequence, &data) of
+                when Left(left as code: Int32) do
+                    destroyString(acc);
+                    destroyString(data);
+                    return failedWith(code);
+                when Right(right as next: String) do
+                    if source = 0 then
+                        destroyString(acc);
+                        acc := next;
+                    else
+                        case combine(elementType, reduction, asSpan(&acc), asSpan(&next)) of
+                            when Left(left as code: Int32) do
+                                destroyString(next);
+                                destroyString(acc);
+                                destroyString(data);
+                                refuseJob(&~comm, 3, "contributions of different length");
+                                return failedWith(code);
+                            when Right(right as merged: String) do
+                                destroyString(next);
+                                destroyString(acc);
+                                acc := merged;
+                        end case;
+                    end if;
+            end case;
+            source := source + 1;
+        end while;
+        destroyString(data);
+        let reduced: Either[Int32, String] := Right(right => acc);
+        return reduced;
+    end;
+
+    -- Whether the arguments of a reduce make sense; the same on every rank.
+    generic [D: Region]
+    function reduceFits(ranks: Nat32, root: Nat32, elementType: Nat8, reduction: Nat8, data: &[String, D]): Bool is
+        if (root >= ranks) or (not reductionFits(elementType, reduction)) then
+            return false;
+        end if;
+        let width: Index := elementWidth(elementType);
+        return (((length(data) / width) * width) = length(data));
+    end;
+
+    generic [R: Region]
+    function reduce(comm: &![Comm, R], root: Nat32, elementType: Nat8, reduction: Nat8, data: String): Either[Int32, String] is
+        let sequence: Nat64 := nextSequence(&~comm);
+        if not reduceFits(comm->ranks, root, elementType, reduction, &data) then
+            destroyString(data);
+            return failedWith(badCollective());
+        end if;
+        if (comm->ranks) = 1 then
+            let alone: Either[Int32, String] := Right(right => data);
+            return alone;
+        end if;
+        return reduceAt(&~comm, root, reduceOperation(), elementType, reduction, sequence, data);
+    end;
+
+    generic [R: Region]
+    function allreduce(comm: &![Comm, R], elementType: Nat8, reduction: Nat8, data: String): Either[Int32, String] is
+        let sequence: Nat64 := nextSequence(&~comm);
+        if not reduceFits(comm->ranks, 0, elementType, reduction, &data) then
+            destroyString(data);
+            return failedWith(badCollective());
+        end if;
+        if (comm->ranks) = 1 then
+            let alone: Either[Int32, String] := Right(right => data);
+            return alone;
+        end if;
+        case reduceAt(&~comm, 0, allreduceOperation(), elementType, reduction, sequence, data) of
+            when Left(left as code: Int32) do
+                return failedWith(code);
+            when Right(right as reduced: String) do
+                if (comm->ownRank) /= 0 then
+                    destroyString(reduced);
+                    return awaitCollective(&~comm, 0, allreduceOperation(), elementType, reduction, resultPhase(), 0, sequence);
+                end if;
+                let payload: String := collectivePayload(allreduceOperation(), elementType, reduction, resultPhase(), 0, sequence, asSpan(&reduced));
+                let code: Int32 := sendAll(&~comm, collectiveKind(), asSpan(&payload));
+                destroyString(payload);
+                if code /= 0 then
+                    destroyString(reduced);
+                    return failedWith(code);
+                end if;
+                let done: Either[Int32, String] := Right(right => reduced);
+                return done;
+        end case;
+    end;
+
+    generic [R: Region]
+    function gather(comm: &![Comm, R], root: Nat32, data: String): Either[Int32, String] is
+        let sequence: Nat64 := nextSequence(&~comm);
+        if root >= (comm->ranks) then
+            destroyString(data);
+            return failedWith(badCollective());
+        end if;
+        if (comm->ranks) = 1 then
+            let alone: Either[Int32, String] := Right(right => data);
+            return alone;
+        end if;
+        if (comm->ownRank) /= root then
+            let payload: String := collectivePayload(gatherOperation(), bytesType(), noReduction(), contributionPhase(), root, sequence, asSpan(&data));
+            destroyString(data);
+            let code: Int32 := sendCollective(&~comm, root, asSpan(&payload));
+            destroyString(payload);
+            if code /= 0 then
+                return failedWith(code);
+            end if;
+            let nothing: Either[Int32, String] := Right(right => makeEmpty());
+            return nothing;
+        end if;
+        let block: Index := length(&data);
+        var out: StringBuilder := makeStringBuilder();
+        var source: Nat32 := 0;
+        while source < (comm->ranks) do
+            case contributionOf(&~comm, source, gatherOperation(), bytesType(), noReduction(), root, sequence, &data) of
+                when Left(left as code: Int32) do
+                    destroyString(build(out));
+                    destroyString(data);
+                    return failedWith(code);
+                when Right(right as part: String) do
+                    if length(&part) /= block then
+                        destroyString(part);
+                        destroyString(build(out));
+                        destroyString(data);
+                        refuseJob(&~comm, 3, "gather blocks of different length");
+                        return failedWith(collectiveMismatch());
+                    end if;
+                    writeString(&!out, asSpan(&part));
+                    destroyString(part);
+            end case;
+            source := source + 1;
+        end while;
+        destroyString(data);
+        let gathered: Either[Int32, String] := Right(right => build(out));
+        return gathered;
+    end;
+
+    -- Sends block i of data to rank i for every rank but root, and gives
+    -- the block of root.
+    generic [R: Region]
+    function scatterOut(comm: &![Comm, R], root: Nat32, sequence: Nat64, data: String, block: Index): Either[Int32, String] is
+        var target: Nat32 := 0;
+        while target < (comm->ranks) do
+            if target /= root then
+                let part: String := blockOf(&data, indexOf32(target) * block, block);
+                let payload: String := collectivePayload(scatterOperation(), bytesType(), noReduction(), resultPhase(), root, sequence, asSpan(&part));
+                destroyString(part);
+                let code: Int32 := sendCollective(&~comm, target, asSpan(&payload));
+                destroyString(payload);
+                if code /= 0 then
+                    destroyString(data);
+                    return failedWith(code);
+                end if;
+            end if;
+            target := target + 1;
+        end while;
+        let mine: Either[Int32, String] := Right(right => blockOf(&data, indexOf32(root) * block, block));
+        destroyString(data);
+        return mine;
+    end;
+
+    generic [R: Region]
+    function scatter(comm: &![Comm, R], root: Nat32, data: String): Either[Int32, String] is
+        let sequence: Nat64 := nextSequence(&~comm);
+        if root >= (comm->ranks) then
+            destroyString(data);
+            return failedWith(badCollective());
+        end if;
+        if (comm->ranks) = 1 then
+            let alone: Either[Int32, String] := Right(right => data);
+            return alone;
+        end if;
+        if (comm->ownRank) /= root then
+            destroyString(data);
+            return awaitCollective(&~comm, root, scatterOperation(), bytesType(), noReduction(), resultPhase(), root, sequence);
+        end if;
+        let ranks: Index := indexOf32(comm->ranks);
+        let block: Index := length(&data) / ranks;
+        if ((block * ranks) /= length(&data)) or (block > maxCollectiveData()) then
+            destroyString(data);
+            refuseJob(&~comm, 4, "scatter data is no whole number of blocks");
+            return failedWith(badCollective());
+        end if;
+        return scatterOut(&~comm, root, sequence, data, block);
+    end;
+
+    ---
+    --- Checkpoints
+    ---
+
+    -- The rank before rank in a ring of ranks ranks, and the one after.
+    function previousOf(place: Nat32, ranks: Nat32): Nat32 is
+        if place = 0 then
+            return ranks - 1;
+        end if;
+        return place - 1;
+    end;
+
+    function nextOf(place: Nat32, ranks: Nat32): Nat32 is
+        if (place + 1) >= ranks then
+            return 0;
+        end if;
+        return place + 1;
+    end;
+
+    -- The checkpoint state of the job, taken out of the comm for the time
+    -- of a call; putCkpt gives it back.
+    generic [R: Region]
+    function takeCkpt(comm: &![Comm, R]): Ckpt is
+        return remove(&!(comm->ck), 0);
+    end;
+
+    generic [R: Region]
+    function putCkpt(comm: &![Comm, R], ck: Ckpt): Unit is
+        insertBack(&!(comm->ck), ck);
+        return nil;
+    end;
+
+    generic [C: Region]
+    function placeLength(ck: &[Ckpt, C]): Index is
+        return length(&(ck->place));
+    end;
+
+    generic [C: Region]
+    function epochOf(ck: &[Ckpt, C]): Nat64 is
+        return ck->epoch;
+    end;
+
+    -- The state with another epoch.
+    function withEpoch(ck: Ckpt, next: Nat64): Ckpt is
+        let { id: String, publicKey: String, signers: Buffer[CompositeKey], place: String, epoch: Nat64 } := ck;
+        return Ckpt(id => id, publicKey => publicKey, signers => signers, place => place, epoch => next);
+    end;
+
+    generic [R: Region, T: Region]
+    function useCheckpoints(comm: &![Comm, R], path: Span[Nat8, T]): Unit is
+        let ck: Ckpt := takeCkpt(&~comm);
+        let { id: String, publicKey: String, signers: Buffer[CompositeKey], place: String, epoch: Nat64 } := ck;
+        destroyString(place);
+        putCkpt(&~comm, Ckpt(id => id, publicKey => publicKey, signers => signers, place => fromSpan(path), epoch => epoch));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function checkpointEpoch(comm: &![Comm, R]): Nat64 is
+        let ck: Ckpt := takeCkpt(&~comm);
+        let epoch: Nat64 := epochOf(&ck);
+        putCkpt(&~comm, ck);
+        return epoch;
+    end;
+
+    -- Ends the job for every other rank, unless the code says they have
+    -- ended it already, and gives the code.
+    generic [R: Region]
+    function failCheckpoint(comm: &![Comm, R], code: Int32): Int32 is
+        if code /= peerAborted() then
+            refuseJob(&~comm, 5, "checkpoint failed");
+        end if;
+        return code;
+    end;
+
+    -- One checkpoint frame of the type kind and the epoch to rank target.
+    generic [R: Region, P: Region]
+    function sendCkpt(comm: &![Comm, R], target: Nat32, kind: Nat8, epoch: Nat64, payload: Span[Nat8, P]): Int32 is
+        var code: Int32 := startFailed();
+        case takePeer(&~comm, target) of
+            when Some(value as peer: Peer) do
+                var open: Peer := peer;
+                code := sendFrameAt(&!open, kind, 0, epoch, payload);
+                putPeer(&~comm, target, open);
+            when None do
+                skip;
+        end case;
+        return code;
+    end;
+
+    -- The next checkpoint frame of the type kind from rank source, with its
+    -- epoch in front of the payload.
+    generic [R: Region]
+    function awaitCkptRaw(comm: &![Comm, R], source: Nat32, kind: Nat8): Either[Int32, String] is
+        case takePeer(&~comm, source) of
+            when Some(value as peer: Peer) do
+                var open: Peer := peer;
+                let got: Either[Int32, String] := awaitData(&!open, ckptTag(kind));
+                putPeer(&~comm, source, open);
+                return got;
+            when None do
+                return failedWith(startFailed());
+        end case;
+    end;
+
+    generic [P: Region]
+    function epochOfFrame(prefixed: Span[Nat8, P]): Nat64 is
+        return idPart(prefixed, 0);
+    end;
+
+    generic [P: Region]
+    function payloadOfFrame(prefixed: Span[Nat8, P]): String is
+        return blockOfSpan(prefixed, 8);
+    end;
+
+    -- The bytes of bytes from start on.
+    generic [P: Region]
+    function blockOfSpan(bytes: Span[Nat8, P], start: Index): String is
+        if spanLength(bytes) <= start then
+            return makeEmpty();
+        end if;
+        return fromSpan(spanPart(bytes, start, spanLength(bytes) - start));
+    end;
+
+    -- The payload of the next checkpoint frame of the type kind from
+    -- source, which has to name epoch.
+    generic [R: Region]
+    function awaitCkpt(comm: &![Comm, R], source: Nat32, kind: Nat8, epoch: Nat64): Either[Int32, String] is
+        case awaitCkptRaw(&~comm, source, kind) of
+            when Left(left as code: Int32) do
+                return failedWith(code);
+            when Right(right as prefixed: String) do
+                if epochOfFrame(asSpan(&prefixed)) /= epoch then
+                    destroyString(prefixed);
+                    return failedWith(badFrame());
+                end if;
+                let payload: String := payloadOfFrame(asSpan(&prefixed));
+                destroyString(prefixed);
+                let taken: Either[Int32, String] := Right(right => payload);
+                return taken;
+        end case;
+    end;
+
+    -- The digest of the file of rank owner that rank target holds, sent as
+    -- chunks of CKPT_DATA of the type given in kind (0 copy, 2 reply).
+    generic [R: Region, F: Region]
+    function sendFileTo(comm: &![Comm, R], target: Nat32, kind: Nat8, owner: Nat32, epoch: Nat64, file: &[String, F]): Int32 is
+        let total: Nat64 := wide(length(file));
+        var offset: Index := 0;
+        var code: Int32 := 0;
+        while (code = 0) and (offset < length(file)) do
+            var amount: Index := length(file) - offset;
+            if amount > chunkBytes() then
+                amount := chunkBytes();
+            end if;
+            let payload: String := dataPayload(kind, owner, wide(offset), total, getSpan(file, offset, (offset + amount) - 1));
+            code := sendCkpt(&~comm, target, ckptDataKind(), epoch, asSpan(&payload));
+            destroyString(payload);
+            offset := offset + amount;
+        end while;
+        return code;
+    end;
+
+    -- A whole rank file of rank owner from rank source, in chunks of
+    -- CKPT_DATA of the type kind.  With refusable, a frame of type 3 means
+    -- the source has no valid copy and gives resumeRefused.  Every chunk is
+    -- checked: its owner, its place in the file, a total that stays the
+    -- same and is no larger than a state allows.
+    generic [R: Region]
+    function receiveFileFrom(comm: &![Comm, R], source: Nat32, kind: Nat8, refusable: Bool, owner: Nat32, epoch: Nat64): Either[Int32, String] is
+        var out: StringBuilder := makeStringBuilder();
+        var got: Index := 0;
+        var total: Nat64 := 0;
+        var code: Int32 := 0;
+        var finished: Bool := false;
+        while (code = 0) and (not finished) do
+            case awaitCkpt(&~comm, source, ckptDataKind(), epoch) of
+                when Left(left as why: Int32) do
+                    code := why;
+                when Right(right as payload: String) do
+                    if not dataIs(asSpan(&payload)) then
+                        code := badFrame();
+                    else
+                        if refusable and (dataKindOf(asSpan(&payload)) = 3) then
+                            code := resumeRefused();
+                        else
+                            if (dataKindOf(asSpan(&payload)) /= kind) or (dataOwner(asSpan(&payload)) /= owner) then
+                                code := badFrame();
+                            else
+                                let announced: Nat64 := dataTotal(asSpan(&payload));
+                                let chunk: String := dataChunk(asSpan(&payload));
+                                if got = 0 then
+                                    total := announced;
+                                end if;
+                                if (announced /= total) or (total < 80) or (total > wide(maxStateBytes() + 80)) then
+                                    code := badFrame();
+                                else
+                                    if (dataOffset(asSpan(&payload)) /= wide(got)) or (length(&chunk) = 0) or (wide(got + length(&chunk)) > total) then
+                                        code := badFrame();
+                                    else
+                                        writeString(&!out, asSpan(&chunk));
+                                        got := got + length(&chunk);
+                                        finished := wide(got) = total;
+                                    end if;
+                                end if;
+                                destroyString(chunk);
+                            end if;
+                        end if;
+                    end if;
+                    destroyString(payload);
+            end case;
+        end while;
+        let file: String := build(out);
+        if code /= 0 then
+            destroyString(file);
+            return failedWith(code);
+        end if;
+        let whole: Either[Int32, String] := Right(right => file);
+        return whole;
+    end;
+
+    -- Writes the rank file of this rank for epoch and gives its bytes.
+    generic [R: Region, C: Region, P: Region]
+    function writeRankFile(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64, payload: Span[Nat8, P]): Either[Int32, String] is
+        let me: Nat32 := comm->ownRank;
+        let ranks: Nat32 := comm->ranks;
+        if not prepareEpoch(asSpan(&(ck->place)), asSpan(&(ck->id)), epoch) then
+            return failedWith(checkpointFailed());
+        end if;
+        case rankFile(asSpan(&(ck->id)), epoch, me, ranks, payload) of
+            when None do
+                return failedWith(checkpointFailed());
+            when Some(value as file: String) do
+                let path: String := rankPath(asSpan(&(ck->place)), asSpan(&(ck->id)), epoch, me, false);
+                let stored: Bool := storeFile(asSpan(&path), asSpan(&file));
+                destroyString(path);
+                if not stored then
+                    destroyString(file);
+                    return failedWith(checkpointFailed());
+                end if;
+                let written: Either[Int32, String] := Right(right => file);
+                return written;
+        end case;
+    end;
+
+    -- Takes the copy the previous rank sends, checks it and keeps it as
+    -- the buddy copy; gives its SHA-256.
+    generic [R: Region, C: Region]
+    function takeBuddyCopy(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64): Either[Int32, String] is
+        let ranks: Nat32 := comm->ranks;
+        let owner: Nat32 := previousOf(comm->ownRank, ranks);
+        case receiveFileFrom(&~comm, owner, 0, false, owner, epoch) of
+            when Left(left as code: Int32) do
+                return failedWith(code);
+            when Right(right as copy: String) do
+                let verdict: Int32 := checkRankFile(asSpan(&copy), asSpan(&(ck->id)), epoch, owner, ranks);
+                if verdict /= 0 then
+                    destroyString(copy);
+                    return failedWith(verdict);
+                end if;
+                let path: String := rankPath(asSpan(&(ck->place)), asSpan(&(ck->id)), epoch, owner, true);
+                let stored: Bool := storeFile(asSpan(&path), asSpan(&copy));
+                destroyString(path);
+                if not stored then
+                    destroyString(copy);
+                    return failedWith(checkpointFailed());
+                end if;
+                case digestOf(asSpan(&copy)) of
+                    when Some(value as digest: String) do
+                        destroyString(copy);
+                        let kept: Either[Int32, String] := Right(right => digest);
+                        return kept;
+                    when None do
+                        destroyString(copy);
+                        return failedWith(checkpointFailed());
+                end case;
+        end case;
+    end;
+
+    -- Gives the file to the next rank and takes the file of the previous
+    -- one.  Even ranks send first and odd ranks receive first, so that two
+    -- neighbours never both wait for the other to read.  Gives the SHA-256
+    -- of the copy taken, the empty string for a job of one rank.
+    generic [R: Region, C: Region, F: Region]
+    function exchangeCopies(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64, file: &[String, F]): Either[Int32, String] is
+        let me: Nat32 := comm->ownRank;
+        let ranks: Nat32 := comm->ranks;
+        if ranks = 1 then
+            let alone: Either[Int32, String] := Right(right => makeEmpty());
+            return alone;
+        end if;
+        let buddy: Nat32 := nextOf(me, ranks);
+        if ((me / 2) * 2) = me then
+            let code: Int32 := sendFileTo(&~comm, buddy, 0, me, epoch, file);
+            if code /= 0 then
+                return failedWith(code);
+            end if;
+            return takeBuddyCopy(&~comm, ck, epoch);
+        end if;
+        case takeBuddyCopy(&~comm, ck, epoch) of
+            when Left(left as why: Int32) do
+                return failedWith(why);
+            when Right(right as digest: String) do
+                let code: Int32 := sendFileTo(&~comm, buddy, 0, me, epoch, file);
+                if code /= 0 then
+                    destroyString(digest);
+                    return failedWith(code);
+                end if;
+                let kept: Either[Int32, String] := Right(right => digest);
+                return kept;
+        end case;
+    end;
+
+    -- Rank 0: collects the digests, signs the COMMIT file, keeps it and
+    -- sends it to the others.  Gives the COMMIT file.
+    generic [R: Region, C: Region, M: Region]
+    function signAndSend(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64, mine: &[String, M]): Either[Int32, String] is
+        var digests: StringBuilder := makeStringBuilder();
+        writeString(&!digests, asSpan(mine));
+        var code: Int32 := 0;
+        var source: Nat32 := 1;
+        while (code = 0) and (source < (comm->ranks)) do
+            case awaitCkpt(&~comm, source, ckptAckKind(), epoch) of
+                when Left(left as why: Int32) do
+                    code := why;
+                when Right(right as digest: String) do
+                    if length(&digest) /= 32 then
+                        code := badFrame();
+                    else
+                        writeString(&!digests, asSpan(&digest));
+                    end if;
+                    destroyString(digest);
+            end case;
+            source := source + 1;
+        end while;
+        let all: String := build(digests);
+        if code /= 0 then
+            destroyString(all);
+            return failedWith(code);
+        end if;
+        if count(&(ck->signers)) = 0 then
+            destroyString(all);
+            return failedWith(checkpointFailed());
+        end if;
+        let content: String := commitBody(asSpan(&(ck->id)), epoch, asSpan(&all));
+        destroyString(all);
+        let signed: Option[String] := signCommit(nthRef(&(ck->signers), 0), asSpan(&content));
+        destroyString(content);
+        case signed of
+            when None do
+                return failedWith(checkpointFailed());
+            when Some(value as commit: String) do
+                let path: String := commitPath(asSpan(&(ck->place)), asSpan(&(ck->id)), epoch);
+                let stored: Bool := storeFile(asSpan(&path), asSpan(&commit));
+                destroyString(path);
+                if not stored then
+                    destroyString(commit);
+                    return failedWith(checkpointFailed());
+                end if;
+                let sent: Int32 := sendAllAt(&~comm, ckptCommitKind(), epoch, asSpan(&commit));
+                if sent /= 0 then
+                    destroyString(commit);
+                    return failedWith(sent);
+                end if;
+                let made: Either[Int32, String] := Right(right => commit);
+                return made;
+        end case;
+    end;
+
+    -- Another rank: takes the COMMIT file of rank 0, verifies it and keeps
+    -- a copy.  Gives the COMMIT file.
+    generic [R: Region, C: Region]
+    function takeCommit(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64): Either[Int32, String] is
+        case awaitCkpt(&~comm, 0, ckptCommitKind(), epoch) of
+            when Left(left as code: Int32) do
+                return failedWith(code);
+            when Right(right as commit: String) do
+                let verdict: Int32 := checkCommit(asSpan(&commit), asSpan(&(ck->publicKey)), asSpan(&(ck->id)), epoch, comm->ranks);
+                if verdict /= 0 then
+                    destroyString(commit);
+                    return failedWith(verdict);
+                end if;
+                let path: String := commitPath(asSpan(&(ck->place)), asSpan(&(ck->id)), epoch);
+                let stored: Bool := storeFile(asSpan(&path), asSpan(&commit));
+                destroyString(path);
+                if not stored then
+                    destroyString(commit);
+                    return failedWith(checkpointFailed());
+                end if;
+                let taken: Either[Int32, String] := Right(right => commit);
+                return taken;
+        end case;
+    end;
+
+    -- The COMMIT file of the epoch: made and sent at rank 0, taken from
+    -- rank 0 at another rank.
+    generic [R: Region, C: Region, M: Region]
+    function commitFor(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64, mine: &[String, M]): Either[Int32, String] is
+        if (comm->ownRank) = 0 then
+            return signAndSend(&~comm, ck, epoch, mine);
+        end if;
+        return takeCommit(&~comm, ck, epoch);
+    end;
+
+    -- Whether the digest in the COMMIT file for rank owner is digest.
+    generic [M: Region, D: Region]
+    function commitHolds(commit: &[String, M], owner: Nat32, digest: &[String, D]): Bool is
+        let listed: String := commitDigest(asSpan(commit), owner);
+        let same: Bool := (length(&listed) = 32) and equal(asSpan(&listed), asSpan(digest));
+        destroyString(listed);
+        return same;
+    end;
+
+    -- From the written file on: the acknowledgement, the copies, the
+    -- COMMIT file, and the check that the COMMIT file lists the digests of
+    -- this rank's file and of the copy held for the previous rank.
+    generic [R: Region, C: Region, F: Region]
+    function completeCheckpoint(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64, file: &[String, F]): Int32 is
+        case digestOf(asSpan(file)) of
+            when None do
+                return checkpointFailed();
+            when Some(value as mine: String) do
+                let me: Nat32 := comm->ownRank;
+                let ranks: Nat32 := comm->ranks;
+                var code: Int32 := 0;
+                if me /= 0 then
+                    code := sendCkpt(&~comm, 0, ckptAckKind(), epoch, asSpan(&mine));
+                end if;
+                var copyDigest: String := makeEmpty();
+                if code = 0 then
+                    case exchangeCopies(&~comm, ck, epoch, file) of
+                        when Left(left as why: Int32) do
+                            code := why;
+                        when Right(right as digest: String) do
+                            destroyString(copyDigest);
+                            copyDigest := digest;
+                    end case;
+                end if;
+                if code = 0 then
+                    case commitFor(&~comm, ck, epoch, &mine) of
+                        when Left(left as why: Int32) do
+                            code := why;
+                        when Right(right as commit: String) do
+                            if not commitHolds(&commit, me, &mine) then
+                                code := digestMismatch();
+                            end if;
+                            if (code = 0) and (ranks > 1) and (not commitHolds(&commit, previousOf(me, ranks), &copyDigest)) then
+                                code := digestMismatch();
+                            end if;
+                            destroyString(commit);
+                    end case;
+                end if;
+                destroyString(copyDigest);
+                destroyString(mine);
+                return code;
+        end case;
+    end;
+
+    -- One checkpoint at epoch with ck taken out of the comm.
+    generic [R: Region, C: Region, P: Region]
+    function runCheckpoint(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64, payload: Span[Nat8, P]): Int32 is
+        let me: Nat32 := comm->ownRank;
+        let ranks: Nat32 := comm->ranks;
+        if me = 0 then
+            removeCommit(asSpan(&(ck->place)), asSpan(&(ck->id)), epoch);
+            if ranks > 1 then
+                let opening: String := beginPayload(ranks);
+                let sent: Int32 := sendAllAt(&~comm, ckptBeginKind(), epoch, asSpan(&opening));
+                destroyString(opening);
+                if sent /= 0 then
+                    return sent;
+                end if;
+            end if;
+        else
+            case awaitCkpt(&~comm, 0, ckptBeginKind(), epoch) of
+                when Left(left as code: Int32) do
+                    return code;
+                when Right(right as opening: String) do
+                    let good: Bool := beginIs(asSpan(&opening), ranks);
+                    destroyString(opening);
+                    if not good then
+                        return badFrame();
+                    end if;
+            end case;
+        end if;
+        case writeRankFile(&~comm, ck, epoch, payload) of
+            when Left(left as code: Int32) do
+                return code;
+            when Right(right as file: String) do
+                let code: Int32 := completeCheckpoint(&~comm, ck, epoch, &file);
+                destroyString(file);
+                if code = 0 then
+                    pruneEpochs(asSpan(&(ck->place)), asSpan(&(ck->id)), epoch);
+                end if;
+                return code;
+        end case;
+    end;
+
+    generic [R: Region, P: Region]
+    function checkpointBytes(comm: &![Comm, R], payload: Span[Nat8, P]): Int32 is
+        if (comm->open) > 0 then
+            return failCheckpoint(&~comm, openHandles());
+        end if;
+        let ck: Ckpt := takeCkpt(&~comm);
+        if placeLength(&ck) = 0 then
+            putCkpt(&~comm, ck);
+            return failCheckpoint(&~comm, checkpointFailed());
+        end if;
+        let epoch: Nat64 := epochOf(&ck) + 1;
+        let code: Int32 := runCheckpoint(&~comm, &ck, epoch, payload);
+        if code /= 0 then
+            putCkpt(&~comm, ck);
+            return failCheckpoint(&~comm, code);
+        end if;
+        putCkpt(&~comm, withEpoch(ck, epoch));
+        return 0;
+    end;
+
+    generic [S: Type(Checkpointable), R: Region, Q: Region]
+    function checkpoint(comm: &![Comm, R], state: &[S, Q]): Int32 is
+        let bytes: String := encodeState(state);
+        if length(&bytes) > maxStateBytes() then
+            destroyString(bytes);
+            return failCheckpoint(&~comm, checkpointFailed());
+        end if;
+        let code: Int32 := checkpointBytes(&~comm, asSpan(&bytes));
+        destroyString(bytes);
+        return code;
+    end;
+
+    ---
+    --- Resume
+    ---
+
+    -- What a RESUME frame said: the epoch of its header and its payload.
+    record Heard: Linear is
+        at: Nat64;
+        payload: String;
+    end;
+
+    -- The next RESUME frame of rank source, which has to be one for
+    -- ranks ranks.
+    generic [R: Region]
+    function awaitResume(comm: &![Comm, R], source: Nat32, ranks: Nat32): Either[Int32, Heard] is
+        case awaitCkptRaw(&~comm, source, resumeKind()) of
+            when Left(left as code: Int32) do
+                let failed: Either[Int32, Heard] := Left(left => code);
+                return failed;
+            when Right(right as prefixed: String) do
+                let epoch: Nat64 := epochOfFrame(asSpan(&prefixed));
+                let payload: String := payloadOfFrame(asSpan(&prefixed));
+                destroyString(prefixed);
+                if (not resumeIs(asSpan(&payload))) or (resumeSize(asSpan(&payload)) /= ranks) then
+                    destroyString(payload);
+                    let refused: Either[Int32, Heard] := Left(left => badFrame());
+                    return refused;
+                end if;
+                let heard: Either[Int32, Heard] := Right(right => Heard(at => epoch, payload => payload));
+                return heard;
+        end case;
+    end;
+
+    -- The SHA-256 of a COMMIT file, 32 zero bytes for none.
+    generic [M: Region]
+    function fingerprintOf(commit: &[String, M]): String is
+        if length(commit) > 0 then
+            case digestOf(asSpan(commit)) of
+                when Some(value as digest: String) do
+                    return digest;
+                when None do
+                    skip;
+            end case;
+        end if;
+        return makeString(32, 0);
+    end;
+
+    generic [R: Region, M: Region]
+    function sendResume(comm: &![Comm, R], target: Nat32, epoch: Nat64, status: Nat32, commit: &[String, M]): Int32 is
+        let fingerprint: String := fingerprintOf(commit);
+        let payload: String := resumePayload(comm->ranks, status, asSpan(&fingerprint), asSpan(commit));
+        let code: Int32 := sendCkpt(&~comm, target, resumeKind(), epoch, asSpan(&payload));
+        destroyString(payload);
+        destroyString(fingerprint);
+        return code;
+    end;
+
+    -- Rank 0: the highest epoch among the COMMIT files of all ranks that
+    -- verify, from the ranks' offers and its own.  Gives the epoch and the
+    -- COMMIT file, or sizeMismatch when only files of another size were
+    -- offered, else resumeRefused.
+    generic [R: Region, C: Region, L: Region]
+    function decideEpoch(comm: &![Comm, R], ck: &[Ckpt, C], ownEpoch: Nat64, ownCommit: &[String, L], ownCode: Int32): Either[Int32, Heard] is
+        let ranks: Nat32 := comm->ranks;
+        var chosenEpoch: Nat64 := ownEpoch;
+        var chosen: String := fromSpan(asSpan(ownCommit));
+        var seen: Int32 := ownCode;
+        var code: Int32 := 0;
+        var source: Nat32 := 1;
+        while (code = 0) and (source < ranks) do
+            case awaitResume(&~comm, source, ranks) of
+                when Left(left as why: Int32) do
+                    code := why;
+                when Right(right as heard: Heard) do
+                    let { at: Nat64, payload: String } := heard;
+                    if resumeStatus(asSpan(&payload)) /= 3 then
+                        code := badFrame();
+                    else
+                        let offered: String := resumeCommit(asSpan(&payload));
+                        if length(&offered) > 0 then
+                            let verdict: Int32 := checkCommit(asSpan(&offered), asSpan(&(ck->publicKey)), asSpan(&(ck->id)), at, ranks);
+                            if (verdict = 0) and (at > chosenEpoch) then
+                                chosenEpoch := at;
+                                destroyString(chosen);
+                                chosen := fromSpan(asSpan(&offered));
+                            end if;
+                            if verdict /= 0 then
+                                seen := sharper(seen, verdict);
+                            end if;
+                        end if;
+                        destroyString(offered);
+                    end if;
+                    destroyString(payload);
+            end case;
+            source := source + 1;
+        end while;
+        if code /= 0 then
+            destroyString(chosen);
+            let failed: Either[Int32, Heard] := Left(left => code);
+            return failed;
+        end if;
+        if chosenEpoch = 0 then
+            destroyString(chosen);
+            let none: Either[Int32, Heard] := Left(left => sharper(resumeRefused(), seen));
+            return none;
+        end if;
+        let decided: Either[Int32, Heard] := Right(right => Heard(at => chosenEpoch, payload => chosen));
+        return decided;
+    end;
+
+    -- Gives the epoch and COMMIT file this rank is to resume: rank 0 decides
+    -- and tells the others; the others offer what they hold, then verify
+    -- what rank 0 decided.
+    generic [R: Region, C: Region]
+    function agreeOnEpoch(comm: &![Comm, R], ck: &[Ckpt, C]): Either[Int32, Heard] is
+        let ranks: Nat32 := comm->ranks;
+        var ownEpoch: Nat64 := 0;
+        var ownCommit: String := makeEmpty();
+        var ownCode: Int32 := 0;
+        case bestCommit(asSpan(&(ck->place)), asSpan(&(ck->id)), asSpan(&(ck->publicKey)), ranks) of
+            when Right(right as commit: String) do
+                ownEpoch := commitEpoch(asSpan(&commit));
+                destroyString(ownCommit);
+                ownCommit := commit;
+            when Left(left as why: Int32) do
+                ownCode := why;
+        end case;
+        if (comm->ownRank) = 0 then
+            case decideEpoch(&~comm, ck, ownEpoch, &ownCommit, ownCode) of
+                when Left(left as why: Int32) do
+                    destroyString(ownCommit);
+                    let failed: Either[Int32, Heard] := Left(left => why);
+                    return failed;
+                when Right(right as decided: Heard) do
+                    destroyString(ownCommit);
+                    let { at: Nat64, payload: String } := decided;
+                    var code: Int32 := 0;
+                    if ranks > 1 then
+                        let fingerprint: String := fingerprintOf(&payload);
+                        let message: String := resumePayload(ranks, 0, asSpan(&fingerprint), asSpan(&payload));
+                        code := sendAllAt(&~comm, resumeKind(), at, asSpan(&message));
+                        destroyString(message);
+                        destroyString(fingerprint);
+                    end if;
+                    if code /= 0 then
+                        destroyString(payload);
+                        let failed: Either[Int32, Heard] := Left(left => code);
+                        return failed;
+                    end if;
+                    let told: Either[Int32, Heard] := Right(right => Heard(at => at, payload => payload));
+                    return told;
+            end case;
+        end if;
+        let sent: Int32 := sendResume(&~comm, 0, ownEpoch, 3, &ownCommit);
+        destroyString(ownCommit);
+        if sent /= 0 then
+            let failed: Either[Int32, Heard] := Left(left => sent);
+            return failed;
+        end if;
+        case awaitResume(&~comm, 0, ranks) of
+            when Left(left as why: Int32) do
+                let failed: Either[Int32, Heard] := Left(left => why);
+                return failed;
+            when Right(right as heard: Heard) do
+                let { at: Nat64, payload: String } := heard;
+                let commit: String := resumeCommit(asSpan(&payload));
+                var verdict: Int32 := 0;
+                if (resumeStatus(asSpan(&payload)) /= 0) or (at = 0) then
+                    verdict := badFrame();
+                else
+                    verdict := checkCommit(asSpan(&commit), asSpan(&(ck->publicKey)), asSpan(&(ck->id)), at, ranks);
+                end if;
+                destroyString(payload);
+                if verdict /= 0 then
+                    destroyString(commit);
+                    let refused: Either[Int32, Heard] := Left(left => verdict);
+                    return refused;
+                end if;
+                let agreed: Either[Int32, Heard] := Right(right => Heard(at => at, payload => commit));
+                return agreed;
+        end case;
+    end;
+
+    -- The rank file of rank owner for epoch if it is at path, whole, and
+    -- the COMMIT file lists its SHA-256.  Left resumeRefused when there is
+    -- no file, else the code of the check it failed.
+    generic [C: Region, P: Region, M: Region]
+    function trustedFile(ck: &[Ckpt, C], path: Span[Nat8, P], epoch: Nat64, owner: Nat32, ranks: Nat32, commit: &[String, M]): Either[Int32, String] is
+        case loadFile(path, maxStateBytes() + 80) of
+            when None do
+                return failedWith(resumeRefused());
+            when Some(value as file: String) do
+                let verdict: Int32 := checkRankFile(asSpan(&file), asSpan(&(ck->id)), epoch, owner, ranks);
+                if verdict /= 0 then
+                    destroyString(file);
+                    return failedWith(verdict);
+                end if;
+                case digestOf(asSpan(&file)) of
+                    when None do
+                        destroyString(file);
+                        return failedWith(checkpointFailed());
+                    when Some(value as digest: String) do
+                        let listed: Bool := commitHolds(commit, owner, &digest);
+                        destroyString(digest);
+                        if not listed then
+                            destroyString(file);
+                            return failedWith(digestMismatch());
+                        end if;
+                        let trusted: Either[Int32, String] := Right(right => file);
+                        return trusted;
+                end case;
+        end case;
+    end;
+
+    -- Of two codes the one that says more: sizeMismatch, then badCommit,
+    -- then resumeRefused, then any other.
+    function sharper(first: Int32, second: Int32): Int32 is
+        if (first = sizeMismatch()) or (second = sizeMismatch()) then
+            return sizeMismatch();
+        end if;
+        if (first = badCommit()) or (second = badCommit()) then
+            return badCommit();
+        end if;
+        if (first /= 0) and (first /= resumeRefused()) then
+            return first;
+        end if;
+        if (second /= 0) and (second /= resumeRefused()) then
+            return second;
+        end if;
+        return resumeRefused();
+    end;
+
+    -- The previous rank has told whether it needs its file; if it does,
+    -- sends the copy kept for it or says there is none.
+    generic [R: Region, C: Region, M: Region]
+    function serveNeighbour(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64, commit: &[String, M]): Int32 is
+        let ranks: Nat32 := comm->ranks;
+        let owner: Nat32 := previousOf(comm->ownRank, ranks);
+        case awaitCkpt(&~comm, owner, ckptDataKind(), epoch) of
+            when Left(left as code: Int32) do
+                return code;
+            when Right(right as request: String) do
+                let good: Bool := dataIs(asSpan(&request)) and (dataOwner(asSpan(&request)) = owner);
+                let kind: Nat8 := dataKindOf(asSpan(&request));
+                destroyString(request);
+                if (not good) or ((kind /= 1) and (kind /= 4)) then
+                    return badFrame();
+                end if;
+                if kind = 4 then
+                    return 0;
+                end if;
+                let path: String := rankPath(asSpan(&(ck->place)), asSpan(&(ck->id)), epoch, owner, true);
+                let copy: Either[Int32, String] := trustedFile(ck, asSpan(&path), epoch, owner, ranks, commit);
+                destroyString(path);
+                case copy of
+                    when Right(right as file: String) do
+                        let code: Int32 := sendFileTo(&~comm, owner, 2, owner, epoch, &file);
+                        destroyString(file);
+                        return code;
+                    when Left(left as why: Int32) do
+                        let refusal: String := dataPayload(3, owner, 0, 0, "");
+                        let code: Int32 := sendCkpt(&~comm, owner, ckptDataKind(), epoch, asSpan(&refusal));
+                        destroyString(refusal);
+                        return code;
+                end case;
+        end case;
+    end;
+
+    -- A rank file and whether it had to be fetched from the buddy.
+    record Loaded: Linear is
+        fetched: Bool;
+        file: String;
+    end;
+
+    -- This rank's file for epoch: the one on disk if it holds, else the one
+    -- the next rank keeps as the buddy copy.  Every rank tells the next one
+    -- whether it needs its copy and serves the previous one, so ranks that
+    -- miss nothing take part too.
+    generic [R: Region, C: Region, M: Region]
+    function ownFile(comm: &![Comm, R], ck: &[Ckpt, C], epoch: Nat64, commit: &[String, M]): Either[Int32, Loaded] is
+        let me: Nat32 := comm->ownRank;
+        let ranks: Nat32 := comm->ranks;
+        let path: String := rankPath(asSpan(&(ck->place)), asSpan(&(ck->id)), epoch, me, false);
+        let local: Either[Int32, String] := trustedFile(ck, asSpan(&path), epoch, me, ranks, commit);
+        var have: String := makeEmpty();
+        var needed: Bool := true;
+        var why: Int32 := resumeRefused();
+        case local of
+            when Right(right as file: String) do
+                destroyString(have);
+                have := file;
+                needed := false;
+            when Left(left as code: Int32) do
+                why := code;
+        end case;
+        if ranks = 1 then
+            destroyString(path);
+            if needed then
+                destroyString(have);
+                let lost: Either[Int32, Loaded] := Left(left => why);
+                return lost;
+            end if;
+            let alone: Either[Int32, Loaded] := Right(right => Loaded(fetched => false, file => have));
+            return alone;
+        end if;
+        var kind: Nat8 := 4;
+        if needed then
+            kind := 1;
+        end if;
+        let buddy: Nat32 := nextOf(me, ranks);
+        let request: String := dataPayload(kind, me, 0, 0, "");
+        var code: Int32 := sendCkpt(&~comm, buddy, ckptDataKind(), epoch, asSpan(&request));
+        destroyString(request);
+        if code = 0 then
+            code := serveNeighbour(&~comm, ck, epoch, commit);
+        end if;
+        if (code = 0) and needed then
+            case receiveFileFrom(&~comm, buddy, 2, true, me, epoch) of
+                when Left(left as refusal: Int32) do
+                    code := sharper(why, refusal);
+                when Right(right as fetched: String) do
+                    code := checkRankFile(asSpan(&fetched), asSpan(&(ck->id)), epoch, me, ranks);
+                    if code = 0 then
+                        case digestOf(asSpan(&fetched)) of
+                            when None do
+                                code := checkpointFailed();
+                            when Some(value as digest: String) do
+                                if not commitHolds(commit, me, &digest) then
+                                    code := digestMismatch();
+                                end if;
+                                destroyString(digest);
+                        end case;
+                    end if;
+                    if (code = 0) and (not storeFile(asSpan(&path), asSpan(&fetched))) then
+                        code := checkpointFailed();
+                    end if;
+                    destroyString(have);
+                    have := fetched;
+            end case;
+        end if;
+        destroyString(path);
+        if code /= 0 then
+            destroyString(have);
+            let failed: Either[Int32, Loaded] := Left(left => code);
+            return failed;
+        end if;
+        let ready: Either[Int32, Loaded] := Right(right => Loaded(fetched => needed, file => have));
+        return ready;
+    end;
+
+    -- Rank 0 hears from every rank that its state is loaded and then tells
+    -- them all to go on; another rank tells rank 0 and waits for the word.
+    generic [R: Region, M: Region]
+    function confirmResume(comm: &![Comm, R], epoch: Nat64, fetched: Bool, commit: &[String, M]): Int32 is
+        let ranks: Nat32 := comm->ranks;
+        if ranks = 1 then
+            return 0;
+        end if;
+        if (comm->ownRank) /= 0 then
+            var status: Nat32 := 0;
+            if fetched then
+                status := 1;
+            end if;
+            let sent: Int32 := sendResume(&~comm, 0, epoch, status, commit);
+            if sent /= 0 then
+                return sent;
+            end if;
+            case awaitResume(&~comm, 0, ranks) of
+                when Left(left as code: Int32) do
+                    return code;
+                when Right(right as heard: Heard) do
+                    let { at: Nat64, payload: String } := heard;
+                    let good: Bool := (at = epoch) and (resumeStatus(asSpan(&payload)) = 0);
+                    destroyString(payload);
+                    if not good then
+                        return badFrame();
+                    end if;
+                    return 0;
+            end case;
+        end if;
+        var source: Nat32 := 1;
+        while source < ranks do
+            case awaitResume(&~comm, source, ranks) of
+                when Left(left as code: Int32) do
+                    return code;
+                when Right(right as heard: Heard) do
+                    let { at: Nat64, payload: String } := heard;
+                    let status: Nat32 := resumeStatus(asSpan(&payload));
+                    destroyString(payload);
+                    if (at /= epoch) or (status > 1) then
+                        return resumeRefused();
+                    end if;
+            end case;
+            source := source + 1;
+        end while;
+        let fingerprint: String := fingerprintOf(commit);
+        let message: String := resumePayload(ranks, 0, asSpan(&fingerprint), "");
+        let told: Int32 := sendAllAt(&~comm, resumeKind(), epoch, asSpan(&message));
+        destroyString(message);
+        destroyString(fingerprint);
+        return told;
+    end;
+
+    -- The state of the last COMMIT all ranks agree on, with ck taken out of
+    -- the comm.  Gives the epoch and the payload of this rank's file.
+    generic [R: Region, C: Region]
+    function runResume(comm: &![Comm, R], ck: &[Ckpt, C]): Either[Int32, Heard] is
+        case agreeOnEpoch(&~comm, ck) of
+            when Left(left as code: Int32) do
+                let failed: Either[Int32, Heard] := Left(left => code);
+                return failed;
+            when Right(right as agreed: Heard) do
+                let { at: Nat64, payload: String } := agreed;
+                let path: String := commitPath(asSpan(&(ck->place)), asSpan(&(ck->id)), at);
+                let ready: Bool := prepareEpoch(asSpan(&(ck->place)), asSpan(&(ck->id)), at) and storeFile(asSpan(&path), asSpan(&payload));
+                destroyString(path);
+                if not ready then
+                    destroyString(payload);
+                    let failed: Either[Int32, Heard] := Left(left => checkpointFailed());
+                    return failed;
+                end if;
+                case ownFile(&~comm, ck, at, &payload) of
+                    when Left(left as code: Int32) do
+                        destroyString(payload);
+                        let failed: Either[Int32, Heard] := Left(left => code);
+                        return failed;
+                    when Right(right as loaded: Loaded) do
+                        let { fetched: Bool, file: String } := loaded;
+                        let code: Int32 := confirmResume(&~comm, at, fetched, &payload);
+                        destroyString(payload);
+                        if code /= 0 then
+                            destroyString(file);
+                            let failed: Either[Int32, Heard] := Left(left => code);
+                            return failed;
+                        end if;
+                        let state: String := rankFilePayload(asSpan(&file));
+                        destroyString(file);
+                        let resumed: Either[Int32, Heard] := Right(right => Heard(at => at, payload => state));
+                        return resumed;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region]
+    function resumeBytes(comm: &![Comm, R]): Either[Int32, String] is
+        if (comm->open) > 0 then
+            return failedWith(failCheckpoint(&~comm, openHandles()));
+        end if;
+        let ck: Ckpt := takeCkpt(&~comm);
+        if placeLength(&ck) = 0 then
+            putCkpt(&~comm, ck);
+            return failedWith(failCheckpoint(&~comm, checkpointFailed()));
+        end if;
+        case runResume(&~comm, &ck) of
+            when Left(left as code: Int32) do
+                putCkpt(&~comm, ck);
+                return failedWith(failCheckpoint(&~comm, code));
+            when Right(right as resumed: Heard) do
+                let { at: Nat64, payload: String } := resumed;
+                putCkpt(&~comm, withEpoch(ck, at));
+                let state: Either[Int32, String] := Right(right => payload);
+                return state;
+        end case;
+    end;
+
+    generic [S: Type(Checkpointable), R: Region]
+    function resume(comm: &![Comm, R]): Either[Int32, S] is
+        case resumeBytes(&~comm) of
+            when Left(left as code: Int32) do
+                let failed: Either[Int32, S] := Left(left => code);
+                return failed;
+            when Right(right as bytes: String) do
+                let decoded: Option[S] := decodeState(asSpan(&bytes));
+                destroyString(bytes);
+                case decoded of
+                    when Some(value as state: S) do
+                        let restored: Either[Int32, S] := Right(right => state);
+                        return restored;
+                    when None do
+                        let failed: Either[Int32, S] := Left(left => failCheckpoint(&~comm, badCheckpointFile()));
+                        return failed;
+                end case;
+        end case;
+    end;
+
+    function finish(comm: Comm): Unit is
+        let { ownRank: Nat32, ranks: Nat32, peers: Buffer[Option[Peer]], beat: Nat64, calls: Nat64, ck: Buffer[Ckpt], open: Nat64 } := comm;
+        var rest: Buffer[Ckpt] := ck;
+        while count(&rest) > 0 do
+            let { id: String, publicKey: String, signers: Buffer[CompositeKey], place: String, epoch: Nat64 } := removeLast(&!rest);
+            destroyString(id);
+            destroyString(publicKey);
+            destroyString(place);
+            destroySigners(signers);
+        end while;
+        destroyEmpty(rest);
+        closePeers(peers);
+        return nil;
+    end;
+end module body.

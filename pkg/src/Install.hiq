@@ -1,0 +1,360 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nthRef,
+    insertBack
+);
+import Standard.Text (
+    equal,
+    endsWith,
+    contains,
+    substring
+);
+import Standard.Failure (
+    Failure,
+    destroyFailure
+);
+import Standard.FileHelpers (
+    copyFile
+);
+import Standard.Platform (
+    systemName
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf,
+    destroyProblem
+);
+import Pkg.Manifest (
+    Manifest,
+    readManifest,
+    nameOf,
+    destroyManifest
+);
+import Pkg.Files (
+    readText,
+    isThere,
+    isDirectory,
+    joinPath,
+    makeDirectories,
+    directoryNames
+);
+import Pkg.Tree (
+    copyTree,
+    removeTree
+);
+import Pkg.Process (
+    Ran,
+    runProgram
+);
+import Pkg.Get (
+    Got
+);
+
+module body Pkg.Install is
+    function gotWith(problem: Problem): Got is
+        var problems: Buffer[Problem] := allocateEmpty();
+        insertBack(&!problems, problem);
+        return Got(count => 0, summary => makeEmpty(), problems => problems);
+    end;
+
+    generic [A: Region, B: Region, C: Region]
+    function said(a: Span[Nat8, A], b: Span[Nat8, B], c: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        writeString(&!out, c);
+        return finalize(out);
+    end;
+
+    generic [N: Region]
+    function lowerOf(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(name) do
+            let byte: Nat8 := name[i];
+            if byte = '.' then
+                writeByte(&!out, '-');
+            else if (byte >= 'A') and (byte <= 'Z') then
+                writeByte(&!out, byte + 32);
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [N: Region]
+    function lastOf(name: Span[Nat8, N]): Span[Nat8, N] is
+        var at: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(name) do
+            if name[i] = '.' then
+                at := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return substring(name, at, spanLength(name));
+    end;
+
+    generic [S: Region, T: Region]
+    function copyOne(source: Span[Nat8, S], target: Span[Nat8, T]): Bool is
+        case copyFile(source, target) of
+            when Right(right as done: Unit) do
+                return true;
+            when Left(left as failure: Failure) do
+                destroyFailure(failure);
+                return false;
+        end case;
+    end;
+
+    generic [M: Region, S: Region]
+    function installPages(mandir: Span[Nat8, M], section: Span[Nat8, S]): Either[Problem, Index] is
+        let source: String := said("man/", section, "");
+        if not isDirectory(asSpan(&source)) then
+            destroyString(source);
+            return Right(right => 0);
+        end if;
+        let target: String := said(mandir, "/", section);
+        if not makeDirectories(asSpan(&target)) then
+            let p: Problem := problemOf(1519, said("the directory cannot be made: ", asSpan(&target), ""), fromLiteral("check that the staging tree may be written"));
+            destroyString(target);
+            destroyString(source);
+            return Left(left => p);
+        end if;
+        case directoryNames(asSpan(&source)) of
+            when Some(value as names: Buffer[String]) do
+                let copied: Either[Problem, Index] := copyNames(asSpan(&source), asSpan(&target), &names);
+                destroyArguments(names);
+                destroyString(target);
+                destroyString(source);
+                return copied;
+            when None do
+                destroyString(target);
+                destroyString(source);
+                return Right(right => 0);
+        end case;
+    end;
+
+    generic [S: Region, T: Region, N: Region]
+    function copyNames(source: Span[Nat8, S], target: Span[Nat8, T], names: &[Buffer[String], N]): Either[Problem, Index] is
+        var count: Index := 0;
+        var i: Index := 0;
+        while i < bufferLength(names) do
+            let name: Span[Nat8, N] := asSpan(nthRef(names, i));
+            let a: String := joinPath(source, name);
+            let b: String := joinPath(target, name);
+            let good: Bool := copyOne(asSpan(&a), asSpan(&b));
+            destroyString(a);
+            if not good then
+                let p: Problem := problemOf(1519, said("a file cannot be installed: ", asSpan(&b), ""), fromLiteral("check that the staging tree may be written"));
+                destroyString(b);
+                return Left(left => p);
+            end if;
+            destroyString(b);
+            count := count + 1;
+            i := i + 1;
+        end while;
+        return Right(right => count);
+    end;
+
+    generic [B: Region, C: Region, N: Region, L: Region]
+    function buildProgramme(base: Span[Nat8, B], compiler: Span[Nat8, C], name: Span[Nat8, N], lower: Span[Nat8, L]): Option[Problem] is
+        let bin: String := joinPath(base, "bin");
+        if not makeDirectories(asSpan(&bin)) then
+            let p: Problem := problemOf(1519, said("the directory cannot be made: ", asSpan(&bin), ""), fromLiteral("check that the staging tree may be written"));
+            destroyString(bin);
+            return Some(value => p);
+        end if;
+        let last: Span[Nat8, N] := lastOf(name);
+        var words: Buffer[String] := allocateEmpty();
+        insertBack(&!words, fromLiteral("compile"));
+        var pair: StringBuilder := makeStringBuilder();
+        writeString(&!pair, "src/");
+        writeString(&!pair, last);
+        writeString(&!pair, ".hih,src/");
+        writeString(&!pair, last);
+        writeString(&!pair, ".hiq");
+        insertBack(&!words, finalize(pair));
+        insertBack(&!words, said("--entrypoint=", name, ":main"));
+        let output: String := joinPath(asSpan(&bin), lower);
+        insertBack(&!words, said("--output=", asSpan(&output), ""));
+        destroyString(output);
+        destroyString(bin);
+        let ran: Either[Problem, Ran] := runProgram(compiler, &words);
+        destroyArguments(words);
+        case ran of
+            when Right(right as r: Ran) do
+                let { exitCode: Int32, output as out: String, errors: String } := r;
+                destroyString(out);
+                if exitCode /= 0 then
+                    let p: Problem := problemOf(1532, said("the programme did not build: ", asSpan(&errors), ""), fromLiteral("run hilde check over src"));
+                    destroyString(errors);
+                    return Some(value => p);
+                end if;
+                destroyString(errors);
+                return None();
+            when Left(left as p: Problem) do
+                return Some(value => p);
+        end case;
+    end;
+
+    generic [R: Region, P: Region, D: Region, C: Region, M: Region]
+    function installWith(root: Span[Nat8, R], prefix: Span[Nat8, P], destdir: Span[Nat8, D], compiler: Span[Nat8, C], manifest: &[Manifest, M]): Got is
+        let name: Span[Nat8, M] := nameOf(manifest);
+        let lower: String := lowerOf(name);
+        let base: String := said(destdir, prefix, "");
+        var count: Index := 0;
+        -- A programme or a library.
+        let mainPath: String := said("src/", lastOf(name), ".hih");
+        var programme: Bool := false;
+        case readText(asSpan(&mainPath)) of
+            when Some(value as text: String) do
+                programme := contains(asSpan(&text), "function main(");
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        destroyString(mainPath);
+        if programme then
+            case buildProgramme(asSpan(&base), compiler, name, asSpan(&lower)) of
+                when Some(value as p: Problem) do
+                    destroyString(lower);
+                    destroyString(base);
+                    return gotWith(p);
+                when None do
+                    count := count + 1;
+            end case;
+        else
+            let share: String := said(asSpan(&base), "/share/hilde/", name);
+            let parent: String := said(asSpan(&base), "/share/hilde", "");
+            let made: Bool := makeDirectories(asSpan(&parent));
+            destroyString(parent);
+            case removeTree(asSpan(&share)) of
+                when Right(right as done: Unit) do
+                    skip;
+                when Left(left as p: Problem) do
+                    destroyProblem(p);
+            end case;
+            case copyTree(root, asSpan(&share)) of
+                when Right(right as done: Unit) do
+                    count := count + 1;
+                when Left(left as p: Problem) do
+                    destroyString(share);
+                    destroyString(lower);
+                    destroyString(base);
+                    return gotWith(p);
+            end case;
+            destroyString(share);
+        end if;
+        -- Manual pages: share/man, but on OpenBSD below another prefix than /usr
+        -- they go to man, where its man(1) looks for the pages of packages.
+        var mandir: String := said(asSpan(&base), "/share/man", "");
+        if equal(systemName(), "openbsd") and (not equal(prefix, "/usr")) then
+            destroyString(mandir);
+            mandir := said(asSpan(&base), "/man", "");
+        end if;
+        case installPages(asSpan(&mandir), "man1") of
+            when Right(right as n: Index) do
+                count := count + n;
+            when Left(left as p: Problem) do
+                destroyString(mandir);
+                destroyString(lower);
+                destroyString(base);
+                return gotWith(p);
+        end case;
+        case installPages(asSpan(&mandir), "man3") of
+            when Right(right as n: Index) do
+                count := count + n;
+            when Left(left as p: Problem) do
+                destroyString(mandir);
+                destroyString(lower);
+                destroyString(base);
+                return gotWith(p);
+        end case;
+        destroyString(mandir);
+        -- Licence and changelog.
+        let docdir: String := said(asSpan(&base), "/share/doc/", asSpan(&lower));
+        var good: Bool := makeDirectories(asSpan(&docdir));
+        if isThere("LICENSE") then
+            let target: String := joinPath(asSpan(&docdir), "LICENSE");
+            good := good and copyOne("LICENSE", asSpan(&target));
+            destroyString(target);
+            count := count + 1;
+        end if;
+        if isThere("CHANGELOG") then
+            let target: String := joinPath(asSpan(&docdir), "CHANGELOG");
+            good := good and copyOne("CHANGELOG", asSpan(&target));
+            destroyString(target);
+            count := count + 1;
+        end if;
+        destroyString(docdir);
+        if not good then
+            destroyString(lower);
+            destroyString(base);
+            return gotWith(problemOf(1519, fromLiteral("the licence or the changelog cannot be installed"), fromLiteral("check that the staging tree may be written")));
+        end if;
+        var line: StringBuilder := makeStringBuilder();
+        writeString(&!line, "hilde install: ");
+        writeString(&!line, asSpan(&lower));
+        writeString(&!line, " into ");
+        writeString(&!line, asSpan(&base));
+        let summary: String := finalize(line);
+        destroyString(lower);
+        destroyString(base);
+        return Got(count => count, summary => summary, problems => allocateEmpty());
+    end;
+
+    generic [R: Region, P: Region, D: Region, C: Region]
+    function installPackage(root: Span[Nat8, R], prefix: Span[Nat8, P], destdir: Span[Nat8, D], compiler: Span[Nat8, C]): Got is
+        if (spanLength(prefix) = 0) or (prefix[0] /= '/') then
+            return gotWith(problemOf(1505, said("the prefix must be an absolute path, not ", prefix, ""), fromLiteral("such as --prefix=/usr/local")));
+        end if;
+        let path: String := joinPath(root, "hilde.toml");
+        let text: Option[String] := readText(asSpan(&path));
+        destroyString(path);
+        case text of
+            when Some(value as toml: String) do
+                let read: Either[Problem, Manifest] := readManifest(asSpan(&toml));
+                destroyString(toml);
+                case read of
+                    when Right(right as manifest: Manifest) do
+                        let done: Got := installWith(root, prefix, destdir, compiler, &manifest);
+                        destroyManifest(manifest);
+                        return done;
+                    when Left(left as p: Problem) do
+                        return gotWith(p);
+                end case;
+            when None do
+                return gotWith(problemOf(1501, fromLiteral("no hilde.toml here"), fromLiteral("run hilde install in the directory of the package")));
+        end case;
+    end;
+end module body.

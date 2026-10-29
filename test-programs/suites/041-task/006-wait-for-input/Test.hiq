@@ -1,0 +1,116 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    closeFile,
+    readAll,
+    Command,
+    makeCommand,
+    addArgument,
+    Process,
+    Running,
+    spawnProcess,
+    waitProcess,
+    exitCode
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    waitReadable
+);
+
+module body Test is
+    -- Wait until the descriptor has something, then read it to the end and
+    -- give back how many bytes came.  While this task is parked on the
+    -- descriptor, other tasks run.
+    function reader(file: FileDescriptor): Int32 is
+        var input: FileDescriptor := file;
+        var count: Int32 := -1;
+        if waitReadable(&input) then
+            printLn(20);
+            case readAll(&!input) of
+                when Some(value as got: String) do
+                    count := 0;
+                    let size: Index := length(&got);
+                    if size > 0 then
+                        for i from 0 to size - 1 do
+                            if nthByte(&got, i) /= 0 then
+                                count := count + 1;
+                            end if;
+                        end for;
+                    end if;
+                    destroyString(got);
+                when None do
+                    count := -2;
+            end case;
+        end if;
+        closeFile(input);
+        return count;
+    end;
+
+    function other(tag: Int32): Int32 is
+        printLn(tag);
+        return tag;
+    end;
+
+    function main(): ExitCode is
+        -- A child that writes three bytes after a second: until then the
+        -- reader is parked, the other task runs, and then nothing can run
+        -- and the scheduler waits in poll(2) for the pipe.
+        var sh: String := fromLiteral("/bin/sh");
+        var dashC: String := fromLiteral("-c");
+        var script: String := fromLiteral("sleep 1; printf abc");
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&sh)), asSpan(&dashC)), asSpan(&script));
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                case openScope() of
+                    when Some(value as opened: Scope) do
+                        var scope: Scope := opened;
+                        let readWork: Fn[FileDescriptor, Int32] := reader;
+                        let otherWork: Fn[Int32, Int32] := other;
+                        case spawn(&!scope, readWork, output) of
+                            when Right(right as readTask: Task[Int32]) do
+                                case spawn(&!scope, otherWork, 10) of
+                                    when Right(right as otherTask: Task[Int32]) do
+                                        -- 10 before 20: the reader was
+                                        -- started first and printed nothing
+                                        -- until the child wrote.
+                                        printLn(join(readTask));
+                                        printLn(join(otherTask));
+                                    when Left(left as unused: Int32) do
+                                        printLn(join(readTask));
+                                        printLn(-1);
+                                end case;
+                            when Left(left as unusedFile: FileDescriptor) do
+                                closeFile(unusedFile);
+                                printLn(-1);
+                        end case;
+                        closeScope(scope);
+                    when None do
+                        closeFile(output);
+                        printLn(-2);
+                end case;
+                closeFile(errors);
+                printLn(exitCode(waitProcess(process)));
+            when None do
+                printLn(-3);
+        end case;
+        destroyString(sh);
+        destroyString(dashC);
+        destroyString(script);
+        return ExitSuccess();
+    end;
+end module body.

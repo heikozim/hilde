@@ -1,0 +1,135 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The C functions called here are written into the programme by the
+-- compiler, which does so because this module is compiled.  They read and
+-- write buffers of the fixed sizes of FIPS 204, so every span is held to
+-- its size before its address goes to C.  Results come out through
+-- buffers allocated here and copied into a String; a buffer that held a
+-- secret is wiped before it is given back.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    allocateBuffer
+);
+import Standard.String (
+    String,
+    makeString,
+    storeNth
+);
+
+module body Bindings.MlDsa is
+    constant seedBytes: Index := 32;
+    constant randomnessBytes: Index := 32;
+    constant contextMost: Index := 255;
+
+    record KeyBytes: Linear is
+        public: String;
+        secret: String;
+    end;
+
+    function publicBytes(level: Int32): Index is
+        return @embed(Index, "hilde_mldsa_public_bytes($1)", level);
+    end;
+
+    function secretBytes(level: Int32): Index is
+        return @embed(Index, "hilde_mldsa_secret_bytes($1)", level);
+    end;
+
+    function signatureBytes(level: Int32): Index is
+        return @embed(Index, "hilde_mldsa_signature_bytes($1)", level);
+    end;
+
+    generic [R: Region]
+    function bytesOf(value: Span[Nat8, R]): Address[Nat8] is
+        if spanLength(value) = 0 then
+            return @embed(Address[Nat8], "(hilde_nat8_t*)\"\"");
+        end if;
+        return @embed(Address[Nat8], "(hilde_nat8_t*)($1).data", value);
+    end;
+
+    function allocated(count: Index): Address[Nat8] is
+        let address: Address[Nat8] := allocateBuffer(count + 1);
+        if @embed(Bool, "(($1) == NULL)", address) then
+            abort("Bindings.MlDsa: out of memory");
+        end if;
+        return address;
+    end;
+
+    function copied(address: Address[Nat8], size: Index): String is
+        var out: String := makeString(size, 0);
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!out, i, @embed(Nat8, "($1)[$2]", address, i));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    function wipedAndFreed(address: Address[Nat8], size: Index): Unit is
+        @embed(Unit, "hilde_wipe($1, $2)", address, size);
+        @embed(Unit, "hilde_free($1)", address);
+        return nil;
+    end;
+
+    generic [S: Region]
+    function keypair(level: Int32, seed: Span[Nat8, S]): Option[KeyBytes] is
+        let publicSize: Index := publicBytes(level);
+        let secretSize: Index := secretBytes(level);
+        if (publicSize = 0) or (spanLength(seed) /= seedBytes) then
+            let none: Option[KeyBytes] := None();
+            return none;
+        end if;
+        let public: Address[Nat8] := allocated(publicSize);
+        let secret: Address[Nat8] := allocated(secretSize);
+        let made: Int32 := @embed(Int32, "hilde_mldsa_keypair($1, $2, $3, $4)", level, bytesOf(seed), public, secret);
+        if made /= 1 then
+            wipedAndFreed(public, publicSize);
+            wipedAndFreed(secret, secretSize);
+            let none: Option[KeyBytes] := None();
+            return none;
+        end if;
+        let pair: KeyBytes := KeyBytes(public => copied(public, publicSize), secret => copied(secret, secretSize));
+        wipedAndFreed(public, publicSize);
+        wipedAndFreed(secret, secretSize);
+        let some: Option[KeyBytes] := Some(value => pair);
+        return some;
+    end;
+
+    generic [K: Region, M: Region, C: Region, N: Region]
+    function sign(level: Int32, secret: Span[Nat8, K], message: Span[Nat8, M], context: Span[Nat8, C], randomness: Span[Nat8, N]): Option[String] is
+        let size: Index := signatureBytes(level);
+        let fits: Bool := (((size /= 0) and (spanLength(secret) = secretBytes(level))) and (spanLength(context) <= contextMost)) and (spanLength(randomness) = randomnessBytes);
+        if not fits then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let out: Address[Nat8] := allocated(size);
+        let signed: Int32 := @embed(Int32, "hilde_mldsa_sign($1, $2, $3, $4, $5, $6, $7, $8)", level, bytesOf(secret), bytesOf(message), spanLength(message), bytesOf(context), spanLength(context), bytesOf(randomness), out);
+        if signed /= 1 then
+            wipedAndFreed(out, size);
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let signature: String := copied(out, size);
+        wipedAndFreed(out, size);
+        let some: Option[String] := Some(value => signature);
+        return some;
+    end;
+
+    generic [P: Region, M: Region, C: Region, G: Region]
+    function verify(level: Int32, public: Span[Nat8, P], message: Span[Nat8, M], context: Span[Nat8, C], signature: Span[Nat8, G]): Bool is
+        let size: Index := publicBytes(level);
+        let fits: Bool := (((size /= 0) and (spanLength(public) = size)) and (spanLength(context) <= contextMost)) and (spanLength(signature) = signatureBytes(level));
+        if not fits then
+            return false;
+        end if;
+        return @embed(Int32, "hilde_mldsa_verify($1, $2, $3, $4, $5, $6, $7)", level, bytesOf(public), bytesOf(message), spanLength(message), bytesOf(context), spanLength(context), bytesOf(signature)) = 1;
+    end;
+end module body.

@@ -1,0 +1,614 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: it reads bytes through spans and binds no C.  Reading
+-- recurses once per level of nesting and stops at mostDepth, so the stack
+-- it takes is bounded.  The document keeps the bytes of its item; the
+-- functions that look into it walk them again from the item's place.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.Text (
+    substring,
+    equal
+);
+import Standard.Utf8 (
+    isValid
+);
+
+module body Standard.Cbor is
+    constant mostDepth: Index := 16;
+    constant mostEntries: Index := 256;
+
+    record Cbor: Linear is
+        bytes: String;
+        invariant length(&bytes) > 0;
+    end;
+
+    record CborItem: Free is
+        at: Index;
+    end;
+
+    -- The first byte of an item split into its major type and additional
+    -- value, the number or length the head carries, and the place after it.
+    record Head: Free is
+        major: Nat8;
+        info: Nat8;
+        argument: Nat64;
+        next: Index;
+    end;
+
+    constant zeroNat: Nat64 := 0;
+    constant noIndex: Index := 0;
+
+    ---
+    --- Small pieces
+    ---
+
+    function natOf(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    function natOfIndex(at: Index): Nat64 is
+        case toNat64(at) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                abort("Standard.Cbor: an index did not fit a Nat64");
+        end case;
+    end;
+
+    -- Only called for a number that was held to the length of a span.
+    function indexOfNat(wide: Nat64): Index is
+        case toIndex(wide) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.Cbor: a number did not fit an Index");
+        end case;
+    end;
+
+    function stop(fault: CborFault, at: Index): Either[CborError, Index] is
+        return Left(left => CborError(fault => fault, offset => at));
+    end;
+
+    function stopHead(fault: CborFault, at: Index): Either[CborError, Head] is
+        return Left(left => CborError(fault => fault, offset => at));
+    end;
+
+    function noItem(): Option[CborItem] is
+        let none: Option[CborItem] := None();
+        return none;
+    end;
+
+    function someItem(at: Index): Option[CborItem] is
+        let some: Option[CborItem] := Some(value => CborItem(at => at));
+        return some;
+    end;
+
+    function noString(): Option[String] is
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    -- Whether value needed the width that info gives it: one byte from 24
+    -- on, two from 256, four from 65536, eight above four bytes.
+    function shortest(info: Nat8, value: Nat64): Bool is
+        if info = 24 then
+            return value >= 24;
+        end if;
+        if info = 25 then
+            return value >= 256;
+        end if;
+        if info = 26 then
+            return value >= 65536;
+        end if;
+        return value >= 4294967296;
+    end;
+
+    -- The head at at.  The additional values 24 to 27 take one, two, four
+    -- or eight bytes after the first, the most significant first.  For
+    -- major type 7 those bytes are a simple value or a float, not a
+    -- number, and no shortest form is asked of them.
+    generic [R: Region]
+    function readHead(data: Span[Nat8, R], at: Index): Either[CborError, Head] is
+        let size: Index := spanLength(data);
+        if at >= size then
+            return stopHead(Truncated(), at);
+        end if;
+        let first: Nat8 := data[at];
+        let major: Nat8 := first / 32;
+        let info: Nat8 := first - (major * 32);
+        if info < 24 then
+            return Right(right => Head(major => major, info => info, argument => natOf(info), next => at + 1));
+        end if;
+        if info = 31 then
+            return stopHead(Indefinite(), at);
+        end if;
+        if info > 27 then
+            return stopHead(Malformed(), at);
+        end if;
+        var width: Index := 1;
+        if info = 25 then
+            width := 2;
+        else if info = 26 then
+            width := 4;
+        else if info = 27 then
+            width := 8;
+        end if;
+        if (size - (at + 1)) < width then
+            return stopHead(Truncated(), at);
+        end if;
+        var value: Nat64 := 0;
+        for i from 1 to width do
+            value := (value * 256) + natOf(data[at + i]);
+        end for;
+        if (major /= 7) and (not shortest(info, value)) then
+            return stopHead(NotShortest(), at);
+        end if;
+        return Right(right => Head(major => major, info => info, argument => value, next => (at + 1) + width));
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    -- Checks the item at at and gives the place after it.  depth is the
+    -- number of arrays and maps around it.
+    generic [R: Region]
+    function skipItem(data: Span[Nat8, R], at: Index, depth: Index): Either[CborError, Index] is
+        let head: Head := readHead(data, at)?;
+        let size: Index := spanLength(data);
+        let rest: Nat64 := natOfIndex(size - head.next);
+        if head.major <= 1 then
+            return Right(right => head.next);
+        end if;
+        if head.major <= 3 then
+            if head.argument > rest then
+                return stop(Truncated(), at);
+            end if;
+            let finish: Index := head.next + indexOfNat(head.argument);
+            if (head.major = 3) and (not isValid(substring(data, head.next, finish))) then
+                return stop(BadText(), at);
+            end if;
+            return Right(right => finish);
+        end if;
+        if head.major = 6 then
+            return stop(Tagged(), at);
+        end if;
+        if head.major = 7 then
+            if ((head.info >= 20) and (head.info <= 23)) or ((head.info >= 25) and (head.info <= 27)) then
+                return Right(right => head.next);
+            end if;
+            return stop(UnknownSimple(), at);
+        end if;
+        if depth >= mostDepth then
+            return stop(TooDeep(), at);
+        end if;
+        -- Each item takes a byte at least, so a count above the bytes left
+        -- is refused before the loop.
+        if head.major = 4 then
+            if head.argument > rest then
+                return stop(Truncated(), at);
+            end if;
+            let count: Index := indexOfNat(head.argument);
+            var place: Index := head.next;
+            var i: Index := 0;
+            while i < count do
+                let after: Index := skipItem(data, place, depth + 1)?;
+                place := after;
+                i := i + 1;
+            end while;
+            return Right(right => place);
+        end if;
+        if head.argument > natOfIndex(mostEntries) then
+            return stop(TooLarge(), at);
+        end if;
+        let pairs: Index := indexOfNat(head.argument);
+        if (pairs * 2) > (size - head.next) then
+            return stop(Truncated(), at);
+        end if;
+        var cursor: Index := head.next;
+        var j: Index := 0;
+        while j < pairs do
+            let keyEnd: Index := skipItem(data, cursor, depth + 1)?;
+            if seenBefore(data, head.next, j, substring(data, cursor, keyEnd)) then
+                return stop(DuplicateKey(), cursor);
+            end if;
+            let valueEnd: Index := skipItem(data, keyEnd, depth + 1)?;
+            cursor := valueEnd;
+            j := j + 1;
+        end while;
+        return Right(right => cursor);
+    end;
+
+    -- Whether one of the first count keys of the map whose pairs begin at
+    -- first is key, byte for byte.  The pairs were checked already.
+    generic [R: Region, S: Region]
+    function seenBefore(data: Span[Nat8, R], first: Index, count: Index, key: Span[Nat8, S]): Bool is
+        var place: Index := first;
+        var i: Index := 0;
+        while i < count do
+            let keyEnd: Index := endOf(data, place, 0);
+            if equal(substring(data, place, keyEnd), key) then
+                return true;
+            end if;
+            place := endOf(data, keyEnd, 0);
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- Where the item at at ends, for bytes skipItem has checked.  It holds
+    -- every length to the bytes and its own depth to mostDepth, so bytes
+    -- it cannot make sense of end at the length and never run deep.
+    generic [R: Region]
+    function endOf(data: Span[Nat8, R], at: Index, depth: Index): Index is
+        let size: Index := spanLength(data);
+        if depth > mostDepth then
+            return size;
+        end if;
+        case readHead(data, at) of
+            when Left(left as unused: CborError) do
+                return size;
+            when Right(right as head: Head) do
+                if (head.major <= 1) or (head.major >= 6) then
+                    return head.next;
+                end if;
+                let rest: Nat64 := natOfIndex(size - head.next);
+                if head.argument > rest then
+                    return size;
+                end if;
+                let count: Index := indexOfNat(head.argument);
+                if head.major <= 3 then
+                    return head.next + count;
+                end if;
+                var items: Index := count;
+                if head.major = 5 then
+                    items := count * 2;
+                end if;
+                var place: Index := head.next;
+                var i: Index := 0;
+                while (i < items) and (place < size) do
+                    place := endOf(data, place, depth + 1);
+                    i := i + 1;
+                end while;
+                return place;
+        end case;
+    end;
+
+    generic [R: Region]
+    function readCbor(data: Span[Nat8, R]): Either[CborError, Cbor] is
+        let finish: Index := skipItem(data, 0, 0)?;
+        if finish /= spanLength(data) then
+            return Left(left => CborError(fault => Trailing(), offset => finish));
+        end if;
+        return Right(right => Cbor(bytes => fromSpan(data)));
+    end;
+
+    generic [R: Region]
+    function readCborPrefix(data: Span[Nat8, R]): Either[CborError, Cbor] is
+        let finish: Index := skipItem(data, 0, 0)?;
+        return Right(right => Cbor(bytes => fromSpan(substring(data, 0, finish))));
+    end;
+
+    function destroyCbor(document: Cbor): Unit is
+        let { bytes: String } := document;
+        destroyString(bytes);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function usedBytes(document: &[Cbor, R]): Index is
+        return length(&(document->bytes));
+    end;
+
+    generic [R: Region]
+    function rootOf(document: &[Cbor, R]): CborItem is
+        return CborItem(at => 0);
+    end;
+
+    ---
+    --- Looking into a document
+    ---
+
+    -- The head of the item, or Left when there is none at its place.
+    generic [R: Region]
+    function headOf(document: &[Cbor, R], item: CborItem): Either[CborError, Head] is
+        let data: Span[Nat8, R] := asSpan(&(document->bytes));
+        return readHead(data, item.at);
+    end;
+
+    -- The content of a byte or text string of major type major, as the
+    -- place where it begins and its length; None for any other item and
+    -- for a length past the bytes.
+    generic [R: Region]
+    function stringPlace(document: &[Cbor, R], item: CborItem, major: Nat8): Option[Head] is
+        let data: Span[Nat8, R] := asSpan(&(document->bytes));
+        case readHead(data, item.at) of
+            when Left(left as unused: CborError) do
+                let none: Option[Head] := None();
+                return none;
+            when Right(right as head: Head) do
+                if (head.major /= major) or (head.argument > natOfIndex(spanLength(data) - head.next)) then
+                    let refused: Option[Head] := None();
+                    return refused;
+                end if;
+                let some: Option[Head] := Some(value => head);
+                return some;
+        end case;
+    end;
+
+    generic [R: Region]
+    function kindOf(document: &[Cbor, R], item: CborItem): Option[CborKind] is
+        case headOf(document, item) of
+            when Left(left as unused: CborError) do
+                let none: Option[CborKind] := None();
+                return none;
+            when Right(right as head: Head) do
+                var kind: CborKind := CborFloat();
+                if head.major = 0 then
+                    kind := CborUnsigned();
+                else if head.major = 1 then
+                    kind := CborNegative();
+                else if head.major = 2 then
+                    kind := CborBytes();
+                else if head.major = 3 then
+                    kind := CborText();
+                else if head.major = 4 then
+                    kind := CborArray();
+                else if head.major = 5 then
+                    kind := CborMap();
+                else if head.major = 6 then
+                    let tagged: Option[CborKind] := None();
+                    return tagged;
+                else if head.info = 20 then
+                    kind := CborFalse();
+                else if head.info = 21 then
+                    kind := CborTrue();
+                else if head.info = 22 then
+                    kind := CborNull();
+                else if head.info = 23 then
+                    kind := CborUndefined();
+                else if (head.info < 25) or (head.info > 27) then
+                    let simple: Option[CborKind] := None();
+                    return simple;
+                end if;
+                let some: Option[CborKind] := Some(value => kind);
+                return some;
+        end case;
+    end;
+
+    generic [R: Region]
+    function unsignedOf(document: &[Cbor, R], item: CborItem): Option[Nat64] is
+        case headOf(document, item) of
+            when Left(left as unused: CborError) do
+                let none: Option[Nat64] := None();
+                return none;
+            when Right(right as head: Head) do
+                if head.major /= 0 then
+                    let other: Option[Nat64] := None();
+                    return other;
+                end if;
+                let some: Option[Nat64] := Some(value => head.argument);
+                return some;
+        end case;
+    end;
+
+    -- A negative item n stands for minus one minus n, so the most it
+    -- reaches within Int64 is n = 2 to the 63 minus 1.
+    generic [R: Region]
+    function integerOf(document: &[Cbor, R], item: CborItem): Option[Int64] is
+        case headOf(document, item) of
+            when Left(left as unused: CborError) do
+                let none: Option[Int64] := None();
+                return none;
+            when Right(right as head: Head) do
+                if head.major > 1 then
+                    let other: Option[Int64] := None();
+                    return other;
+                end if;
+                let n: Int64 := toInt64(head.argument)?;
+                if head.major = 0 then
+                    let plus: Option[Int64] := Some(value => n);
+                    return plus;
+                end if;
+                let minus: Option[Int64] := Some(value => -1 - n);
+                return minus;
+        end case;
+    end;
+
+    generic [R: Region]
+    function bytesOf(document: &[Cbor, R], item: CborItem): Option[String] is
+        let head: Head := stringPlace(document, item, 2)?;
+        let data: Span[Nat8, R] := asSpan(&(document->bytes));
+        let content: Span[Nat8, R] := substring(data, head.next, head.next + indexOfNat(head.argument));
+        let some: Option[String] := Some(value => fromSpan(content));
+        return some;
+    end;
+
+    generic [R: Region]
+    function textOf(document: &[Cbor, R], item: CborItem): Option[String] is
+        let head: Head := stringPlace(document, item, 3)?;
+        let data: Span[Nat8, R] := asSpan(&(document->bytes));
+        let content: Span[Nat8, R] := substring(data, head.next, head.next + indexOfNat(head.argument));
+        let some: Option[String] := Some(value => fromSpan(content));
+        return some;
+    end;
+
+    generic [R: Region]
+    function boolOf(document: &[Cbor, R], item: CborItem): Option[Bool] is
+        case headOf(document, item) of
+            when Left(left as unused: CborError) do
+                let none: Option[Bool] := None();
+                return none;
+            when Right(right as head: Head) do
+                if (head.major = 7) and (head.info = 20) then
+                    let no: Option[Bool] := Some(value => false);
+                    return no;
+                end if;
+                if (head.major = 7) and (head.info = 21) then
+                    let yes: Option[Bool] := Some(value => true);
+                    return yes;
+                end if;
+                let other: Option[Bool] := None();
+                return other;
+        end case;
+    end;
+
+    -- The count of an array or a map whose major type is major, held to
+    -- the bytes left, which no checked document exceeds.
+    generic [R: Region]
+    function containerCount(document: &[Cbor, R], item: CborItem, major: Nat8): Option[Head] is
+        let data: Span[Nat8, R] := asSpan(&(document->bytes));
+        case readHead(data, item.at) of
+            when Left(left as unused: CborError) do
+                let none: Option[Head] := None();
+                return none;
+            when Right(right as head: Head) do
+                if (head.major /= major) or (head.argument > natOfIndex(spanLength(data) - head.next)) then
+                    let refused: Option[Head] := None();
+                    return refused;
+                end if;
+                let some: Option[Head] := Some(value => head);
+                return some;
+        end case;
+    end;
+
+    generic [R: Region]
+    function countOf(document: &[Cbor, R], item: CborItem): Option[Index] is
+        case containerCount(document, item, 4) of
+            when Some(value as array: Head) do
+                let items: Option[Index] := Some(value => indexOfNat(array.argument));
+                return items;
+            when None do
+                let map: Head := containerCount(document, item, 5)?;
+                let pairs: Option[Index] := Some(value => indexOfNat(map.argument));
+                return pairs;
+        end case;
+    end;
+
+    -- The place of the item at position n among the items that follow the
+    -- head, all of them counted, keys and values alike.
+    generic [R: Region]
+    function placeAfter(document: &[Cbor, R], head: Head, n: Index): Option[CborItem] is
+        let data: Span[Nat8, R] := asSpan(&(document->bytes));
+        let size: Index := spanLength(data);
+        var place: Index := head.next;
+        var i: Index := 0;
+        while (i < n) and (place < size) do
+            place := endOf(data, place, 0);
+            i := i + 1;
+        end while;
+        if place >= size then
+            return noItem();
+        end if;
+        return someItem(place);
+    end;
+
+    generic [R: Region]
+    function nthOf(document: &[Cbor, R], item: CborItem, n: Index): Option[CborItem] is
+        let head: Head := containerCount(document, item, 4)?;
+        if natOfIndex(n) >= head.argument then
+            return noItem();
+        end if;
+        return placeAfter(document, head, n);
+    end;
+
+    generic [R: Region]
+    function keyOf(document: &[Cbor, R], item: CborItem, n: Index): Option[CborItem] is
+        let head: Head := containerCount(document, item, 5)?;
+        if natOfIndex(n) >= head.argument then
+            return noItem();
+        end if;
+        return placeAfter(document, head, n * 2);
+    end;
+
+    generic [R: Region]
+    function valueOf(document: &[Cbor, R], item: CborItem, n: Index): Option[CborItem] is
+        let head: Head := containerCount(document, item, 5)?;
+        if natOfIndex(n) >= head.argument then
+            return noItem();
+        end if;
+        return placeAfter(document, head, (n * 2) + 1);
+    end;
+
+    generic [R: Region, S: Region]
+    function textKey(document: &[Cbor, R], item: CborItem, name: Span[Nat8, S]): Option[CborItem] is
+        let head: Head := containerCount(document, item, 5)?;
+        let pairs: Index := indexOfNat(head.argument);
+        let data: Span[Nat8, R] := asSpan(&(document->bytes));
+        let size: Index := spanLength(data);
+        var place: Index := head.next;
+        var i: Index := 0;
+        while (i < pairs) and (place < size) do
+            let keyEnd: Index := endOf(data, place, 0);
+            case readHead(data, place) of
+                when Right(right as key: Head) do
+                    if (key.major = 3) and equal(substring(data, key.next, keyEnd), name) then
+                        if keyEnd >= size then
+                            return noItem();
+                        end if;
+                        return someItem(keyEnd);
+                    end if;
+                when Left(left as unused: CborError) do
+                    return noItem();
+            end case;
+            place := endOf(data, keyEnd, 0);
+            i := i + 1;
+        end while;
+        return noItem();
+    end;
+
+    generic [R: Region]
+    function integerKey(document: &[Cbor, R], item: CborItem, key: Int64): Option[CborItem] is
+        let head: Head := containerCount(document, item, 5)?;
+        let pairs: Index := indexOfNat(head.argument);
+        let data: Span[Nat8, R] := asSpan(&(document->bytes));
+        let size: Index := spanLength(data);
+        var place: Index := head.next;
+        var i: Index := 0;
+        while (i < pairs) and (place < size) do
+            let keyEnd: Index := endOf(data, place, 0);
+            case integerOf(document, CborItem(at => place)) of
+                when Some(value as number: Int64) do
+                    if number = key then
+                        if keyEnd >= size then
+                            return noItem();
+                        end if;
+                        return someItem(keyEnd);
+                    end if;
+                when None do
+                    skip;
+            end case;
+            place := endOf(data, keyEnd, 0);
+            i := i + 1;
+        end while;
+        return noItem();
+    end;
+
+    generic [R: Region]
+    function encodedOf(document: &[Cbor, R], item: CborItem): Option[String] is
+        let data: Span[Nat8, R] := asSpan(&(document->bytes));
+        if item.at >= spanLength(data) then
+            return noString();
+        end if;
+        let finish: Index := endOf(data, item.at, 0);
+        let some: Option[String] := Some(value => fromSpan(substring(data, item.at, finish)));
+        return some;
+    end;
+end module body.

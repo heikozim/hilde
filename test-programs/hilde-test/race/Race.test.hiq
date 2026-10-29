@@ -1,0 +1,222 @@
+"""
+The negative control of hilde test --race: two tasks add to one cell with
+a plain load and store, no lock and no atomic, which is a data race when
+the two run on two workers.  Without an instrument it goes unseen and the
+test passes; ThreadSanitizer reports it and the test fails.  Run with the
+standard library as --modules, and with more than one worker.
+
+The race is made so that ThreadSanitizer sees it however busy the machine
+is.  First the two tasks meet on a flag beside the cell, spinning without
+yielding: the first writes 1 and waits for 2, the second waits for 1 and
+writes 2.  A task that spins keeps its worker, so the two now run on two
+workers at the same time; one after the other on one worker they would be
+ordered, since the runtime tells ThreadSanitizer of every switch as a
+synchronisation.  Then each adds to the cell once and meets the other on a
+channel without room, the first sending and the second receiving.  So
+whichever adds first waits, alive and idle, until the other has added too:
+ThreadSanitizer finds the earlier access in that task's recent history
+and reports the race.  A task that waits longer than waitLimit on the
+flag ends the test with a message instead of hanging.
+"""
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullCheck,
+    allocateBuffer,
+    positiveOffset,
+    load,
+    store,
+    deallocate
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    Sender,
+    Receiver,
+    Channel,
+    openChannel,
+    send,
+    receive,
+    closeSender,
+    closeReceiver
+);
+import Standard.Time (
+    monotonicNanos
+);
+
+module body Race.Test is
+    """
+    How long a task waits on the flag, in nanoseconds: far longer than a
+    worker takes to start on a busy machine, far shorter than the limit
+    hilde test puts on one test.
+    """
+    constant waitLimit: Nat64 := 30'000'000'000;
+
+    """
+    What the first task gets: the flag, with the cell after it, and the
+    sending end of the channel.
+    """
+    record FirstPart: Linear is
+        flag: Pointer[Int64];
+        out: Sender[Unit];
+    end;
+
+    """
+    What the second task gets: the flag, with the cell after it, and the
+    receiving end of the channel.
+    """
+    record SecondPart: Linear is
+        flag: Pointer[Int64];
+        back: Receiver[Unit];
+    end;
+
+    """
+    The monotonic clock, or fallback where there is none.
+    """
+    function readingOr(fallback: Nat64): Nat64 is
+        case monotonicNanos() of
+            when Some(value as reading: Nat64) do
+                return reading;
+            when None do
+                return fallback;
+        end case;
+    end;
+
+    """
+    Spins until the flag holds at least wanted, without yielding.  Ends the
+    test when that takes longer than waitLimit.
+    """
+    function waitUntil(flag: Pointer[Int64], wanted: Int64): Unit is
+        let none: Nat64 := 0;
+        let start: Nat64 := readingOr(none);
+        while load(flag) < wanted do
+            if (readingOr(start) - start) > waitLimit then
+                abort("the two tasks did not run at the same time");
+            end if;
+        end while;
+        return nil;
+    end;
+
+    """
+    The cell, one Int64 after the flag.
+    """
+    function cellOf(flag: Pointer[Int64]): Pointer[Int64] is
+        let one: Index := 1;
+        return positiveOffset(flag, one);
+    end;
+
+    """
+    Adds one to the cell with a plain load and store.
+    """
+    function bump(cell: Pointer[Int64]): Unit is
+        let one: Int64 := 1;
+        store(cell, load(cell) + one);
+        return nil;
+    end;
+
+    function first(part: FirstPart): Unit is
+        let { flag: Pointer[Int64], out: Sender[Unit] } := part;
+        var sender: Sender[Unit] := out;
+        let one: Int64 := 1;
+        let two: Int64 := 2;
+        store(flag, one);
+        waitUntil(flag, two);
+        bump(cellOf(flag));
+        case send(&!sender, nil) of
+            when None do
+                skip;
+            when Some(value as unused: Unit) do
+                abort("the second task closed the channel");
+        end case;
+        closeSender(sender);
+        return nil;
+    end;
+
+    function second(part: SecondPart): Unit is
+        let { flag: Pointer[Int64], back: Receiver[Unit] } := part;
+        var receiver: Receiver[Unit] := back;
+        let one: Int64 := 1;
+        let two: Int64 := 2;
+        waitUntil(flag, one);
+        store(flag, two);
+        bump(cellOf(flag));
+        case receive(&!receiver) of
+            when Some(value as unused: Unit) do
+                skip;
+            when None do
+                abort("the first task closed the channel");
+        end case;
+        closeReceiver(receiver);
+        return nil;
+    end;
+
+    """
+    Starts the two tasks on the flag and the channel's ends, and waits for
+    both.
+    """
+    function race(scope: Scope, flag: Pointer[Int64], sender: Sender[Unit], receiver: Receiver[Unit]): Scope is
+        var open: Scope := scope;
+        let early: Fn[FirstPart, Unit] := first;
+        let late: Fn[SecondPart, Unit] := second;
+        case spawn(&!open, early, FirstPart(flag => flag, out => sender)) of
+            when Right(right as one: Task[Unit]) do
+                case spawn(&!open, late, SecondPart(flag => flag, back => receiver)) of
+                    when Right(right as other: Task[Unit]) do
+                        join(one);
+                        join(other);
+                    when Left(left as refused: SecondPart) do
+                        -- The first task waits on the flag for a second
+                        -- that never comes, and ends the test after
+                        -- waitLimit.
+                        let { flag as unusedFlag: Pointer[Int64], back: Receiver[Unit] } := refused;
+                        closeReceiver(back);
+                        join(one);
+                end case;
+            when Left(left as refused: FirstPart) do
+                let { flag as unusedFlag: Pointer[Int64], out: Sender[Unit] } := refused;
+                closeSender(out);
+                closeReceiver(receiver);
+        end case;
+        return open;
+    end;
+
+    function testTwoTasksShareACell(): Unit is
+        let two: Index := 2;
+        let address: Address[Int64] := allocateBuffer(two);
+        case nullCheck(address) of
+            when Some(value as flag: Pointer[Int64]) do
+                let zero: Int64 := 0;
+                store(flag, zero);
+                store(cellOf(flag), zero);
+                let room: Index := 0;
+                let opened: Option[Channel[Unit]] := openChannel(room);
+                case opened of
+                    when Some(value as channel: Channel[Unit]) do
+                        let { sender: Sender[Unit], receiver: Receiver[Unit] } := channel;
+                        case openScope() of
+                            when Some(value as scope: Scope) do
+                                closeScope(race(scope, flag, sender, receiver));
+                            when None do
+                                closeSender(sender);
+                                closeReceiver(receiver);
+                                abort("no scope");
+                        end case;
+                    when None do
+                        abort("no channel");
+                end case;
+                if load(cellOf(flag)) = zero then
+                    abort("the tasks did not run");
+                end if;
+                deallocate(flag);
+            when None do
+                abort("no memory");
+        end case;
+        return nil;
+    end;
+end module body.

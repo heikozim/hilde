@@ -1,0 +1,396 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    length,
+    nthByte,
+    storeNth,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.X509 (
+    PrivateKey,
+    KeyKind,
+    EcP256,
+    EcP384,
+    EcP521,
+    Ed25519Key,
+    Rsa2048,
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
+    generateKey,
+    publicKeyDer,
+    signMessage,
+    destroyPrivateKey
+);
+import Standard.Jws (
+    base64UrlEncode,
+    base64UrlDecode,
+    signCompact,
+    verifyCompact,
+    publicKeyFromJwk,
+    jwkOfPublicKey,
+    verifyWithJwks,
+    claimsProblem
+);
+
+module body Standard.Jws.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameStrings(left: &[String, R], right: &[String, S]): Bool is
+        if length(left) /= length(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(left) do
+            if nthByte(left, i) /= nthByte(right, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function key(kind: KeyKind): PrivateKey is
+        case generateKey(kind) of
+            when Some(value as made: PrivateKey) do
+                return made;
+            when None do
+                abort("no key");
+        end case;
+    end;
+
+    generic [K: Region]
+    function publicOf(made: &[PrivateKey, K]): String is
+        case publicKeyDer(made) of
+            when Some(value as der: String) do
+                return der;
+            when None do
+                abort("no public key");
+        end case;
+    end;
+
+    function payloadIs(found: Option[String], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as payload: String) do
+                assertTrue(same(&payload, expected), message);
+                destroyString(payload);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function refused(found: Option[String], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as payload: String) do
+                destroyString(payload);
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    function testBase64Url(): Unit is
+        let encoded: String := base64UrlEncode("foobar");
+        assertTrue(same(&encoded, "Zm9vYmFy"), "foobar");
+        destroyString(encoded);
+        payloadIs(base64UrlDecode("Zm9vYmE"), "fooba", "fooba");
+        case base64UrlDecode("-_-_") of
+            when Some(value as bytes: String) do
+                assertTrue(length(&bytes) = 3, "three bytes");
+                assertTrue((nthByte(&bytes, 0) = 251) and (nthByte(&bytes, 2) = 191), "minus and underscore");
+                destroyString(bytes);
+            when None do
+                assertFailure("minus and underscore refused");
+        end case;
+        refused(base64UrlDecode("+/+/"), "plus and slash are not base64url");
+        refused(base64UrlDecode("Zm9vYmE="), "padding");
+        return nil;
+    end;
+
+    -- A token of kind verifies under its key and under no other.
+    function roundTrip(kind: KeyKind, other: KeyKind): Unit is
+        let signer: PrivateKey := key(kind);
+        let stranger: PrivateKey := key(other);
+        let public: String := publicOf(&signer);
+        let otherPublic: String := publicOf(&stranger);
+        case signCompact(&signer, "{\"sub\":\"ann\"}", "k1") of
+            when Some(value as token: String) do
+                payloadIs(verifyCompact(asSpan(&token), asSpan(&public)), "{\"sub\":\"ann\"}", "the token verifies");
+                refused(verifyCompact(asSpan(&token), asSpan(&otherPublic)), "not under another key");
+                -- One byte of the payload changed.
+                var changed: String := fromSpan(asSpan(&token));
+                let middle: Index := length(&changed) / 2;
+                if nthByte(&changed, middle) = 'A' then
+                    storeNth(&!changed, middle, 'B');
+                else
+                    storeNth(&!changed, middle, 'A');
+                end if;
+                refused(verifyCompact(asSpan(&changed), asSpan(&public)), "not after a byte changed");
+                destroyString(changed);
+                destroyString(token);
+            when None do
+                assertFailure("no token");
+        end case;
+        destroyString(public);
+        destroyString(otherPublic);
+        destroyPrivateKey(signer);
+        destroyPrivateKey(stranger);
+        return nil;
+    end;
+
+    function testRoundTrips(): Unit is
+        roundTrip(EcP256(), EcP256());
+        roundTrip(EcP384(), EcP256());
+        roundTrip(EcP521(), EcP384());
+        roundTrip(Ed25519Key(), Ed25519Key());
+        roundTrip(Rsa2048(), Rsa2048());
+        roundTrip(MlDsa44(), MlDsa44());
+        return nil;
+    end;
+
+    -- A token whose header says none, and one signed with P-256 that claims
+    -- ES384, are refused.
+    function testAlgorithmChosenByTheKey(): Unit is
+        let signer: PrivateKey := key(EcP256());
+        let public: String := publicOf(&signer);
+        refused(verifyCompact("eyJhbGciOiJub25lIn0.eyJzdWIiOiJhbm4ifQ.", asSpan(&public)), "alg none");
+        case signCompact(&signer, "{}", "") of
+            when Some(value as token: String) do
+                -- The header {"alg":"ES384"} in place of the real one.
+                var forged: StringBuilder := makeStringBuilder();
+                writeString(&!forged, "eyJhbGciOiJFUzM4NCJ9");
+                var i: Index := 0;
+                while (i < length(&token)) and (nthByte(&token, i) /= '.') do
+                    i := i + 1;
+                end while;
+                writeString(&!forged, getSpan(&token, i, length(&token) - 1));
+                let other: String := finalize(forged);
+                refused(verifyCompact(asSpan(&other), asSpan(&public)), "a header that names another algorithm");
+                destroyString(other);
+                destroyString(token);
+            when None do
+                assertFailure("no token");
+        end case;
+        destroyString(public);
+        destroyPrivateKey(signer);
+        return nil;
+    end;
+
+    -- A token signed by the key itself over header, with the payload {}.
+    generic [K: Region]
+    function signedOver(signer: &[PrivateKey, K], header: Span[Nat8, Static]): String is
+        let head: String := base64UrlEncode(header);
+        var input: StringBuilder := makeStringBuilder();
+        writeString(&!input, asSpan(&head));
+        writeString(&!input, ".e30");
+        destroyString(head);
+        let signed: String := finalize(input);
+        var token: StringBuilder := makeStringBuilder();
+        writeString(&!token, asSpan(&signed));
+        writeByte(&!token, '.');
+        case signMessage(signer, asSpan(&signed)) of
+            when Some(value as signature: String) do
+                let encoded: String := base64UrlEncode(asSpan(&signature));
+                writeString(&!token, asSpan(&encoded));
+                destroyString(encoded);
+                destroyString(signature);
+            when None do
+                assertFailure("no signature");
+        end case;
+        destroyString(signed);
+        return finalize(token);
+    end;
+
+    -- A token the key really signed, whose header names another algorithm
+    -- than the key's, is refused; the same token with the key's own
+    -- algorithm verifies, which shows the token is made right.
+    function testForeignHeaderSigned(): Unit is
+        let signer: PrivateKey := key(Ed25519Key());
+        let public: String := publicOf(&signer);
+        let own: String := signedOver(&signer, "{\"alg\":\"EdDSA\"}");
+        payloadIs(verifyCompact(asSpan(&own), asSpan(&public)), "{}", "the header of the key's own algorithm");
+        let foreign: String := signedOver(&signer, "{\"alg\":\"ES384\"}");
+        refused(verifyCompact(asSpan(&foreign), asSpan(&public)), "a signed header that names another algorithm");
+        let none: String := signedOver(&signer, "{\"alg\":\"none\"}");
+        refused(verifyCompact(asSpan(&none), asSpan(&public)), "a signed header that names none");
+        destroyString(own);
+        destroyString(foreign);
+        destroyString(none);
+        destroyString(public);
+        destroyPrivateKey(signer);
+        return nil;
+    end;
+
+    -- The JWK of a key made by libcrypto gives back its DER, byte for byte.
+    function jwkRoundTrip(kind: KeyKind, message: Span[Nat8, Static]): Unit is
+        let made: PrivateKey := key(kind);
+        let public: String := publicOf(&made);
+        case jwkOfPublicKey(asSpan(&public)) of
+            when Some(value as jwk: String) do
+                case publicKeyFromJwk(asSpan(&jwk)) of
+                    when Some(value as back: String) do
+                        assertTrue(sameStrings(&public, &back), message);
+                        destroyString(back);
+                    when None do
+                        assertFailure(message);
+                end case;
+                destroyString(jwk);
+            when None do
+                assertFailure(message);
+        end case;
+        destroyString(public);
+        destroyPrivateKey(made);
+        return nil;
+    end;
+
+    function testJwk(): Unit is
+        jwkRoundTrip(EcP256(), "P-256");
+        jwkRoundTrip(EcP384(), "P-384");
+        jwkRoundTrip(EcP521(), "P-521");
+        jwkRoundTrip(Ed25519Key(), "Ed25519");
+        jwkRoundTrip(Rsa2048(), "RSA");
+        jwkRoundTrip(MlDsa44(), "ML-DSA-44, kty AKP");
+        jwkRoundTrip(MlDsa65(), "ML-DSA-65, kty AKP");
+        jwkRoundTrip(MlDsa87(), "ML-DSA-87, kty AKP");
+        refused(publicKeyFromJwk("{\"kty\":\"AKP\",\"alg\":\"ML-DSA-99\",\"pub\":\"AAAA\"}"), "an ML-DSA variant that is none");
+        refused(publicKeyFromJwk("{\"kty\":\"AKP\",\"alg\":\"ML-DSA-44\",\"pub\":\"AAAA\"}"), "an ML-DSA-44 key too short");
+        refused(publicKeyFromJwk("{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"AAAA\",\"y\":\"AAAA\"}"), "coordinates too short");
+        refused(publicKeyFromJwk("{\"kty\":\"oct\",\"k\":\"AAAA\"}"), "a symmetric key");
+        return nil;
+    end;
+
+    -- RFC 8037 appendix A.4: the Ed25519 signature of the RFC verifies
+    -- under the JWK of the RFC.
+    function testRfc8037(): Unit is
+        case publicKeyFromJwk("{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}") of
+            when Some(value as public: String) do
+                payloadIs(verifyCompact("eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc.hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg", asSpan(&public)),
+                    "Example of Ed25519 signing", "the token of RFC 8037");
+                destroyString(public);
+            when None do
+                assertFailure("the JWK of RFC 8037 was refused");
+        end case;
+        return nil;
+    end;
+
+    -- A set of two keys; the token names the second by kid.
+    function testJwks(): Unit is
+        let first: PrivateKey := key(EcP256());
+        let second: PrivateKey := key(Ed25519Key());
+        let firstPublic: String := publicOf(&first);
+        let secondPublic: String := publicOf(&second);
+        case jwkOfPublicKey(asSpan(&firstPublic)) of
+            when Some(value as firstJwk: String) do
+                case jwkOfPublicKey(asSpan(&secondPublic)) of
+                    when Some(value as secondJwk: String) do
+                        var set: StringBuilder := makeStringBuilder();
+                        writeString(&!set, "{\"keys\":[{\"kid\":\"one\",");
+                        writeString(&!set, getSpan(&firstJwk, 1, length(&firstJwk) - 1));
+                        writeString(&!set, ",{\"kid\":\"two\",");
+                        writeString(&!set, getSpan(&secondJwk, 1, length(&secondJwk) - 1));
+                        writeString(&!set, "]}");
+                        let jwks: String := finalize(set);
+                        case signCompact(&second, "{\"n\":2}", "two") of
+                            when Some(value as token: String) do
+                                payloadIs(verifyWithJwks(asSpan(&token), asSpan(&jwks)), "{\"n\":2}", "found by its kid");
+                                destroyString(token);
+                            when None do
+                                assertFailure("no token");
+                        end case;
+                        case signCompact(&second, "{\"n\":3}", "three") of
+                            when Some(value as token: String) do
+                                refused(verifyWithJwks(asSpan(&token), asSpan(&jwks)), "a kid the set does not have");
+                                destroyString(token);
+                            when None do
+                                assertFailure("no token");
+                        end case;
+                        destroyString(jwks);
+                        destroyString(secondJwk);
+                    when None do
+                        assertFailure("no second JWK");
+                end case;
+                destroyString(firstJwk);
+            when None do
+                assertFailure("no first JWK");
+        end case;
+        destroyString(firstPublic);
+        destroyString(secondPublic);
+        destroyPrivateKey(first);
+        destroyPrivateKey(second);
+        return nil;
+    end;
+
+    function holds(found: Option[String], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as why: String) do
+                destroyString(why);
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    function fails(found: Option[String], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case found of
+            when Some(value as why: String) do
+                assertTrue(same(&why, expected), message);
+                destroyString(why);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function testClaims(): Unit is
+        let token: Span[Nat8, Static] := "{\"iss\":\"https://id.example\",\"aud\":[\"x\",\"wiki\"],\"exp\":2000,\"nbf\":900,\"nonce\":\"n1\"}";
+        holds(claimsProblem(token, "https://id.example", "wiki", "n1", 1000, 60), "the claims hold");
+        fails(claimsProblem(token, "https://evil.example", "wiki", "n1", 1000, 60), "iss is another issuer", "another issuer");
+        fails(claimsProblem(token, "https://id.example", "blog", "n1", 1000, 60), "aud does not name the audience", "another audience");
+        fails(claimsProblem(token, "https://id.example", "wiki", "n1", 2061, 60), "the token has expired", "expired beyond the leeway");
+        holds(claimsProblem(token, "https://id.example", "wiki", "n1", 2059, 60), "expired within the leeway");
+        fails(claimsProblem(token, "https://id.example", "wiki", "n1", 800, 60), "the token is not valid yet", "before nbf");
+        fails(claimsProblem(token, "https://id.example", "wiki", "n2", 1000, 60), "nonce is another nonce", "another nonce");
+        fails(claimsProblem("{\"iss\":\"https://id.example\",\"aud\":\"wiki\"}", "https://id.example", "wiki", "", 1000, 60), "there is no exp", "no exp");
+        return nil;
+    end;
+end module body.

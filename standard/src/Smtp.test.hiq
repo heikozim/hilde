@@ -1,0 +1,414 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- What can be checked without a relay: addresses, the envelope, the
+-- message, and the refusals that come before any connection.  The
+-- dialogue itself is tested end to end against a relay of its own.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    constantTimeEqual
+);
+import Standard.Calendar (
+    Instant
+);
+import Standard.Smtp (
+    Security,
+    ImplicitTls,
+    StartTls,
+    LoopbackCleartext,
+    MailFailureKind,
+    BadInput,
+    NotResolved,
+    ConnectFailed,
+    TimedOut,
+    TlsFailed,
+    NoStartTls,
+    NotLoopback,
+    CleartextLogin,
+    LoginRefused,
+    Refused,
+    BadReply,
+    MailFailure,
+    validAddress,
+    Envelope,
+    makeEnvelope,
+    addRecipient,
+    recipientCount,
+    destroyEnvelope,
+    composeMessage,
+    Relay,
+    makeRelay,
+    destroyRelay,
+    sendMail
+);
+
+module body Standard.Smtp.Test is
+    constant limit: Nat32 := 1000;
+    constant submission: Nat16 := 587;
+
+    -- The bytes a to b, each once, then text.
+    function withBytes(a: Nat8, b: Nat8, text: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, a);
+        writeByte(&!out, b);
+        writeString(&!out, text);
+        return finalize(out);
+    end;
+
+    -- count copies of text.
+    function repeated(text: Span[Nat8, Static], count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeString(&!out, text);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function testAddresses(): Unit is
+        assertTrue(validAddress("a@b.c"), "a short address is valid");
+        assertTrue(validAddress("first.last+tag@mail-1.example.org"), "dots, a plus and a hyphen are valid");
+        assertTrue(validAddress("!#$%&'*+-/=?^_`{|}~@example.org"), "every sign of an atom is valid in the local part");
+        assertTrue(not validAddress(""), "the empty address is refused");
+        assertTrue(not validAddress("ab"), "an address without @ is refused");
+        assertTrue(not validAddress("@b.c"), "an empty local part is refused");
+        assertTrue(not validAddress("a@"), "an empty domain is refused");
+        assertTrue(not validAddress("a@b@c.d"), "a second @ is refused");
+        assertTrue(not validAddress("a b@c.d"), "a space is refused");
+        assertTrue(not validAddress("a@b.c>\r\nRCPT TO:<x@y.z"), "a line break and angle brackets are refused");
+        assertTrue(not validAddress("\"a\"@b.c"), "a quoted local part is refused");
+        assertTrue(not validAddress(".a@b.c"), "a local part that begins with a dot is refused");
+        assertTrue(not validAddress("a.@b.c"), "a local part that ends with a dot is refused");
+        assertTrue(not validAddress("a@.b.c"), "a domain that begins with a dot is refused");
+        assertTrue(not validAddress("a@b.c."), "a domain that ends with a dot is refused");
+        assertTrue(not validAddress("a@[192.0.2.1]"), "an address literal as the domain is refused");
+        let umlaut: String := withBytes(195, 164, "@b.c");
+        assertTrue(not validAddress(asSpan(&umlaut)), "a local part beyond ASCII is refused");
+        destroyString(umlaut);
+        let sixtyFour: String := repeated("abcdefgh", 8);
+        var fits: StringBuilder := makeStringBuilder();
+        writeString(&!fits, asSpan(&sixtyFour));
+        writeString(&!fits, "@b.c");
+        let longest: String := finalize(fits);
+        assertTrue(validAddress(asSpan(&longest)), "a local part of 64 bytes is valid");
+        destroyString(longest);
+        var over: StringBuilder := makeStringBuilder();
+        writeString(&!over, asSpan(&sixtyFour));
+        writeString(&!over, "x@b.c");
+        let tooLong: String := finalize(over);
+        assertTrue(not validAddress(asSpan(&tooLong)), "a local part of 65 bytes is refused");
+        destroyString(tooLong);
+        destroyString(sixtyFour);
+        return nil;
+    end;
+
+    function testEnvelope(): Unit is
+        case makeEnvelope("not an address") of
+            when Some(value as made: Envelope) do
+                assertTrue(false, "an envelope from a bad address is refused");
+                destroyEnvelope(made);
+            when None do
+                assertTrue(true, "an envelope from a bad address is refused");
+        end case;
+        case makeEnvelope("from@example.org") of
+            when Some(value as made: Envelope) do
+                var envelope: Envelope := made;
+                assertTrue(recipientCount(&envelope) = 0, "a new envelope has no recipient");
+                assertTrue(not addRecipient(&!envelope, "to@example.org\r\nDATA"), "a recipient with a line break is refused");
+                assertTrue(recipientCount(&envelope) = 0, "a refused recipient is not added");
+                assertTrue(addRecipient(&!envelope, "to@example.org"), "a recipient is added");
+                assertTrue(addRecipient(&!envelope, "other@example.net"), "a second recipient is added");
+                assertTrue(recipientCount(&envelope) = 2, "the envelope has two recipients");
+                destroyEnvelope(envelope);
+            when None do
+                assertTrue(false, "an envelope from a good address is made");
+        end case;
+        return nil;
+    end;
+
+    function instant(): Instant is
+        let seconds: Int64 := 1790000000;
+        let nanos: Nat32 := 0;
+        let at: Instant := Instant(seconds => seconds, nanos => nanos);
+        return at;
+    end;
+
+    generic [S: Region, T: Region]
+    function composesTo(subject: Span[Nat8, S], text: Span[Nat8, T], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case composeMessage("from@example.org", "to@example.org", subject, text, instant()) of
+            when Some(value as made: String) do
+                assertTrue(constantTimeEqual(asSpan(&made), expected), message);
+                destroyString(made);
+            when None do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    generic [S: Region, T: Region]
+    function refusesToCompose(subject: Span[Nat8, S], text: Span[Nat8, T], message: Span[Nat8, Static]): Unit is
+        case composeMessage("from@example.org", "to@example.org", subject, text, instant()) of
+            when Some(value as made: String) do
+                assertTrue(false, message);
+                destroyString(made);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function testComposeAscii(): Unit is
+        composesTo("Hello", "line one\nline two\r\nline three",
+            "Date: Mon, 21 Sep 2026 14:13:20 +0000\r\nFrom: from@example.org\r\nTo: to@example.org\r\nSubject: Hello\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\nline one\r\nline two\r\nline three\r\n",
+            "an ASCII message is written as 7bit with CRLF line ends and the date of RFC 5322");
+        return nil;
+    end;
+
+    function testComposeUtf8(): Unit is
+        -- Gruesse aus Koeln with its umlauts and sharp s, and Strasse with
+        -- its sharp s, as UTF-8.
+        var subject: StringBuilder := makeStringBuilder();
+        writeString(&!subject, "Gr");
+        writeByte(&!subject, 195);
+        writeByte(&!subject, 188);
+        writeByte(&!subject, 195);
+        writeByte(&!subject, 159);
+        writeString(&!subject, "e aus K");
+        writeByte(&!subject, 195);
+        writeByte(&!subject, 182);
+        writeString(&!subject, "ln");
+        let title: String := finalize(subject);
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, "Stra");
+        writeByte(&!text, 195);
+        writeByte(&!text, 159);
+        writeString(&!text, "e\nzweite Zeile");
+        let content: String := finalize(text);
+        composesTo(asSpan(&title), asSpan(&content),
+            "Date: Mon, 21 Sep 2026 14:13:20 +0000\r\nFrom: from@example.org\r\nTo: to@example.org\r\nSubject: =?UTF-8?B?R3LDvMOfZSBhdXMgS8O2bG4=?=\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nU3RyYcOfZQ0KendlaXRlIFplaWxl\r\n",
+            "a subject beyond ASCII is an encoded word, and the text base64 of its CRLF form");
+        destroyString(title);
+        destroyString(content);
+        -- Thirty a with umlaut, 60 bytes: one word of 22 characters, 44
+        -- bytes, and one of the other 8.
+        var long: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 30 do
+            writeByte(&!long, 195);
+            writeByte(&!long, 164);
+            i := i + 1;
+        end while;
+        let longTitle: String := finalize(long);
+        composesTo(asSpan(&longTitle), "x",
+            "Date: Mon, 21 Sep 2026 14:13:20 +0000\r\nFrom: from@example.org\r\nTo: to@example.org\r\nSubject: =?UTF-8?B?w6TDpMOkw6TDpMOkw6TDpMOkw6TDpMOkw6TDpMOkw6TDpMOkw6TDpMOkw6Q=?=\r\n =?UTF-8?B?w6TDpMOkw6TDpMOkw6TDpA==?=\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\nx\r\n",
+            "a long subject is split into encoded words of whole characters");
+        destroyString(longTitle);
+        return nil;
+    end;
+
+    function testComposeRefusals(): Unit is
+        refusesToCompose("Hello\r\nBcc: x@y.z", "text", "a subject with a line break is refused");
+        refusesToCompose("Hello\tthere", "text", "a subject with a tab is refused");
+        let bad: String := withBytes(255, 254, "");
+        refusesToCompose("Hello", asSpan(&bad), "a text that is not UTF-8 is refused");
+        refusesToCompose(asSpan(&bad), "text", "a subject that is not UTF-8 is refused");
+        destroyString(bad);
+        case composeMessage("from@example.org", "to@example.org\r\nBcc: x@y.z", "Hello", "text", instant()) of
+            when Some(value as made: String) do
+                assertTrue(false, "a To address with a line break is refused");
+                destroyString(made);
+            when None do
+                assertTrue(true, "a To address with a line break is refused");
+        end case;
+        -- A line of 999 bytes cannot go as 7bit.
+        let longLine: String := repeated("abcdefghi", 111);
+        case composeMessage("from@example.org", "to@example.org", "Hello", asSpan(&longLine), instant()) of
+            when Some(value as made: String) do
+                let marker: String := fromLiteral("Content-Transfer-Encoding: base64");
+                assertTrue(holds(&made, &marker), "a line longer than 998 bytes makes the text base64");
+                destroyString(marker);
+                destroyString(made);
+            when None do
+                assertTrue(false, "a line longer than 998 bytes makes the text base64");
+        end case;
+        destroyString(longLine);
+        return nil;
+    end;
+
+    -- Whether text holds part.
+    generic [R: Region, S: Region]
+    function holds(text: &[String, R], part: &[String, S]): Bool is
+        let whole: Span[Nat8, R] := asSpan(text);
+        let piece: Span[Nat8, S] := asSpan(part);
+        let size: Index := spanLength(whole);
+        let wanted: Index := spanLength(piece);
+        if wanted > size then
+            return false;
+        end if;
+        var start: Index := 0;
+        while (start + wanted) <= size do
+            var same: Bool := true;
+            var k: Index := 0;
+            while same and (k < wanted) do
+                if whole[start + k] /= piece[k] then
+                    same := false;
+                end if;
+                k := k + 1;
+            end while;
+            if same then
+                return true;
+            end if;
+            start := start + 1;
+        end while;
+        return false;
+    end;
+
+    function testRelay(): Unit is
+        case makeRelay("", submission, StartTls(), "ca.pem", limit) of
+            when Some(value as made: Relay) do
+                assertTrue(false, "an empty host is refused");
+                destroyRelay(made);
+            when None do
+                assertTrue(true, "an empty host is refused");
+        end case;
+        case makeRelay("mail example", submission, StartTls(), "ca.pem", limit) of
+            when Some(value as made: Relay) do
+                assertTrue(false, "a host with a space is refused");
+                destroyRelay(made);
+            when None do
+                assertTrue(true, "a host with a space is refused");
+        end case;
+        case makeRelay("::1", submission, LoopbackCleartext(), "", limit) of
+            when Some(value as made: Relay) do
+                assertTrue(true, "an IPv6 literal is a host");
+                destroyRelay(made);
+            when None do
+                assertTrue(false, "an IPv6 literal is a host");
+        end case;
+        case makeRelay("mail.example.org", submission, ImplicitTls(), "ca.pem", limit) of
+            when Some(value as made: Relay) do
+                assertTrue(true, "a host name is a host");
+                destroyRelay(made);
+            when None do
+                assertTrue(false, "a host name is a host");
+        end case;
+        return nil;
+    end;
+
+    function kindIs(result: Either[MailFailure, Unit], wanted: MailFailureKind): Bool is
+        case result of
+            when Right(right as sent: Unit) do
+                return false;
+            when Left(left as failed: MailFailure) do
+                let { kind: MailFailureKind, detail: String } := failed;
+                destroyString(detail);
+                return sameKind(kind, wanted);
+        end case;
+    end;
+
+    function kindNumber(kind: MailFailureKind): Nat8 is
+        case kind of
+            when BadInput do
+                return 1;
+            when NotResolved do
+                return 2;
+            when ConnectFailed do
+                return 3;
+            when TimedOut do
+                return 4;
+            when TlsFailed do
+                return 5;
+            when NoStartTls do
+                return 6;
+            when NotLoopback do
+                return 7;
+            when CleartextLogin do
+                return 8;
+            when LoginRefused do
+                return 9;
+            when Refused do
+                return 10;
+            when BadReply do
+                return 11;
+        end case;
+    end;
+
+    function sameKind(a: MailFailureKind, b: MailFailureKind): Bool is
+        return kindNumber(a) = kindNumber(b);
+    end;
+
+    -- sendMail through a relay at host with security, from an envelope
+    -- with recipients or none; what failed, or Right.
+    generic [U: Region, P: Region]
+    function attempt(host: Span[Nat8, Static], security: Security, user: Span[Nat8, U], password: Span[Nat8, P], withRecipient: Bool): Either[MailFailure, Unit] is
+        case makeRelay(host, submission, security, "ca.pem", limit) of
+            when Some(value as relay: Relay) do
+                case makeEnvelope("from@example.org") of
+                    when Some(value as made: Envelope) do
+                        var envelope: Envelope := made;
+                        if withRecipient then
+                            let added: Bool := addRecipient(&!envelope, "to@example.org");
+                        end if;
+                        let result: Either[MailFailure, Unit] := sendMail(&relay, user, password, &envelope, "Subject: x\r\n\r\ny\r\n");
+                        destroyEnvelope(envelope);
+                        destroyRelay(relay);
+                        return result;
+                    when None do
+                        destroyRelay(relay);
+                        return notMade();
+                end case;
+            when None do
+                return notMade();
+        end case;
+    end;
+
+    -- Right, which no refusal gives, for a relay or an envelope that
+    -- could not be made.
+    function notMade(): Either[MailFailure, Unit] is
+        let sent: Either[MailFailure, Unit] := Right(right => nil);
+        return sent;
+    end;
+
+    -- Every case here is refused before a connection is tried; one that
+    -- was tried would end in ConnectFailed or TimedOut instead.
+    function testRefusedBeforeConnecting(): Unit is
+        assertTrue(kindIs(attempt("127.0.0.1", LoopbackCleartext(), "user", "password", true), CleartextLogin()),
+            "a login without TLS is refused, even to loopback");
+        let zeroUser: String := withBytes(117, 0, "ser");
+        assertTrue(kindIs(attempt("192.0.2.1", StartTls(), asSpan(&zeroUser), "password", true), BadInput()),
+            "a user name with a zero byte is refused");
+        destroyString(zeroUser);
+        let zeroPassword: String := withBytes(112, 0, "ass");
+        assertTrue(kindIs(attempt("192.0.2.1", StartTls(), "user", asSpan(&zeroPassword), true), BadInput()),
+            "a password with a zero byte is refused");
+        destroyString(zeroPassword);
+        assertTrue(kindIs(attempt("192.0.2.1", StartTls(), "", "", false), BadInput()),
+            "an envelope without a recipient is refused");
+        assertTrue(kindIs(attempt("192.0.2.1", LoopbackCleartext(), "", "", true), NotLoopback()),
+            "cleartext to an address that is not loopback is refused");
+        assertTrue(kindIs(attempt("::ffff:c000:201", LoopbackCleartext(), "", "", true), NotLoopback()),
+            "cleartext to a mapped address that is not loopback is refused");
+        return nil;
+    end;
+end module body.

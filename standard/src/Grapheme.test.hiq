@@ -1,0 +1,347 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The rules are held by a digest that scripts/unicode/make-grapheme-
+-- tables.py computes with ICU's character break iterator: over the
+-- boundaries of every text of one, two and three representatives, one code
+-- point of each class, and of twenty longer texts.  The examples are
+-- written as the hexadecimal of their UTF-8, since the source is ASCII.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    insertBack,
+    length as bufferLength,
+    nth
+);
+import Standard.Text (
+    hexToBytes
+);
+import Standard.Utf8 (
+    CodePoint,
+    makeCodePoint,
+    appendCodePoint
+);
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Grapheme (
+    clusterEnd,
+    countClusters
+);
+
+module body Standard.Grapheme.Test is
+    -- The number of clusters of the UTF-8 given in hexadecimal, or none.
+    function clustersOf(hex: Span[Nat8, Static]): Option[Index] is
+        case hexToBytes(hex) of
+            when Some(value as text: String) do
+                let count: Option[Index] := countClusters(asSpan(&text));
+                destroyString(text);
+                return count;
+            when None do
+                abort("Standard.Grapheme.Test: the hexadecimal of an example is not well formed");
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    function counts(hex: Span[Nat8, Static], want: Index): Bool is
+        case clustersOf(hex) of
+            when Some(value as got: Index) do
+                return got = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refused(hex: Span[Nat8, Static]): Bool is
+        case clustersOf(hex) of
+            when Some(value as got: Index) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function testExamples(): Unit is
+        assertTrue(counts("", 0), "the empty text has no cluster");
+        assertTrue(counts("616263", 3), "three letters are three clusters");
+        assertTrue(counts("65cc81", 1), "e and a combining acute are one");
+        assertTrue(counts("0d0a", 1), "CR LF is one");
+        assertTrue(counts("0d0d0a", 2), "CR, then CR LF");
+        assertTrue(counts("f09f87a9f09f87aaf09f87ab", 2), "three regional indicators are a flag and one left over");
+        assertTrue(counts("f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6", 1), "a family joined by zero width joiners is one");
+        assertTrue(counts("e0a495e0a58de0a4b7e0a4bf", 1), "a Devanagari conjunct with its vowel sign is one");
+        assertTrue(counts("e0a495e0a58d61", 2), "a linker before a letter of another script does not join");
+        assertTrue(counts("e18480e185a1e186a8", 1), "a Hangul syllable in its three parts is one");
+        assertTrue(counts("d880d880d9a1", 1), "two Arabic number signs join the digit after them");
+        return nil;
+    end;
+
+    function testRefusal(): Unit is
+        assertTrue(refused("ff"), "a byte that is not UTF-8 is refused");
+        assertTrue(refused("61ff"), "a text with such a byte is refused");
+        case hexToBytes("61ff62") of
+            when Some(value as text: String) do
+                case clusterEnd(asSpan(&text), 0) of
+                    when Some(value as stop: Index) do
+                        assertTrue(stop = 1, "the cluster ends before a byte that is not UTF-8");
+                    when None do
+                        assertTrue(false, "the cluster ends before a byte that is not UTF-8");
+                end case;
+                case clusterEnd(asSpan(&text), 1) of
+                    when Some(value as stop: Index) do
+                        assertTrue(false, "no cluster starts at a byte that is not UTF-8");
+                    when None do
+                        assertTrue(true, "no cluster starts at a byte that is not UTF-8");
+                end case;
+                case clusterEnd(asSpan(&text), 3) of
+                    when Some(value as stop: Index) do
+                        assertTrue(false, "no cluster starts at the end");
+                    when None do
+                        assertTrue(true, "no cluster starts at the end");
+                end case;
+                destroyString(text);
+            when None do
+                assertTrue(false, "the hexadecimal of the test is well formed");
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- The digest
+    ---
+
+    -- One code point of each class, as --digest prints them, six
+    -- hexadecimal digits each.
+    function representatives(): Span[Nat8, Static] is
+        return "00000000000A00000D0000610000A900030000060000090300091500094D\
+            \0011000011600011A800200C00200D00AC0000AC0101F1E6";
+    end;
+
+    -- The longer texts of the generator: six hexadecimal digits a code
+    -- point, a bar after each text.
+    function extraTexts(): Span[Nat8, Static] is
+        return "01F1E901F1EA01F1EB01F1F701F1EE|00006101F1E901F1EA01F1EB|01F4\
+            \6901F3FD00200D01F52C|01F46800200D01F46900200D01F46700200D01F\
+            \466|01F46900200D000061|00006100200D01F469|00276400FE0F00200D\
+            \01F525|00091500094D00093700093F|00091500093C00094D000937|000\
+            \91500094D00200D000937|00091500094D00094D000937|0009150003010\
+            \00937|00091500094D000061|0009950009CD0009B70009CD0009A3|0011\
+            \000011610011A8001100|00AC000011A80011A8001161|00AC0100116100\
+            \11A8|00000D00000A00030100000D00000D00000A|000600000600000661\
+            \000301|000E01000E33000E33000301|";
+    end;
+
+    function pointAt(list: Span[Nat8, Static], at: Index): Index is
+        var total: Index := 0;
+        var i: Index := 0;
+        while i < 6 do
+            let byte: Nat8 := list[at + i];
+            var digit: Nat8 := byte - '0';
+            if byte >= 'A' then
+                digit := (byte - 'A') + 10;
+            end if;
+            case toIndex(digit) of
+                when Some(value as d: Index) do
+                    total := (total * 16) + d;
+                when None do
+                    abort("Standard.Grapheme.Test: a digit did not fit an Index");
+            end case;
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    function hashByte(hash: Nat32, byte: Nat8): Nat32 is
+        let prime: Nat32 := 16777619;
+        case toNat32(byte) of
+            when Some(value as wide: Nat32) do
+                return modularMultiply(bitwiseXor(hash, wide), prime);
+            when None do
+                abort("Standard.Grapheme.Test: a byte did not fit a Nat32");
+        end case;
+    end;
+
+    -- The hash after the decimal digits of value.
+    function hashDecimal(hash: Nat32, value: Index): Nat32 is
+        var h: Nat32 := hash;
+        if value >= 10 then
+            h := hashDecimal(h, value / 10);
+        end if;
+        let ten: Index := 10;
+        case toNat8(rem(value, ten)) of
+            when Some(value as digit: Nat8) do
+                return hashByte(h, digit + '0');
+            when None do
+                abort("Standard.Grapheme.Test: a digit did not fit a Nat8");
+        end case;
+    end;
+
+    -- The number of bytes of the code point in UTF-8.
+    function width(point: Index): Index is
+        if point < #x80 then
+            return 1;
+        end if;
+        if point < #x800 then
+            return 2;
+        end if;
+        if point < #x10000 then
+            return 3;
+        end if;
+        return 4;
+    end;
+
+    generic [B: Region]
+    function append(builder: &![StringBuilder, B], scalar: Index): Unit is
+        case toNat32(scalar) of
+            when Some(value as wide: Nat32) do
+                case makeCodePoint(wide) of
+                    when Some(value as point: CodePoint) do
+                        appendCodePoint(&~builder, point);
+                    when None do
+                        abort("Standard.Grapheme.Test: not a code point");
+                end case;
+            when None do
+                abort("Standard.Grapheme.Test: not a Nat32");
+        end case;
+        return nil;
+    end;
+
+    -- The hash after the boundaries of the text of the code points, as the
+    -- oracle prints them: code point offsets separated by spaces, 0 and the
+    -- number of code points included, and a newline.
+    generic [R: Region]
+    function hashText(hash: Nat32, points: &[Buffer[Index], R]): Nat32 is
+        let count: Index := bufferLength(points);
+        var builder: StringBuilder := makeStringBuilder();
+        -- starts holds the byte offset of each code point and, last, the
+        -- length of the text.
+        var starts: Buffer[Index] := allocateEmpty();
+        var bytes: Index := 0;
+        var k: Index := 0;
+        while k < count do
+            insertBack(&!starts, bytes);
+            append(&!builder, nth(points, k));
+            bytes := bytes + width(nth(points, k));
+            k := k + 1;
+        end while;
+        insertBack(&!starts, bytes);
+        let text: String := finalize(builder);
+        var h: Nat32 := hashByte(hash, '0');
+        var at: Index := 0;
+        while at < bytes do
+            case clusterEnd(asSpan(&text), at) of
+                when Some(value as stop: Index) do
+                    var j: Index := 0;
+                    while j <= count do
+                        if nth(&starts, j) = stop then
+                            h := hashByte(h, ' ');
+                            h := hashDecimal(h, j);
+                        end if;
+                        j := j + 1;
+                    end while;
+                    at := stop;
+                when None do
+                    abort("Standard.Grapheme.Test: a text of the digest was refused");
+                    at := bytes;
+            end case;
+        end while;
+        destroyString(text);
+        destroyFree(starts);
+        return hashByte(h, '\n');
+    end;
+
+    -- The hash after the text of the code points given.
+    function hashOf(hash: Nat32, a: Index, b: Index, c: Index, size: Index): Nat32 is
+        let reps: Span[Nat8, Static] := representatives();
+        var points: Buffer[Index] := allocateEmpty();
+        insertBack(&!points, pointAt(reps, a * 6));
+        if size >= 2 then
+            insertBack(&!points, pointAt(reps, b * 6));
+        end if;
+        if size >= 3 then
+            insertBack(&!points, pointAt(reps, c * 6));
+        end if;
+        let h: Nat32 := hashText(hash, &points);
+        destroyFree(points);
+        return h;
+    end;
+
+    -- A list of code points with nothing in it.
+    function emptyPoints(): Buffer[Index] is
+        let empty: Buffer[Index] := allocateEmpty();
+        return empty;
+    end;
+
+    -- The digest of --digest: the texts of one, two and three
+    -- representatives, in that order, then the longer texts.
+    function digest(): Nat32 is
+        var hash: Nat32 := 2166136261;
+        let first: Index := 0;
+        let n: Index := spanLength(representatives()) / 6;
+        var a: Index := 0;
+        while a < n do
+            hash := hashOf(hash, a, 0, 0, 1);
+            a := a + 1;
+        end while;
+        a := first;
+        while a < n do
+            var b: Index := 0;
+            while b < n do
+                hash := hashOf(hash, a, b, 0, 2);
+                b := b + 1;
+            end while;
+            a := a + 1;
+        end while;
+        a := first;
+        while a < n do
+            var b: Index := 0;
+            while b < n do
+                var c: Index := 0;
+                while c < n do
+                    hash := hashOf(hash, a, b, c, 3);
+                    c := c + 1;
+                end while;
+                b := b + 1;
+            end while;
+            a := a + 1;
+        end while;
+        let extra: Span[Nat8, Static] := extraTexts();
+        var points: Buffer[Index] := allocateEmpty();
+        var at: Index := 0;
+        while at < spanLength(extra) do
+            if extra[at] = '|' then
+                hash := hashText(hash, &points);
+                destroyFree(points);
+                points := emptyPoints();
+                at := at + 1;
+            else
+                insertBack(&!points, pointAt(extra, at));
+                at := at + 6;
+            end if;
+        end while;
+        destroyFree(points);
+        return hash;
+    end;
+
+    function testDigest(): Unit is
+        let want: Nat32 := 4053743472;
+        assertTrue(digest() = want, "the boundaries of 6194 texts are those of ICU 78.3");
+        return nil;
+    end;
+end module body.

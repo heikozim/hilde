@@ -1,0 +1,300 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: Bindings.Resolve asks the resolver, through getaddrinfo.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length,
+    nth,
+    insertBack
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    storeNth,
+    asSpan,
+    getSpan,
+    nthByte,
+    length as stringLength
+);
+import Standard.Ip (
+    IpAddress,
+    parseIp,
+    parseIpv4,
+    ipFromBytes,
+    ipToBytes,
+    isIpv6,
+    sameIp,
+    inSubnet
+);
+import Bindings.Resolve (
+    recordSize,
+    resolveRecords
+);
+
+module body Standard.Resolve is
+    constant maximumName: Index := 253;
+    constant maximumLabel: Index := 63;
+    constant byteDot: Nat8 := 46;
+    constant byteHyphen: Nat8 := 45;
+    constant byteColon: Nat8 := 58;
+    constant zeroIndex: Index := 0;
+    constant mappedPrefixLength: Index := 7;
+
+    -- A letter, a digit or a hyphen.
+    function labelByte(byte: Nat8): Bool is
+        let lowA: Nat8 := 'a';
+        let lowZ: Nat8 := 'z';
+        let highA: Nat8 := 'A';
+        let highZ: Nat8 := 'Z';
+        let zero: Nat8 := '0';
+        let nine: Nat8 := '9';
+        return ((byte >= lowA) and (byte <= lowZ)) or (((byte >= highA) and (byte <= highZ)) or (((byte >= zero) and (byte <= nine)) or (byte = byteHyphen)));
+    end;
+
+    -- Whether the label from first to just before stop is one RFC 1123
+    -- allows: 1 to 63 bytes, letters, digits and hyphens, no hyphen at
+    -- either end.
+    generic [R: Region]
+    function validLabel(name: Span[Nat8, R], first: Index, stop: Index): Bool is
+        if stop <= first then
+            return false;
+        end if;
+        if (stop - first) > maximumLabel then
+            return false;
+        end if;
+        if (name[first] = byteHyphen) or (name[stop - 1] = byteHyphen) then
+            return false;
+        end if;
+        var i: Index := first;
+        while i < stop do
+            if not labelByte(name[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function validHostname(name: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(name);
+        if (size = zeroIndex) or (size > maximumName) then
+            return false;
+        end if;
+        var first: Index := zeroIndex;
+        var i: Index := zeroIndex;
+        while i < size do
+            if name[i] = byteDot then
+                if not validLabel(name, first, i) then
+                    return false;
+                end if;
+                first := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return validLabel(name, first, size);
+    end;
+
+    -- Whether the name begins with ::ffff: in either case.
+    generic [R: Region]
+    function mappedPrefix(name: Span[Nat8, R]): Bool is
+        if spanLength(name) <= mappedPrefixLength then
+            return false;
+        end if;
+        let lowF: Nat8 := 'f';
+        let highF: Nat8 := 'F';
+        var i: Index := zeroIndex;
+        while i < mappedPrefixLength do
+            let byte: Nat8 := name[i];
+            if (i < 2) or (i = 6) then
+                if byte /= byteColon then
+                    return false;
+                end if;
+            else
+                if (byte /= lowF) and (byte /= highF) then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- A literal address: dotted quad, IPv6 text, or an IPv4 address in
+    -- the mapped form ::ffff: and a dotted quad, which parseIp does not
+    -- read.  An IPv6 address in ::ffff:0:0/96 written in groups, which
+    -- parseIp reads, is the IPv4 address it maps as well.  The part after
+    -- the prefix is copied, since a span cannot be cut.
+    generic [R: Region]
+    function literal(name: Span[Nat8, R]): Option[IpAddress] is
+        if mappedPrefix(name) then
+            let restSize: Index := spanLength(name) - mappedPrefixLength;
+            let zeroByte: Nat8 := 0;
+            var rest: String := makeString(restSize, zeroByte);
+            var i: Index := zeroIndex;
+            while i < restSize do
+                storeNth(&!rest, i, name[mappedPrefixLength + i]);
+                i := i + 1;
+            end while;
+            let dotted: Option[IpAddress] := parseIpv4(asSpan(&rest));
+            destroyString(rest);
+            case dotted of
+                when Some(value as address: IpAddress) do
+                    return Some(value => address);
+                when None do
+                    skip;
+            end case;
+        end if;
+        case parseIp(name) of
+            when Some(value as address: IpAddress) do
+                return Some(value => unmapped(address));
+            when None do
+                let none: Option[IpAddress] := None();
+                return none;
+        end case;
+    end;
+
+    -- The IPv4 address an IPv6 address in ::ffff:0:0/96 maps, or the
+    -- address as it is.
+    function unmapped(address: IpAddress): IpAddress is
+        if not isIpv6(address) then
+            return address;
+        end if;
+        case parseIp("::ffff:0:0") of
+            when Some(value as mappedNet: IpAddress) do
+                if not inSubnet(address, mappedNet, 96) then
+                    return address;
+                end if;
+            when None do
+                return address;
+        end case;
+        let bytes: String := ipToBytes(address);
+        let four: Option[IpAddress] := ipFromBytes(getSpan(&bytes, 12, 15));
+        destroyString(bytes);
+        case four of
+            when Some(value as v4: IpAddress) do
+                return v4;
+            when None do
+                return address;
+        end case;
+    end;
+
+    function keeps(family: Family, address: IpAddress): Bool is
+        case family of
+            when AnyFamily do
+                return true;
+            when OnlyIpv4 do
+                return not isIpv6(address);
+            when OnlyIpv6 do
+                return isIpv6(address);
+        end case;
+    end;
+
+    generic [R: Region]
+    function holds(found: &[Buffer[IpAddress], R], address: IpAddress): Bool is
+        let count: Index := length(found);
+        var i: Index := zeroIndex;
+        while i < count do
+            if sameIp(nth(found, i), address) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The answer from the addresses kept, or the reason there is none:
+    -- NoAddressOfFamily when some were found and none of the family.
+    function answer(found: Buffer[IpAddress], seen: Index): Either[ResolveFailure, Buffer[IpAddress]] is
+        if (length(&found) = zeroIndex) and (seen > zeroIndex) then
+            destroyFree(found);
+            let none: Either[ResolveFailure, Buffer[IpAddress]] := Left(left => NoAddressOfFamily());
+            return none;
+        else
+            let some: Either[ResolveFailure, Buffer[IpAddress]] := Right(right => found);
+            return some;
+        end if;
+    end;
+
+    -- The address in the record that begins at at: its length, then its
+    -- bytes.  None for a length that is neither 4 nor 16.
+    generic [R: Region]
+    function addressAt(records: &[String, R], at: Index): Option[IpAddress] is
+        case toIndex(nthByte(records, at)) of
+            when Some(value as size: Index) do
+                if (size = zeroIndex) or ((at + size) >= stringLength(records)) then
+                    let none: Option[IpAddress] := None();
+                    return none;
+                end if;
+                return ipFromBytes(getSpan(records, at + 1, at + size));
+            when None do
+                let none: Option[IpAddress] := None();
+                return none;
+        end case;
+    end;
+
+    -- The addresses in the records of the binding, of the family, each
+    -- once.
+    function fromRecords(records: String, family: Family): Either[ResolveFailure, Buffer[IpAddress]] is
+        var found: Buffer[IpAddress] := allocateEmpty();
+        let total: Index := stringLength(&records) / recordSize;
+        var i: Index := zeroIndex;
+        while i < total do
+            case addressAt(&records, i * recordSize) of
+                when Some(value as address: IpAddress) do
+                    if keeps(family, address) and (not holds(&found, address)) then
+                        insertBack(&!found, address);
+                    end if;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        destroyString(records);
+        let result: Either[ResolveFailure, Buffer[IpAddress]] := answer(found, total);
+        return result;
+    end;
+
+    generic [R: Region]
+    function resolveHost(name: Span[Nat8, R], family: Family): Either[ResolveFailure, Buffer[IpAddress]] is
+        case literal(name) of
+            when Some(value as address: IpAddress) do
+                var found: Buffer[IpAddress] := allocateEmpty();
+                if keeps(family, address) then
+                    insertBack(&!found, address);
+                end if;
+                let one: Index := 1;
+                return answer(found, one);
+            when None do
+                skip;
+        end case;
+        if not validHostname(name) then
+            let refused: Either[ResolveFailure, Buffer[IpAddress]] := Left(left => NotAHostName());
+            return refused;
+        end if;
+        case resolveRecords(name) of
+            when Right(right as records: String) do
+                return fromRecords(records, family);
+            when Left(left as code: Int32) do
+                let unknown: Int32 := -1;
+                let unavailable: Int32 := -2;
+                var failure: ResolveFailure := ResolveFailed();
+                if code = unknown then
+                    failure := UnknownName();
+                else if code = unavailable then
+                    failure := ResolverUnavailable();
+                end if;
+                let failed: Either[ResolveFailure, Buffer[IpAddress]] := Left(left => failure);
+                return failed;
+        end case;
+    end;
+end module body.

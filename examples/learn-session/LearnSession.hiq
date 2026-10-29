@@ -1,0 +1,187 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    removeFile
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite
+);
+import Standard.Cookie (
+    strictOptions,
+    cookieValue,
+    setCookie,
+    deleteCookie
+);
+import Standard.Session (
+    SessionError,
+    defaultSessionLimits,
+    prepareSessions,
+    isSessionToken,
+    createSession,
+    loadSession,
+    rotateSession,
+    destroySession
+);
+import Standard.Csrf (
+    csrfToken,
+    csrfValid,
+    sameOriginRequest
+);
+
+module body Example.LearnSession is
+    -- A fixed key for the example; a server reads its key from its secret
+    -- store.
+    constant csrfKey: Span[Nat8, Static] := "example-key-of-thirty-two-bytes!";
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    function printHeader(made: Option[String]): Unit is
+        case made of
+            when Some(value as header: String) do
+                print("Set-Cookie: ");
+                printText(&header);
+                printLn("");
+                destroyString(header);
+            when None do
+                printLn("refused");
+        end case;
+        return nil;
+    end;
+
+    -- What the session of token holds at now, as the example prints it.
+    generic [R: Region, T: Region]
+    function show(db: &![Database[Writing], R], token: &[String, T], now: Int64): Unit is
+        case loadSession(&~db, asSpan(token), defaultSessionLimits(), now) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as data: String) do
+                        print("the session holds: ");
+                        printText(&data);
+                        printLn("");
+                        destroyString(data);
+                    when None do
+                        printLn("no session");
+                end case;
+            when Left(left as error: SessionError) do
+                printLn("the session could not be read");
+        end case;
+        return nil;
+    end;
+
+    -- The browser comes back with the cookie: its header is read, the
+    -- session loaded, a form checked, and the login rotates the token.
+    generic [R: Region]
+    function visit(db: &![Database[Writing], R], token: String): Unit is
+        var header: StringBuilder := makeStringBuilder();
+        writeString(&!header, "theme=dark; session=");
+        writeString(&!header, asSpan(&token));
+        let cookies: String := finalize(header);
+        case cookieValue(asSpan(&cookies), "session") of
+            when Some(value as back: String) do
+                print("the cookie came back with the token: ");
+                printLn(isSessionToken(asSpan(&back)));
+                show(&~db, &back, 1060);
+                case csrfToken(csrfKey, asSpan(&back)) of
+                    when Some(value as field: String) do
+                        print("the form's token is valid: ");
+                        printLn(csrfValid(csrfKey, asSpan(&back), asSpan(&field)));
+                        destroyString(field);
+                    when None do
+                        printLn("no form token");
+                end case;
+                print("the same form from another site is taken: ");
+                printLn(sameOriginRequest("cross-site", "https://evil.example", "https://example.org"));
+                case rotateSession(&~db, asSpan(&back), defaultSessionLimits(), 1120) of
+                    when Right(right as rotated: Option[String]) do
+                        case rotated of
+                            when Some(value as renewed: String) do
+                                printLn("after the login the token is a new one:");
+                                print("  the old token: ");
+                                show(&~db, &back, 1130);
+                                print("  the new token: ");
+                                show(&~db, &renewed, 1130);
+                                case destroySession(&~db, asSpan(&renewed)) of
+                                    when Right(right as done: Unit) do
+                                        print("after the logout: ");
+                                        show(&~db, &renewed, 1140);
+                                    when Left(left as error: SessionError) do
+                                        printLn("the logout failed");
+                                end case;
+                                destroyString(renewed);
+                            when None do
+                                printLn("nothing rotated");
+                        end case;
+                    when Left(left as error: SessionError) do
+                        printLn("the rotation failed");
+                end case;
+                destroyString(back);
+            when None do
+                printLn("no session cookie");
+        end case;
+        destroyString(cookies);
+        destroyString(token);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        printHeader(setCookie("theme", "dark", "/", strictOptions()));
+        printHeader(deleteCookie("theme", "/", strictOptions()));
+        printHeader(setCookie("theme", "dark; Domain=evil.example", "/", strictOptions()));
+        let path: String := fromLiteral("learn-session.db");
+        let removed: Bool := removeFile(asSpan(&path));
+        case openSqlite("learn-session.db") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case prepareSessions(&!db) of
+                    when Right(right as done: Unit) do
+                        case createSession(&!db, "user=ann", 1000) of
+                            when Right(right as token: String) do
+                                print("a new session, its token has the form of one: ");
+                                printLn(isSessionToken(asSpan(&token)));
+                                visit(&!db, token);
+                            when Left(left as error: SessionError) do
+                                printLn("no session");
+                        end case;
+                    when Left(left as error: SessionError) do
+                        printLn("no table");
+                end case;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                printLn("no database");
+        end case;
+        let gone: Bool := removeFile(asSpan(&path));
+        destroyString(path);
+        return ExitSuccess();
+    end;
+end module body.

@@ -1,0 +1,74 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Arena (
+    Arena,
+    createArena,
+    freeArena
+);
+import Standard.Task (
+    Scope,
+    Task,
+    spawn
+);
+
+module body Standard.TaskArena is
+    -- A value and the arena that goes with it.  Only arenaAllocate and
+    -- arenaSpan take from the arena; every other allocation of the task
+    -- still comes from malloc.
+    record WithArena[V: Type]: Linear is
+        value: V;
+        arena: Arena;
+    end;
+
+    -- What spawn moves into the task: the work, the argument and the arena
+    -- made for it.  Through spawn, so that its argument is checked (H3002).
+    record Job[A: Type, T: Type]: Linear is
+        work: Fn[WithArena[A], WithArena[T]];
+        argument: A;
+        arena: Arena;
+    end;
+
+    -- The task itself: hand the work its argument and arena, take back its
+    -- result and an arena, free the arena, give the result to join.
+    generic [A: Type, T: Type]
+    function runJob(job: Job[A, T]): T is
+        let { work: Fn[WithArena[A], WithArena[T]], argument: A, arena: Arena } := job;
+        let input: WithArena[A] := WithArena(value => argument, arena => arena);
+        let output: WithArena[T] := work(input);
+        let { value: T, arena as back: Arena } := output;
+        freeArena(back);
+        return value;
+    end;
+
+    generic [A: Type, T: Type, R: Region]
+    function spawnWithArena(scope: &![Scope, R],
+        work: Fn[WithArena[A], WithArena[T]],
+        argument: A,
+        capacity: ByteSize): Either[A, Task[T]] is
+        case createArena(capacity) of
+            when Some(value as arena: Arena) do
+                let job: Job[A, T] := Job(work => work, argument => argument, arena => arena);
+                let run: Fn[Job[A, T], T] := runJob;
+                case spawn(&~scope, run, job) of
+                    when Right(right as task: Task[T]) do
+                        let started: Either[A, Task[T]] := Right(right => task);
+                        return started;
+                    when Left(left as back: Job[A, T]) do
+                        let { work as unused: Fn[WithArena[A], WithArena[T]],
+                            argument as original: A,
+                            arena as made: Arena } := back;
+                        freeArena(made);
+                        let refused: Either[A, Task[T]] := Left(left => original);
+                        return refused;
+                end case;
+            when None do
+                let none: Either[A, Task[T]] := Left(left => argument);
+                return none;
+        end case;
+    end;
+end module body.

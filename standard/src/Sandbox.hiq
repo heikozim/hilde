@@ -1,0 +1,1303 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: the calls into C are those of Bindings.Sandbox.  Here the
+-- policy is checked, the strings are made with their zero bytes, and the
+-- report is built from what each call answered, never from what was asked.
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    initialize as makeStarts,
+    nth as startOf,
+    storeNth as storeStart,
+    destroyFree as destroyStarts
+);
+import Bindings.Sandbox (
+    platform,
+    setNoNewPrivileges,
+    queryNoNewPrivileges as bindQueryNoNewPrivileges,
+    pledgeWithExec,
+    unveil,
+    unveilProbe,
+    lockUnveil,
+    seatbelt,
+    capsicum,
+    queryCapsicum as bindQueryCapsicum,
+    landlockAbi,
+    landlockOpen,
+    landlockAdd,
+    landlockRestrict,
+    landlockClose,
+    seccomp,
+    querySeccomp as bindQuerySeccomp,
+    threadCount
+);
+
+module body Standard.Sandbox is
+    record Mechanism: Free is
+        code: Nat8;
+    end;
+
+    constant mechanismNoNewPrivileges: Mechanism := Mechanism(code => 1);
+    constant mechanismPledge: Mechanism := Mechanism(code => 2);
+    constant mechanismUnveil: Mechanism := Mechanism(code => 3);
+    constant mechanismLandlock: Mechanism := Mechanism(code => 4);
+    constant mechanismSeccomp: Mechanism := Mechanism(code => 5);
+    constant mechanismExecPromises: Mechanism := Mechanism(code => 6);
+    constant mechanismSeatbelt: Mechanism := Mechanism(code => 7);
+    constant mechanismCapsicum: Mechanism := Mechanism(code => 8);
+
+    -- The number of paths unveil takes in its simplest shape, all of them
+    -- directories: the kernel's ceiling on unveiled directories.  Folding
+    -- aims at it; what really fits is measured.
+    constant unveilTarget: Index := 128;
+
+    record Policy: Linear is
+        -- The promises, words separated by one space.
+        promises: StringBuilder;
+        promiseWords: Index;
+        -- The execpromises, in the same form.
+        execPromises: StringBuilder;
+        execWords: Index;
+        -- Every path and its permissions, each followed by a zero byte.
+        grants: String;
+        pathCount: Index;
+        -- Whether applyPolicy may fold paths when unveil has no room.
+        folding: Bool;
+        valid: Bool;
+    end;
+
+    record Report: Free is
+        refused: Bool;
+        noNewPrivileges: Bool;
+        pledged: Bool;
+        execPledged: Bool;
+        unveiled: Bool;
+        landlock: Bool;
+        seccomp: Bool;
+        seatbelt: Bool;
+        capsicum: Bool;
+        -- Whether Capsicum was not tried for the promises.
+        capsicumRefused: Bool;
+        landlockAbi: Int32;
+        pathsAsked: Index;
+        pathsApplied: Index;
+        pathsFolded: Index;
+        -- The number of the first path unveil had no room for, counted
+        -- from 1; 0 when it had room.
+        firstRefused: Index;
+        threadsInTheWay: Bool;
+        invariant pathsApplied <= pathsAsked;
+        invariant pathsFolded <= pathsAsked;
+        invariant firstRefused <= pathsAsked;
+    end;
+
+    ---
+    --- Checking what a policy is given
+    ---
+
+    -- Every promise word of OpenBSD's pledge(2), separated by one space.
+    function knownPromises(): String is
+        return fromLiteral("stdio rpath wpath cpath dpath inet mcast fattr chown flock unix dns getpw sendfd recvfd tape tty proc exec prot_exec settime ps vminfo id pf route wroute audio video bpf unveil error");
+    end;
+
+    -- Whether bytes start up to stop of text are exactly the word of known
+    -- that runs from first up to last.
+    generic [R: Region, S: Region]
+    function sameWord(known: Span[Nat8, R], first: Index, last: Index,
+        text: Span[Nat8, S], start: Index, stop: Index): Bool is
+        if (last - first) /= (stop - start) then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < (last - first) do
+            if known[first + i] /= text[start + i] then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    -- Whether bytes start up to stop of text are one of the known words.
+    generic [R: Region]
+    function isPromise(text: Span[Nat8, R], start: Index, stop: Index): Bool is
+        let known: String := knownPromises();
+        let size: Index := length(&known);
+        var found: Bool := false;
+        var first: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            -- The end of the list closes the last word as a space would.
+            var boundary: Bool := (i = size);
+            if not boundary then
+                boundary := (nthByte(&known, i) = ' ');
+            end if;
+            if boundary then
+                if sameWord(asSpan(&known), first, i, text, start, stop) then
+                    found := true;
+                end if;
+                first := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(known);
+        return found;
+    end;
+
+    -- Whether text is one or more known words, each separated from the next
+    -- by one space.
+    generic [R: Region]
+    function validPromises(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        if size = 0 then
+            return false;
+        end if;
+        var valid: Bool := true;
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            var boundary: Bool := (i = size);
+            if not boundary then
+                boundary := (text[i] = ' ');
+            end if;
+            if boundary then
+                -- An empty word is two spaces, or a space at an end.
+                if i = start then
+                    valid := false;
+                else
+                    if not isPromise(text, start, i) then
+                        valid := false;
+                    end if;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return valid;
+    end;
+
+    -- Whether text is some of r, w, x and c, each at most once.
+    generic [R: Region]
+    function validPermissions(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        if (size = 0) or (size > 4) then
+            return false;
+        end if;
+        var read: Bool := false;
+        var write: Bool := false;
+        var execute: Bool := false;
+        var create: Bool := false;
+        var valid: Bool := true;
+        for i from 0 to size - 1 do
+            let b: Nat8 := text[i];
+            -- A letter seen before, or another byte, makes it invalid.
+            if b = 'r' then
+                if read then
+                    valid := false;
+                end if;
+                read := true;
+            else
+                if b = 'w' then
+                    if write then
+                        valid := false;
+                    end if;
+                    write := true;
+                else
+                    if b = 'x' then
+                        if execute then
+                            valid := false;
+                        end if;
+                        execute := true;
+                    else
+                        if b = 'c' then
+                            if create then
+                                valid := false;
+                            end if;
+                            create := true;
+                        else
+                            valid := false;
+                        end if;
+                    end if;
+                end if;
+            end if;
+        end for;
+        return valid;
+    end;
+
+    -- Whether text is a path this module hands on: not empty, and no zero
+    -- byte, which would end it early for the kernel.
+    generic [R: Region]
+    function validPath(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        if size = 0 then
+            return false;
+        end if;
+        var valid: Bool := true;
+        for i from 0 to size - 1 do
+            if text[i] = 0 then
+                valid := false;
+            end if;
+        end for;
+        return valid;
+    end;
+
+    ---
+    --- The policy
+    ---
+
+    function makePolicy(): Policy is
+        return Policy(
+            promises => makeStringBuilder(),
+            promiseWords => 0,
+            execPromises => makeStringBuilder(),
+            execWords => 0,
+            grants => makeString(0, 0),
+            pathCount => 0,
+            folding => false,
+            valid => true
+        );
+    end;
+
+    generic [R: Region]
+    function allowPromises(policy: Policy, promises: Span[Nat8, R]): Policy is
+        let { promises as have: StringBuilder, promiseWords: Index, execPromises: StringBuilder,
+            execWords: Index, grants: String, pathCount: Index, folding: Bool,
+            valid: Bool } := policy;
+        var builder: StringBuilder := have;
+        var nowValid: Bool := valid;
+        var words: Index := promiseWords;
+        if validPromises(promises) then
+            if words > 0 then
+                writeByte(&!builder, ' ');
+            end if;
+            writeString(&!builder, promises);
+            words := words + 1;
+        else
+            nowValid := false;
+        end if;
+        return Policy(promises => builder, promiseWords => words, execPromises => execPromises,
+            execWords => execWords, grants => grants, pathCount => pathCount,
+            folding => folding, valid => nowValid);
+    end;
+
+    generic [R: Region]
+    function allowExecPromises(policy: Policy, promises: Span[Nat8, R]): Policy is
+        let { promises as now: StringBuilder, promiseWords: Index, execPromises as have: StringBuilder,
+            execWords: Index, grants: String, pathCount: Index, folding: Bool,
+            valid: Bool } := policy;
+        var builder: StringBuilder := have;
+        var nowValid: Bool := valid;
+        var words: Index := execWords;
+        if validPromises(promises) then
+            if words > 0 then
+                writeByte(&!builder, ' ');
+            end if;
+            writeString(&!builder, promises);
+            words := words + 1;
+        else
+            nowValid := false;
+        end if;
+        return Policy(promises => now, promiseWords => promiseWords, execPromises => builder,
+            execWords => words, grants => grants, pathCount => pathCount,
+            folding => folding, valid => nowValid);
+    end;
+
+    generic [R: Region, S: Region]
+    function allowPath(policy: Policy, path: Span[Nat8, R], permissions: Span[Nat8, S]): Policy is
+        let { promises: StringBuilder, promiseWords: Index, execPromises: StringBuilder,
+            execWords: Index, grants as have: String, pathCount: Index, folding: Bool,
+            valid: Bool } := policy;
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, asSpan(&have));
+        destroyString(have);
+        var nowValid: Bool := valid;
+        var count: Index := pathCount;
+        if validPath(path) and validPermissions(permissions) then
+            writeString(&!builder, path);
+            writeByte(&!builder, 0);
+            writeString(&!builder, permissions);
+            writeByte(&!builder, 0);
+            count := count + 1;
+        else
+            nowValid := false;
+        end if;
+        return Policy(promises => promises, promiseWords => promiseWords, execPromises => execPromises,
+            execWords => execWords, grants => finalize(builder), pathCount => count,
+            folding => folding, valid => nowValid);
+    end;
+
+    function allowFolding(policy: Policy): Policy is
+        let { promises: StringBuilder, promiseWords: Index, execPromises: StringBuilder,
+            execWords: Index, grants: String, pathCount: Index, folding: Bool,
+            valid: Bool } := policy;
+        return Policy(promises => promises, promiseWords => promiseWords, execPromises => execPromises,
+            execWords => execWords, grants => grants, pathCount => pathCount,
+            folding => true, valid => valid);
+    end;
+
+    generic [R: Region]
+    function policyValid(policy: &[Policy, R]): Bool is
+        return policy->valid;
+    end;
+
+    generic [R: Region]
+    function policyPathCount(policy: &[Policy, R]): Index is
+        return policy->pathCount;
+    end;
+
+    generic [R: Region]
+    function describePaths(policy: &[Policy, R]): String is
+        let grants: Span[Nat8, R] := asSpan(&(policy->grants));
+        let count: Index := policy->pathCount;
+        var builder: StringBuilder := makeStringBuilder();
+        var at: Index := 0;
+        var k: Index := 0;
+        while k < count do
+            let pathEnd: Index := nextZero(grants, at);
+            let permissionsEnd: Index := nextZero(grants, pathEnd + 1);
+            writeString(&!builder, spanPart(grants, at, pathEnd - at));
+            writeByte(&!builder, ' ');
+            writeString(&!builder, spanPart(grants, pathEnd + 1, permissionsEnd - (pathEnd + 1)));
+            writeByte(&!builder, '\n');
+            at := permissionsEnd + 1;
+            k := k + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    function discardPolicy(policy: Policy): Unit is
+        let { promises: StringBuilder, promiseWords: Index, execPromises: StringBuilder,
+            execWords: Index, grants: String, pathCount: Index, folding: Bool,
+            valid: Bool } := policy;
+        destroyString(finalize(promises));
+        destroyString(finalize(execPromises));
+        destroyString(grants);
+        return nil;
+    end;
+
+    ---
+    --- The strings handed to the binding
+    ---
+
+    -- Bytes start up to and including the zero byte at stop, as a string of
+    -- their own: exactly one zero byte, at its end.
+    generic [R: Region]
+    function segment(block: Span[Nat8, R], start: Index, stop: Index): String is
+        var out: String := makeString((stop - start) + 1, 0);
+        var i: Index := start;
+        while i < stop do
+            storeNth(&!out, i - start, block[i]);
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The index of the first zero byte at or after start.  grants holds two
+    -- per path, so it is never looked for past the end.
+    generic [R: Region]
+    function nextZero(block: Span[Nat8, R], start: Index): Index is
+        var i: Index := start;
+        while block[i] /= 0 do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- A literal with its zero byte.
+    function terminatedLiteral(text: Span[Nat8, Static]): String is
+        let source: String := fromLiteral(text);
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, asSpan(&source));
+        writeByte(&!builder, 0);
+        destroyString(source);
+        return finalize(builder);
+    end;
+
+    -- The words of a builder with their zero byte.
+    function terminated(builder: StringBuilder): String is
+        var words: StringBuilder := builder;
+        writeByte(&!words, 0);
+        return finalize(words);
+    end;
+
+    ---
+    --- Folding
+    ---
+
+    -- Where each path of grants starts.  Only called with count above 0.
+    generic [R: Region]
+    function entryStarts(grants: Span[Nat8, R], count: Index): Buffer[Index] is
+        let zero: Index := 0;
+        var starts: Buffer[Index] := makeStarts(count, zero);
+        var at: Index := 0;
+        var k: Index := 0;
+        while k < count do
+            storeStart(&!starts, k, at);
+            let pathEnd: Index := nextZero(grants, at);
+            at := nextZero(grants, pathEnd + 1) + 1;
+            k := k + 1;
+        end while;
+        return starts;
+    end;
+
+    -- The end of the parent directory of the path that starts at start: the
+    -- index of the path's last slash, so that the parent runs from start up
+    -- to it.  0 when there is none to fold onto: a path that does not start
+    -- with a slash, or whose parent is the root, however many slashes spell
+    -- it.  A fold onto the root would grant the whole file system.
+    generic [R: Region]
+    function parentEnd(grants: Span[Nat8, R], start: Index): Index is
+        if grants[start] /= '/' then
+            return 0;
+        end if;
+        let stop: Index := nextZero(grants, start);
+        var last: Index := start;
+        var i: Index := start;
+        while i < stop do
+            if grants[i] = '/' then
+                last := i;
+            end if;
+            i := i + 1;
+        end while;
+        var onlySlashes: Bool := true;
+        i := start;
+        while i < last do
+            if grants[i] /= '/' then
+                onlySlashes := false;
+            end if;
+            i := i + 1;
+        end while;
+        if onlySlashes then
+            return 0;
+        end if;
+        return last;
+    end;
+
+    -- Whether the bytes from a up to aStop equal those from b up to bStop.
+    generic [R: Region]
+    function sameBytes(grants: Span[Nat8, R], a: Index, aStop: Index, b: Index, bStop: Index): Bool is
+        if (aStop - a) /= (bStop - b) then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < (aStop - a) do
+            if grants[a + i] /= grants[b + i] then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    -- Whether every letter of the permissions from sub up to subStop is
+    -- among those from whole up to wholeStop.
+    generic [R: Region]
+    function permissionsWithin(grants: Span[Nat8, R], sub: Index, subStop: Index,
+        whole: Index, wholeStop: Index): Bool is
+        var within: Bool := true;
+        var i: Index := sub;
+        while i < subStop do
+            var found: Bool := false;
+            var j: Index := whole;
+            while j < wholeStop do
+                if grants[j] = grants[i] then
+                    found := true;
+                end if;
+                j := j + 1;
+            end while;
+            if not found then
+                within := false;
+            end if;
+            i := i + 1;
+        end while;
+        return within;
+    end;
+
+    -- Whether the permissions of the paths that start at a and b hold the
+    -- same letters.
+    generic [R: Region]
+    function samePermissions(grants: Span[Nat8, R], a: Index, b: Index): Bool is
+        let aFrom: Index := nextZero(grants, a) + 1;
+        let aStop: Index := nextZero(grants, aFrom);
+        let bFrom: Index := nextZero(grants, b) + 1;
+        let bStop: Index := nextZero(grants, bFrom);
+        return permissionsWithin(grants, aFrom, aStop, bFrom, bStop)
+            and permissionsWithin(grants, bFrom, bStop, aFrom, aStop);
+    end;
+
+    -- The entry whose path is the parent of the path at start, which ends
+    -- at parentStop, or count when no entry is.
+    generic [R: Region, S: Region]
+    function entryOfParent(grants: Span[Nat8, R], starts: &[Buffer[Index], S], count: Index,
+        start: Index, parentStop: Index): Index is
+        var found: Index := count;
+        var k: Index := count;
+        while k > 0 do
+            k := k - 1;
+            let at: Index := startOf(starts, k);
+            if sameBytes(grants, at, nextZero(grants, at), start, parentStop) then
+                found := k;
+            end if;
+        end while;
+        return found;
+    end;
+
+    -- Whether the path at start and the path at other have the same parent
+    -- and the same permissions, so that they fold together.
+    generic [R: Region]
+    function siblings(grants: Span[Nat8, R], start: Index, other: Index): Bool is
+        let parent: Index := parentEnd(grants, start);
+        let otherParent: Index := parentEnd(grants, other);
+        if (parent = 0) or (otherParent = 0) then
+            return false;
+        end if;
+        if not sameBytes(grants, start, parent, other, otherParent) then
+            return false;
+        end if;
+        return samePermissions(grants, start, other);
+    end;
+
+    -- The path at start may fold onto its parent: it has one, and the
+    -- parent is not an entry that grants more than the path does, which
+    -- would hand the path the parent's wider grant.
+    generic [R: Region, S: Region]
+    function mayFold(grants: Span[Nat8, R], starts: &[Buffer[Index], S], count: Index,
+        start: Index): Bool is
+        let parent: Index := parentEnd(grants, start);
+        if parent = 0 then
+            return false;
+        end if;
+        let target: Index := entryOfParent(grants, starts, count, start, parent);
+        if target = count then
+            return true;
+        end if;
+        let targetStart: Index := startOf(starts, target);
+        let targetFrom: Index := nextZero(grants, targetStart) + 1;
+        let letters: Index := nextZero(grants, start) + 1;
+        return permissionsWithin(grants, targetFrom, nextZero(grants, targetFrom),
+            letters, nextZero(grants, letters));
+    end;
+
+    record Folded: Linear is
+        grants: String;
+        count: Index;
+        changed: Bool;
+    end;
+
+    -- The entry that leads the largest group of siblings that may fold, or
+    -- count when no group has two.
+    generic [R: Region, S: Region]
+    function largestGroup(grants: Span[Nat8, R], starts: &[Buffer[Index], S], count: Index): Index is
+        var best: Index := 1;
+        var winner: Index := count;
+        var i: Index := 0;
+        while i < count do
+            let start: Index := startOf(starts, i);
+            if mayFold(grants, starts, count, start) then
+                var size: Index := 0;
+                var j: Index := 0;
+                while j < count do
+                    if siblings(grants, start, startOf(starts, j)) then
+                        size := size + 1;
+                    end if;
+                    j := j + 1;
+                end while;
+                if size > best then
+                    best := size;
+                    winner := i;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return winner;
+    end;
+
+    -- The permissions of the path at start, and those of the path at other
+    -- it lacks.
+    generic [R: Region, S: Region]
+    function writeUnion(builder: &![StringBuilder, S], grants: Span[Nat8, R], start: Index, other: Index): Unit is
+        let letters: Index := nextZero(grants, start) + 1;
+        let stop: Index := nextZero(grants, letters);
+        let otherFrom: Index := nextZero(grants, other) + 1;
+        let otherStop: Index := nextZero(grants, otherFrom);
+        writeString(&~builder, spanPart(grants, letters, stop - letters));
+        var i: Index := otherFrom;
+        while i < otherStop do
+            if not permissionsWithin(grants, i, i + 1, letters, stop) then
+                writeByte(&~builder, grants[i]);
+            end if;
+            i := i + 1;
+        end while;
+        writeByte(&~builder, 0);
+        return nil;
+    end;
+
+    -- The whole entry that starts at start, path and permissions.
+    generic [R: Region, S: Region]
+    function writeEntry(builder: &![StringBuilder, S], grants: Span[Nat8, R], start: Index): Unit is
+        let stop: Index := nextZero(grants, nextZero(grants, start) + 1) + 1;
+        writeString(&~builder, spanPart(grants, start, stop - start));
+        return nil;
+    end;
+
+    -- One fold: the largest group of siblings with the same permissions
+    -- becomes their parent with those permissions.  A parent that is an
+    -- entry already takes them into its own.  The same list, unchanged,
+    -- when no group of two is left.
+    generic [R: Region]
+    function foldOnce(grants: Span[Nat8, R], count: Index): Folded is
+        if count < 2 then
+            return unfolded(grants, count);
+        else
+            let starts: Buffer[Index] := entryStarts(grants, count);
+            let winner: Index := largestGroup(grants, &starts, count);
+            if winner = count then
+                destroyStarts(starts);
+                return unfolded(grants, count);
+            else
+                return foldGroup(grants, starts, count, winner);
+            end if;
+        end if;
+    end;
+
+    -- The list as it is, when nothing folds.
+    generic [R: Region]
+    function unfolded(grants: Span[Nat8, R], count: Index): Folded is
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, grants);
+        return Folded(grants => finalize(builder), count => count, changed => false);
+    end;
+
+    -- The list with the group that winner leads folded onto its parent.
+    generic [R: Region]
+    function foldGroup(grants: Span[Nat8, R], starts: Buffer[Index], count: Index, winner: Index): Folded is
+        var builder: StringBuilder := makeStringBuilder();
+        let lead: Index := startOf(&starts, winner);
+        let parent: Index := parentEnd(grants, lead);
+        let target: Index := entryOfParent(grants, &starts, count, lead, parent);
+        var kept: Index := 0;
+        var k: Index := 0;
+        while k < count do
+            let at: Index := startOf(&starts, k);
+            if k = target then
+                writeString(&!builder, spanPart(grants, at, (nextZero(grants, at) + 1) - at));
+                writeUnion(&!builder, grants, at, lead);
+                kept := kept + 1;
+            else
+                if not siblings(grants, lead, at) then
+                    writeEntry(&!builder, grants, at);
+                    kept := kept + 1;
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        if target = count then
+            -- The parent is new: its path, then the group's permissions.
+            writeString(&!builder, spanPart(grants, lead, parent - lead));
+            writeByte(&!builder, 0);
+            let letters: Index := nextZero(grants, lead) + 1;
+            writeString(&!builder, spanPart(grants, letters, (nextZero(grants, letters) + 1) - letters));
+            kept := kept + 1;
+        end if;
+        destroyStarts(starts);
+        return Folded(grants => finalize(builder), count => kept, changed => true);
+    end;
+
+    -- Folds until at most target paths are left or nothing folds.
+    function foldDown(grants: String, count: Index, target: Index): Folded is
+        if count <= target then
+            return Folded(grants => grants, count => count, changed => false);
+        else
+            let once: Folded := foldOnce(asSpan(&grants), count);
+            destroyString(grants);
+            let { grants as next: String, count as left: Index, changed: Bool } := once;
+            if changed then
+                return foldDown(next, left, target);
+            else
+                return Folded(grants => next, count => left, changed => false);
+            end if;
+        end if;
+    end;
+
+    function foldPolicy(policy: Policy, target: Index): Policy is
+        let { promises: StringBuilder, promiseWords: Index, execPromises: StringBuilder,
+            execWords: Index, grants: String, pathCount: Index, folding: Bool,
+            valid: Bool } := policy;
+        let down: Folded := foldDown(grants, pathCount, target);
+        let { grants as folded: String, count: Index, changed: Bool } := down;
+        return Policy(promises => promises, promiseWords => promiseWords, execPromises => execPromises,
+            execWords => execWords, grants => folded, pathCount => count,
+            folding => folding, valid => valid);
+    end;
+
+    ---
+    --- OpenBSD
+    ---
+
+    record Fitted: Linear is
+        grants: String;
+        count: Index;
+        -- The number of the first path unveil had no room for, from 1, or 0.
+        firstRefused: Index;
+    end;
+
+    -- The probe's answer as the number of a refused path: the index plus
+    -- one, or 0 when every path fitted or the probe did not run.
+    function refusedNumber(probed: Int32): Index is
+        if probed < 0 then
+            return 0;
+        end if;
+        return toIndex32(probed) + 1;
+    end;
+
+    -- Measures in a child whether unveil has room for the paths, folds them
+    -- when it has not and folding is allowed, and measures again.  A probe
+    -- that did not run is no verdict: the paths are applied as they are.
+    function fitUnveil(grants: String, count: Index, folding: Bool): Fitted is
+        var first: Index := 0;
+        if count > 0 then
+            first := refusedNumber(unveilProbe(&grants, count));
+        end if;
+        if (first = 0) or (not folding) then
+            return Fitted(grants => grants, count => count, firstRefused => first);
+        else
+            let down: Folded := foldDown(grants, count, unveilTarget);
+            let { grants as folded: String, count as left: Index, changed: Bool } := down;
+            let again: Index := refusedNumber(unveilProbe(&folded, left));
+            return Fitted(grants => folded, count => left, firstRefused => again);
+        end if;
+    end;
+
+    -- Unveils every path of grants, or hides the whole file system when
+    -- there is none, and locks the view.  The number of paths taken; unveil
+    -- is in force when at least one call succeeded and the lock held.
+    generic [R: Region]
+    function unveilAll(grants: Span[Nat8, R], count: Index): Report is
+        var applied: Index := 0;
+        var engaged: Bool := false;
+        if count = 0 then
+            -- No path: the root with no permission, so that nothing is seen.
+            let root: String := terminatedLiteral("/");
+            let none: String := terminatedLiteral("");
+            engaged := unveil(&root, &none) = 1;
+            destroyString(root);
+            destroyString(none);
+        else
+            var at: Index := 0;
+            var k: Index := 0;
+            while k < count do
+                let pathEnd: Index := nextZero(grants, at);
+                let permissionsEnd: Index := nextZero(grants, pathEnd + 1);
+                let path: String := segment(grants, at, pathEnd);
+                let permissions: String := segment(grants, pathEnd + 1, permissionsEnd);
+                if unveil(&path, &permissions) = 1 then
+                    applied := applied + 1;
+                    engaged := true;
+                end if;
+                destroyString(path);
+                destroyString(permissions);
+                at := permissionsEnd + 1;
+                k := k + 1;
+            end while;
+        end if;
+        let locked: Bool := lockUnveil() = 1;
+        return Report(refused => false, noNewPrivileges => false, pledged => false,
+            execPledged => false, unveiled => engaged and locked, landlock => false,
+            seccomp => false, seatbelt => false, capsicum => false, capsicumRefused => false, landlockAbi => -1, pathsAsked => count,
+            pathsApplied => applied, pathsFolded => 0,
+            firstRefused => 0, threadsInTheWay => false);
+    end;
+
+    -- OpenBSD, in this order: the paths, the lock, then pledge, which
+    -- would refuse a later unveil.  Paths unveil has no room for apply
+    -- nothing at all: a view cut off at the path the kernel refused is not
+    -- a smaller sandbox, it is one nobody asked for.
+    generic [R: Region, S: Region]
+    function applyOpenBsd(promises: &[String, R], words: Index, execPromises: &[String, S],
+        execWords: Index, grants: String, count: Index, folding: Bool): Report is
+        let fitted: Fitted := fitUnveil(grants, count, folding);
+        let { grants as view: String, count as viewCount: Index, firstRefused: Index } := fitted;
+        if firstRefused /= 0 then
+            destroyString(view);
+            return Report(refused => false, noNewPrivileges => false, pledged => false,
+                execPledged => false, unveiled => false, landlock => false,
+                seccomp => false, seatbelt => false, capsicum => false, capsicumRefused => false, landlockAbi => -1, pathsAsked => count,
+                pathsApplied => 0, pathsFolded => count - viewCount,
+                firstRefused => firstRefused, threadsInTheWay => false);
+        else
+            let viewed: Report := unveilAll(asSpan(&view), viewCount);
+            destroyString(view);
+            var pledged: Bool := false;
+            var execPledged: Bool := false;
+            if (words > 0) or (execWords > 0) then
+                let took: Bool := pledgeWithExec(promises, words > 0, execPromises, execWords > 0) = 1;
+                pledged := took and (words > 0);
+                execPledged := took and (execWords > 0);
+            end if;
+            return Report(refused => false, noNewPrivileges => false, pledged => pledged,
+                execPledged => execPledged, unveiled => viewed.unveiled, landlock => false,
+                seccomp => false, seatbelt => false, capsicum => false, capsicumRefused => false, landlockAbi => -1, pathsAsked => count,
+                pathsApplied => viewed.pathsApplied, pathsFolded => count - viewCount,
+                firstRefused => 0, threadsInTheWay => false);
+        end if;
+    end;
+
+    ---
+    --- Linux
+    ---
+
+    -- The Landlock ruleset of grants, applied when no other thread runs.
+    generic [R: Region]
+    function landlockAll(grants: Span[Nat8, R], count: Index, abi: Int32): Report is
+        var applied: Index := 0;
+        var restricted: Bool := false;
+        var inTheWay: Bool := false;
+        if abi >= 1 then
+            if threadCount() /= 1 then
+                -- Another thread would stay unconfined, and an unknown count
+                -- is treated the same way.
+                inTheWay := true;
+            else
+                let ruleset: Int32 := landlockOpen(abi);
+                if ruleset >= 0 then
+                    var at: Index := 0;
+                    var k: Index := 0;
+                    while k < count do
+                        let pathEnd: Index := nextZero(grants, at);
+                        let permissionsEnd: Index := nextZero(grants, pathEnd + 1);
+                        let path: String := segment(grants, at, pathEnd);
+                        let permissions: String := segment(grants, pathEnd + 1, permissionsEnd);
+                        if landlockAdd(ruleset, abi, &path, &permissions) = 1 then
+                            applied := applied + 1;
+                        end if;
+                        destroyString(path);
+                        destroyString(permissions);
+                        at := permissionsEnd + 1;
+                        k := k + 1;
+                    end while;
+                    -- A ruleset without a rule is applied as well: the policy
+                    -- asked for no path, or none could be taken, and either
+                    -- way no file is reachable.
+                    restricted := landlockRestrict(ruleset) = 1;
+                end if;
+            end if;
+        end if;
+        return Report(refused => false, noNewPrivileges => false, pledged => false,
+            execPledged => false, unveiled => false, landlock => restricted,
+            seccomp => false, seatbelt => false, capsicum => false, capsicumRefused => false, landlockAbi => abi, pathsAsked => count,
+            pathsApplied => applied, pathsFolded => 0, firstRefused => 0,
+            threadsInTheWay => inTheWay);
+    end;
+
+    -- Linux: Landlock and seccomp both need no new privileges for a process
+    -- without privilege, so neither is tried without it.  Nothing is
+    -- folded: Landlock's rules add up, so a parent would widen every path
+    -- beneath it, and the kernel has room for far more paths than unveil.
+    generic [R: Region]
+    function applyLinux(grants: Span[Nat8, R], count: Index): Report is
+        if setNoNewPrivileges() /= 1 then
+            return nothingApplied(false, count);
+        end if;
+        let abi: Int32 := landlockAbi();
+        let ruled: Report := landlockAll(grants, count, abi);
+        let filtered: Bool := seccomp() = 1;
+        return Report(refused => false, noNewPrivileges => true, pledged => false,
+            execPledged => false, unveiled => false, landlock => ruled.landlock,
+            seccomp => filtered, seatbelt => false, capsicum => false, capsicumRefused => false, landlockAbi => abi, pathsAsked => count,
+            pathsApplied => ruled.pathsApplied, pathsFolded => 0, firstRefused => 0,
+            threadsInTheWay => ruled.threadsInTheWay);
+    end;
+
+    ---
+    --- macOS
+    ---
+
+    -- macOS: Seatbelt takes the paths and the promises in one call, which
+    -- starts the programme again under the profile and returns in the
+    -- confined process.  Not tried while other threads run: they would go
+    -- on in the first process while the confined one runs the programme
+    -- again.
+    generic [R: Region, S: Region]
+    function applyMac(promises: &[String, R], words: Index, grants: &[String, S], count: Index): Report is
+        if threadCount() /= 1 then
+            return Report(refused => false, noNewPrivileges => false, pledged => false,
+                execPledged => false, unveiled => false, landlock => false,
+                seccomp => false, seatbelt => false, capsicum => false, capsicumRefused => false, landlockAbi => -1,
+                pathsAsked => count, pathsApplied => 0, pathsFolded => 0,
+                firstRefused => 0, threadsInTheWay => true);
+        end if;
+        let outcome: Int32 := seatbelt(grants, count, promises, words > 0);
+        var applied: Index := 0;
+        if outcome >= 0 then
+            applied := toIndex32(outcome);
+        end if;
+        return Report(refused => false, noNewPrivileges => false, pledged => false,
+            execPledged => false, unveiled => false, landlock => false,
+            seccomp => false, seatbelt => outcome >= 0, capsicum => false, capsicumRefused => false, landlockAbi => -1,
+            pathsAsked => count, pathsApplied => applied, pathsFolded => 0,
+            firstRefused => 0, threadsInTheWay => false);
+    end;
+
+    ---
+    --- FreeBSD
+    ---
+
+    -- FreeBSD: Capsicum takes the paths and the promises in one call, which
+    -- opens the paths and enters capability mode for the whole process,
+    -- so other threads are no reason to leave it out.
+    generic [R: Region, S: Region]
+    function applyFreeBsd(promises: &[String, R], words: Index, grants: &[String, S], count: Index): Report is
+        let outcome: Int32 := capsicum(grants, count, promises, words > 0);
+        var applied: Index := 0;
+        if outcome >= 0 then
+            applied := toIndex32(outcome);
+        end if;
+        return Report(refused => false, noNewPrivileges => false, pledged => false,
+            execPledged => false, unveiled => false, landlock => false,
+            seccomp => false, seatbelt => false, capsicum => outcome >= 0,
+            capsicumRefused => outcome = -3, landlockAbi => -1,
+            pathsAsked => count, pathsApplied => applied, pathsFolded => 0,
+            firstRefused => 0, threadsInTheWay => false);
+    end;
+
+    ---
+    --- Applying
+    ---
+
+    function nothingApplied(refused: Bool, count: Index): Report is
+        return Report(refused => refused, noNewPrivileges => false, pledged => false,
+            execPledged => false, unveiled => false, landlock => false, seccomp => false, seatbelt => false, capsicum => false, capsicumRefused => false,
+            landlockAbi => -1, pathsAsked => count, pathsApplied => 0,
+            pathsFolded => 0, firstRefused => 0, threadsInTheWay => false);
+    end;
+
+    function sandboxAvailable(): Bool is
+        return platform() /= 0;
+    end;
+
+    function applyPolicy(policy: Policy): Report is
+        let { promises: StringBuilder, promiseWords: Index, execPromises: StringBuilder,
+            execWords: Index, grants: String, pathCount: Index, folding: Bool,
+            valid: Bool } := policy;
+        let promiseText: String := terminated(promises);
+        let execText: String := terminated(execPromises);
+        let where: Int32 := platform();
+        var report: Report := nothingApplied(not valid, pathCount);
+        if valid and (where = 1) then
+            report := applyOpenBsd(&promiseText, promiseWords, &execText, execWords,
+                grants, pathCount, folding);
+        else
+            if valid and (where = 2) then
+                report := applyLinux(asSpan(&grants), pathCount);
+            end if;
+            if valid and (where = 3) then
+                if pathCount = 0 then
+                    -- No path: a single zero byte, so that C has a byte to
+                    -- be pointed at.
+                    let none: String := terminatedLiteral("");
+                    report := applyMac(&promiseText, promiseWords, &none, 0);
+                    destroyString(none);
+                else
+                    report := applyMac(&promiseText, promiseWords, &grants, pathCount);
+                end if;
+            end if;
+            if valid and (where = 4) then
+                if pathCount = 0 then
+                    let none: String := terminatedLiteral("");
+                    report := applyFreeBsd(&promiseText, promiseWords, &none, 0);
+                    destroyString(none);
+                else
+                    report := applyFreeBsd(&promiseText, promiseWords, &grants, pathCount);
+                end if;
+            end if;
+            destroyString(grants);
+        end if;
+        destroyString(promiseText);
+        destroyString(execText);
+        return report;
+    end;
+
+    ---
+    --- The report
+    ---
+
+    function reportRefused(report: Report): Bool is
+        return report.refused;
+    end;
+
+    function reportApplied(report: Report): Bool is
+        return ((report.noNewPrivileges or report.pledged) or (report.seatbelt or report.capsicum))
+            or ((report.unveiled or report.landlock) or report.seccomp);
+    end;
+
+    function reportHas(report: Report, mechanism: Mechanism): Bool is
+        let code: Nat8 := mechanism.code;
+        if code = 1 then
+            return report.noNewPrivileges;
+        end if;
+        if code = 2 then
+            return report.pledged;
+        end if;
+        if code = 3 then
+            return report.unveiled;
+        end if;
+        if code = 4 then
+            return report.landlock;
+        end if;
+        if code = 5 then
+            return report.seccomp;
+        end if;
+        if code = 6 then
+            return report.execPledged;
+        end if;
+        if code = 7 then
+            return report.seatbelt;
+        end if;
+        if code = 8 then
+            return report.capsicum;
+        end if;
+        return false;
+    end;
+
+    function reportPathsAsked(report: Report): Index is
+        return report.pathsAsked;
+    end;
+
+    function reportPathsApplied(report: Report): Index is
+        return report.pathsApplied;
+    end;
+
+    function reportPathsFolded(report: Report): Index is
+        return report.pathsFolded;
+    end;
+
+    function reportBudgetExceeded(report: Report): Bool is
+        return report.firstRefused /= 0;
+    end;
+
+    function reportFirstRefused(report: Report): Index is
+        return report.firstRefused;
+    end;
+
+    function reportLandlockAbi(report: Report): Int32 is
+        return report.landlockAbi;
+    end;
+
+    function reportThreadsInTheWay(report: Report): Bool is
+        return report.threadsInTheWay;
+    end;
+
+    function reportCapsicumRefused(report: Report): Bool is
+        return report.capsicumRefused;
+    end;
+
+    -- The decimal digits of value.
+    generic [R: Region]
+    function writeDecimal(builder: &![StringBuilder, R], value: Index): Unit is
+        if value >= 10 then
+            writeDecimal(&~builder, value / 10);
+        end if;
+        let digits: String := fromLiteral("0123456789");
+        let ten: Index := 10;
+        writeByte(&~builder, nthByte(&digits, rem(value, ten)));
+        destroyString(digits);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function writeLiteral(builder: &![StringBuilder, R], text: Span[Nat8, Static]): Unit is
+        let source: String := fromLiteral(text);
+        writeString(&~builder, asSpan(&source));
+        destroyString(source);
+        return nil;
+    end;
+
+    -- ", " before every part but the first.
+    generic [R: Region]
+    function separate(builder: &![StringBuilder, R], first: Bool): Bool is
+        if not first then
+            writeLiteral(&~builder, ", ");
+        end if;
+        return false;
+    end;
+
+    generic [R: Region]
+    function writeCount(builder: &![StringBuilder, R], applied: Index, asked: Index): Unit is
+        writeDecimal(&~builder, applied);
+        writeLiteral(&~builder, " of ");
+        writeDecimal(&~builder, asked);
+        writeLiteral(&~builder, " paths");
+        return nil;
+    end;
+
+    function describeReport(report: Report): String is
+        var builder: StringBuilder := makeStringBuilder();
+        writeLiteral(&!builder, "sandbox:     ");
+        if report.refused then
+            writeLiteral(&!builder, "refused, the policy is not valid");
+        else
+            if report.firstRefused /= 0 then
+                writeLiteral(&!builder, "not applied, unveil has no room for path ");
+                writeDecimal(&!builder, report.firstRefused);
+                writeLiteral(&!builder, " of ");
+                writeDecimal(&!builder, report.pathsAsked - report.pathsFolded);
+                if report.pathsFolded > 0 then
+                    writeLiteral(&!builder, ", folded from ");
+                    writeDecimal(&!builder, report.pathsAsked);
+                end if;
+            else
+                describeParts(&!builder, report);
+            end if;
+        end if;
+        return finalize(builder);
+    end;
+
+    generic [R: Region]
+    function describeParts(builder: &![StringBuilder, R], report: Report): Unit is
+        var first: Bool := true;
+        if report.pledged then
+            first := separate(&~builder, first);
+            writeLiteral(&~builder, "pledge");
+        end if;
+        if report.execPledged then
+            first := separate(&~builder, first);
+            writeLiteral(&~builder, "execpromises");
+        end if;
+        if report.unveiled then
+            first := separate(&~builder, first);
+            writeLiteral(&~builder, "unveil ");
+            writeCount(&~builder, report.pathsApplied, report.pathsAsked - report.pathsFolded);
+            if report.pathsFolded > 0 then
+                writeLiteral(&~builder, ", folded from ");
+                writeDecimal(&~builder, report.pathsAsked);
+            end if;
+        end if;
+        if report.noNewPrivileges then
+            first := separate(&~builder, first);
+            writeLiteral(&~builder, "no-new-privileges");
+        end if;
+        if report.landlock then
+            first := separate(&~builder, first);
+            writeLiteral(&~builder, "landlock abi ");
+            writeDecimal(&~builder, toIndex32(report.landlockAbi));
+            writeLiteral(&~builder, ", ");
+            writeCount(&~builder, report.pathsApplied, report.pathsAsked);
+        end if;
+        if report.threadsInTheWay then
+            first := separate(&~builder, first);
+            if platform() = 3 then
+                writeLiteral(&~builder, "seatbelt not applied, other threads run");
+            else
+                writeLiteral(&~builder, "landlock not applied, other threads run");
+            end if;
+        end if;
+        if report.seccomp then
+            first := separate(&~builder, first);
+            writeLiteral(&~builder, "seccomp");
+        end if;
+        if report.seatbelt then
+            first := separate(&~builder, first);
+            writeLiteral(&~builder, "seatbelt ");
+            writeCount(&~builder, report.pathsApplied, report.pathsAsked);
+        end if;
+        if report.capsicum then
+            first := separate(&~builder, first);
+            writeLiteral(&~builder, "capsicum ");
+            writeCount(&~builder, report.pathsApplied, report.pathsAsked);
+        end if;
+        if report.capsicumRefused then
+            first := separate(&~builder, first);
+            writeLiteral(&~builder, "capsicum not applied, the promises need the network or exec or are missing");
+        end if;
+        if first then
+            if sandboxAvailable() then
+                writeLiteral(&~builder, "none");
+            else
+                writeLiteral(&~builder, "not available");
+            end if;
+        end if;
+        return nil;
+    end;
+
+    -- A non-negative Int32 as an Index; a negative one as 0.
+    function toIndex32(value: Int32): Index is
+        case toIndex(value) of
+            when Some(value as converted: Index) do
+                return converted;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    ---
+    --- Asking the kernel instead of the report
+    ---
+
+    function answer(code: Int32): Option[Bool] is
+        if code < 0 then
+            let none: Option[Bool] := None();
+            return none;
+        end if;
+        let some: Option[Bool] := Some(value => code = 1);
+        return some;
+    end;
+
+    function queryNoNewPrivileges(): Option[Bool] is
+        return answer(bindQueryNoNewPrivileges());
+    end;
+
+    function querySeccomp(): Option[Bool] is
+        return answer(bindQuerySeccomp());
+    end;
+
+    function queryCapsicum(): Option[Bool] is
+        return answer(bindQueryCapsicum());
+    end;
+
+    -- A claim of the report held against the kernel's answer: what the
+    -- report claims, the kernel must confirm, and where it cannot be asked
+    -- a claim is not confirmed.  What the report does not claim may still
+    -- be in force, set by the parent process or a container, and is not
+    -- held against it.
+    function agrees(claimed: Bool, asked: Option[Bool]): Bool is
+        if not claimed then
+            return true;
+        end if;
+        case asked of
+            when Some(value: Bool) do
+                return value;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function reportAgreesWithSystem(report: Report): Bool is
+        return (agrees(report.noNewPrivileges, queryNoNewPrivileges())
+            and agrees(report.seccomp, querySeccomp()))
+            and agrees(report.capsicum, queryCapsicum());
+    end;
+end module body.

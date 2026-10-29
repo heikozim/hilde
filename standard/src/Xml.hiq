@@ -1,0 +1,810 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  As in Standard.Html, a document keeps its names and texts
+-- in one buffer of bytes, the pool, and its tokens and attributes as
+-- records of where they stand in it.  The reader is one pass; a step that
+-- finds the input not well formed records the problem and the offset in
+-- the state, and the loop stops there.  A stack of the open starts holds
+-- the nesting, so an end must name the element it closes.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromByteBuffer
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    insertBack,
+    removeLast,
+    length as bufferLength,
+    lengthMut as bufferLengthMut,
+    nth,
+    nthMut
+);
+import Standard.Text (
+    substring
+);
+import Standard.Utf8 (
+    isValid
+);
+
+module body Standard.Xml is
+    constant noIndex: Index := 0;
+    constant zeroNat: Nat64 := 0;
+    constant mostDepth: Index := 256;
+    constant spaceByte: Nat8 := 32;
+
+    record TokenRecord: Free is
+        kind: XmlKind;
+        textAt: Index;
+        textLength: Index;
+        firstAttribute: Index;
+        attributeTotal: Index;
+    end;
+
+    record AttributeRecord: Free is
+        nameAt: Index;
+        nameLength: Index;
+        valueAt: Index;
+        valueLength: Index;
+    end;
+
+    record XmlDocument: Linear is
+        pool: String;
+        tokens: Buffer[TokenRecord];
+        attributes: Buffer[AttributeRecord];
+    end;
+
+    -- The problem found, 0 for none, and where.
+    record State: Free is
+        problem: Index;
+        offset: Index;
+        rootSeen: Bool;
+    end;
+
+    function problemOf(code: Index): XmlProblem is
+        if code = 2 then
+            return NotUtf8();
+        else if code = 3 then
+            return DoctypeRefused();
+        else if code = 4 then
+            return UnknownEntity();
+        else if code = 5 then
+            return TooDeep();
+        end if;
+        return NotWellFormed();
+    end;
+
+    generic [S: Region]
+    function fail(state: &![State, S], code: Index, at: Index): Unit is
+        if state->problem = 0 then
+            state->problem := code;
+            state->offset := at;
+        end if;
+        return nil;
+    end;
+
+    ---
+    --- Bytes
+    ---
+
+    function isSpace(byte: Nat8): Bool is
+        return ((byte = 32) or (byte = 9)) or ((byte = 10) or (byte = 13));
+    end;
+
+    function isNameStart(byte: Nat8): Bool is
+        let letter: Bool := ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+        return (letter or ((byte = '_') or (byte = ':'))) or (byte >= 128);
+    end;
+
+    function isNameByte(byte: Nat8): Bool is
+        let digit: Bool := (byte >= '0') and (byte <= '9');
+        return isNameStart(byte) or (digit or ((byte = '-') or (byte = '.')));
+    end;
+
+    function natOf(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    function byteOf(wide: Nat64): Nat8 is
+        case toNat8(wide) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                abort("Standard.Xml: a byte did not fit a Nat8");
+                let zero: Nat8 := 0;
+                return zero;
+        end case;
+    end;
+
+    generic [R: Region]
+    function startsWithAt(text: Span[Nat8, R], at: Index, word: Span[Nat8, Static]): Bool is
+        if (at + spanLength(word)) > spanLength(text) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if text[at + i] /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The index of the first close from start on, or the size of text.
+    generic [R: Region]
+    function findFrom(text: Span[Nat8, R], start: Index, close: Span[Nat8, Static]): Index is
+        var i: Index := start;
+        while i < spanLength(text) do
+            if startsWithAt(text, i, close) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(text);
+    end;
+
+    generic [R: Region]
+    function nameEnd(text: Span[Nat8, R], at: Index): Index is
+        var i: Index := at;
+        while (i < spanLength(text)) and isNameByte(text[i]) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    generic [R: Region]
+    function skipSpaces(text: Span[Nat8, R], at: Index): Index is
+        var i: Index := at;
+        while (i < spanLength(text)) and isSpace(text[i]) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    ---
+    --- References
+    ---
+
+    -- A code point as UTF-8 into the pool.
+    generic [P: Region]
+    function putCodePoint(pool: &![Buffer[Nat8], P], point: Nat64): Unit is
+        if point < 128 then
+            insertBack(&~pool, byteOf(point));
+        else if point < 2048 then
+            insertBack(&~pool, byteOf((point / 64) + 192));
+            insertBack(&~pool, byteOf((point - ((point / 64) * 64)) + 128));
+        else if point < 65536 then
+            insertBack(&~pool, byteOf((point / 4096) + 224));
+            insertBack(&~pool, byteOf(((point / 64) - ((point / 4096) * 64)) + 128));
+            insertBack(&~pool, byteOf((point - ((point / 64) * 64)) + 128));
+        else
+            insertBack(&~pool, byteOf((point / 262144) + 240));
+            insertBack(&~pool, byteOf(((point / 4096) - ((point / 262144) * 64)) + 128));
+            insertBack(&~pool, byteOf(((point / 64) - ((point / 4096) * 64)) + 128));
+            insertBack(&~pool, byteOf((point - ((point / 64) * 64)) + 128));
+        end if;
+        return nil;
+    end;
+
+    -- Whether point is a character of XML 1.0.
+    function isCharacter(point: Nat64): Bool is
+        if (point = 9) or ((point = 10) or (point = 13)) then
+            return true;
+        end if;
+        if (point >= 32) and (point <= 55295) then
+            return true;
+        end if;
+        if (point >= 57344) and (point <= 65533) then
+            return true;
+        end if;
+        return (point >= 65536) and (point <= 1114111);
+    end;
+
+    -- The reference at at, where text holds an ampersand, decoded into the
+    -- pool; the index after it.
+    generic [R: Region, P: Region, S: Region]
+    function reference(pool: &![Buffer[Nat8], P], state: &![State, S], text: Span[Nat8, R], at: Index): Index is
+        let close: Index := findFrom(text, at, ";");
+        if (close >= spanLength(text)) or ((close - at) > 12) then
+            fail(&~state, 1, at);
+            return spanLength(text);
+        end if;
+        let name: Span[Nat8, R] := substring(text, at + 1, close);
+        if sameWord(name, "amp") then
+            insertBack(&~pool, '&' : Nat8);
+        else if sameWord(name, "lt") then
+            insertBack(&~pool, '<' : Nat8);
+        else if sameWord(name, "gt") then
+            insertBack(&~pool, '>' : Nat8);
+        else if sameWord(name, "quot") then
+            insertBack(&~pool, 34 : Nat8);
+        else if sameWord(name, "apos") then
+            insertBack(&~pool, 39 : Nat8);
+        else if (spanLength(name) >= 2) and (name[0] = '#') then
+            var hex: Bool := false;
+            var i: Index := 1;
+            if (name[1] = 'x') then
+                hex := true;
+                i := 2 : Index;
+            end if;
+            var point: Nat64 := 0;
+            var good: Bool := i < spanLength(name);
+            while good and (i < spanLength(name)) do
+                let byte: Nat8 := name[i];
+                if (byte >= '0') and (byte <= '9') then
+                    if hex then
+                        point := (point * 16) + natOf(byte - '0');
+                    else
+                        point := (point * 10) + natOf(byte - '0');
+                    end if;
+                else if hex and ((byte >= 'a') and (byte <= 'f')) then
+                    point := (point * 16) + (natOf(byte - 'a') + 10);
+                else if hex and ((byte >= 'A') and (byte <= 'F')) then
+                    point := (point * 16) + (natOf(byte - 'A') + 10);
+                else
+                    good := false;
+                end if;
+                i := i + 1;
+            end while;
+            if good and isCharacter(point) then
+                putCodePoint(&~pool, point);
+            else
+                fail(&~state, 1, at);
+            end if;
+        else
+            fail(&~state, 4, at);
+        end if;
+        return close + 1;
+    end;
+
+    generic [R: Region]
+    function sameWord(text: Span[Nat8, R], word: Span[Nat8, Static]): Bool is
+        if spanLength(text) /= spanLength(word) then
+            return false;
+        end if;
+        return startsWithAt(text, 0, word);
+    end;
+
+    ---
+    --- Tokens
+    ---
+
+    generic [T: Region, A: Region]
+    function addToken(tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        kind: XmlKind, textAt: Index, size: Index, first: Index): Unit is
+        let total: Index := bufferLengthMut(&~attributes) - first;
+        insertBack(&~tokens, TokenRecord(kind => kind, textAt => textAt, textLength => size,
+            firstAttribute => first, attributeTotal => total));
+        return nil;
+    end;
+
+    -- Character data from at up to the next angle bracket, decoded, as a
+    -- text token; outside the root element it may only be white space.
+    -- The index of the angle bracket.
+    generic [R: Region, P: Region, T: Region, A: Region, K: Region, S: Region]
+    function characterData(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        stack: &![Buffer[Index], K], state: &![State, S], text: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(text);
+        let start: Index := bufferLengthMut(&~pool);
+        var i: Index := at;
+        var blank: Bool := true;
+        while (i < size) and ((text[i] /= '<') and (state->problem = 0)) do
+            let byte: Nat8 := text[i];
+            if not isSpace(byte) then
+                blank := false;
+            end if;
+            if byte = '&' then
+                i := reference(&~pool, &~state, text, i);
+            else if (byte = '>') and ((i >= 2) and ((text[i - 1] = ']') and (text[i - 2] = ']'))) then
+                fail(&~state, 1, i);
+            else
+                insertBack(&~pool, byte);
+                i := i + 1;
+            end if;
+        end while;
+        if bufferLengthMut(&~stack) = 0 then
+            if not blank then
+                fail(&~state, 1, at);
+            end if;
+            -- White space outside the root is no token.
+            while bufferLengthMut(&~pool) > start do
+                let dropped: Nat8 := removeLast(&~pool);
+            end while;
+        else if bufferLengthMut(&~pool) > start then
+            let first: Index := bufferLengthMut(&~attributes);
+            addToken(&~tokens, &~attributes, XmlText(), start, bufferLengthMut(&~pool) - start, first);
+        end if;
+        return i;
+    end;
+
+    -- Whether the pool holds the same size bytes at first and at second.
+    generic [P: Region]
+    function samePoolBytes(pool: &![Buffer[Nat8], P], first: Index, second: Index, size: Index): Bool is
+        var i: Index := 0;
+        while i < size do
+            let left: Nat8 := nthMut(&~pool, first + i);
+            let right: Nat8 := nthMut(&~pool, second + i);
+            if left /= right then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- A start tag at at, where text holds an angle bracket and a name.
+    generic [R: Region, P: Region, T: Region, A: Region, K: Region, S: Region]
+    function startTag(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        stack: &![Buffer[Index], K], state: &![State, S], text: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(text);
+        if (bufferLengthMut(&~stack) = 0) and state->rootSeen then
+            fail(&~state, 1, at);
+            return size;
+        end if;
+        if bufferLengthMut(&~stack) >= mostDepth then
+            fail(&~state, 5, at);
+            return size;
+        end if;
+        let nameStop: Index := nameEnd(text, at + 1);
+        let nameAt: Index := bufferLengthMut(&~pool);
+        var k: Index := at + 1;
+        while k < nameStop do
+            insertBack(&~pool, text[k]);
+            k := k + 1;
+        end while;
+        let nameSize: Index := nameStop - (at + 1);
+        let first: Index := bufferLengthMut(&~attributes);
+        var i: Index := nameStop;
+        while (i < size) and (state->problem = 0) do
+            let spaced: Index := skipSpaces(text, i);
+            if spaced >= size then
+                fail(&~state, 1, spaced);
+                return size;
+            end if;
+            if text[spaced] = '>' then
+                addToken(&~tokens, &~attributes, XmlStart(), nameAt, nameSize, first);
+                insertBack(&~stack, bufferLengthMut(&~tokens) - 1);
+                state->rootSeen := true;
+                return spaced + 1;
+            end if;
+            if (text[spaced] = '/') and (((spaced + 1) < size) and (text[spaced + 1] = '>')) then
+                addToken(&~tokens, &~attributes, XmlStart(), nameAt, nameSize, first);
+                let none: Index := bufferLengthMut(&~attributes);
+                addToken(&~tokens, &~attributes, XmlEnd(), nameAt, nameSize, none);
+                state->rootSeen := true;
+                return spaced + 2;
+            end if;
+            -- An attribute must follow white space.
+            if (spaced = i) or (not isNameStart(text[spaced])) then
+                fail(&~state, 1, spaced);
+                return size;
+            end if;
+            let attributeStop: Index := nameEnd(text, spaced);
+            let attributeAt: Index := bufferLengthMut(&~pool);
+            k := spaced;
+            while k < attributeStop do
+                insertBack(&~pool, text[k]);
+                k := k + 1;
+            end while;
+            let attributeSize: Index := attributeStop - spaced;
+            var j: Index := skipSpaces(text, attributeStop);
+            if (j >= size) or (text[j] /= '=') then
+                fail(&~state, 1, j);
+                return size;
+            end if;
+            j := skipSpaces(text, j + 1);
+            if (j >= size) or ((text[j] /= '"') and (text[j] /= 39)) then
+                fail(&~state, 1, j);
+                return size;
+            end if;
+            let quote: Nat8 := text[j];
+            let valueAt: Index := bufferLengthMut(&~pool);
+            j := j + 1;
+            while ((j < size) and (text[j] /= quote)) and (state->problem = 0) do
+                let byte: Nat8 := text[j];
+                if byte = '<' then
+                    fail(&~state, 1, j);
+                else if byte = '&' then
+                    j := reference(&~pool, &~state, text, j);
+                else if isSpace(byte) then
+                    insertBack(&~pool, spaceByte);
+                    j := j + 1;
+                else
+                    insertBack(&~pool, byte);
+                    j := j + 1;
+                end if;
+            end while;
+            if j >= size then
+                fail(&~state, 1, j);
+                return size;
+            end if;
+            let valueSize: Index := bufferLengthMut(&~pool) - valueAt;
+            -- Two attributes of one name are not well formed.
+            var a: Index := first;
+            while a < bufferLengthMut(&~attributes) do
+                let other: AttributeRecord := nthMut(&~attributes, a);
+                if other.nameLength = attributeSize then
+                    if samePoolBytes(&~pool, other.nameAt, attributeAt, attributeSize) then
+                        fail(&~state, 1, spaced);
+                    end if;
+                end if;
+                a := a + 1;
+            end while;
+            insertBack(&~attributes, AttributeRecord(nameAt => attributeAt, nameLength => attributeSize,
+                valueAt => valueAt, valueLength => valueSize));
+            i := j + 1;
+        end while;
+        fail(&~state, 1, i);
+        return size;
+    end;
+
+    -- An end tag at at, where text holds an angle bracket and a slash.
+    generic [R: Region, P: Region, T: Region, A: Region, K: Region, S: Region]
+    function endTag(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        stack: &![Buffer[Index], K], state: &![State, S], text: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(text);
+        let nameStop: Index := nameEnd(text, at + 2);
+        let close: Index := skipSpaces(text, nameStop);
+        if ((close >= size) or (text[close] /= '>')) or (bufferLengthMut(&~stack) = 0) then
+            fail(&~state, 1, at);
+            return size;
+        end if;
+        let open: Index := removeLast(&~stack);
+        let start: TokenRecord := nthMut(&~tokens, open);
+        let nameSize: Index := nameStop - (at + 2);
+        var same: Bool := nameSize = start.textLength;
+        var i: Index := 0;
+        while same and (i < nameSize) do
+            let byte: Nat8 := nthMut(&~pool, start.textAt + i);
+            same := byte = text[(at + 2) + i];
+            i := i + 1;
+        end while;
+        if not same then
+            fail(&~state, 1, at);
+            return size;
+        end if;
+        let none: Index := bufferLengthMut(&~attributes);
+        addToken(&~tokens, &~attributes, XmlEnd(), start.textAt, start.textLength, none);
+        return close + 1;
+    end;
+
+    -- Markup that begins with an exclamation or question mark: a comment,
+    -- a CDATA section, a processing instruction, or a document type, which
+    -- is refused.
+    generic [R: Region, P: Region, T: Region, A: Region, K: Region, S: Region]
+    function declaration(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        stack: &![Buffer[Index], K], state: &![State, S], text: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(text);
+        if startsWithAt(text, at, "<!--") then
+            let close: Index := findFrom(text, at + 4, "--");
+            if (close >= size) or (not startsWithAt(text, close, "-->")) then
+                fail(&~state, 1, at);
+                return size;
+            end if;
+            return close + 3;
+        end if;
+        if startsWithAt(text, at, "<![CDATA[") then
+            if bufferLengthMut(&~stack) = 0 then
+                fail(&~state, 1, at);
+                return size;
+            end if;
+            let close: Index := findFrom(text, at + 9, "]]>");
+            if close >= size then
+                fail(&~state, 1, at);
+                return size;
+            end if;
+            let start: Index := bufferLengthMut(&~pool);
+            var i: Index := at + 9;
+            while i < close do
+                insertBack(&~pool, text[i]);
+                i := i + 1;
+            end while;
+            if close > (at + 9) then
+                let first: Index := bufferLengthMut(&~attributes);
+                addToken(&~tokens, &~attributes, XmlText(), start, close - (at + 9), first);
+            end if;
+            return close + 3;
+        end if;
+        if startsWithAt(text, at, "<!DOCTYPE") then
+            fail(&~state, 3, at);
+            return size;
+        end if;
+        if startsWithAt(text, at, "<?") then
+            let close: Index := findFrom(text, at + 2, "?>");
+            if close >= size then
+                fail(&~state, 1, at);
+                return size;
+            end if;
+            return close + 2;
+        end if;
+        fail(&~state, 1, at);
+        return size;
+    end;
+
+    generic [R: Region]
+    function parseXml(text: Span[Nat8, R]): Either[XmlError, XmlDocument] is
+        let size: Index := spanLength(text);
+        var pool: Buffer[Nat8] := allocateEmpty();
+        var tokens: Buffer[TokenRecord] := allocateEmpty();
+        var attributes: Buffer[AttributeRecord] := allocateEmpty();
+        var stack: Buffer[Index] := allocateEmpty();
+        var state: State := State(problem => noIndex, offset => noIndex, rootSeen => false);
+        if not isValid(text) then
+            fail(&!state, 2, noIndex);
+        end if;
+        var i: Index := 0;
+        -- The byte order mark of UTF-8.
+        if size >= 3 then
+            if ((text[0] = 239) and (text[1] = 187)) and (text[2] = 191) then
+                i := 3 : Index;
+            end if;
+        end if;
+        while (i < size) and (state.problem = 0) do
+            if text[i] /= '<' then
+                i := characterData(&!pool, &!tokens, &!attributes, &!stack, &!state, text, i);
+            else if ((i + 1) < size) and (text[i + 1] = '/') then
+                i := endTag(&!pool, &!tokens, &!attributes, &!stack, &!state, text, i);
+            else if ((i + 1) < size) and ((text[i + 1] = '!') or (text[i + 1] = '?')) then
+                i := declaration(&!pool, &!tokens, &!attributes, &!stack, &!state, text, i);
+            else if ((i + 1) < size) and isNameStart(text[i + 1]) then
+                i := startTag(&!pool, &!tokens, &!attributes, &!stack, &!state, text, i);
+            else
+                fail(&!state, 1, i);
+            end if;
+        end while;
+        if (state.problem = 0) and ((bufferLength(&stack) /= 0) or (not state.rootSeen)) then
+            fail(&!state, 1, size);
+        end if;
+        destroyFree(stack);
+        if state.problem /= 0 then
+            destroyFree(pool);
+            destroyFree(tokens);
+            destroyFree(attributes);
+            let failed: Either[XmlError, XmlDocument] := Left(left => XmlError(problem => problemOf(state.problem), offset => state.offset));
+            return failed;
+        else
+            let read: Either[XmlError, XmlDocument] := Right(right => XmlDocument(pool => fromByteBuffer(pool), tokens => tokens, attributes => attributes));
+            return read;
+        end if;
+    end;
+
+    function destroyXmlDocument(document: XmlDocument): Unit is
+        let { pool: String, tokens: Buffer[TokenRecord], attributes: Buffer[AttributeRecord] } := document;
+        destroyString(pool);
+        destroyFree(tokens);
+        destroyFree(attributes);
+        return nil;
+    end;
+
+    ---
+    --- Asking a document
+    ---
+
+    generic [R: Region]
+    function xmlTokenCount(document: &[XmlDocument, R]): Index is
+        return bufferLength(&(document->tokens));
+    end;
+
+    generic [R: Region]
+    function xmlTokenKind(document: &[XmlDocument, R], n: Index): Option[XmlKind] is
+        if n >= bufferLength(&(document->tokens)) then
+            let none: Option[XmlKind] := None();
+            return none;
+        end if;
+        let token: TokenRecord := nth(&(document->tokens), n);
+        let some: Option[XmlKind] := Some(value => token.kind);
+        return some;
+    end;
+
+    function kindNumber(kind: XmlKind): Index is
+        case kind of
+            when XmlStart do
+                return 1;
+            when XmlEnd do
+                return 2;
+            when XmlText do
+                return 3;
+        end case;
+    end;
+
+    generic [R: Region]
+    function kindAt(document: &[XmlDocument, R], n: Index): Index is
+        case xmlTokenKind(document, n) of
+            when Some(value as found: XmlKind) do
+                return kindNumber(found);
+            when None do
+                return noIndex;
+        end case;
+    end;
+
+    generic [R: Region]
+    function poolSpan(document: &[XmlDocument, R], at: Index, size: Index): Span[Nat8, R] is
+        return substring(asSpan(&(document->pool)), at, at + size);
+    end;
+
+    generic [R: Region]
+    function xmlTokenText(document: &[XmlDocument, R], n: Index): Span[Nat8, R] is
+        if n >= bufferLength(&(document->tokens)) then
+            return poolSpan(document, noIndex, noIndex);
+        end if;
+        let token: TokenRecord := nth(&(document->tokens), n);
+        return poolSpan(document, token.textAt, token.textLength);
+    end;
+
+    generic [R: Region]
+    function xmlAttributeCount(document: &[XmlDocument, R], n: Index): Index is
+        if n >= bufferLength(&(document->tokens)) then
+            return noIndex;
+        end if;
+        let token: TokenRecord := nth(&(document->tokens), n);
+        if kindNumber(token.kind) /= 1 then
+            return noIndex;
+        end if;
+        return token.attributeTotal;
+    end;
+
+    generic [R: Region]
+    function attributeRecord(document: &[XmlDocument, R], n: Index, a: Index): Option[AttributeRecord] is
+        if a >= xmlAttributeCount(document, n) then
+            let none: Option[AttributeRecord] := None();
+            return none;
+        end if;
+        let token: TokenRecord := nth(&(document->tokens), n);
+        let some: Option[AttributeRecord] := Some(value => nth(&(document->attributes), token.firstAttribute + a));
+        return some;
+    end;
+
+    generic [R: Region]
+    function xmlAttributeName(document: &[XmlDocument, R], n: Index, a: Index): Span[Nat8, R] is
+        case attributeRecord(document, n, a) of
+            when Some(value as found: AttributeRecord) do
+                return poolSpan(document, found.nameAt, found.nameLength);
+            when None do
+                return poolSpan(document, noIndex, noIndex);
+        end case;
+    end;
+
+    generic [R: Region]
+    function xmlAttributeValue(document: &[XmlDocument, R], n: Index, a: Index): Span[Nat8, R] is
+        case attributeRecord(document, n, a) of
+            when Some(value as found: AttributeRecord) do
+                return poolSpan(document, found.valueAt, found.valueLength);
+            when None do
+                return poolSpan(document, noIndex, noIndex);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameSpans(left: Span[Nat8, R], right: Span[Nat8, S]): Bool is
+        if spanLength(left) /= spanLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(left) do
+            if left[i] /= right[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function xmlAttributeOf(document: &[XmlDocument, R], n: Index, name: Span[Nat8, S]): Option[String] is
+        var a: Index := 0;
+        while a < xmlAttributeCount(document, n) do
+            if sameSpans(xmlAttributeName(document, n, a), name) then
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, xmlAttributeValue(document, n, a));
+                let some: Option[String] := Some(value => finalize(out));
+                return some;
+            end if;
+            a := a + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function xmlElementEnd(document: &[XmlDocument, R], n: Index): Option[Index] is
+        if kindAt(document, n) /= 1 then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        var depth: Index := 0;
+        var k: Index := n;
+        while k < xmlTokenCount(document) do
+            let kind: Index := kindAt(document, k);
+            if kind = 1 then
+                depth := depth + 1;
+            else if kind = 2 then
+                depth := depth - 1;
+                if depth = 0 then
+                    let some: Option[Index] := Some(value => k);
+                    return some;
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function xmlInnerText(document: &[XmlDocument, R], n: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        case xmlElementEnd(document, n) of
+            when Some(value as stop: Index) do
+                var k: Index := n + 1;
+                while k < stop do
+                    if kindAt(document, k) = 3 then
+                        writeString(&!out, xmlTokenText(document, k));
+                    end if;
+                    k := k + 1;
+                end while;
+            when None do
+                skip;
+        end case;
+        return finalize(out);
+    end;
+
+    generic [R: Region, S: Region]
+    function xmlFindStart(document: &[XmlDocument, R], after: Index, name: Span[Nat8, S]): Option[Index] is
+        var k: Index := after;
+        while k < xmlTokenCount(document) do
+            if (kindAt(document, k) = 1) and sameSpans(xmlTokenText(document, k), name) then
+                let some: Option[Index] := Some(value => k);
+                return some;
+            end if;
+            k := k + 1;
+        end while;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function escapeXml(text: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if byte = '&' then
+                writeString(&!out, "&amp;");
+            else if byte = '<' then
+                writeString(&!out, "&lt;");
+            else if byte = '>' then
+                writeString(&!out, "&gt;");
+            else if byte = '"' then
+                writeString(&!out, "&quot;");
+            else if byte = 39 then
+                writeString(&!out, "&apos;");
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+end module body.

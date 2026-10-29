@@ -1,0 +1,203 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Archives in tar, tar with gzip and zip, read whole and written in memory.
+
+- Reading stays within a Budget: so many entries, bytes in one entry and bytes in all.
+- The budget is checked on the headers first, and again while a compressed entry unpacks.
+- Reading checks the headers but not the names, which are listed as the archive holds them.
+- Extracting judges every name first: absolute, empty, a zero byte or a .. part is refused.
+- A name under which a symbolic link already lies inside the target is refused as well.
+- A symbolic link is made only when its target, seen from its own directory, stays inside.
+- A hard link is never extracted, and nothing that exists is overwritten.
+- Modes are cut to 0755 for a directory and 0644 for a file, whatever the archive says.
+
+    case readArchive(asSpan(&bytes), TarGz(), defaultBudget()) of
+        when Right(right as archive: Archive) do
+            let unpacked: Either[Failure, Unit] := extractArchive(&archive, "/var/www/site");
+            destroyArchive(archive);
+        when Left(left as failure: Failure) do
+            report(failure);
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.String (
+    String
+);
+import Standard.Failure (
+    Failure
+);
+
+module Standard.Archive is
+    """
+    The format of an archive.
+    """
+    union ArchiveFormat: Free is
+        case Tar;
+        case TarGz;
+        case Zip;
+    end;
+
+    """
+    What reading and extracting may take: the entries, the bytes of one
+    entry, the bytes of all entries.
+    """
+    record Budget: Free is
+        entries: Nat32;
+        largestEntry: Nat64;
+        total: Nat64;
+    end;
+
+    """
+    65536 entries, 1 GiB in one entry, 4 GiB in all.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function defaultBudget(): Budget;
+
+    """
+    What an entry is.  A hard link and anything else, a device or a fifo,
+    are read and listed but never extracted.
+    """
+    union EntryKind: Free is
+        case ArchivedFile;
+        case ArchivedDirectory;
+        case ArchivedLink;
+        case ArchivedHardLink;
+        case ArchivedOther;
+    end;
+
+    """
+    An archive that was read.  Linear: destroyArchive gives it back.
+    """
+    type Archive: Linear;
+
+    """
+    Reads archive, in format, within budget.  A failure is Invalid for an
+    archive that is not well formed or goes beyond the budget, with a
+    message that says where.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function readArchive(archive: Span[Nat8, R], format: ArchiveFormat, budget: Budget): Either[Failure, Archive];
+
+    """
+    How many entries the archive holds.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function entryCount(archive: &[Archive, R]): Index;
+
+    """
+    The name of entry n, as the archive holds it, without a slash at the
+    end of a directory's.  Empty for an n beyond the entries.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    generic [R: Region]
+    function entryName(archive: &[Archive, R], n: Index): Span[Nat8, R];
+
+    """
+    The kind of entry n; ArchivedFile for an n beyond the entries.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function entryKind(archive: &[Archive, R], n: Index): EntryKind;
+
+    """
+    The size of entry n unpacked; 0 for a directory, a link, or an n
+    beyond the entries.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function entrySize(archive: &[Archive, R], n: Index): Nat64;
+
+    """
+    The permission bits of entry n as the archive holds them.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function entryMode(archive: &[Archive, R], n: Index): Nat32;
+
+    """
+    Where the symbolic link of entry n points; empty for any other entry.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    generic [R: Region]
+    function entryLinkTarget(archive: &[Archive, R], n: Index): Span[Nat8, R];
+
+    """
+    The content of file entry n, unpacked.  A failure for an entry that is
+    not a file, or one whose content does not unpack to its size and its
+    checksum.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function entryContent(archive: &[Archive, R], n: Index): Either[Failure, String];
+
+    """
+    Extracts every entry into the directory target, which must exist.  The
+    names are judged before anything is written; a refused name is
+    Invalid.  When a later step fails, what was written stays.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function extractArchive(archive: &[Archive, R], target: Span[Nat8, S]): Either[Failure, Unit];
+
+    """
+    Frees archive.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyArchive(archive: Archive): Unit;
+
+    ---
+    --- Writing
+    ---
+
+    """
+    An archive being written.  Linear: finishArchive gives it back.
+    """
+    type ArchiveWriter: Linear;
+
+    """
+    A writer for an archive in format; a Zip compresses its files with
+    DEFLATE when compress is true and stores them otherwise, and the
+    other formats ignore it.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function makeArchiveWriter(format: ArchiveFormat, compress: Bool): ArchiveWriter;
+
+    """
+    Adds a file of name with content and the permission bits mode.
+    Returns false, and adds nothing, for a name refused as extraction
+    refuses one, or longer than the format holds.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function addFile(writer: &![ArchiveWriter, R], name: Span[Nat8, S], content: Span[Nat8, T], mode: Nat32): Bool;
+
+    """
+    Adds a directory of name with mode.  Returns false as addFile does.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function addDirectory(writer: &![ArchiveWriter, R], name: Span[Nat8, S], mode: Nat32): Bool;
+
+    """
+    Adds a symbolic link of name that points at target.  Returns false as
+    addFile does, and for an empty target.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function addLink(writer: &![ArchiveWriter, R], name: Span[Nat8, S], target: Span[Nat8, T]): Bool;
+
+    """
+    The bytes of the archive written.  It holds the files, directories and
+    symbolic links with their names and modes, and every time in it is zero.
+    No contract: a text whose length follows its input.
+    """
+    function finishArchive(writer: ArchiveWriter): String;
+end module.

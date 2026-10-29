@@ -1,0 +1,1008 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Binds libpq through the declarations of Bindings.C.Libpq.  Every value
+-- goes to the server apart from the text of the statement, in the binary
+-- form of its type, and every result comes back in binary form: a value is
+-- never written into SQL, and no number is printed or parsed on the way.
+-- It is an unsafe module for the addresses and the C expressions;
+-- Standard.Postgres is the safe module built on it.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullPointer,
+    nullCheck,
+    allocateBuffer
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    insertBack,
+    remove,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    storeNth,
+    getSpan,
+    length as stringLength
+);
+import Bindings.C.Libpq (
+    PQlibVersion,
+    CONNECTION_OK,
+    PGRES_COMMAND_OK,
+    PGRES_TUPLES_OK,
+    PQTRANS_IDLE,
+    PQTRANS_INERROR,
+    PG_DIAG_SQLSTATE,
+    PQconnectdbParams,
+    PQfinish,
+    PQstatus,
+    PQtransactionStatus,
+    PQerrorMessage,
+    PQsslInUse,
+    PQexec,
+    PQexecParams,
+    PQresultStatus,
+    PQresultErrorField,
+    PQntuples,
+    PQnfields,
+    PQftype,
+    PQcmdTuples,
+    PQgetvalue,
+    PQgetlength,
+    PQgetisnull,
+    PQclear
+);
+
+module body Bindings.Postgres is
+    record Connection: Linear is
+        handle: Address[Unit];
+    end;
+
+    record Transaction: Linear is
+        handle: Address[Unit];
+    end;
+
+    -- One value: its type, its bytes in the binary form of that type, and
+    -- whether it is null, in which case the bytes are empty and the type
+    -- is left to the server.
+    record Item: Linear is
+        oid: Nat32;
+        payload: String;
+        absent: Bool;
+    end;
+
+    record Values: Linear is
+        items: Buffer[Item];
+    end;
+
+    -- row is -1 before the first advance.  failure is 0 until something
+    -- fails; result is null when the server gave no result at all.
+    record Cursor: Linear is
+        handle: Address[Unit];
+        result: Address[Unit];
+        row: Int32;
+        rows: Int32;
+        failure: Int32;
+        invariant (row + 1) >= 0;
+        invariant row <= rows;
+    end;
+
+    constant connectionFailed: Int32 := -1;
+    constant newerDatabase: Int32 := -2;
+    constant tooLarge: Int32 := -3;
+    constant connectionLost: Int32 := -4;
+
+    -- 25P02, in_failed_sql_transaction: a commit after a failed statement.
+    constant failedTransaction: Int32 := 3624914;
+
+    -- 25001, active_sql_transaction: a begin while a transaction is open.
+    constant alreadyInTransaction: Int32 := 3592513;
+
+    -- The type numbers of the server, pg_type.oid, which are fixed for the
+    -- built-in types.
+    constant oidBool: Nat32 := 16;
+    constant oidBytea: Nat32 := 17;
+    constant oidName: Nat32 := 19;
+    constant oidInt8: Nat32 := 20;
+    constant oidInt2: Nat32 := 21;
+    constant oidInt4: Nat32 := 23;
+    constant oidText: Nat32 := 25;
+    constant oidFloat4: Nat32 := 700;
+    constant oidFloat8: Nat32 := 701;
+    constant oidBpchar: Nat32 := 1042;
+    constant oidVarchar: Nat32 := 1043;
+    constant oidTimestamp: Nat32 := 1114;
+    constant oidTimestamptz: Nat32 := 1184;
+
+    -- The binary timestamp counts microseconds from 2000-01-01 UTC; this
+    -- module counts them from 1970-01-01 UTC.
+    constant epochShift: Int64 := 946684800000000;
+
+    ---
+    --- Codes
+    ---
+
+    generic [R: Region]
+    function stateNumber(text: Span[Nat8, R]): Int32 is
+        var value: Int32 := 0;
+        var i: Index := 0;
+        while i < 5 do
+            let b: Nat8 := text[i];
+            var digit: Int32 := 0;
+            if (b >= '0') and (b <= '9') then
+                digit := byteInt32(b) - 48;
+            else if (b >= 'A') and (b <= 'Z') then
+                digit := byteInt32(b) - 55;
+            end if;
+            value := (value * 36) + digit;
+            i := i + 1;
+        end while;
+        return value;
+    end;
+
+    function byteInt32(b: Nat8): Int32 is
+        case toInt32(b) of
+            when Some(value as v: Int32) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The SQLSTATE of a result; connectionLost when there is no result or
+    -- the result names none.
+    function stateOf(result: Address[Unit]): Int32 is
+        if isNull(result) then
+            return connectionLost;
+        end if;
+        let field: Address[Nat8] := PQresultErrorField(result, PG_DIAG_SQLSTATE);
+        if isNullBytes(field) then
+            return connectionLost;
+        end if;
+        let text: Span[Nat8, Static] := @embed(Span[Nat8, Static], "hilde_make_span((void*)$1, strlen((const char*)$1))", field);
+        if spanLength(text) /= 5 then
+            return connectionLost;
+        end if;
+        -- 0 is the number of success, which a failed result cannot carry.
+        let number: Int32 := stateNumber(text);
+        if number = 0 then
+            return connectionLost;
+        end if;
+        return number;
+    end;
+
+    ---
+    --- C memory
+    ---
+
+    function isNull(address: Address[Unit]): Bool is
+        return @embed(Bool, "($1 == NULL)", address);
+    end;
+
+    function isNullBytes(address: Address[Nat8]): Bool is
+        return @embed(Bool, "($1 == NULL)", address);
+    end;
+
+    function sameHandle(a: Address[Unit], b: Address[Unit]): Bool is
+        return @embed(Bool, "($1 == $2)", a, b);
+    end;
+
+    generic [R: Region]
+    function containsZero(value: Span[Nat8, R]): Bool is
+        var i: Index := 0;
+        while i < spanLength(value) do
+            if value[i] = 0 then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- A copy of the span with a zero byte after it, in memory of its own;
+    -- release frees it.
+    generic [R: Region]
+    function cCopy(value: Span[Nat8, R]): Address[Nat8] is
+        let size: Index := spanLength(value);
+        let address: Address[Nat8] := allocateBuffer(size + 1);
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[Nat8]) do
+                skip;
+            when None do
+                abort("Standard.Postgres: out of memory");
+        end case;
+        if size > 0 then
+            @embed(Address[Nat8], "hilde_memcpy($1, (void*)($2).data, $3)", address, value, size);
+        end if;
+        @embed(Unit, "(($1)[$2] = 0)", address, size);
+        return address;
+    end;
+
+    -- Free a copy, its bytes overwritten first: one of them is a password.
+    function release(address: Address[Nat8]): Unit is
+        @embed(Unit, "hilde_wipe($1, strlen((const char*)$1))", address);
+        @embed(Unit, "hilde_free($1)", address);
+        return nil;
+    end;
+
+    generic [T: Type]
+    function checkMemory(address: Address[T]): Unit is
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[T]) do
+                skip;
+            when None do
+                abort("Standard.Postgres: out of memory");
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Connecting
+    ---
+
+    -- The decimal digits of a port, as a String.
+    function portText(port: Nat16): String is
+        var digits: Index := 1;
+        var scale: Nat16 := 1;
+        while (port / scale) >= 10 do
+            scale := scale * 10;
+            digits := digits + 1;
+        end while;
+        var text: String := makeString(digits, '0');
+        var rest: Nat16 := port;
+        var i: Index := 0;
+        while i < digits do
+            let digit: Nat16 := rest / scale;
+            storeNth(&!text, i, digitByte(digit));
+            rest := rest - (digit * scale);
+            scale := scale / 10;
+            i := i + 1;
+        end while;
+        return text;
+    end;
+
+    function digitByte(digit: Nat16): Nat8 is
+        case toNat8(digit + 48) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return '0';
+        end case;
+    end;
+
+    generic [R: Region]
+    function textOf(text: &[String, R]): Span[Nat8, R] is
+        let size: Index := stringLength(text);
+        if size = 0 then
+            return @embed(Span[Nat8, R], "hilde_make_span((void*)\"\", 0)");
+        end if;
+        return getSpan(text, 0, size - 1);
+    end;
+
+    -- keyword and value as the pair at position at of the two arrays.
+    generic [R: Region]
+    function setPair(keys: Address[Address[Nat8]], values: Address[Address[Nat8]], at: Index, keyword: Span[Nat8, Static], value: Span[Nat8, R]): Unit is
+        @embed(Unit, "(($1)[$2] = $3)", keys, at, cCopy(keyword));
+        @embed(Unit, "(($1)[$2] = $3)", values, at, cCopy(value));
+        return nil;
+    end;
+
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function connect(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F], readOnly: Bool): Either[PgError, Connection] is
+        -- libpq ends each value at a zero byte, so a value holding one
+        -- would be cut short without a word.  It is refused here.
+        let zeros: Bool := (containsZero(host) or containsZero(database)) or (containsZero(user) or containsZero(password));
+        if zeros or containsZero(caFile) then
+            return Left(left => PgError(code => connectionFailed));
+        end if;
+        let slots: Index := 11;
+        let keys: Address[Address[Nat8]] := allocateBuffer(slots);
+        checkMemory(keys);
+        let values: Address[Address[Nat8]] := allocateBuffer(slots);
+        checkMemory(values);
+        let portString: String := portText(port);
+        setPair(keys, values, 0, "host", host);
+        setPair(keys, values, 1, "port", textOf(&portString));
+        setPair(keys, values, 2, "dbname", database);
+        setPair(keys, values, 3, "user", user);
+        setPair(keys, values, 4, "password", password);
+        setPair(keys, values, 5, "sslmode", "verify-full");
+        setPair(keys, values, 6, "sslrootcert", caFile);
+        setPair(keys, values, 7, "connect_timeout", "10");
+        setPair(keys, values, 8, "client_encoding", "UTF8");
+        var used: Index := 9;
+        if readOnly then
+            setPair(keys, values, 9, "options", "-c default_transaction_read_only=on");
+            used := used + 1;
+        end if;
+        destroyString(portString);
+        @embed(Unit, "(($1)[$2] = NULL)", keys, used);
+        @embed(Unit, "(($1)[$2] = NULL)", values, used);
+        let noExpand: Int32 := 0;
+        let handle: Address[Unit] := PQconnectdbParams(keys, values, noExpand);
+        var i: Index := 0;
+        while i < used do
+            release(@embed(Address[Nat8], "($1)[$2]", keys, i));
+            release(@embed(Address[Nat8], "($1)[$2]", values, i));
+            i := i + 1;
+        end while;
+        @embed(Unit, "hilde_free($1)", keys);
+        @embed(Unit, "hilde_free($1)", values);
+        if isNull(handle) then
+            abort("Standard.Postgres: out of memory");
+        end if;
+        if PQstatus(handle) /= CONNECTION_OK then
+            PQfinish(handle);
+            return Left(left => PgError(code => connectionFailed));
+        end if;
+        return Right(right => Connection(handle => handle));
+    end;
+
+    function closeDatabase(db: Connection): Unit is
+        let { handle: Address[Unit] } := db;
+        PQfinish(handle);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function lastMessage(db: &[Connection, R]): String is
+        let text: Address[Nat8] := PQerrorMessage(db->handle);
+        let span: Span[Nat8, Static] := @embed(Span[Nat8, Static], "hilde_make_span((void*)$1, strlen((const char*)$1))", text);
+        return copyText(span);
+    end;
+
+    generic [R: Region]
+    function usesTls(db: &[Connection, R]): Bool is
+        return PQsslInUse(db->handle) = 1;
+    end;
+
+    ---
+    --- Values, in the binary form of their type
+    ---
+
+    function noValues(): Values is
+        let items: Buffer[Item] := allocateEmpty();
+        return Values(items => items);
+    end;
+
+    function withItem(values: Values, item: Item): Values is
+        let { items: Buffer[Item] } := values;
+        var list: Buffer[Item] := items;
+        insertBack(&!list, item);
+        return Values(items => list);
+    end;
+
+    -- The size low bytes of bits, the most significant first.
+    function bigEndian(bits: Nat64, size: Index): String is
+        var text: String := makeString(size, '0');
+        var i: Index := 0;
+        while i < size do
+            let shift: Index := ((size - 1) - i) * 8;
+            storeNth(&!text, i, @embed(Nat8, "((hilde_nat8_t)((uint64_t)($1) >> $2))", bits, shift));
+            i := i + 1;
+        end while;
+        return text;
+    end;
+
+    function withInt64(values: Values, value: Int64): Values is
+        let bits: Nat64 := @embed(Nat64, "((uint64_t)($1))", value);
+        return withItem(values, Item(oid => oidInt8, payload => bigEndian(bits, 8), absent => false));
+    end;
+
+    function withFloat64(values: Values, value: Float64): Values is
+        let bits: Nat64 := @embed(Nat64, "(((union { double d; uint64_t u; }){ .d = $1 }).u)", value);
+        return withItem(values, Item(oid => oidFloat8, payload => bigEndian(bits, 8), absent => false));
+    end;
+
+    function withBool(values: Values, value: Bool): Values is
+        var bits: Nat64 := 0;
+        if value then
+            bits := bits + 1;
+        end if;
+        return withItem(values, Item(oid => oidBool, payload => bigEndian(bits, 1), absent => false));
+    end;
+
+    -- The two infinities of the server are the largest and the smallest
+    -- Int64 on either side and pass unchanged.
+    function withTimestamp(values: Values, value: Int64): Values is
+        var server: Int64 := value;
+        if (value /= maximum_int64) and (value /= minimum_int64) then
+            server := value - epochShift;
+        end if;
+        let bits: Nat64 := @embed(Nat64, "((uint64_t)($1))", server);
+        return withItem(values, Item(oid => oidTimestamptz, payload => bigEndian(bits, 8), absent => false));
+    end;
+
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values is
+        return withItem(values, Item(oid => oidText, payload => copyText(value), absent => false));
+    end;
+
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values is
+        return withItem(values, Item(oid => oidBytea, payload => copyText(value), absent => false));
+    end;
+
+    function withNull(values: Values): Values is
+        let unknown: Nat32 := 0;
+        return withItem(values, Item(oid => unknown, payload => makeString(0, '0'), absent => true));
+    end;
+
+    function dropValues(values: Values): Unit is
+        let { items: Buffer[Item] } := values;
+        var list: Buffer[Item] := items;
+        while bufferLength(&list) > 0 do
+            let { oid: Nat32, payload: String, absent: Bool } := remove(&!list, 0);
+            destroyString(payload);
+        end while;
+        destroyEmpty(list);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index is
+        return bufferLength(&(values->items));
+    end;
+
+    ---
+    --- Running a statement
+    ---
+
+    function sizeInt32(size: Index): Option[Int32] is
+        return toInt32(size);
+    end;
+
+    function countInt32(count: Index): Int32 is
+        case toInt32(count) of
+            when Some(value as v: Int32) do
+                return v;
+            when None do
+                abort("Standard.Postgres: too many values");
+        end case;
+    end;
+
+    -- PQexecParams with every value of values; the result, null when libpq
+    -- gave none, and tooLarge in failure when a value is 2 GiB or more, in
+    -- which case nothing was sent.
+    generic [R: Region]
+    function run(handle: Address[Unit], sql: Span[Nat8, R], values: Values): Cursor is
+        let { items: Buffer[Item] } := values;
+        var list: Buffer[Item] := items;
+        let count: Index := bufferLength(&list);
+        let types: Address[Nat32] := allocateBuffer(count + 1);
+        checkMemory(types);
+        let data: Address[Address[Nat8]] := allocateBuffer(count + 1);
+        checkMemory(data);
+        let lengths: Address[Int32] := allocateBuffer(count + 1);
+        checkMemory(lengths);
+        let formats: Address[Int32] := allocateBuffer(count + 1);
+        checkMemory(formats);
+        var kept: Buffer[String] := allocateEmpty();
+        var failure: Int32 := 0;
+        var i: Index := 0;
+        while bufferLength(&list) > 0 do
+            let { oid: Nat32, payload: String, absent: Bool } := remove(&!list, 0);
+            let size: Index := stringLength(&payload);
+            @embed(Unit, "(($1)[$2] = $3)", types, i, oid);
+            @embed(Unit, "(($1)[$2] = 1)", formats, i);
+            if absent then
+                @embed(Unit, "(($1)[$2] = NULL)", data, i);
+                @embed(Unit, "(($1)[$2] = 0)", lengths, i);
+            else
+                case sizeInt32(size) of
+                    when Some(value as v: Int32) do
+                        @embed(Unit, "(($1)[$2] = $3)", lengths, i, v);
+                    when None do
+                        failure := tooLarge;
+                        @embed(Unit, "(($1)[$2] = 0)", lengths, i);
+                end case;
+                if size = 0 then
+                    @embed(Unit, "(($1)[$2] = (hilde_nat8_t*)\"\")", data, i);
+                else
+                    @embed(Unit, "(($1)[$2] = (hilde_nat8_t*)($3).data)", data, i, textOf(&payload));
+                end if;
+            end if;
+            insertBack(&!kept, payload);
+            i := i + 1;
+        end while;
+        destroyEmpty(list);
+        var result: Address[Unit] := nullPointer();
+        if failure = 0 then
+            let text: Address[Nat8] := cCopy(sql);
+            let binary: Int32 := 1;
+            result := PQexecParams(handle, text, countInt32(count), types, data, lengths, formats, binary);
+            @embed(Unit, "hilde_free($1)", text);
+            let status: Int32 := statusOf(result);
+            if (status /= PGRES_TUPLES_OK) and (status /= PGRES_COMMAND_OK) then
+                failure := stateOf(result);
+            end if;
+        end if;
+        while bufferLength(&kept) > 0 do
+            destroyString(remove(&!kept, 0));
+        end while;
+        destroyEmpty(kept);
+        @embed(Unit, "hilde_free($1)", types);
+        @embed(Unit, "hilde_free($1)", data);
+        @embed(Unit, "hilde_free($1)", lengths);
+        @embed(Unit, "hilde_free($1)", formats);
+        var rows: Int32 := 0;
+        if failure = 0 then
+            rows := PQntuples(result);
+        end if;
+        return Cursor(handle => handle, result => result, row => -1, rows => rows, failure => failure);
+    end;
+
+    -- PQresultStatus of a result that may be null; -1 for none.
+    function statusOf(result: Address[Unit]): Int32 is
+        if isNull(result) then
+            return -1;
+        end if;
+        return PQresultStatus(result);
+    end;
+
+    generic [R: Region, S: Region]
+    function start(db: &![Connection, R], sql: Span[Nat8, S], values: Values): Cursor is
+        return run(db->handle, sql, values);
+    end;
+
+    generic [R: Region, S: Region]
+    function execute(db: &![Connection, R], sql: Span[Nat8, S], values: Values): Either[PgError, Nat64] is
+        let cursor: Cursor := run(db->handle, sql, values);
+        var count: Nat64 := 0;
+        if failureOf(&cursor) = 0 then
+            count := tuplesOf(resultOf(&cursor));
+        end if;
+        case finish(db, cursor) of
+            when Some(value as error: PgError) do
+                return Left(left => error);
+            when None do
+                return Right(right => count);
+        end case;
+    end;
+
+    generic [R: Region]
+    function failureOf(cursor: &[Cursor, R]): Int32 is
+        return cursor->failure;
+    end;
+
+    generic [R: Region]
+    function resultOf(cursor: &[Cursor, R]): Address[Unit] is
+        return cursor->result;
+    end;
+
+    -- End a cursor of this module's own: clear its result and give its
+    -- failure code.
+    function close(cursor: Cursor): Int32 is
+        let { handle: Address[Unit], result: Address[Unit], row: Int32, rows: Int32, failure: Int32 } := cursor;
+        if not isNull(result) then
+            PQclear(result);
+        end if;
+        return failure;
+    end;
+
+    -- The row count of PQcmdTuples, which is decimal text, empty for a
+    -- statement that counts nothing.
+    function tuplesOf(result: Address[Unit]): Nat64 is
+        let text: Address[Nat8] := PQcmdTuples(result);
+        let digits: Span[Nat8, Static] := @embed(Span[Nat8, Static], "hilde_make_span((void*)$1, strlen((const char*)$1))", text);
+        var count: Nat64 := 0;
+        var i: Index := 0;
+        while i < spanLength(digits) do
+            case toNat64(digits[i] - '0') of
+                when Some(value as d: Nat64) do
+                    count := (count * 10) + d;
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool is
+        if cursor->failure /= 0 then
+            return false;
+        end if;
+        if (cursor->row + 1) >= cursor->rows then
+            cursor->row := cursor->rows;
+            return false;
+        end if;
+        cursor->row := cursor->row + 1;
+        return true;
+    end;
+
+    generic [R: Region]
+    function columnCount(cursor: &[Cursor, R]): Int32 is
+        if cursor->failure /= 0 then
+            return 0;
+        end if;
+        return PQnfields(cursor->result);
+    end;
+
+    -- The column index of the current row, which must be there.
+    generic [R: Region]
+    function checkCell(cursor: &[Cursor, R], index: Int32): Unit is
+        let inside: Bool := (cursor->row >= 0) and (cursor->row < cursor->rows);
+        if (cursor->failure /= 0) or (not inside) then
+            abort("Standard.Postgres: a column was read without a current row");
+        end if;
+        if index >= PQnfields(cursor->result) then
+            abort("Standard.Postgres: a column past the last one was read");
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool is
+        checkCell(cursor, index);
+        return PQgetisnull(cursor->result, cursor->row, index) = 1;
+    end;
+
+    -- The bytes of the cell, which must not be null and must be of one of
+    -- the types allowed.
+    generic [R: Region]
+    function cell(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        checkCell(cursor, index);
+        if PQgetisnull(cursor->result, cursor->row, index) = 1 then
+            abort("Standard.Postgres: a null column was read as a value; read it as an Option");
+        end if;
+        let bytes: Address[Nat8] := PQgetvalue(cursor->result, cursor->row, index);
+        let size: Int32 := PQgetlength(cursor->result, cursor->row, index);
+        return @embed(Span[Nat8, R], "hilde_make_span((void*)$1, (size_t)$2)", bytes, size);
+    end;
+
+    generic [R: Region]
+    function typeOf(cursor: &[Cursor, R], index: Int32): Nat32 is
+        return PQftype(cursor->result, index);
+    end;
+
+    -- The bytes of a span as one unsigned number, the first the most
+    -- significant.
+    generic [R: Region]
+    function bitsOf(bytes: Span[Nat8, R]): Nat64 is
+        var bits: Nat64 := 0;
+        var i: Index := 0;
+        while i < spanLength(bytes) do
+            bits := @embed(Nat64, "(((uint64_t)($1) << 8) | (uint64_t)($2))", bits, bytes[i]);
+            i := i + 1;
+        end while;
+        return bits;
+    end;
+
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64 is
+        let kind: Nat32 := typeOf(cursor, index);
+        let bytes: Span[Nat8, R] := cell(cursor, index);
+        let bits: Nat64 := bitsOf(bytes);
+        if (kind = oidInt8) and (spanLength(bytes) = 8) then
+            return @embed(Int64, "((int64_t)($1))", bits);
+        else if (kind = oidInt4) and (spanLength(bytes) = 4) then
+            return @embed(Int64, "((int64_t)(int32_t)(uint32_t)($1))", bits);
+        else if (kind = oidInt2) and (spanLength(bytes) = 2) then
+            return @embed(Int64, "((int64_t)(int16_t)(uint16_t)($1))", bits);
+        end if;
+        abort("Standard.Postgres: the column is not int2, int4 or int8");
+    end;
+
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64 is
+        let kind: Nat32 := typeOf(cursor, index);
+        let bytes: Span[Nat8, R] := cell(cursor, index);
+        let bits: Nat64 := bitsOf(bytes);
+        if (kind = oidFloat8) and (spanLength(bytes) = 8) then
+            return @embed(Float64, "(((union { uint64_t u; double d; }){ .u = $1 }).d)", bits);
+        else if (kind = oidFloat4) and (spanLength(bytes) = 4) then
+            return @embed(Float64, "((double)((union { uint32_t u; float f; }){ .u = (uint32_t)$1 }).f)", bits);
+        end if;
+        abort("Standard.Postgres: the column is not float4 or float8");
+    end;
+
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool is
+        let kind: Nat32 := typeOf(cursor, index);
+        let bytes: Span[Nat8, R] := cell(cursor, index);
+        if (kind /= oidBool) or (spanLength(bytes) /= 1) then
+            abort("Standard.Postgres: the column is not bool");
+        end if;
+        return bytes[0] /= 0;
+    end;
+
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64 is
+        let kind: Nat32 := typeOf(cursor, index);
+        let bytes: Span[Nat8, R] := cell(cursor, index);
+        let isTime: Bool := (kind = oidTimestamptz) or (kind = oidTimestamp);
+        if (not isTime) or (spanLength(bytes) /= 8) then
+            abort("Standard.Postgres: the column is not timestamptz or timestamp");
+        end if;
+        let server: Int64 := @embed(Int64, "((int64_t)($1))", bitsOf(bytes));
+        if (server = maximum_int64) or (server = minimum_int64) then
+            return server;
+        end if;
+        return server + epochShift;
+    end;
+
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        let kind: Nat32 := typeOf(cursor, index);
+        let textual: Bool := ((kind = oidText) or (kind = oidVarchar)) or ((kind = oidBpchar) or (kind = oidName));
+        if not textual then
+            abort("Standard.Postgres: the column is not text, varchar, char or name");
+        end if;
+        return cell(cursor, index);
+    end;
+
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        if typeOf(cursor, index) /= oidBytea then
+            abort("Standard.Postgres: the column is not bytea");
+        end if;
+        return cell(cursor, index);
+    end;
+
+    generic [R: Region]
+    function finish(db: &![Connection, R], cursor: Cursor): Option[PgError] is
+        let { handle: Address[Unit], result: Address[Unit], row: Int32, rows: Int32, failure: Int32 } := cursor;
+        if not sameHandle(handle, db->handle) then
+            abort("Standard.Postgres: a statement was finished on another connection than it was started on");
+        end if;
+        if not isNull(result) then
+            PQclear(result);
+        end if;
+        if failure /= 0 then
+            return Some(value => PgError(code => failure));
+        end if;
+        return None();
+    end;
+
+    ---
+    --- Transactions
+    ---
+
+    -- Run one statement of this module's own with PQexec: begin, commit,
+    -- rollback, the text of a migration.  Its failure code, 0 for none.
+    function runSimple(handle: Address[Unit], text: Address[Nat8]): Int32 is
+        let result: Address[Unit] := PQexec(handle, text);
+        let status: Int32 := statusOf(result);
+        var failure: Int32 := 0;
+        if (status /= PGRES_COMMAND_OK) and (status /= PGRES_TUPLES_OK) then
+            failure := stateOf(result);
+        end if;
+        if not isNull(result) then
+            PQclear(result);
+        end if;
+        return failure;
+    end;
+
+    function runStatic(handle: Address[Unit], sql: Span[Nat8, Static]): Int32 is
+        let text: Address[Nat8] := cCopy(sql);
+        let failure: Int32 := runSimple(handle, text);
+        @embed(Unit, "hilde_free($1)", text);
+        return failure;
+    end;
+
+    -- The server only warns about a begin inside a transaction and goes on,
+    -- so the second Transaction would commit the outer one early; the state
+    -- of the connection is asked first.
+    generic [R: Region]
+    function begin(db: &![Connection, R]): Either[PgError, Transaction] is
+        if PQtransactionStatus(db->handle) /= PQTRANS_IDLE then
+            return Left(left => PgError(code => alreadyInTransaction));
+        end if;
+        let failure: Int32 := runStatic(db->handle, "BEGIN");
+        if failure /= 0 then
+            return Left(left => PgError(code => failure));
+        end if;
+        return Right(right => Transaction(handle => db->handle));
+    end;
+
+    -- After a failed statement the server takes a commit as a rollback and
+    -- reports success; the state of the transaction is asked first, so that
+    -- such a commit is a failure here.
+    generic [R: Region]
+    function commit(db: &![Connection, R], transaction: Transaction): Either[PgError, Unit] is
+        let { handle: Address[Unit] } := transaction;
+        if not sameHandle(handle, db->handle) then
+            abort("Standard.Postgres: a transaction was committed on another connection than it was begun on");
+        end if;
+        if PQtransactionStatus(handle) = PQTRANS_INERROR then
+            let back: Int32 := runStatic(handle, "ROLLBACK");
+            return Left(left => PgError(code => failedTransaction));
+        end if;
+        let failure: Int32 := runStatic(handle, "COMMIT");
+        if failure /= 0 then
+            let back: Int32 := runStatic(handle, "ROLLBACK");
+            return Left(left => PgError(code => failure));
+        end if;
+        return Right(right => nil);
+    end;
+
+    generic [R: Region]
+    function rollback(db: &![Connection, R], transaction: Transaction): Unit is
+        let { handle: Address[Unit] } := transaction;
+        if not sameHandle(handle, db->handle) then
+            abort("Standard.Postgres: a transaction was rolled back on another connection than it was begun on");
+        end if;
+        let back: Int32 := runStatic(handle, "ROLLBACK");
+        return nil;
+    end;
+
+    ---
+    --- Migrations
+    ---
+
+    -- The highest version in the ledger; the ledger is locked by the
+    -- transaction this runs in, so that two programmes migrating at once
+    -- take turns.
+    function ledgerVersion(handle: Address[Unit]): Either[PgError, Index] is
+        let lock: Int32 := runStatic(handle, "LOCK TABLE hilde_migrations IN EXCLUSIVE MODE");
+        if lock /= 0 then
+            return Left(left => PgError(code => lock));
+        end if;
+        var cursor: Cursor := run(handle, "SELECT coalesce(max(version), 0)::int8 FROM hilde_migrations", noValues());
+        var version: Index := 0;
+        if advance(&!cursor) then
+            case toIndex(columnInt64(&cursor, 0)) of
+                when Some(value as v: Index) do
+                    version := v;
+                when None do
+                    skip;
+            end case;
+        end if;
+        let failure: Int32 := close(cursor);
+        if failure /= 0 then
+            return Left(left => PgError(code => failure));
+        end if;
+        return Right(right => version);
+    end;
+
+    function indexInt64(value: Index): Int64 is
+        case toInt64(value) of
+            when Some(value as v: Int64) do
+                return v;
+            when None do
+                abort("Standard.Postgres: a migration number past Int64");
+        end case;
+    end;
+
+    -- One migration, number, in a transaction of its own: applied when
+    -- the ledger is below it, skipped when another programme got there
+    -- first.  true in the Right when it was applied now.
+    function applyOne(handle: Address[Unit], number: Index, text: Span[Nat8, Static]): Either[PgError, Bool] is
+        var failure: Int32 := runStatic(handle, "BEGIN");
+        if failure /= 0 then
+            return Left(left => PgError(code => failure));
+        end if;
+        var applied: Bool := false;
+        case ledgerVersion(handle) of
+            when Left(left as error: PgError) do
+                failure := error.code;
+            when Right(right as have: Index) do
+                if have < number then
+                    let script: Address[Nat8] := cCopy(text);
+                    failure := runSimple(handle, script);
+                    @embed(Unit, "hilde_free($1)", script);
+                    if failure = 0 then
+                        let values: Values := withInt64(noValues(), indexInt64(number));
+                        let insert: Cursor := run(handle, "INSERT INTO hilde_migrations (version) VALUES ($1)", values);
+                        failure := close(insert);
+                        applied := failure = 0;
+                    end if;
+                end if;
+        end case;
+        if failure /= 0 then
+            return rolledBack(handle, failure);
+        end if;
+        failure := runStatic(handle, "COMMIT");
+        if failure /= 0 then
+            return rolledBack(handle, failure);
+        end if;
+        return Right(right => applied);
+    end;
+
+    function rolledBack(handle: Address[Unit], failure: Int32): Either[PgError, Bool] is
+        let back: Int32 := runStatic(handle, "ROLLBACK");
+        return Left(left => PgError(code => failure));
+    end;
+
+    generic [R: Region]
+    function migrate(db: &![Connection, R], migrations: Span[Nat8, Static]): Either[PgError, Index] is
+        let handle: Address[Unit] := db->handle;
+        let created: Int32 := runStatic(handle, "CREATE TABLE IF NOT EXISTS hilde_migrations (version int8 PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
+        if created /= 0 then
+            return Left(left => PgError(code => created));
+        end if;
+        -- Walk the constant: "<size>\n<text>" for each migration, in order,
+        -- the form @migrations gives.
+        var at: Index := 0;
+        var number: Index := 0;
+        var applied: Index := 0;
+        let total: Index := spanLength(migrations);
+        while at < total do
+            var size: Index := 0;
+            while digitAt(migrations, at) do
+                size := ((size * 10) + byteIndex(migrations[at])) - 48;
+                at := at + 1;
+            end while;
+            at := at + 1;
+            number := number + 1;
+            case applyOne(handle, number, spanPart(migrations, at, size)) of
+                when Left(left as error: PgError) do
+                    return Left(left => error);
+                when Right(right as now: Bool) do
+                    if now then
+                        applied := applied + 1;
+                    end if;
+            end case;
+            at := at + size;
+        end while;
+        -- A ledger above the last migration this programme has.
+        let check: Int32 := runStatic(handle, "BEGIN");
+        if check /= 0 then
+            return Left(left => PgError(code => check));
+        end if;
+        var newer: Bool := false;
+        case ledgerVersion(handle) of
+            when Left(left as error: PgError) do
+                let back: Int32 := runStatic(handle, "ROLLBACK");
+                return Left(left => error);
+            when Right(right as have: Index) do
+                newer := have > number;
+        end case;
+        let ended: Int32 := runStatic(handle, "COMMIT");
+        if newer then
+            return Left(left => PgError(code => newerDatabase));
+        end if;
+        return Right(right => applied);
+    end;
+
+    function digitAt(migrations: Span[Nat8, Static], at: Index): Bool is
+        if at >= spanLength(migrations) then
+            return false;
+        end if;
+        let b: Nat8 := migrations[at];
+        return (b >= '0') and (b <= '9');
+    end;
+
+    function byteIndex(b: Nat8): Index is
+        case toIndex(b) of
+            when Some(value as v: Index) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    ---
+    --- Text
+    ---
+
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): String is
+        let size: Index := spanLength(text);
+        var copy: String := makeString(size, '0');
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!copy, i, text[i]);
+            i := i + 1;
+        end while;
+        return copy;
+    end;
+
+    function libraryVersion(): Int32 is
+        return PQlibVersion();
+    end;
+end module body.

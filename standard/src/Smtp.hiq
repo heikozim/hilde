@@ -1,0 +1,1594 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The dialogue runs over a session that carries its own
+-- failure: a step does nothing once one before it failed, so the steps
+-- follow each other without a branch for each, and the session is closed
+-- in one place.  The session keeps the relay's last reply, cleaned, as
+-- the detail of a failure; after a refused login it keeps a fixed
+-- sentence instead, since a relay may quote the login back.  Only the
+-- change to TLS after STARTTLS takes one session and gives back another,
+-- since the TLS client takes the socket.
+import Standard.String (
+    String,
+    fromLiteral,
+    fromByteBuffer,
+    length as stringLength,
+    nthByte,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length as bufferLength,
+    nth as bufferNth,
+    lengthMut as bufferLengthMut,
+    nthMut as bufferNthMut,
+    insertBack,
+    removeLast
+);
+import Standard.Utf8 (
+    Decoded,
+    decodeAt,
+    decodedWidth,
+    isValid
+);
+import Standard.Base64 (
+    encode as base64
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    civilAt,
+    weekday
+);
+import Standard.Ip (
+    IpAddress,
+    parseIp,
+    inSubnet,
+    ipToBytes
+);
+import Standard.Resolve (
+    AnyFamily,
+    ResolveFailure,
+    resolveHost,
+    validHostname
+);
+import Standard.File (
+    FileDescriptor,
+    ConnectFailure,
+    ConnectRefused,
+    ConnectTimedOut,
+    ConnectUnreachable,
+    ConnectError,
+    WaitFailure,
+    WaitTimedOut,
+    WaitFailed,
+    connectTcp,
+    closeFile,
+    makeNonblocking,
+    readWithin,
+    writeWithin
+);
+import Standard.Tls (
+    Client,
+    connectOver,
+    sendWithin,
+    receiveWithin,
+    closeClient
+);
+import Standard.Time (
+    monotonicNanos
+);
+
+module body Standard.Smtp is
+    constant zeroIndex: Index := 0;
+    constant oneIndex: Index := 1;
+    constant twoIndex: Index := 2;
+    constant threeIndex: Index := 3;
+    constant fourIndex: Index := 4;
+    constant zero32: Nat32 := 0;
+    constant zeroByte: Nat8 := 0;
+    constant byteLineFeed: Nat8 := 10;
+    constant byteStop: Nat8 := 46;
+    constant byteZero: Nat8 := 48;
+    constant utcOffset: Int32 := 0;
+    constant nanosPerMilli: Nat64 := 1000000;
+    constant receiveSize: Index := 4096;
+    constant mostPending: Index := 65536;
+    constant mostDetail: Index := 512;
+    constant mostLines: Index := 1000;
+    constant connectMillis: Nat32 := 10000;
+    constant mostLocal: Index := 64;
+    constant mostAddress: Index := 254;
+    constant mostLine: Index := 76;
+    constant loopbackBits4: Index := 8;
+    constant loopbackBits6: Index := 128;
+    constant code220: Nat32 := 220;
+    constant code235: Nat32 := 235;
+    constant code250: Nat32 := 250;
+    constant code251: Nat32 := 251;
+    constant code354: Nat32 := 354;
+
+    ---
+    --- Addresses
+    ---
+
+    function isLetterOrDigit(byte: Nat8): Bool is
+        if (byte >= 'a') and (byte <= 'z') then
+            return true;
+        end if;
+        if (byte >= 'A') and (byte <= 'Z') then
+            return true;
+        end if;
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    -- A byte of an atom of RFC 5322 section 3.2.3, or a dot.
+    function isLocalByte(byte: Nat8): Bool is
+        if isLetterOrDigit(byte) then
+            return true;
+        end if;
+        let signs: Span[Nat8, Static] := "!#$%&'*+-/=?^_`{|}~.";
+        let size: Index := spanLength(signs);
+        var i: Index := zeroIndex;
+        while i < size do
+            if signs[i] = byte then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    function isDomainByte(byte: Nat8): Bool is
+        return isLetterOrDigit(byte) or ((byte = '-') or (byte = '.'));
+    end;
+
+    generic [R: Region]
+    function validAddress(address: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(address);
+        if (size < 3) or (size > mostAddress) then
+            return false;
+        end if;
+        var at: Index := size;
+        var i: Index := zeroIndex;
+        while i < size do
+            if address[i] = '@' then
+                if at /= size then
+                    -- A second @.
+                    return false;
+                end if;
+                at := i;
+            end if;
+            i := i + 1;
+        end while;
+        if (at = size) or ((at = zeroIndex) or (at > mostLocal)) then
+            return false;
+        end if;
+        if (at + 1) = size then
+            return false;
+        end if;
+        i := zeroIndex;
+        while i < at do
+            if not isLocalByte(address[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        if (address[zeroIndex] = '.') or (address[at - 1] = '.') then
+            return false;
+        end if;
+        i := at + 1;
+        while i < size do
+            if not isDomainByte(address[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        if (address[at + 1] = '.') or (address[size - 1] = '.') then
+            return false;
+        end if;
+        return true;
+    end;
+
+    generic [R: Region]
+    function copied(text: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, text);
+        return finalize(out);
+    end;
+
+    ---
+    --- The envelope and the relay
+    ---
+
+    -- The recipients one after the other, each followed by a line feed,
+    -- which no valid address holds.
+    record Envelope: Linear is
+        sender: String;
+        recipients: Buffer[Nat8];
+        count: Index;
+    end;
+
+    generic [R: Region]
+    function makeEnvelope(sender: Span[Nat8, R]): Option[Envelope] is
+        if not validAddress(sender) then
+            let none: Option[Envelope] := None();
+            return none;
+        end if;
+        let recipients: Buffer[Nat8] := allocateEmpty();
+        let made: Envelope := Envelope(sender => copied(sender), recipients => recipients, count => zeroIndex);
+        return Some(value => made);
+    end;
+
+    generic [R: Region, S: Region]
+    function addRecipient(envelope: &![Envelope, R], recipient: Span[Nat8, S]): Bool is
+        if not validAddress(recipient) then
+            return false;
+        end if;
+        let size: Index := spanLength(recipient);
+        var i: Index := zeroIndex;
+        while i < size do
+            pushByte(&~envelope, recipient[i]);
+            i := i + 1;
+        end while;
+        pushByte(&~envelope, byteLineFeed);
+        envelope->count := envelope->count + 1;
+        return true;
+    end;
+
+    -- A borrow of a field through a write reference takes the reference
+    -- with it, so each such borrow below stands alone in a function of its
+    -- own, and its callers lend the reference again.
+    generic [R: Region]
+    function pushByte(envelope: &![Envelope, R], byte: Nat8): Unit is
+        insertBack(&!(envelope->recipients), byte);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function recipientCount(envelope: &[Envelope, R]): Index is
+        return envelope->count;
+    end;
+
+    function destroyEnvelope(envelope: Envelope): Unit is
+        let { sender: String, recipients: Buffer[Nat8], count: Index } := envelope;
+        destroyString(sender);
+        destroyFree(recipients);
+        return nil;
+    end;
+
+    -- The bytes of the recipient list from start up to stop.
+    generic [R: Region]
+    function recipientAt(envelope: &[Envelope, R], start: Index, stop: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := start;
+        while i < stop do
+            writeByte(&!out, bufferNth(&(envelope->recipients), i));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    record Relay: Linear is
+        host: String;
+        port: Nat16;
+        security: Security;
+        caFile: String;
+        milliseconds: Nat32;
+    end;
+
+    generic [H: Region, C: Region]
+    function makeRelay(host: Span[Nat8, H], port: Nat16, security: Security, caFile: Span[Nat8, C], milliseconds: Nat32): Option[Relay] is
+        var literal: Bool := false;
+        case parseIp(host) of
+            when Some(value as address: IpAddress) do
+                literal := true;
+            when None do
+                skip;
+        end case;
+        if (not literal) and (not validHostname(host)) then
+            let none: Option[Relay] := None();
+            return none;
+        end if;
+        let made: Relay := Relay(host => copied(host), port => port, security => security, caFile => copied(caFile), milliseconds => milliseconds);
+        return Some(value => made);
+    end;
+
+    function destroyRelay(relay: Relay): Unit is
+        let { host: String, port: Nat16, security: Security, caFile: String, milliseconds: Nat32 } := relay;
+        destroyString(host);
+        destroyString(caFile);
+        return nil;
+    end;
+
+    ---
+    --- The message
+    ---
+
+    -- value in decimal digits, at least width of them.
+    generic [B: Region]
+    function writeDigits(out: &![StringBuilder, B], value: Int64, width: Index): Unit is
+        var digits: Buffer[Nat8] := allocateEmpty();
+        var rest: Int64 := value;
+        let ten: Int64 := 10;
+        let none: Int64 := 0;
+        var more: Bool := true;
+        while more do
+            case toNat8(rem(rest, ten)) of
+                when Some(value as digit: Nat8) do
+                    insertBack(&!digits, digit + '0');
+                when None do
+                    abort("Standard.Smtp: a digit did not fit a byte");
+            end case;
+            rest := rest / ten;
+            more := rest > none;
+        end while;
+        while bufferLengthMut(&!digits) < width do
+            insertBack(&!digits, byteZero);
+        end while;
+        var i: Index := bufferLengthMut(&!digits);
+        while i > zeroIndex do
+            i := i - 1;
+            writeByte(&~out, bufferNthMut(&!digits, i));
+        end while;
+        destroyFree(digits);
+        return nil;
+    end;
+
+    function widen8(value: Nat8): Int64 is
+        case toInt64(value) of
+            when Some(value as widened: Int64) do
+                return widened;
+            when None do
+                abort("Standard.Smtp: a Nat8 did not fit an Int64");
+                let none: Int64 := 0;
+                return none;
+        end case;
+    end;
+
+    function widen32(value: Int32): Int64 is
+        case toInt64(value) of
+            when Some(value as widened: Int64) do
+                return widened;
+            when None do
+                abort("Standard.Smtp: an Int32 did not fit an Int64");
+                let none: Int64 := 0;
+                return none;
+        end case;
+    end;
+
+    -- The three letters of the name numbered index, counted from 1.
+    generic [B: Region]
+    function writeName(out: &![StringBuilder, B], names: Span[Nat8, Static], index: Nat8): Unit is
+        case toIndex(index) of
+            when Some(value as place: Index) do
+                let start: Index := (place - 1) * 3;
+                writeByte(&~out, names[start]);
+                writeByte(&~out, names[start + 1]);
+                writeByte(&~out, names[start + 2]);
+            when None do
+                abort("Standard.Smtp: a name's number did not fit an Index");
+        end case;
+        return nil;
+    end;
+
+    -- The date of RFC 5322 section 3.3 in UTC, as in
+    -- Sun, 27 Sep 2026 05:05:04 +0000.
+    generic [B: Region]
+    function writeDate(out: &![StringBuilder, B], civil: Civil): Unit is
+        writeName(&~out, "MonTueWedThuFriSatSun", weekday(civil));
+        writeString(&~out, ", ");
+        writeDigits(&~out, widen8(civil.day), oneIndex);
+        writeByte(&~out, ' ');
+        writeName(&~out, "JanFebMarAprMayJunJulAugSepOctNovDec", civil.month);
+        writeByte(&~out, ' ');
+        writeDigits(&~out, widen32(civil.year), fourIndex);
+        writeByte(&~out, ' ');
+        writeDigits(&~out, widen8(civil.hour), twoIndex);
+        writeByte(&~out, ':');
+        writeDigits(&~out, widen8(civil.minute), twoIndex);
+        writeByte(&~out, ':');
+        writeDigits(&~out, widen8(civil.second), twoIndex);
+        writeString(&~out, " +0000");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function isAscii(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        var i: Index := zeroIndex;
+        while i < size do
+            if text[i] >= 128 then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function holdsControl(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        var i: Index := zeroIndex;
+        while i < size do
+            if (text[i] < 32) or (text[i] = 127) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The bytes of text from start, count of them, as a string.
+    generic [R: Region]
+    function piece(text: Span[Nat8, R], start: Index, count: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := zeroIndex;
+        while i < count do
+            writeByte(&!out, text[start + i]);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The subject as encoded words of RFC 2047, each of at most 45 bytes
+    -- of whole characters, so that no word is longer than 75 characters;
+    -- the words are separated by CRLF and a space.
+    generic [B: Region, R: Region]
+    function writeEncodedWords(out: &![StringBuilder, B], text: Span[Nat8, R]): Unit is
+        let size: Index := spanLength(text);
+        let most: Index := 45;
+        var start: Index := zeroIndex;
+        var first: Bool := true;
+        while start < size do
+            var stop: Index := start;
+            var going: Bool := true;
+            while going and (stop < size) do
+                case decodeAt(text, stop) of
+                    when Some(value as decoded: Decoded) do
+                        let width: Index := decodedWidth(decoded);
+                        if ((stop + width) - start) > most then
+                            going := false;
+                        else
+                            stop := stop + width;
+                        end if;
+                    when None do
+                        abort("Standard.Smtp: a checked subject was not UTF-8");
+                end case;
+            end while;
+            if not first then
+                writeString(&~out, "\r\n ");
+            end if;
+            first := false;
+            let chunk: String := piece(text, start, stop - start);
+            let encoded: String := base64(asSpan(&chunk));
+            destroyString(chunk);
+            writeString(&~out, "=?UTF-8?B?");
+            writeString(&~out, asSpan(&encoded));
+            writeString(&~out, "?=");
+            destroyString(encoded);
+            start := stop;
+        end while;
+        return nil;
+    end;
+
+    -- Whether no line of text is longer than 998 bytes, as RFC 5322 asks.
+    generic [R: Region]
+    function shortLines(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        let most: Index := 998;
+        var run: Index := zeroIndex;
+        var i: Index := zeroIndex;
+        while i < size do
+            if text[i] = '\n' then
+                run := zeroIndex;
+            else
+                run := run + 1;
+                if run > most then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- text with every line feed written as CRLF and every carriage return
+    -- dropped, so that a CRLF in text stays one.
+    generic [B: Region, R: Region]
+    function writeLines(out: &![StringBuilder, B], text: Span[Nat8, R]): Unit is
+        let size: Index := spanLength(text);
+        var i: Index := zeroIndex;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if byte = '\n' then
+                writeString(&~out, "\r\n");
+            else
+                if byte /= '\r' then
+                    writeByte(&~out, byte);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [F: Region, T: Region, S: Region, X: Region]
+    function composeMessage(sender: Span[Nat8, F], recipient: Span[Nat8, T], subject: Span[Nat8, S], text: Span[Nat8, X], at: Instant): Option[String] is
+        if (not validAddress(sender)) or (not validAddress(recipient)) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if holdsControl(subject) or ((not isValid(subject)) or (not isValid(text))) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case civilAt(at, utcOffset) of
+            when None do
+                let none: Option[String] := None();
+                return none;
+            when Some(value as civil: Civil) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "Date: ");
+                writeDate(&!out, civil);
+                writeString(&!out, "\r\nFrom: ");
+                writeString(&!out, sender);
+                writeString(&!out, "\r\nTo: ");
+                writeString(&!out, recipient);
+                writeString(&!out, "\r\nSubject: ");
+                if isAscii(subject) then
+                    writeString(&!out, subject);
+                else
+                    writeEncodedWords(&!out, subject);
+                end if;
+                writeString(&!out, "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n");
+                if isAscii(text) and shortLines(text) then
+                    writeString(&!out, "Content-Transfer-Encoding: 7bit\r\n\r\n");
+                    writeLines(&!out, text);
+                    writeString(&!out, "\r\n");
+                else
+                    writeString(&!out, "Content-Transfer-Encoding: base64\r\n\r\n");
+                    -- Text is encoded in its canonical form, with CRLF line
+                    -- ends, as RFC 2045 section 6.8 asks.
+                    var canonical: StringBuilder := makeStringBuilder();
+                    writeLines(&!canonical, text);
+                    let lines: String := finalize(canonical);
+                    let encoded: String := base64(asSpan(&lines));
+                    destroyString(lines);
+                    let size: Index := stringLength(&encoded);
+                    var i: Index := zeroIndex;
+                    while i < size do
+                        writeByte(&!out, nthByte(&encoded, i));
+                        i := i + 1;
+                        if (rem(i, mostLine) = zeroIndex) or (i = size) then
+                            writeString(&!out, "\r\n");
+                        end if;
+                    end while;
+                    destroyString(encoded);
+                end if;
+                return Some(value => finalize(out));
+        end case;
+    end;
+
+    ---
+    --- The clock
+    ---
+
+    -- When the dialogue must be done, in the monotonic clock's
+    -- nanoseconds.  Without such a clock, limited is false and every step
+    -- gets the whole time.
+    record Clock: Free is
+        deadline: Nat64;
+        limited: Bool;
+        perStep: Nat32;
+    end;
+
+    function wide(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.Smtp: a Nat32 did not fit a Nat64");
+                let none: Nat64 := 0;
+                return none;
+        end case;
+    end;
+
+    function startClock(totalMillis: Nat32): Clock is
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                let clock: Clock := Clock(deadline => now + (wide(totalMillis) * nanosPerMilli), limited => true, perStep => totalMillis);
+                return clock;
+            when None do
+                let zero: Nat64 := 0;
+                let clock: Clock := Clock(deadline => zero, limited => false, perStep => totalMillis);
+                return clock;
+        end case;
+    end;
+
+    -- The milliseconds left, rounded up; 0 when the time is up.
+    function remainingMillis(clock: Clock): Nat32 is
+        if not clock.limited then
+            return clock.perStep;
+        end if;
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                if now >= clock.deadline then
+                    return zero32;
+                end if;
+                case toNat32(((clock.deadline - now) + (nanosPerMilli - 1)) / nanosPerMilli) of
+                    when Some(value as left: Nat32) do
+                        return left;
+                    when None do
+                        return maximum_nat32;
+                end case;
+            when None do
+                return clock.perStep;
+        end case;
+    end;
+
+    function expired(clock: Clock): Bool is
+        return clock.limited and (remainingMillis(clock) = zero32);
+    end;
+
+    ---
+    --- The session
+    ---
+
+    union Channel: Linear is
+        case Plain is
+            socket: FileDescriptor;
+        case Secure is
+            client: Client;
+        case Closed;
+    end;
+
+    -- listening is true while the reply to EHLO is read: only then do
+    -- the lines after the first say what the relay offers.
+    record Session: Linear is
+        channel: Channel;
+        pending: Buffer[Nat8];
+        detail: Buffer[Nat8];
+        failure: Option[MailFailureKind];
+        clock: Clock;
+        listening: Bool;
+        offersStartTls: Bool;
+        offersPlain: Bool;
+    end;
+
+    function makeSession(channel: Channel, clock: Clock): Session is
+        let none: Option[MailFailureKind] := None();
+        let pending: Buffer[Nat8] := allocateEmpty();
+        let detail: Buffer[Nat8] := allocateEmpty();
+        let made: Session := Session(channel => channel, pending => pending, detail => detail, failure => none, clock => clock, listening => false, offersStartTls => false, offersPlain => false);
+        return made;
+    end;
+
+    function closeChannel(channel: Channel): Unit is
+        case channel of
+            when Plain(socket: FileDescriptor) do
+                let closed: Bool := closeFile(socket);
+            when Secure(client: Client) do
+                closeClient(client);
+            when Closed do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function failed(session: &![Session, R]): Bool is
+        case session->failure of
+            when Some(value as kind: MailFailureKind) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- text into detail, cleaned: a byte that is not printable ASCII
+    -- becomes a full stop, and at most 512 bytes are kept.
+    generic [R: Region, S: Region]
+    function setDetail(detail: &![Buffer[Nat8], R], text: Span[Nat8, S]): Unit is
+        while bufferLengthMut(&~detail) > zeroIndex do
+            let dropped: Nat8 := removeLast(&~detail);
+        end while;
+        let size: Index := spanLength(text);
+        var i: Index := zeroIndex;
+        while (i < size) and (i < mostDetail) do
+            let byte: Nat8 := text[i];
+            if (byte < 32) or (byte >= 127) then
+                insertBack(&~detail, byteStop);
+            else
+                insertBack(&~detail, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Marks the session failed with kind and text as the detail, unless
+    -- it failed before.
+    generic [R: Region, S: Region]
+    function fail(session: &![Session, R], kind: MailFailureKind, text: Span[Nat8, S]): Unit is
+        if failed(&~session) then
+            return nil;
+        end if;
+        session->failure := Some(value => kind);
+        writeDetail(&~session, text);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeDetail(session: &![Session, R], text: Span[Nat8, S]): Unit is
+        setDetail(&!(session->detail), text);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function addPending(session: &![Session, R], data: &[String, S]): Unit is
+        appendPending(&!(session->pending), data);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pendingStop(session: &![Session, R]): Index is
+        return lineEnd(&!(session->pending));
+    end;
+
+    generic [R: Region]
+    function takePending(session: &![Session, R], stop: Index): String is
+        return takeLine(&!(session->pending), stop);
+    end;
+
+    ---
+    --- Reading and writing
+    ---
+
+    -- Whether kind is a time limit that ran out.  Where the limit is
+    -- noticed, before a read or inside it, depends on how fast the
+    -- programme runs, so both places give the same detail.
+    function isTimeout(kind: MailFailureKind): Bool is
+        case kind of
+            when TimedOut do
+                return true;
+            when BadInput do
+                return false;
+            when NotResolved do
+                return false;
+            when ConnectFailed do
+                return false;
+            when TlsFailed do
+                return false;
+            when NoStartTls do
+                return false;
+            when NotLoopback do
+                return false;
+            when CleartextLogin do
+                return false;
+            when LoginRefused do
+                return false;
+            when Refused do
+                return false;
+            when BadReply do
+                return false;
+        end case;
+    end;
+
+    -- Some bytes from the channel within left milliseconds; an empty
+    -- string when the relay closed the connection.
+    generic [R: Region]
+    function receiveSome(session: &![Session, R], left: Nat32): Either[MailFailureKind, String] is
+        let clock: Clock := session->clock;
+        case &!(session->channel) of
+            when Plain(socket: &![FileDescriptor, R]) do
+                case readWithin(socket, receiveSize, left) of
+                    when Right(right as data: String) do
+                        let got: Either[MailFailureKind, String] := Right(right => data);
+                        return got;
+                    when Left(left as why: WaitFailure) do
+                        case why of
+                            when WaitTimedOut do
+                                let late: Either[MailFailureKind, String] := Left(left => TimedOut());
+                                return late;
+                            when WaitFailed do
+                                let broken: Either[MailFailureKind, String] := Left(left => BadReply());
+                                return broken;
+                        end case;
+                end case;
+            when Secure(client: &![Client, R]) do
+                case receiveWithin(client, receiveSize, left) of
+                    when Right(right as data: String) do
+                        let got: Either[MailFailureKind, String] := Right(right => data);
+                        return got;
+                    when Left(left as message: String) do
+                        destroyString(message);
+                        if expired(clock) then
+                            let late: Either[MailFailureKind, String] := Left(left => TimedOut());
+                            return late;
+                        else
+                            let broken: Either[MailFailureKind, String] := Left(left => TlsFailed());
+                            return broken;
+                        end if;
+                end case;
+            when Closed do
+                let broken: Either[MailFailureKind, String] := Left(left => BadReply());
+                return broken;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function appendPending(pending: &![Buffer[Nat8], R], data: &[String, S]): Unit is
+        let size: Index := stringLength(data);
+        var i: Index := zeroIndex;
+        while i < size do
+            insertBack(&~pending, nthByte(data, i));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- More bytes into pending; the session fails when none came.
+    generic [R: Region]
+    function receiveMore(session: &![Session, R]): Unit is
+        let left: Nat32 := remainingMillis(session->clock);
+        if left = zero32 then
+            fail(&~session, TimedOut(), "the time limit ran out waiting for the relay");
+            return nil;
+        end if;
+        case receiveSome(&~session, left) of
+            when Left(left as kind: MailFailureKind) do
+                if isTimeout(kind) then
+                    fail(&~session, kind, "the time limit ran out waiting for the relay");
+                else
+                    fail(&~session, kind, "the relay's answer did not come");
+                end if;
+            when Right(right as data: String) do
+                if stringLength(&data) = zeroIndex then
+                    fail(&~session, BadReply(), "the relay closed the connection");
+                else
+                    addPending(&~session, &data);
+                end if;
+                destroyString(data);
+        end case;
+        return nil;
+    end;
+
+    -- The index of the first line feed in pending, or its length when
+    -- there is none.
+    generic [R: Region]
+    function lineEnd(pending: &![Buffer[Nat8], R]): Index is
+        let size: Index := bufferLengthMut(&~pending);
+        var i: Index := zeroIndex;
+        while i < size do
+            if bufferNthMut(&~pending, i) = '\n' then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return size;
+    end;
+
+    -- Drops the first count bytes of pending.  Removing them one by one
+    -- from the front would move the rest each time; this moves every byte
+    -- twice at most.
+    generic [R: Region]
+    function dropFront(pending: &![Buffer[Nat8], R], count: Index): Unit is
+        var rest: Buffer[Nat8] := allocateEmpty();
+        while bufferLengthMut(&~pending) > count do
+            insertBack(&!rest, removeLast(&~pending));
+        end while;
+        while bufferLengthMut(&~pending) > zeroIndex do
+            let dropped: Nat8 := removeLast(&~pending);
+        end while;
+        while bufferLengthMut(&!rest) > zeroIndex do
+            insertBack(&~pending, removeLast(&!rest));
+        end while;
+        destroyFree(rest);
+        return nil;
+    end;
+
+    -- The first line of pending, size bytes and its line feed, taken out
+    -- of it; the line comes back without carriage returns.
+    generic [R: Region]
+    function takeLine(pending: &![Buffer[Nat8], R], size: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := zeroIndex;
+        while i < size do
+            let byte: Nat8 := bufferNthMut(&~pending, i);
+            if byte /= '\r' then
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        dropFront(&~pending, size + 1);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function pendingLine(session: &![Session, R]): Option[String] is
+        let stop: Index := pendingStop(&~session);
+        if stop = pendingSize(&~session) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let line: String := takePending(&~session, stop);
+        return Some(value => line);
+    end;
+
+    generic [R: Region]
+    function pendingSize(session: &![Session, R]): Index is
+        return bufferLengthMut(&!(session->pending));
+    end;
+
+    generic [R: Region]
+    function startTlsOffered(session: &![Session, R]): Bool is
+        return session->offersStartTls;
+    end;
+
+    function digitOf(byte: Nat8): Option[Nat32] is
+        if (byte < '0') or (byte > '9') then
+            let none: Option[Nat32] := None();
+            return none;
+        end if;
+        return toNat32(byte - '0');
+    end;
+
+    -- The code of a reply line, or None when its first three bytes are not
+    -- digits.
+    generic [R: Region]
+    function codeOf(line: &[String, R]): Option[Nat32] is
+        if stringLength(line) < 3 then
+            let none: Option[Nat32] := None();
+            return none;
+        end if;
+        let hundred: Nat32 := 100;
+        let ten: Nat32 := 10;
+        case digitOf(nthByte(line, zeroIndex)) of
+            when None do
+                let none: Option[Nat32] := None();
+                return none;
+            when Some(value as a: Nat32) do
+                case digitOf(nthByte(line, oneIndex)) of
+                    when None do
+                        let none: Option[Nat32] := None();
+                        return none;
+                    when Some(value as b: Nat32) do
+                        case digitOf(nthByte(line, twoIndex)) of
+                            when None do
+                                let none: Option[Nat32] := None();
+                                return none;
+                            when Some(value as c: Nat32) do
+                                return Some(value => ((a * hundred) + (b * ten)) + c);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    function upper(byte: Nat8): Nat8 is
+        if (byte >= 'a') and (byte <= 'z') then
+            return byte - 32;
+        end if;
+        return byte;
+    end;
+
+    -- Whether the text of a reply line, after its code and the byte after
+    -- it, is word, or word and a space and more, in any case.
+    generic [R: Region]
+    function lineStartsWith(line: &[String, R], word: Span[Nat8, Static]): Bool is
+        let size: Index := spanLength(word);
+        if stringLength(line) < (size + 4) then
+            return false;
+        end if;
+        var i: Index := zeroIndex;
+        while i < size do
+            if upper(nthByte(line, i + 4)) /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        if stringLength(line) = (size + 4) then
+            return true;
+        end if;
+        return nthByte(line, size + 4) = ' ';
+    end;
+
+    -- Whether the AUTH line of an EHLO reply names PLAIN among its
+    -- mechanisms, each after a space.
+    generic [R: Region]
+    function namesPlain(line: &[String, R]): Bool is
+        let word: Span[Nat8, Static] := "PLAIN";
+        let size: Index := stringLength(line);
+        var i: Index := 4;
+        while i < size do
+            if nthByte(line, i) = ' ' then
+                var matches: Bool := (i + 5) < size;
+                if matches and ((i + 6) < size) then
+                    matches := nthByte(line, i + 6) = ' ';
+                end if;
+                var k: Index := zeroIndex;
+                while matches and (k < 5) do
+                    if upper(nthByte(line, (i + 1) + k)) /= word[k] then
+                        matches := false;
+                    end if;
+                    k := k + 1;
+                end while;
+                if matches then
+                    return true;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The reply to a step, read whole: its code, or 0 when the session
+    -- failed.  The reply's text, cleaned, becomes the session's detail.
+    generic [R: Region]
+    function readReply(session: &![Session, R]): Nat32 is
+        var code: Nat32 := zero32;
+        var first: Bool := true;
+        var done: Bool := false;
+        var lines: Index := zeroIndex;
+        var kept: Index := zeroIndex;
+        var text: StringBuilder := makeStringBuilder();
+        while (not done) and (not failed(&~session)) do
+            case pendingLine(&~session) of
+                when Some(value as line: String) do
+                    lines := lines + 1;
+                    case codeOf(&line) of
+                        when None do
+                            fail(&~session, BadReply(), "a reply line without a code");
+                        when Some(value as lineCode: Nat32) do
+                            if first then
+                                code := lineCode;
+                            end if;
+                            if (lineCode /= code) or (lines > mostLines) then
+                                fail(&~session, BadReply(), "a reply with lines of different codes, or of more than 1000 lines");
+                            else
+                                if session->listening and (not first) then
+                                    if lineStartsWith(&line, "STARTTLS") then
+                                        session->offersStartTls := true;
+                                    end if;
+                                    if lineStartsWith(&line, "AUTH") and namesPlain(&line) then
+                                        session->offersPlain := true;
+                                    end if;
+                                end if;
+                                if kept < mostDetail then
+                                    if not first then
+                                        writeByte(&!text, ' ');
+                                    end if;
+                                    writeString(&!text, asSpan(&line));
+                                    kept := (kept + stringLength(&line)) + 1;
+                                end if;
+                                if stringLength(&line) = 3 then
+                                    done := true;
+                                else
+                                    let separator: Nat8 := nthByte(&line, threeIndex);
+                                    if separator = ' ' then
+                                        done := true;
+                                    else
+                                        if separator /= '-' then
+                                            fail(&~session, BadReply(), "a reply line that is neither the last nor a continued one");
+                                        end if;
+                                    end if;
+                                end if;
+                            end if;
+                            first := false;
+                    end case;
+                    destroyString(line);
+                when None do
+                    if pendingSize(&~session) > mostPending then
+                        fail(&~session, BadReply(), "a reply line longer than 64 KiB");
+                    else
+                        receiveMore(&~session);
+                    end if;
+            end case;
+        end while;
+        let said: String := finalize(text);
+        if failed(&~session) then
+            destroyString(said);
+            return zero32;
+        else
+            writeDetail(&~session, asSpan(&said));
+            destroyString(said);
+            return code;
+        end if;
+    end;
+
+    generic [R: Region, S: Region]
+    function sendSome(session: &![Session, R], data: Span[Nat8, S], left: Nat32, clock: Clock): Option[MailFailureKind] is
+        case &!(session->channel) of
+            when Plain(socket: &![FileDescriptor, R]) do
+                case writeWithin(socket, data, left) of
+                    when Right(right as done: Unit) do
+                        let none: Option[MailFailureKind] := None();
+                        return none;
+                    when Left(left as why: WaitFailure) do
+                        case why of
+                            when WaitTimedOut do
+                                return Some(value => TimedOut());
+                            when WaitFailed do
+                                return Some(value => BadReply());
+                        end case;
+                end case;
+            when Secure(client: &![Client, R]) do
+                case sendWithin(client, data, left) of
+                    when Right(right as done: Unit) do
+                        let none: Option[MailFailureKind] := None();
+                        return none;
+                    when Left(left as message: String) do
+                        destroyString(message);
+                        if expired(clock) then
+                            return Some(value => TimedOut());
+                        else
+                            return Some(value => TlsFailed());
+                        end if;
+                end case;
+            when Closed do
+                return Some(value => BadReply());
+        end case;
+    end;
+
+    -- Sends data over the channel within the time left.
+    generic [R: Region, S: Region]
+    function sendData(session: &![Session, R], data: Span[Nat8, S]): Unit is
+        if failed(&~session) then
+            return nil;
+        end if;
+        let clock: Clock := session->clock;
+        let left: Nat32 := remainingMillis(clock);
+        if left = zero32 then
+            fail(&~session, TimedOut(), "the time limit ran out before a command was sent");
+            return nil;
+        end if;
+        case sendSome(&~session, data, left, clock) of
+            when Some(value as kind: MailFailureKind) do
+                if isTimeout(kind) then
+                    fail(&~session, kind, "the time limit ran out before a command was sent");
+                else
+                    fail(&~session, kind, "a command could not be sent");
+                end if;
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Reads the reply, whose code must be first or second; any other
+    -- code fails the session with refused.
+    generic [R: Region]
+    function expectReply(session: &![Session, R], first: Nat32, second: Nat32, refused: MailFailureKind): Unit is
+        if failed(&~session) then
+            return nil;
+        end if;
+        let code: Nat32 := readReply(&~session);
+        if failed(&~session) then
+            return nil;
+        end if;
+        if (code /= first) and (code /= second) then
+            session->failure := Some(value => refused);
+        end if;
+        return nil;
+    end;
+
+    -- A command and its reply.
+    generic [R: Region, S: Region]
+    function step(session: &![Session, R], command: Span[Nat8, S], first: Nat32, second: Nat32, refused: MailFailureKind): Unit is
+        sendData(&~session, command);
+        expectReply(&~session, first, second, refused);
+        return nil;
+    end;
+
+    -- EHLO and its reply, which sets what the relay offers anew.
+    generic [R: Region]
+    function hello(session: &![Session, R]): Unit is
+        session->offersStartTls := false;
+        session->offersPlain := false;
+        session->listening := true;
+        step(&~session, "EHLO localhost\r\n", code250, code250, Refused());
+        session->listening := false;
+        return nil;
+    end;
+
+    -- head, middle and tail as one string.
+    generic [S: Region]
+    function commandWith(head: Span[Nat8, Static], middle: Span[Nat8, S], tail: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, head);
+        writeString(&!out, middle);
+        writeString(&!out, tail);
+        return finalize(out);
+    end;
+
+    ---
+    --- The dialogue
+    ---
+
+    -- The message with CRLF line ends, a dot doubled at the start of a
+    -- line, and the line with a single dot that ends the data.
+    generic [R: Region]
+    function dataOf(message: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(message);
+        var atLineStart: Bool := true;
+        var i: Index := zeroIndex;
+        while i < size do
+            let byte: Nat8 := message[i];
+            if atLineStart and (byte = '.') then
+                writeByte(&!out, '.');
+            end if;
+            if byte = '\n' then
+                writeString(&!out, "\r\n");
+                atLineStart := true;
+            else
+                if byte /= '\r' then
+                    writeByte(&!out, byte);
+                    atLineStart := false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        if not atLineStart then
+            writeString(&!out, "\r\n");
+        end if;
+        writeString(&!out, ".\r\n");
+        return finalize(out);
+    end;
+
+    -- The command AUTH PLAIN with user and password, RFC 4616.
+    generic [U: Region, P: Region]
+    function plainLogin(user: Span[Nat8, U], password: Span[Nat8, P]): String is
+        var joined: StringBuilder := makeStringBuilder();
+        writeByte(&!joined, zeroByte);
+        writeString(&!joined, user);
+        writeByte(&!joined, zeroByte);
+        writeString(&!joined, password);
+        let secret: String := finalize(joined);
+        let encoded: String := base64(asSpan(&secret));
+        destroyString(secret);
+        let command: String := commandWith("AUTH PLAIN ", asSpan(&encoded), "\r\n");
+        destroyString(encoded);
+        return command;
+    end;
+
+    -- The login.  A refusal keeps a fixed sentence as the detail and not
+    -- the relay's reply, which may quote the command and with it the
+    -- password.
+    generic [R: Region, U: Region, P: Region]
+    function logIn(session: &![Session, R], user: Span[Nat8, U], password: Span[Nat8, P]): Unit is
+        if failed(&~session) then
+            return nil;
+        end if;
+        if not session->offersPlain then
+            fail(&~session, LoginRefused(), "the relay does not offer AUTH PLAIN over TLS");
+            return nil;
+        end if;
+        let login: String := plainLogin(user, password);
+        sendData(&~session, asSpan(&login));
+        destroyString(login);
+        if failed(&~session) then
+            return nil;
+        end if;
+        let code: Nat32 := readReply(&~session);
+        if failed(&~session) then
+            return nil;
+        end if;
+        if code /= code235 then
+            fail(&~session, LoginRefused(), "the relay refused the login");
+        end if;
+        return nil;
+    end;
+
+    -- From EHLO on: the login, the envelope, the data, QUIT.  The
+    -- greeting is read first when greet is true.
+    generic [S: Region, U: Region, P: Region, E: Region, M: Region]
+    function converse(session: &![Session, S], greet: Bool, user: Span[Nat8, U], password: Span[Nat8, P], envelope: &[Envelope, E], message: Span[Nat8, M]): Unit is
+        if greet then
+            expectReply(&~session, code220, code220, Refused());
+        end if;
+        hello(&~session);
+        if spanLength(user) > zeroIndex then
+            logIn(&~session, user, password);
+        end if;
+        let mailFrom: String := commandWith("MAIL FROM:<", asSpan(&(envelope->sender)), ">\r\n");
+        step(&~session, asSpan(&mailFrom), code250, code250, Refused());
+        destroyString(mailFrom);
+        let size: Index := bufferLength(&(envelope->recipients));
+        var start: Index := zeroIndex;
+        var i: Index := zeroIndex;
+        while (i < size) and (not failed(&~session)) do
+            if bufferNth(&(envelope->recipients), i) = '\n' then
+                let address: String := recipientAt(envelope, start, i);
+                let rcpt: String := commandWith("RCPT TO:<", asSpan(&address), ">\r\n");
+                destroyString(address);
+                step(&~session, asSpan(&rcpt), code250, code251, Refused());
+                destroyString(rcpt);
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        step(&~session, "DATA\r\n", code354, code354, Refused());
+        if not failed(&~session) then
+            let data: String := dataOf(message);
+            sendData(&~session, asSpan(&data));
+            destroyString(data);
+            expectReply(&~session, code250, code250, Refused());
+        end if;
+        if not failed(&~session) then
+            -- The mail is accepted; QUIT is a courtesy whose answer is not
+            -- waited for, and whose failure does not undo the mail.
+            sendData(&~session, "QUIT\r\n");
+            let clear: Option[MailFailureKind] := None();
+            session->failure := clear;
+        end if;
+        return nil;
+    end;
+
+    ---
+    --- Connecting
+    ---
+
+    function isLoopback(address: IpAddress): Bool is
+        case parseIp("127.0.0.0") of
+            when Some(value as four: IpAddress) do
+                if inSubnet(address, four, loopbackBits4) then
+                    return true;
+                end if;
+            when None do
+                skip;
+        end case;
+        case parseIp("::1") of
+            when Some(value as six: IpAddress) do
+                return inSubnet(address, six, loopbackBits6);
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function allLoopback(found: &[Buffer[IpAddress], R]): Bool is
+        let count: Index := bufferLength(found);
+        var i: Index := zeroIndex;
+        while i < count do
+            if not isLoopback(bufferNth(found, i)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function refusedWith(kind: MailFailureKind, detail: Span[Nat8, Static]): Either[MailFailure, Unit] is
+        let answer: Either[MailFailure, Unit] := Left(left => MailFailure(kind => kind, detail => fromLiteral(detail)));
+        return answer;
+    end;
+
+    function connectTimedOut(why: ConnectFailure): Bool is
+        case why of
+            when ConnectTimedOut do
+                return true;
+            when ConnectRefused do
+                return false;
+            when ConnectUnreachable do
+                return false;
+            when ConnectError do
+                return false;
+        end case;
+    end;
+
+    -- A connection to the first of the addresses from i on that takes one,
+    -- each attempt within 10 seconds and the time left.
+    generic [R: Region]
+    function connectFrom(addresses: &[Buffer[IpAddress], R], i: Index, port: Nat16, clock: Clock, timedOut: Bool): Either[MailFailureKind, FileDescriptor] is
+        if i >= bufferLength(addresses) then
+            if timedOut then
+                let late: Either[MailFailureKind, FileDescriptor] := Left(left => TimedOut());
+                return late;
+            end if;
+            let none: Either[MailFailureKind, FileDescriptor] := Left(left => ConnectFailed());
+            return none;
+        end if;
+        let left: Nat32 := remainingMillis(clock);
+        if left = zero32 then
+            let late: Either[MailFailureKind, FileDescriptor] := Left(left => TimedOut());
+            return late;
+        end if;
+        var limit: Nat32 := connectMillis;
+        if left < limit then
+            limit := left;
+        end if;
+        let bytes: String := ipToBytes(bufferNth(addresses, i));
+        let attempt: Either[ConnectFailure, FileDescriptor] := connectTcp(asSpan(&bytes), port, limit);
+        destroyString(bytes);
+        case attempt of
+            when Right(right as socket: FileDescriptor) do
+                let made: Either[MailFailureKind, FileDescriptor] := Right(right => socket);
+                return made;
+            when Left(left as why: ConnectFailure) do
+                return connectFrom(addresses, i + 1, port, clock, timedOut or connectTimedOut(why));
+        end case;
+    end;
+
+    -- The session's end: Right, or its failure with its detail; the
+    -- channel is closed either way.
+    function finish(session: Session): Either[MailFailure, Unit] is
+        let { channel: Channel, pending: Buffer[Nat8], detail: Buffer[Nat8], failure: Option[MailFailureKind], clock: Clock, listening: Bool, offersStartTls: Bool, offersPlain: Bool } := session;
+        closeChannel(channel);
+        destroyFree(pending);
+        case failure of
+            when None do
+                destroyFree(detail);
+                let sent: Either[MailFailure, Unit] := Right(right => nil);
+                return sent;
+            when Some(value as kind: MailFailureKind) do
+                let answer: Either[MailFailure, Unit] := Left(left => MailFailure(kind => kind, detail => fromByteBuffer(detail)));
+                return answer;
+        end case;
+    end;
+
+    -- A session over TLS begun on socket, or a failed one when the
+    -- handshake did not complete.  The TLS client takes the socket and
+    -- closes it on failure.
+    generic [H: Region, C: Region]
+    function secureOver(socket: FileDescriptor, host: &[String, H], caFile: &[String, C], clock: Clock): Session is
+        let left: Nat32 := remainingMillis(clock);
+        case connectOver(socket, asSpan(host), asSpan(caFile), left) of
+            when Right(right as client: Client) do
+                return makeSession(Secure(client => client), clock);
+            when Left(left as message: String) do
+                var broken: Session := makeSession(Closed(), clock);
+                if expired(clock) then
+                    fail(&!broken, TimedOut(), "the time limit ran out during the TLS handshake");
+                else
+                    fail(&!broken, TlsFailed(), asSpan(&message));
+                end if;
+                destroyString(message);
+                return broken;
+        end case;
+    end;
+
+    -- The dialogue up to TLS: the greeting, EHLO, STARTTLS and its
+    -- reply over the plain socket, then TLS over the same socket.  A relay
+    -- that does not offer STARTTLS, refuses it, or sends anything after
+    -- agreeing to it fails the session, which is then not continued in
+    -- cleartext.
+    generic [H: Region, C: Region]
+    function upgrade(session: Session, host: &[String, H], caFile: &[String, C]): Session is
+        var plain: Session := session;
+        expectReply(&!plain, code220, code220, Refused());
+        hello(&!plain);
+        let offered: Bool := startTlsOffered(&!plain);
+        if (not failed(&!plain)) and (not offered) then
+            fail(&!plain, NoStartTls(), "the relay does not offer STARTTLS");
+        end if;
+        step(&!plain, "STARTTLS\r\n", code220, code220, NoStartTls());
+        let more: Index := pendingSize(&!plain);
+        if (not failed(&!plain)) and (more > zeroIndex) then
+            -- Bytes sent after the relay's 220 and before TLS would be read
+            -- as if they had come through TLS.
+            fail(&!plain, NoStartTls(), "the relay sent more after agreeing to STARTTLS");
+        end if;
+        if failed(&!plain) then
+            return plain;
+        else
+            let { channel: Channel, pending: Buffer[Nat8], detail: Buffer[Nat8], failure: Option[MailFailureKind], clock: Clock, listening: Bool, offersStartTls: Bool, offersPlain: Bool } := plain;
+            destroyFree(pending);
+            destroyFree(detail);
+            case channel of
+                when Plain(socket: FileDescriptor) do
+                    return secureOver(socket, host, caFile, clock);
+                when Secure(client: Client) do
+                    var broken: Session := makeSession(Secure(client => client), clock);
+                    fail(&!broken, BadReply(), "TLS was begun twice");
+                    return broken;
+                when Closed do
+                    var broken: Session := makeSession(Closed(), clock);
+                    fail(&!broken, BadReply(), "there was no connection");
+                    return broken;
+            end case;
+        end if;
+    end;
+
+    -- A plain session on socket, made non-blocking.
+    function plainSession(socket: FileDescriptor, clock: Clock): Session is
+        var open: FileDescriptor := socket;
+        let ready: Bool := makeNonblocking(&!open);
+        var session: Session := makeSession(Plain(socket => open), clock);
+        if not ready then
+            fail(&!session, ConnectFailed(), "the socket could not be made non-blocking");
+        end if;
+        return session;
+    end;
+
+    generic [R: Region, U: Region, P: Region, E: Region, M: Region]
+    function overSocket(socket: FileDescriptor, relay: &[Relay, R], user: Span[Nat8, U], password: Span[Nat8, P], envelope: &[Envelope, E], message: Span[Nat8, M], clock: Clock): Either[MailFailure, Unit] is
+        case relay->security of
+            when ImplicitTls do
+                var secure: Session := secureOver(socket, &(relay->host), &(relay->caFile), clock);
+                converse(&!secure, true, user, password, envelope, message);
+                return finish(secure);
+            when StartTls do
+                var secure: Session := upgrade(plainSession(socket, clock), &(relay->host), &(relay->caFile));
+                converse(&!secure, false, user, password, envelope, message);
+                return finish(secure);
+            when LoopbackCleartext do
+                var plain: Session := plainSession(socket, clock);
+                converse(&!plain, true, user, password, envelope, message);
+                return finish(plain);
+        end case;
+    end;
+
+    generic [R: Region]
+    function holdsZero(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        var i: Index := zeroIndex;
+        while i < size do
+            if text[i] = 0 then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    function isCleartext(security: Security): Bool is
+        case security of
+            when LoopbackCleartext do
+                return true;
+            when StartTls do
+                return false;
+            when ImplicitTls do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, U: Region, P: Region, E: Region, M: Region]
+    function sendMail(relay: &[Relay, R], user: Span[Nat8, U], password: Span[Nat8, P], envelope: &[Envelope, E], message: Span[Nat8, M]): Either[MailFailure, Unit] is
+        let login: Bool := spanLength(user) > zeroIndex;
+        if login and (holdsZero(user) or holdsZero(password)) then
+            return refusedWith(BadInput(), "a user name or a password holds a zero byte");
+        end if;
+        if login and isCleartext(relay->security) then
+            return refusedWith(CleartextLogin(), "a login is never sent without TLS");
+        end if;
+        if recipientCount(envelope) = zeroIndex then
+            return refusedWith(BadInput(), "the envelope has no recipient");
+        end if;
+        let clock: Clock := startClock(relay->milliseconds);
+        case resolveHost(asSpan(&(relay->host)), AnyFamily()) of
+            when Left(left as why: ResolveFailure) do
+                return refusedWith(NotResolved(), "the relay's host has no address");
+            when Right(right as found: Buffer[IpAddress]) do
+                if isCleartext(relay->security) and (not allLoopback(&found)) then
+                    destroyFree(found);
+                    return refusedWith(NotLoopback(), "cleartext is only for a relay on a loopback address");
+                else
+                    let attempt: Either[MailFailureKind, FileDescriptor] := connectFrom(&found, zeroIndex, relay->port, clock, false);
+                    destroyFree(found);
+                    case attempt of
+                        when Left(left as kind: MailFailureKind) do
+                            return refusedWith(kind, "no address of the relay took the connection in time");
+                        when Right(right as socket: FileDescriptor) do
+                            return overSocket(socket, relay, user, password, envelope, message, clock);
+                    end case;
+                end if;
+        end case;
+    end;
+end module body.

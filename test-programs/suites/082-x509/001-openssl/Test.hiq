@@ -1,0 +1,367 @@
+-- Standard.X509 against the openssl
+-- command: a CA and a server certificate made here are verified by openssl
+-- verify and read by openssl x509; the server certificate serves a TLS
+-- handshake that Standard.Tls verifies against the CA; and a request made by
+-- openssl req is turned into a certificate here and verified by openssl.
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    replace
+);
+import Standard.File (
+    FileDescriptor,
+    TcpListener,
+    ConnectFailure,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    openRead,
+    openWrite,
+    readAll,
+    writeAll,
+    closeFile,
+    removeFile,
+    listenTcp,
+    tcpListenerPort,
+    acceptTcpWithin,
+    closeTcpListener,
+    connectTcp
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    closeScope,
+    spawn,
+    join
+);
+import Standard.Tls (
+    Client,
+    Server,
+    connectOver,
+    send,
+    receiveWithin,
+    closeClient,
+    makeServerFromMemory,
+    acceptOver,
+    closeServer
+);
+import Standard.X509 (
+    PrivateKey,
+    Certificate,
+    EcP256,
+    EcP384,
+    generateKey,
+    privateKeyToPem,
+    destroyPrivateKey,
+    certificateToPem,
+    destroyCertificate,
+    selfSigned,
+    issue,
+    issueFromRequest
+);
+
+module body Test is
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function writeFile(name: Span[Nat8, Static], text: &[String, R]): Bool is
+        case openWrite(name) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, asSpan(text));
+                return closeFile(file) and written;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function readFile(name: Span[Nat8, Static]): String is
+        case openRead(name) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var text: String := fromLiteral("");
+                case readAll(&!file) of
+                    when Some(value as read: String) do
+                        destroyString(text);
+                        text := read;
+                    when None do
+                        skip;
+                end case;
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return fromLiteral("");
+        end case;
+    end;
+
+    -- Runs openssl with the arguments, prints its standard output and,
+    -- when it fails, its exit code.
+    function openssl(arguments: Command): Unit is
+        case spawnProcess(arguments) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                let closedInput: Bool := closeFile(input);
+                var out: FileDescriptor := output;
+                var err: FileDescriptor := errors;
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        -- openssl ends some lines with a space.
+                        let trimmed: String := replace(asSpan(&text), " \n", "\n");
+                        printText(&trimmed);
+                        destroyString(trimmed);
+                        destroyString(text);
+                    when None do
+                        printLn("(no output)");
+                end case;
+                case readAll(&!err) of
+                    when Some(value as text: String) do
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                let closedOut: Bool := closeFile(out);
+                let closedErr: Bool := closeFile(err);
+                let status: ProcessStatus := waitProcess(process);
+                if (not exitedNormally(status)) or (exitCode(status) /= 0) then
+                    print("openssl exit code ");
+                    printLn(exitCode(status));
+                end if;
+            when None do
+                printLn("openssl could not be started");
+        end case;
+        return nil;
+    end;
+
+    function command(words: Span[Nat8, Static]): Command is
+        let env: String := fromLiteral("/usr/bin/env");
+        var made: Command := makeCommand(asSpan(&env));
+        destroyString(env);
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(words) do
+            if (i = spanLength(words)) or (words[i] = ' ') then
+                let word: String := copyOf(words, start, i);
+                made := addArgument(made, asSpan(&word));
+                destroyString(word);
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return made;
+    end;
+
+    function copyOf(words: Span[Nat8, Static], start: Index, stop: Index): String is
+        var out: String := makeString(stop - start, 0);
+        var i: Index := start;
+        while i < stop do
+            storeNth(&!out, i - start, words[i]);
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    function loopback(): String is
+        var address: String := makeString(4, 0);
+        storeNth(&!address, 0, 127);
+        storeNth(&!address, 3, 1);
+        return address;
+    end;
+
+    -- The client: connects, verifies the server against ca.pem for
+    -- localhost, and reads a line.
+    function client(port: Nat16): String is
+        var out: StringBuilder := makeStringBuilder();
+        let address: String := loopback();
+        case connectTcp(asSpan(&address), port, 5000) of
+            when Right(right as socket: FileDescriptor) do
+                case connectOver(socket, "localhost", "ca.pem", 5000) of
+                    when Right(right as opened: Client) do
+                        var tls: Client := opened;
+                        writeString(&!out, "client: the server's certificate verified against the CA\n");
+                        case receiveWithin(&!tls, 100, 5000) of
+                            when Right(right as got: String) do
+                                writeString(&!out, "client: received ");
+                                writeString(&!out, asSpan(&got));
+                                destroyString(got);
+                            when Left(left as message: String) do
+                                writeString(&!out, "client: receive failed\n");
+                                destroyString(message);
+                        end case;
+                        closeClient(tls);
+                    when Left(left as message: String) do
+                        writeString(&!out, "client: handshake failed: ");
+                        writeString(&!out, asSpan(&message));
+                        writeString(&!out, "\n");
+                        destroyString(message);
+                end case;
+            when Left(left as failure: ConnectFailure) do
+                writeString(&!out, "client: connect failed\n");
+        end case;
+        destroyString(address);
+        return finalize(out);
+    end;
+
+    generic [C: Region, K: Region]
+    function serveTls(certificate: &[String, C], keyPem: &[String, K]): Unit is
+        case makeServerFromMemory(asSpan(certificate), asSpan(keyPem)) of
+            when Right(right as server: Server) do
+                let address: String := loopback();
+                case listenTcp(asSpan(&address), 0) of
+                    when Some(value as listener: TcpListener) do
+                        case openScope() of
+                            when Some(value as opened: Scope) do
+                                var scope: Scope := opened;
+                                let talk: Fn[Nat16, String] := client;
+                                case spawn(&!scope, talk, tcpListenerPort(&listener)) of
+                                    when Right(right as task: Task[String]) do
+                                        case acceptTcpWithin(&listener, 5000) of
+                                            when Some(value as socket: FileDescriptor) do
+                                                case acceptOver(&server, socket, 5000) of
+                                                    when Right(right as accepted: Client) do
+                                                        var connection: Client := accepted;
+                                                        case send(&!connection, "served with a certificate made in Hilde\n") of
+                                                            when Right(right as sent: Unit) do
+                                                                skip;
+                                                            when Left(left as message: String) do
+                                                                destroyString(message);
+                                                        end case;
+                                                        closeClient(connection);
+                                                    when Left(left as message: String) do
+                                                        printLn("server: handshake failed");
+                                                        destroyString(message);
+                                                end case;
+                                            when None do
+                                                printLn("server: nobody connected");
+                                        end case;
+                                        let report: String := join(task);
+                                        printText(&report);
+                                        destroyString(report);
+                                    when Left(left as back: Nat16) do
+                                        printLn("no client task");
+                                end case;
+                                closeScope(scope);
+                            when None do
+                                printLn("no scope");
+                        end case;
+                        let closed: Bool := closeTcpListener(listener);
+                    when None do
+                        printLn("listenTcp failed");
+                end case;
+                destroyString(address);
+                closeServer(server);
+            when Left(left as message: String) do
+                print("makeServerFromMemory failed: ");
+                printText(&message);
+                printLn("");
+                destroyString(message);
+        end case;
+        return nil;
+    end;
+
+    generic [A: Region, K: Region]
+    function fromOpensslRequest(ca: &[Certificate, A], caKey: &[PrivateKey, K]): Unit is
+        openssl(command("openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout client-key.pem -subj /CN=client.example -addext subjectAltName=DNS:client.example -outform DER -out client.der"));
+        let request: String := readFile("client.der");
+        case issueFromRequest(ca, caKey, asSpan(&request), 5) of
+            when Some(value as issued: Certificate) do
+                case certificateToPem(&issued) of
+                    when Some(value as pem: String) do
+                        print("issued from the request of openssl: ");
+                        printLn(writeFile("client.pem", &pem));
+                        openssl(command("openssl verify -CAfile ca.pem -verify_hostname client.example client.pem"));
+                        openssl(command("openssl x509 -in client.pem -noout -subject -ext subjectAltName"));
+                        destroyString(pem);
+                    when None do
+                        printLn("no PEM of the issued certificate");
+                end case;
+                destroyCertificate(issued);
+            when None do
+                printLn("the request of openssl was refused");
+        end case;
+        destroyString(request);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case generateKey(EcP384()) of
+            when Some(value as caKey: PrivateKey) do
+                case selfSigned(&caKey, "Hilde Suite CA", "", 2, true) of
+                    when Some(value as ca: Certificate) do
+                        case generateKey(EcP256()) of
+                            when Some(value as leafKey: PrivateKey) do
+                                case issue(&ca, &caKey, &leafKey, "localhost", "localhost", 2, false) of
+                                    when Some(value as leaf: Certificate) do
+                                        case certificateToPem(&ca) of
+                                            when Some(value as caPem: String) do
+                                                case certificateToPem(&leaf) of
+                                                    when Some(value as leafPem: String) do
+                                                        print("written: ");
+                                                        print(writeFile("ca.pem", &caPem));
+                                                        print(" ");
+                                                        printLn(writeFile("leaf.pem", &leafPem));
+                                                        openssl(command("openssl verify -CAfile ca.pem -verify_hostname localhost leaf.pem"));
+                                                        openssl(command("openssl x509 -in leaf.pem -noout -subject -issuer -ext subjectAltName,basicConstraints,extendedKeyUsage"));
+                                                        case privateKeyToPem(&leafKey) of
+                                                            when Some(value as keyPem: String) do
+                                                                serveTls(&leafPem, &keyPem);
+                                                                destroyString(keyPem);
+                                                            when None do
+                                                                printLn("no key PEM");
+                                                        end case;
+                                                        fromOpensslRequest(&ca, &caKey);
+                                                        destroyString(leafPem);
+                                                    when None do
+                                                        printLn("no leaf PEM");
+                                                end case;
+                                                destroyString(caPem);
+                                            when None do
+                                                printLn("no CA PEM");
+                                        end case;
+                                        destroyCertificate(leaf);
+                                    when None do
+                                        printLn("no leaf");
+                                end case;
+                                destroyPrivateKey(leafKey);
+                            when None do
+                                printLn("no leaf key");
+                        end case;
+                        destroyCertificate(ca);
+                    when None do
+                        printLn("no CA");
+                end case;
+                destroyPrivateKey(caKey);
+            when None do
+                printLn("no CA key");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

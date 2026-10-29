@@ -1,0 +1,1058 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Every command gives back a Done: whether it did what it was asked, a count
+-- (files written, trees held), a line saying what it did, and the problems.
+-- show prints a Done as text or as JSON, the same for every command.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    destroyWiped,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nthRef,
+    insertBack,
+    removeFirst,
+    removeLast,
+    destroyEmpty
+);
+import Standard.Text (
+    equal,
+    formatNat,
+    parseInt,
+    trim,
+    substring,
+    endsWith
+);
+import Standard.Json (
+    JsonWriter,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    beginArray,
+    endArray,
+    writeName,
+    writeString as writeJsonString,
+    writeInteger,
+    writeBool,
+    finishJson
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal
+);
+import Standard.IO.Terminal (
+    StandardError,
+    acquireError,
+    releaseError,
+    writeErrorText
+);
+import Standard.About (
+    fullVersion,
+    info
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.File (
+    environmentValue
+);
+import Standard.Arguments (
+    Command,
+    FlagKey,
+    PathKey,
+    TextKey,
+    PositionalKey,
+    SubcommandKey,
+    ArgumentError,
+    Outcome,
+    Run,
+    Help,
+    Version,
+    Matches,
+    makeCommand,
+    destroyCommand,
+    setVersion,
+    setCopyright,
+    setFullVersion,
+    setInfo,
+    addSandbox,
+    option,
+    addFlag,
+    addText,
+    addJson,
+    addPositional,
+    addSubcommand,
+    usageLine,
+    processArguments,
+    destroyArguments,
+    parse,
+    destroyMatches,
+    describeError,
+    destroyError,
+    flagCount,
+    textOf,
+    positionalOf,
+    positionalAt,
+    positionalCount,
+    chosen
+);
+import Pkg.Report (
+    Problem,
+    problemOf,
+    describeProblem,
+    writeProblem,
+    destroyProblem
+);
+import Pkg.Process (
+    Ran,
+    findProgram,
+    runProgram,
+    destroyRan
+);
+import Pkg.Verify (
+    Verified,
+    verifyPackage
+);
+import Pkg.Get (
+    Got,
+    Wanted,
+    readWanted,
+    getPackages
+);
+import Pkg.Api (
+    Declaration,
+    ApiDiff,
+    diffTrees,
+    levelName,
+    declarationsIn,
+    destroyDeclarations
+);
+import Pkg.Doc (
+    describe,
+    manualPage,
+    mdocDate
+);
+import Pkg.Files (
+    isThere,
+    writeText,
+    writeSecret,
+    isDirectory,
+    joinPath,
+    directoryNames
+);
+import Pkg.Install (
+    installPackage
+);
+import Pkg.Update (
+    updatePackages
+);
+import Pkg.Export (
+    exportPackage
+);
+import Standard.Signify (
+    KeyPair,
+    generateKeys
+);
+import Pkg.New (
+    NewPlan,
+    newPackage,
+    newModule,
+    destroyPlan
+);
+
+module body Pkg.Main is
+    function toolVersion(): Span[Nat8, Static] is
+        return "1.0.0";
+    end;
+
+    -- What a command did.
+    record Done: Linear is
+        ok: Bool;
+        count: Int64;
+        summary: String;
+        problems: Buffer[Problem];
+    end;
+
+    record Keys: Free is
+        sandbox: FlagKey;
+        verify: SubcommandKey;
+        verifyJson: FlagKey;
+        new: SubcommandKey;
+        newJson: FlagKey;
+        newName: PositionalKey;
+        newBin: FlagKey;
+        newGit: FlagKey;
+        newPackaging: FlagKey;
+        get: SubcommandKey;
+        getJson: FlagKey;
+        getWanted: PositionalKey;
+        getGit: TextKey;
+        doc: SubcommandKey;
+        docJson: FlagKey;
+        docWhat: PositionalKey;
+        docMan: FlagKey;
+        export: SubcommandKey;
+        exportJson: FlagKey;
+        exportKey: TextKey;
+        exportWithC: FlagKey;
+        exportMakeKey: TextKey;
+        update: SubcommandKey;
+        updateJson: FlagKey;
+        updateCheck: FlagKey;
+        api: SubcommandKey;
+        apiJson: FlagKey;
+        apiTrees: PositionalKey;
+        install: SubcommandKey;
+        installJson: FlagKey;
+        installPrefix: TextKey;
+        installDestdir: TextKey;
+    end;
+
+    function destroyProblems(problems: Buffer[Problem]): Unit is
+        var rest: Buffer[Problem] := problems;
+        while bufferLength(&rest) > 0 do
+            destroyProblem(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function countOf(n: Index): Int64 is
+        case toInt64(n) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Pkg.Main: a count did not fit an Int64");
+        end case;
+    end;
+
+    function indexText(n: Index): String is
+        case toNat64(n) of
+            when Some(value as wide: Nat64) do
+                return formatNat(wide);
+            when None do
+                abort("Pkg.Main: a count did not fit a Nat64");
+        end case;
+    end;
+
+    function failed(problem: Problem): Done is
+        var problems: Buffer[Problem] := allocateEmpty();
+        insertBack(&!problems, problem);
+        return Done(ok => false, count => 0, summary => makeEmpty(), problems => problems);
+    end;
+
+    -- hilde verify: the package in the working directory.
+    function runVerify(): Done is
+        let library: String := libraryDir();
+        let verified: Verified := verifyPackage(".", asSpan(&library));
+        destroyString(library);
+        let { checked: Index, problems: Buffer[Problem] } := verified;
+        let ok: Bool := bufferLength(&problems) = 0;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "hilde verify: ");
+        let n: String := indexText(checked);
+        writeString(&!out, asSpan(&n));
+        destroyString(n);
+        if ok then
+            writeString(&!out, " trees in vendor/ hold to hilde.sum");
+        else
+            writeString(&!out, " trees held, and vendor/ does not hold to hilde.sum");
+        end if;
+        return Done(ok => ok, count => countOf(checked), summary => finalize(out), problems => problems);
+    end;
+
+    -- The first line of what a programme printed, trimmed.
+    generic [R: Region]
+    function firstLine(text: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while (i < spanLength(text)) and (text[i] /= '\n') do
+            writeByte(&!out, text[i]);
+            i := i + 1;
+        end while;
+        let line: String := finalize(out);
+        let trimmed: String := fromSpan(trim(asSpan(&line)));
+        destroyString(line);
+        return trimmed;
+    end;
+
+    -- git config of the key, or the empty text.
+    generic [G: Region]
+    function gitConfig(git: Span[Nat8, G], key: Span[Nat8, Static]): String is
+        var words: Buffer[String] := allocateEmpty();
+        insertBack(&!words, fromLiteral("config"));
+        insertBack(&!words, fromLiteral(key));
+        let ran: Either[Problem, Ran] := runProgram(git, &words);
+        destroyArguments(words);
+        case ran of
+            when Right(right as r: Ran) do
+                let { exitCode: Int32, output: String, errors: String } := r;
+                destroyString(errors);
+                if exitCode /= 0 then
+                    destroyString(output);
+                    return makeEmpty();
+                end if;
+                let line: String := firstLine(asSpan(&output));
+                destroyString(output);
+                return line;
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                return makeEmpty();
+        end case;
+    end;
+
+    -- The author of a new package: the name and mail git knows, or a
+    -- word to replace.
+    function author(): String is
+        case findProgram("git") of
+            when Some(value as git: String) do
+                let name: String := gitConfig(asSpan(&git), "user.name");
+                let mail: String := gitConfig(asSpan(&git), "user.email");
+                destroyString(git);
+                if length(&name) = 0 then
+                    destroyString(name);
+                    destroyString(mail);
+                    return fromLiteral("The Author");
+                end if;
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, asSpan(&name));
+                if length(&mail) > 0 then
+                    writeString(&!out, " <");
+                    writeString(&!out, asSpan(&mail));
+                    writeByte(&!out, '>');
+                end if;
+                destroyString(name);
+                destroyString(mail);
+                return finalize(out);
+            when None do
+                return fromLiteral("The Author");
+        end case;
+    end;
+
+    -- The time of a new changelog entry: SOURCE_DATE_EPOCH when it is set,
+    -- as reproducible builds ask, else the clock.
+    function nowSeconds(): Int64 is
+        case environmentValue("SOURCE_DATE_EPOCH") of
+            when Some(value as text: String) do
+                let read: Option[Int64] := parseInt(asSpan(&text));
+                destroyString(text);
+                case read of
+                    when Some(value as seconds: Int64) do
+                        return seconds;
+                    when None do
+                        skip;
+                end case;
+            when None do
+                skip;
+        end case;
+        case toInt64(wallNanos() / 1000000000) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- git init in the new directory.
+    generic [D: Region]
+    function gitInit(directory: Span[Nat8, D]): Option[Problem] is
+        case findProgram("git") of
+            when Some(value as git: String) do
+                var words: Buffer[String] := allocateEmpty();
+                insertBack(&!words, fromLiteral("init"));
+                insertBack(&!words, fromLiteral("-q"));
+                insertBack(&!words, fromSpan(directory));
+                let ran: Either[Problem, Ran] := runProgram(asSpan(&git), &words);
+                destroyArguments(words);
+                destroyString(git);
+                case ran of
+                    when Right(right as r: Ran) do
+                        let good: Bool := r.exitCode = 0;
+                        destroyRan(r);
+                        if good then
+                            return None();
+                        end if;
+                        return Some(value => problemOf(1508, fromLiteral("git init failed in the new package"), fromLiteral("run git init there yourself")));
+                    when Left(left as p: Problem) do
+                        return Some(value => p);
+                end case;
+            when None do
+                return Some(value => problemOf(1507, fromLiteral("git is not on PATH, so --git could not make a repository"), fromLiteral("install git, or leave out --git")));
+        end case;
+    end;
+
+    generic [P: Region]
+    function makeIt(plan: &[NewPlan, P], isModule: Bool): Either[Problem, Index] is
+        if isModule then
+            return newModule(plan, ".");
+        end if;
+        return newPackage(plan, ".");
+    end;
+
+    generic [M: Region]
+    function runNew(matches: &[Matches, M], keys: Keys): Done is
+        let count: Index := positionalCount(matches, keys.newName);
+        if count = 0 then
+            return failed(problemOf(1505, fromLiteral("hilde new needs the name of the package"), fromLiteral("hilde new Acme.Json, or hilde new module Acme.Json.Parse")));
+        end if;
+        var isModule: Bool := false;
+        var name: String := makeEmpty();
+        case positionalAt(matches, keys.newName, 0) of
+            when Some(value as first: &[String, M]) do
+                if equal(asSpan(first), "module") and (count = 2) then
+                    isModule := true;
+                    case positionalAt(matches, keys.newName, 1) of
+                        when Some(value as second: &[String, M]) do
+                            destroyString(name);
+                            name := fromSpan(asSpan(second));
+                        when None do
+                            skip;
+                    end case;
+                else if count = 1 then
+                    destroyString(name);
+                    name := fromSpan(asSpan(first));
+                end if;
+            when None do
+                skip;
+        end case;
+        if length(&name) = 0 then
+            destroyString(name);
+            return failed(problemOf(1505, fromLiteral("hilde new takes one name, or the word module and one name"), fromLiteral("hilde new Acme.Json, or hilde new module Acme.Json.Parse")));
+        end if;
+        let shown: String := fromSpan(asSpan(&name));
+        let plan: NewPlan := NewPlan(
+            name => name,
+            binary => flagCount(matches, keys.newBin) > 0,
+            packaging => flagCount(matches, keys.newPackaging) > 0,
+            author => author(),
+            seconds => nowSeconds()
+        );
+        case makeIt(&plan, isModule) of
+            when Right(right as written: Index) do
+                var problems: Buffer[Problem] := allocateEmpty();
+                if (not isModule) and (flagCount(matches, keys.newGit) > 0) then
+                    case gitInit(asSpan(&shown)) of
+                        when Some(value as p: Problem) do
+                            insertBack(&!problems, p);
+                        when None do
+                            skip;
+                    end case;
+                end if;
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "hilde new: ");
+                let n: String := indexText(written);
+                writeString(&!out, asSpan(&n));
+                destroyString(n);
+                writeString(&!out, " files written for ");
+                writeString(&!out, asSpan(&shown));
+                destroyString(shown);
+                destroyPlan(plan);
+                let ok: Bool := bufferLength(&problems) = 0;
+                return Done(ok => ok, count => countOf(written), summary => finalize(out), problems => problems);
+            when Left(left as p: Problem) do
+                destroyString(shown);
+                destroyPlan(plan);
+                return failed(p);
+        end case;
+    end;
+
+    function doneOf(got: Got): Done is
+        let { count: Index, summary: String, problems: Buffer[Problem] } := got;
+        let ok: Bool := bufferLength(&problems) = 0;
+        return Done(ok => ok, count => countOf(count), summary => summary, problems => problems);
+    end;
+
+    -- hilde get, with the package asked for when one is given.
+    generic [M: Region]
+    function runGet(matches: &[Matches, M], keys: Keys): Done is
+        var git: String := makeEmpty();
+        case textOf(matches, keys.getGit) of
+            when Some(value as g: &[String, M]) do
+                destroyString(git);
+                git := fromSpan(asSpan(g));
+            when None do
+                skip;
+        end case;
+        case positionalOf(matches, keys.getWanted) of
+            when Some(value as w: &[String, M]) do
+                case readWanted(asSpan(w), asSpan(&git)) of
+                    when Right(right as wanted: Wanted) do
+                        destroyString(git);
+                        return doneOf(getPackages(".", Some(value => wanted)));
+                    when Left(left as p: Problem) do
+                        destroyString(git);
+                        return failed(p);
+                end case;
+            when None do
+                if length(&git) > 0 then
+                    destroyString(git);
+                    return failed(problemOf(1505, fromLiteral("--git names the URL of a package, and no package is given"), fromLiteral("hilde get Prefix@vX.Y.Z --git=<url>")));
+                end if;
+                destroyString(git);
+                return doneOf(getPackages(".", None()));
+        end case;
+    end;
+
+    -- The compiler that called: HILDE_COMPILER, else hilde on PATH.
+    function compilerPath(): String is
+        case environmentValue("HILDE_COMPILER") of
+            when Some(value as path: String) do
+                return path;
+            when None do
+                case findProgram("hilde") of
+                    when Some(value as found: String) do
+                        return found;
+                    when None do
+                        return fromLiteral("hilde");
+                end case;
+        end case;
+    end;
+
+    -- The standard library beside the compiler that called.
+    function libraryDir(): String is
+        let compiler: String := compilerPath();
+        let base: String := directoryOf(asSpan(&compiler));
+        destroyString(compiler);
+        let library: String := joinPath(asSpan(&base), "standard/src");
+        destroyString(base);
+        return library;
+    end;
+
+    -- The directory of a path, or . for a name alone.
+    generic [P: Region]
+    function directoryOf(path: Span[Nat8, P]): String is
+        var at: Index := 0;
+        var any: Bool := false;
+        var i: Index := 0;
+        while i < spanLength(path) do
+            if path[i] = '/' then
+                at := i;
+                any := true;
+            end if;
+            i := i + 1;
+        end while;
+        if not any then
+            return fromLiteral(".");
+        end if;
+        return fromSpan(substring(path, 0, at));
+    end;
+
+    -- The directories hilde doc reads: src, the trees of vendor/ and the
+    -- standard library beside the compiler.
+    function docDirectories(): Buffer[String] is
+        var dirs: Buffer[String] := allocateEmpty();
+        if isDirectory("src") then
+            insertBack(&!dirs, fromLiteral("src"));
+        end if;
+        case directoryNames("vendor") of
+            when Some(value as names: Buffer[String]) do
+                addVendored(&names, &!dirs);
+                destroyArguments(names);
+            when None do
+                skip;
+        end case;
+        let compiler: String := compilerPath();
+        let base: String := directoryOf(asSpan(&compiler));
+        destroyString(compiler);
+        let library: String := joinPath(asSpan(&base), "standard/src");
+        destroyString(base);
+        if isDirectory(asSpan(&library)) then
+            insertBack(&!dirs, library);
+        else
+            destroyString(library);
+        end if;
+        return dirs;
+    end;
+
+    generic [N: Region, B: Region]
+    function addVendored(names: &[Buffer[String], N], dirs: &![Buffer[String], B]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(names) do
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, "vendor/");
+            writeString(&!out, asSpan(nthRef(names, i)));
+            writeString(&!out, "/src");
+            let dir: String := finalize(out);
+            if isDirectory(asSpan(&dir)) then
+                insertBack(&~dirs, dir);
+            else
+                destroyString(dir);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The declarations of every directory, in order.
+    generic [D: Region]
+    function allDeclarations(dirs: &[Buffer[String], D]): Buffer[Declaration] is
+        var out: Buffer[Declaration] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(dirs) do
+            case declarationsIn(asSpan(nthRef(dirs, i))) of
+                when Right(right as found: Buffer[Declaration]) do
+                    var rest: Buffer[Declaration] := found;
+                    while bufferLength(&rest) > 0 do
+                        insertBack(&!out, removeFirst(&!rest));
+                    end while;
+                    destroyEmptyDeclarations(rest);
+                when Left(left as p: Problem) do
+                    destroyProblem(p);
+            end case;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    function destroyEmptyDeclarations(rest: Buffer[Declaration]): Unit is
+        destroyDeclarations(rest);
+        return nil;
+    end;
+
+    -- hilde doc: one module or Module.name, as text or as a manual page.
+    generic [M: Region]
+    function runDoc(matches: &[Matches, M], keys: Keys): Done is
+        case positionalOf(matches, keys.docWhat) of
+            when Some(value as w: &[String, M]) do
+                let dirs: Buffer[String] := docDirectories();
+                let all: Buffer[Declaration] := allDeclarations(&dirs);
+                destroyArguments(dirs);
+                if flagCount(matches, keys.docMan) > 0 then
+                    let date: String := mdocDate(nowSeconds());
+                    let page: Option[String] := manualPage(&all, asSpan(w), asSpan(&date));
+                    destroyString(date);
+                    destroyDeclarations(all);
+                    return docDone(page, asSpan(w));
+                end if;
+                let text: Option[String] := describe(&all, asSpan(w));
+                destroyDeclarations(all);
+                return docDone(text, asSpan(w));
+            when None do
+                return failed(problemOf(1505, fromLiteral("hilde doc needs a module, or a module, a dot and a name"), fromLiteral("such as hilde doc Standard.Text.trim")));
+        end case;
+    end;
+
+    generic [W: Region]
+    function docDone(text: Option[String], what: Span[Nat8, W]): Done is
+        case text of
+            when Some(value as t: String) do
+                return Done(ok => true, count => 1, summary => t, problems => allocateEmpty());
+            when None do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "no module or declaration ");
+                writeString(&!out, what);
+                writeString(&!out, " in src, vendor/ or the standard library");
+                return failed(problemOf(1522, finalize(out), fromLiteral("name a module as it is declared, such as Standard.Text, or a function in it, such as Standard.Text.trim")));
+        end case;
+    end;
+
+    -- hilde export --make-key=base: base.pub and base.sec, a signify key
+    -- without a passphrase, neither written over.
+    generic [B: Region]
+    function makeKey(base: Span[Nat8, B]): Done is
+        var pub: StringBuilder := makeStringBuilder();
+        writeString(&!pub, base);
+        writeString(&!pub, ".pub");
+        let pubPath: String := finalize(pub);
+        var sec: StringBuilder := makeStringBuilder();
+        writeString(&!sec, base);
+        writeString(&!sec, ".sec");
+        let secPath: String := finalize(sec);
+        if isThere(asSpan(&pubPath)) or isThere(asSpan(&secPath)) then
+            destroyString(pubPath);
+            destroyString(secPath);
+            return failed(problemOf(1521, fromLiteral("the key files are there already"), fromLiteral("choose another name; a key is never written over")));
+        end if;
+        case generateKeys(base) of
+            when Some(value as keys: KeyPair) do
+                let { publicKey: String, secretKey: String } := keys;
+                var good: Bool := writeSecret(asSpan(&secPath), asSpan(&secretKey));
+                good := good and writeText(asSpan(&pubPath), asSpan(&publicKey));
+                destroyString(publicKey);
+                destroyWiped(secretKey);
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "hilde export: the key ");
+                writeString(&!out, asSpan(&pubPath));
+                writeString(&!out, " and its secret ");
+                writeString(&!out, asSpan(&secPath));
+                writeString(&!out, " are written; name the public key as signify-key in hilde.toml");
+                destroyString(pubPath);
+                destroyString(secPath);
+                if not good then
+                    destroyString(finalize(out));
+                    return failed(problemOf(1519, fromLiteral("the key files cannot be written"), fromLiteral("check that the directory may be written")));
+                end if;
+                return Done(ok => true, count => 2, summary => finalize(out), problems => allocateEmpty());
+            when None do
+                destroyString(pubPath);
+                destroyString(secPath);
+                return failed(problemOf(1513, fromLiteral("no key could be made: the name holds a new line, or the crypto library failed"), fromLiteral("name the key with one line")));
+        end case;
+    end;
+
+    -- hilde install --prefix=dir --destdir=dir.
+    generic [M: Region]
+    function runInstall(matches: &[Matches, M], keys: Keys): Done is
+        var prefix: String := fromLiteral("/usr/local");
+        case textOf(matches, keys.installPrefix) of
+            when Some(value as p: &[String, M]) do
+                destroyString(prefix);
+                prefix := fromSpan(asSpan(p));
+            when None do
+                skip;
+        end case;
+        case textOf(matches, keys.installDestdir) of
+            when Some(value as d: &[String, M]) do
+                if length(d) > 0 then
+                    let compiler: String := compilerPath();
+                    let done: Got := installPackage(".", asSpan(&prefix), asSpan(d), asSpan(&compiler));
+                    destroyString(compiler);
+                    destroyString(prefix);
+                    return doneOf(done);
+                end if;
+            when None do
+                skip;
+        end case;
+        destroyString(prefix);
+        return failed(problemOf(1505, fromLiteral("hilde install writes only into a staging tree, and no --destdir is given"), fromLiteral("such as hilde install --prefix=/usr/local --destdir=stage")));
+    end;
+
+    -- hilde update [--check].
+    generic [M: Region]
+    function runUpdate(matches: &[Matches, M], keys: Keys): Done is
+        let compiler: String := compilerPath();
+        let done: Got := updatePackages(".", flagCount(matches, keys.updateCheck) > 0, asSpan(&compiler));
+        destroyString(compiler);
+        return doneOf(done);
+    end;
+
+    -- hilde api-diff old new: the level, the changes and the callers in
+    -- src of what broke.
+    generic [M: Region]
+    function runApiDiff(matches: &[Matches, M], keys: Keys): Done is
+        if positionalCount(matches, keys.apiTrees) /= 2 then
+            return failed(problemOf(1505, fromLiteral("hilde api-diff takes two directories, the old interfaces and the new"), fromLiteral("such as hilde api-diff old/src src")));
+        end if;
+        case positionalAt(matches, keys.apiTrees, 0) of
+            when Some(value as old: &[String, M]) do
+                case positionalAt(matches, keys.apiTrees, 1) of
+                    when Some(value as new: &[String, M]) do
+                        var sites: Span[Nat8, Static] := "";
+                        if isDirectory("src") then
+                            sites := "src";
+                        end if;
+                        case diffTrees(asSpan(old), asSpan(new), sites) of
+                            when Right(right as diff: ApiDiff) do
+                                let { level: Nat8, changes: Buffer[String], sites as found: Buffer[String] } := diff;
+                                var out: StringBuilder := makeStringBuilder();
+                                writeString(&!out, "hilde api-diff: ");
+                                writeString(&!out, levelName(level));
+                                writeByte(&!out, '\n');
+                                writeLines(&!out, &changes);
+                                if bufferLength(&found) > 0 then
+                                    writeString(&!out, "Calls of what broke:\n");
+                                    writeLines(&!out, &found);
+                                end if;
+                                destroyArguments(changes);
+                                destroyArguments(found);
+                                return Done(ok => true, count => countOfLevel(level), summary => finalize(out), problems => allocateEmpty());
+                            when Left(left as p: Problem) do
+                                return failed(p);
+                        end case;
+                    when None do
+                        return failed(problemOf(1505, fromLiteral("no new directory"), fromLiteral("hilde api-diff old new")));
+                end case;
+            when None do
+                return failed(problemOf(1505, fromLiteral("no old directory"), fromLiteral("hilde api-diff old new")));
+        end case;
+    end;
+
+    function countOfLevel(level: Nat8): Int64 is
+        case toInt64(level) of
+            when Some(value as n: Int64) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [B: Region, T: Region]
+    function writeLines(out: &![StringBuilder, B], texts: &[Buffer[String], T]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(texts) do
+            writeString(&~out, "    ");
+            writeString(&~out, asSpan(nthRef(texts, i)));
+            writeByte(&~out, '\n');
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- hilde export.
+    generic [M: Region]
+    function runExport(matches: &[Matches, M], keys: Keys): Done is
+        case textOf(matches, keys.exportMakeKey) of
+            when Some(value as base: &[String, M]) do
+                if length(base) > 0 then
+                    return makeKey(asSpan(base));
+                end if;
+            when None do
+                skip;
+        end case;
+        case textOf(matches, keys.exportKey) of
+            when Some(value as key: &[String, M]) do
+                if length(key) > 0 then
+                    let compiler: String := compilerPath();
+                    let made: Got := exportPackage(".", asSpan(key), flagCount(matches, keys.exportWithC) > 0, asSpan(&compiler), nowSeconds());
+                    destroyString(compiler);
+                    return doneOf(made);
+                end if;
+            when None do
+                skip;
+        end case;
+        return failed(problemOf(1513, fromLiteral("hilde export needs the secret key that signs the release"), fromLiteral("hilde export --secret-key=release.sec, or make one with hilde export --make-key=release")));
+    end;
+
+    -- Prints the Done in text or in JSON and gives the exit status.
+    generic [E: Region]
+    function show(done: Done, command: Span[Nat8, Static], json: Bool, errors: &![StandardError, E]): Int32 is
+        let { ok: Bool, count: Int64, summary: String, problems: Buffer[Problem] } := done;
+        if json then
+            var w: JsonWriter := makeJsonWriter();
+            beginObject(&!w);
+            writeName(&!w, "command");
+            writeJsonString(&!w, command);
+            writeName(&!w, "ok");
+            writeBool(&!w, ok);
+            writeName(&!w, "count");
+            writeInteger(&!w, count);
+            writeName(&!w, "summary");
+            writeJsonString(&!w, asSpan(&summary));
+            writeName(&!w, "problems");
+            beginArray(&!w);
+            var i: Index := 0;
+            while i < bufferLength(&problems) do
+                writeProblem(&!w, nthRef(&problems, i));
+                i := i + 1;
+            end while;
+            endArray(&!w);
+            endObject(&!w);
+            case finishJson(w) of
+                when Some(value as text: String) do
+                    printLn(asSpan(&text));
+                    destroyString(text);
+                when None do
+                    abort("Pkg.Main: the JSON writer was left unbalanced");
+            end case;
+        else
+            if endsWith(asSpan(&summary), "\n") then
+                print(asSpan(&summary));
+            else if length(&summary) > 0 then
+                printLn(asSpan(&summary));
+            end if;
+            var i: Index := 0;
+            while i < bufferLength(&problems) do
+                let text: String := describeProblem(nthRef(&problems, i));
+                let written: Bool := writeErrorText(&~errors, asSpan(&text));
+                destroyString(text);
+                i := i + 1;
+            end while;
+        end if;
+        destroyString(summary);
+        destroyProblems(problems);
+        if ok then
+            return 0;
+        end if;
+        return 1;
+    end;
+
+    generic [C: Region, M: Region, E: Region]
+    function dispatch(root: &[Command, C], matches: &[Matches, M], keys: Keys, errors: &![StandardError, E]): Int32 is
+        if flagCount(matches, keys.sandbox) > 0 then
+            print(sandboxText());
+            return 0;
+        end if;
+        if chosen(matches, keys.verify) then
+            return show(runVerify(), "verify", flagCount(matches, keys.verifyJson) > 0, &~errors);
+        else if chosen(matches, keys.new) then
+            return show(runNew(matches, keys), "new", flagCount(matches, keys.newJson) > 0, &~errors);
+        else if chosen(matches, keys.get) then
+            return show(runGet(matches, keys), "get", flagCount(matches, keys.getJson) > 0, &~errors);
+        else if chosen(matches, keys.doc) then
+            return show(runDoc(matches, keys), "doc", flagCount(matches, keys.docJson) > 0, &~errors);
+        else if chosen(matches, keys.update) then
+            return show(runUpdate(matches, keys), "update", flagCount(matches, keys.updateJson) > 0, &~errors);
+        else if chosen(matches, keys.api) then
+            return show(runApiDiff(matches, keys), "api-diff", flagCount(matches, keys.apiJson) > 0, &~errors);
+        else if chosen(matches, keys.install) then
+            return show(runInstall(matches, keys), "install", flagCount(matches, keys.installJson) > 0, &~errors);
+        else if chosen(matches, keys.export) then
+            return show(runExport(matches, keys), "export", flagCount(matches, keys.exportJson) > 0, &~errors);
+        end if;
+        let usage: String := usageLine(root);
+        let written: Bool := writeErrorText(&~errors, asSpan(&usage));
+        let ended: Bool := writeErrorText(&~errors, "\n");
+        destroyString(usage);
+        return 2;
+    end;
+
+    function commandLine(): Command is
+        var root: Command := makeCommand("hilde", "The package commands of Hilde.");
+        setVersion(&!root, "1.0.0");
+        setCopyright(&!root, "2026 Heiko Zimmermann");
+        setFullVersion(&!root, fullVersion("1.0.0", "2026 Heiko Zimmermann"));
+        setInfo(&!root, info("tool", "the package commands of Hilde", "hilde-pkg", "1.0.0", ""));
+        return root;
+    end;
+
+    -- What hilde-pkg prints for sandbox: it applies no policy, since every
+    -- policy of this process would confine git and the compiler it starts
+    -- as well, and the paths those need are not known here.
+    function sandboxText(): Span[Nat8, Static] is
+        return "hilde-pkg: no mechanism applied: the process starts git and the compiler, which a policy of this process would confine with it\n\nsandbox profile \"hilde-pkg\"\npaths: 0\n";
+    end;
+
+    generic [E: Region]
+    function run(errors: &![StandardError, E]): Int32 is
+        var root: Command := commandLine();
+        var verify: Command := makeCommand("verify", "Hold vendor/ against hilde.sum, without the network.");
+        let verifyJson: FlagKey := addJson(&!verify);
+        var new: Command := makeCommand("new", "Make a new package, or with the word module a new module of this package.");
+        let newJson: FlagKey := addJson(&!new);
+        let newName: PositionalKey := addPositional(&!new, "name", "The module prefix of the package, or module and the name of the module", true, true);
+        let newBin: FlagKey := addFlag(&!new, option("bin", 'b', "A programme with a main function"));
+        let newGit: FlagKey := addFlag(&!new, option("git", 'g', "Make a git repository of it"));
+        let newPackaging: FlagKey := addFlag(&!new, option("packaging", 'p', "Add scripts for Debian, OpenBSD and FreeBSD packages"));
+        var get: Command := makeCommand("get", "Fetch the required packages into vendor/ and write hilde.sum.");
+        let getJson: FlagKey := addJson(&!get);
+        let getWanted: PositionalKey := addPositional(&!get, "package", "A package to require or raise, as Prefix@vX.Y.Z", false, false);
+        let getGit: TextKey := addText(&!get, option("git", 'G', "The git URL of a package not required yet"), "");
+        let verifyKey: SubcommandKey := addSubcommand(&!root, verify);
+        var doc: Command := makeCommand("doc", "The documentation of a module or of a declaration in it, from src, vendor/ and the standard library.");
+        let docJson: FlagKey := addJson(&!doc);
+        let docWhat: PositionalKey := addPositional(&!doc, "name", "A module, or a module, a dot and a name", true, false);
+        let docMan: FlagKey := addFlag(&!doc, option("man", 'm', "The manual page of the module, in mdoc of section 3"));
+        let getKey: SubcommandKey := addSubcommand(&!root, get);
+        let none: Nat8 := 0;
+        let sandbox: FlagKey := addSandbox(&!root);
+        var export: Command := makeCommand("export", "Make a release: tests, version, llms.txt, manual pages, signatures and the archive in dist/.");
+        let exportJson: FlagKey := addJson(&!export);
+        let exportKey: TextKey := addText(&!export, option("secret-key", none, "The secret key of signify that signs the release"), "");
+        let exportWithC: FlagKey := addFlag(&!export, option("with-c", none, "Write the generated C of this system into c/"));
+        let exportMakeKey: TextKey := addText(&!export, option("make-key", none, "Make a signify key pair base.pub and base.sec, and nothing else"), "");
+        let docKey: SubcommandKey := addSubcommand(&!root, doc);
+        let exportKeyed: SubcommandKey := addSubcommand(&!root, export);
+        var update: Command := makeCommand("update", "Raise the requirements within their major, keeping a raise only when the tests and guard pass.");
+        let updateJson: FlagKey := addJson(&!update);
+        let updateCheck: FlagKey := addFlag(&!update, option("check", none, "List the raises there would be, and change nothing"));
+        let updateKey: SubcommandKey := addSubcommand(&!root, update);
+        var api: Command := makeCommand("api-diff", "What changed between two directories of interfaces, and whether that is a patch, a minor or a major version.");
+        let apiJson: FlagKey := addJson(&!api);
+        let apiTrees: PositionalKey := addPositional(&!api, "directory", "The old interfaces, then the new", true, true);
+        let apiKey: SubcommandKey := addSubcommand(&!root, api);
+        var install: Command := makeCommand("install", "Install the package into a staging tree for a system package.");
+        let installJson: FlagKey := addJson(&!install);
+        let installPrefix: TextKey := addText(&!install, option("prefix", none, "Where the system package puts it"), "/usr/local");
+        let installDestdir: TextKey := addText(&!install, option("destdir", none, "The staging tree everything is written below"), "");
+        let installKey: SubcommandKey := addSubcommand(&!root, install);
+        let newKey: SubcommandKey := addSubcommand(&!root, new);
+        let keys: Keys := Keys(
+            sandbox => sandbox,
+            verify => verifyKey,
+            verifyJson => verifyJson,
+            new => newKey,
+            newJson => newJson,
+            newName => newName,
+            newBin => newBin,
+            newGit => newGit,
+            newPackaging => newPackaging,
+            get => getKey,
+            getJson => getJson,
+            getWanted => getWanted,
+            getGit => getGit,
+            doc => docKey,
+            docJson => docJson,
+            docWhat => docWhat,
+            docMan => docMan,
+            export => exportKeyed,
+            exportJson => exportJson,
+            exportKey => exportKey,
+            exportWithC => exportWithC,
+            exportMakeKey => exportMakeKey,
+            update => updateKey,
+            updateJson => updateJson,
+            updateCheck => updateCheck,
+            api => apiKey,
+            apiJson => apiJson,
+            apiTrees => apiTrees,
+            install => installKey,
+            installJson => installJson,
+            installPrefix => installPrefix,
+            installDestdir => installDestdir
+        );
+        let words: Buffer[String] := processArguments();
+        var status: Int32 := 2;
+        case parse(&root, &words) of
+            when Right(right as outcome: Outcome) do
+                case outcome of
+                    when Run(matches as m: Matches) do
+                        status := dispatch(&root, &m, keys, &~errors);
+                        destroyMatches(m);
+                    when Help(text as t: String) do
+                        print(asSpan(&t));
+                        destroyString(t);
+                        status := 0;
+                    when Version(text as t: String) do
+                        print(asSpan(&t));
+                        destroyString(t);
+                        status := 0;
+                end case;
+            when Left(left as error: ArgumentError) do
+                let message: String := describeError(&root, &error);
+                let written: Bool := writeErrorText(&~errors, asSpan(&message));
+                destroyString(message);
+                destroyError(error);
+        end case;
+        destroyArguments(words);
+        destroyCommand(root);
+        return status;
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var r: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!r);
+        var errors: StandardError := acquireError(&!terminal);
+        let status: Int32 := run(&!errors);
+        releaseError(errors);
+        releaseTerminal(terminal);
+        surrenderRoot(r);
+        if status = 0 then
+            return ExitSuccess();
+        else if status = 1 then
+            return ExitFailure();
+        end if;
+        return ExitStatus(status => 2);
+    end;
+end module body.

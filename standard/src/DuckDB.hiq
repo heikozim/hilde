@@ -1,0 +1,464 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  Bindings.DuckDB does the work with addresses and C;
+-- its handles are wrapped here, one record each, and the mode of a
+-- connection, Writing or Reading, is checked by the types of this module.
+import Standard.String (
+    String
+);
+import Bindings.DuckDB (
+    Connection as Handle,
+    Transaction as BindTransaction,
+    Values as BindValues,
+    Cursor as BindCursor,
+    DuckError as BindError,
+    openFailed as bindOpenFailed,
+    newerDatabase as bindNewerDatabase,
+    statementRefused as bindStatementRefused,
+    duplicateKey as bindDuplicateKey,
+    writeConflict as bindWriteConflict,
+    failedTransaction as bindFailedTransaction,
+    constraintType as bindConstraintType,
+    catalogType as bindCatalogType,
+    parserType as bindParserType,
+    binderType as bindBinderType,
+    invalidInputType as bindInvalidInputType,
+    permissionType as bindPermissionType,
+    connect,
+    closeDatabase as bindCloseDatabase,
+    lastMessage as bindLastMessage,
+    libraryVersion as bindLibraryVersion,
+    migrate as bindMigrate,
+    begin as bindBegin,
+    commit as bindCommit,
+    rollback as bindRollback,
+    copyText as bindCopyText,
+    noValues as bindNoValues,
+    withInt64 as bindWithInt64,
+    withFloat64 as bindWithFloat64,
+    withBool as bindWithBool,
+    withTimestamp as bindWithTimestamp,
+    withText as bindWithText,
+    withBytes as bindWithBytes,
+    withNull as bindWithNull,
+    dropValues as bindDropValues,
+    valueCount as bindValueCount,
+    start as bindStart,
+    execute as bindExecute,
+    advance as bindAdvance,
+    columnCount as bindColumnCount,
+    isNullColumn as bindIsNullColumn,
+    columnInt64 as bindColumnInt64,
+    columnFloat64 as bindColumnFloat64,
+    columnBool as bindColumnBool,
+    columnTimestamp as bindColumnTimestamp,
+    columnText as bindColumnText,
+    columnBytes as bindColumnBytes,
+    finish as bindFinish
+);
+
+module body Standard.DuckDB is
+    record Connection[M: Free]: Linear is
+        handle: Handle;
+        mode: M;
+    end;
+
+    record Transaction: Linear is
+        inner: BindTransaction;
+    end;
+
+    record Values: Linear is
+        inner: BindValues;
+    end;
+
+    record Cursor: Linear is
+        inner: BindCursor;
+    end;
+
+    constant openFailed: Int32 := bindOpenFailed;
+    constant newerDatabase: Int32 := bindNewerDatabase;
+    constant statementRefused: Int32 := bindStatementRefused;
+    constant duplicateKey: Int32 := bindDuplicateKey;
+    constant writeConflict: Int32 := bindWriteConflict;
+    constant failedTransaction: Int32 := bindFailedTransaction;
+
+    function errorOf(error: BindError): DuckError is
+        return DuckError(code => error.code);
+    end;
+
+    function isUniqueViolation(error: DuckError): Bool is
+        return error.code = duplicateKey;
+    end;
+
+    function isConstraintViolation(error: DuckError): Bool is
+        return isUniqueViolation(error) or (error.code = bindConstraintType);
+    end;
+
+    function isBusy(error: DuckError): Bool is
+        return error.code = writeConflict;
+    end;
+
+    function describe(error: DuckError): Span[Nat8, Static] is
+        let code: Int32 := error.code;
+        if code = openFailed then
+            return "the database file could not be opened";
+        else if code = newerDatabase then
+            return "the database has more migrations than this programme knows";
+        else if code = statementRefused then
+            return "the statement was refused before it ran";
+        else if code = duplicateKey then
+            return "a unique key was violated";
+        else if code = bindConstraintType then
+            return "a constraint was violated";
+        else if code = writeConflict then
+            return "another transaction wrote the same rows";
+        else if code = failedTransaction then
+            return "a statement of the transaction had failed";
+        else if code = bindPermissionType then
+            return "the statement reaches outside the database file, which is switched off";
+        else if code = bindCatalogType then
+            return "the statement names a table or a column that is not there";
+        else if (code = bindParserType) or (code = bindBinderType) then
+            return "the statement is not valid SQL";
+        else if code = bindInvalidInputType then
+            return "DuckDB refused the statement for its input";
+        end if;
+        return "DuckDB refused the statement";
+    end;
+
+    ---
+    --- Opening and closing
+    ---
+
+    generic [R: Region]
+    function openWriter(path: Span[Nat8, R]): Either[DuckError, Connection[Writing]] is
+        case connect(path, false) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as handle: Handle) do
+                return Right(right => Connection(handle => handle, mode => Writing()));
+        end case;
+    end;
+
+    generic [R: Region]
+    function openReader(path: Span[Nat8, R]): Either[DuckError, Connection[Reading]] is
+        case connect(path, true) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as handle: Handle) do
+                return Right(right => Connection(handle => handle, mode => Reading()));
+        end case;
+    end;
+
+    generic [M: Free]
+    function closeDatabase(db: Connection[M]): Unit is
+        let { handle: Handle, mode: M } := db;
+        bindCloseDatabase(handle);
+        return nil;
+    end;
+
+    generic [M: Free, R: Region]
+    function lastMessage(db: &[Connection[M], R]): String is
+        return bindLastMessage(&(db->handle));
+    end;
+
+    function libraryVersion(): Span[Nat8, Static] is
+        return bindLibraryVersion();
+    end;
+
+    generic [R: Region]
+    function migrate(db: &![Connection[Writing], R], migrations: Span[Nat8, Static]): Either[DuckError, Index] is
+        case bindMigrate(&!(db->handle), migrations) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as count: Index) do
+                return Right(right => count);
+        end case;
+    end;
+
+    ---
+    --- Transactions
+    ---
+
+    generic [M: Free, R: Region]
+    function begin(db: &![Connection[M], R]): Either[DuckError, Transaction] is
+        case bindBegin(&!(db->handle)) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as inner: BindTransaction) do
+                return Right(right => Transaction(inner => inner));
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function commit(db: &![Connection[M], R], transaction: Transaction): Either[DuckError, Unit] is
+        let { inner: BindTransaction } := transaction;
+        case bindCommit(&!(db->handle), inner) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as done: Unit) do
+                return Right(right => nil);
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function rollback(db: &![Connection[M], R], transaction: Transaction): Unit is
+        let { inner: BindTransaction } := transaction;
+        bindRollback(&!(db->handle), inner);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): String is
+        return bindCopyText(text);
+    end;
+
+    ---
+    --- Values
+    ---
+
+    function noValues(): Values is
+        return Values(inner => bindNoValues());
+    end;
+
+    function withInt64(values: Values, value: Int64): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithInt64(inner, value));
+    end;
+
+    function withFloat64(values: Values, value: Float64): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithFloat64(inner, value));
+    end;
+
+    function withBool(values: Values, value: Bool): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithBool(inner, value));
+    end;
+
+    function withTimestamp(values: Values, value: Int64): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithTimestamp(inner, value));
+    end;
+
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithText(inner, value));
+    end;
+
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithBytes(inner, value));
+    end;
+
+    function withNull(values: Values): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithNull(inner));
+    end;
+
+    function dropValues(values: Values): Unit is
+        let { inner: BindValues } := values;
+        bindDropValues(inner);
+        return nil;
+    end;
+
+    function withInt64OrNull(values: Values, value: Option[Int64]): Values is
+        case value of
+            when Some(value as v: Int64) do
+                return withInt64(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    function withFloat64OrNull(values: Values, value: Option[Float64]): Values is
+        case value of
+            when Some(value as v: Float64) do
+                return withFloat64(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    function withBoolOrNull(values: Values, value: Option[Bool]): Values is
+        case value of
+            when Some(value as v: Bool) do
+                return withBool(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    function withTimestampOrNull(values: Values, value: Option[Int64]): Values is
+        case value of
+            when Some(value as v: Int64) do
+                return withTimestamp(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    generic [R: Region]
+    function withTextOrNull(values: Values, value: Option[Span[Nat8, R]]): Values is
+        case value of
+            when Some(value as v: Span[Nat8, R]) do
+                return withText(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    generic [R: Region]
+    function withBytesOrNull(values: Values, value: Option[Span[Nat8, R]]): Values is
+        case value of
+            when Some(value as v: Span[Nat8, R]) do
+                return withBytes(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index is
+        return bindValueCount(&(values->inner));
+    end;
+
+    ---
+    --- Statements
+    ---
+
+    generic [M: Free, R: Region, S: Region]
+    function start(db: &![Connection[M], R], sql: Span[Nat8, S], values: Values): Cursor is
+        let { inner: BindValues } := values;
+        return Cursor(inner => bindStart(&!(db->handle), sql, inner));
+    end;
+
+    generic [R: Region, S: Region]
+    function startWrite(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Cursor is
+        let { inner: BindValues } := values;
+        return Cursor(inner => bindStart(&!(db->handle), sql, inner));
+    end;
+
+    generic [R: Region, S: Region]
+    function execute(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Either[DuckError, Nat64] is
+        let { inner: BindValues } := values;
+        case bindExecute(&!(db->handle), sql, inner) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as count: Nat64) do
+                return Right(right => count);
+        end case;
+    end;
+
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool is
+        return bindAdvance(&!(cursor->inner));
+    end;
+
+    generic [R: Region]
+    function columnCount(cursor: &[Cursor, R]): Int32 is
+        return bindColumnCount(&(cursor->inner));
+    end;
+
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64 is
+        return bindColumnInt64(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64 is
+        return bindColumnFloat64(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool is
+        return bindColumnBool(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64 is
+        return bindColumnTimestamp(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        return bindColumnText(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        return bindColumnBytes(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool is
+        return bindIsNullColumn(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnInt64OrNone(cursor: &[Cursor, R], index: Int32): Option[Int64] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnInt64(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnFloat64OrNone(cursor: &[Cursor, R], index: Int32): Option[Float64] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnFloat64(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnBoolOrNone(cursor: &[Cursor, R], index: Int32): Option[Bool] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnBool(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnTimestampOrNone(cursor: &[Cursor, R], index: Int32): Option[Int64] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnTimestamp(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnTextOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnText(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnBytesOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnBytes(cursor, index));
+    end;
+
+    generic [M: Free, R: Region]
+    function finish(db: &![Connection[M], R], cursor: Cursor): Option[DuckError] is
+        let { inner: BindCursor } := cursor;
+        case bindFinish(&!(db->handle), inner) of
+            when Some(value as error: BindError) do
+                return Some(value => errorOf(error));
+            when None do
+                return None();
+        end case;
+    end;
+end module body.

@@ -1,0 +1,1 @@
+The third example of docs/arguments-from-clap.md, with CONVERT_JOBS=4 set by env.txt: a choice and a whole number that read the environment, two flags that exclude each other, an option that needs another, a positional path that is required; the vectors run are the environment alone, everything on the line, and each mistake in turn.

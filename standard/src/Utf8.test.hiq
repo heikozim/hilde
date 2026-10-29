@@ -1,0 +1,252 @@
+--
+-- Part of the Hilde project, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Tests for Standard.Utf8.
+--
+-- The inputs are built byte by byte rather than written as literals,
+-- because the bytes are the subject: a test for an overlong encoding that
+-- went through a string literal would be testing the lexer's escapes.
+--
+-- Every refusal below has a valid twin beside it.  A decoder that refused
+-- everything would pass a file full of refusals and prove nothing.
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    makeEmpty,
+    makeString,
+    storeNth,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    finalize
+);
+import Standard.Utf8 (
+    CodePoint,
+    makeCodePoint,
+    codePointValue,
+    encodedWidth,
+    Decoded,
+    decodedPoint,
+    decodedWidth,
+    decodeAt,
+    isValid,
+    countCodePoints,
+    appendCodePoint
+);
+
+module body Standard.Utf8.Test is
+    ---
+    --- Building the inputs
+    ---
+
+    function oneByte(a: Nat8): String is
+        var out: String := makeString(1, a);
+        return out;
+    end;
+
+    function twoBytes(a: Nat8, b: Nat8): String is
+        var out: String := makeString(2, a);
+        storeNth(&!out, 1, b);
+        return out;
+    end;
+
+    function threeBytes(a: Nat8, b: Nat8, c: Nat8): String is
+        var out: String := makeString(3, a);
+        storeNth(&!out, 1, b);
+        storeNth(&!out, 2, c);
+        return out;
+    end;
+
+    function fourBytes(a: Nat8, b: Nat8, c: Nat8, d: Nat8): String is
+        var out: String := makeString(4, a);
+        storeNth(&!out, 1, b);
+        storeNth(&!out, 2, c);
+        storeNth(&!out, 3, d);
+        return out;
+    end;
+
+    ---
+    --- Asking
+    ---
+
+    -- Consumes the string it is given.
+    function textIsValid(text: String): Bool is
+        var subject: String := text;
+        let answer: Bool := isValid(asSpan(&subject));
+        destroyString(subject);
+        return answer;
+    end;
+
+    -- Consumes the string.  True when the first sequence decodes to exactly
+    -- this scalar and this width.
+    function firstIs(text: String, scalar: Nat32, width: Index): Bool is
+        var subject: String := text;
+        let start: Index := 0;
+        var answer: Bool := false;
+        case decodeAt(asSpan(&subject), start) of
+            when Some(value as decoded: Decoded) do
+                if codePointValue(decodedPoint(decoded)) = scalar then
+                    answer := decodedWidth(decoded) = width;
+                end if;
+            when None do
+                answer := false;
+        end case;
+        destroyString(subject);
+        return answer;
+    end;
+
+    -- Consumes the string.  True when it holds exactly this many scalars.
+    function countIs(text: String, wanted: Index): Bool is
+        var subject: String := text;
+        var answer: Bool := false;
+        case countCodePoints(asSpan(&subject)) of
+            when Some(value as found: Index) do
+                answer := found = wanted;
+            when None do
+                answer := false;
+        end case;
+        destroyString(subject);
+        return answer;
+    end;
+
+    function scalarAccepted(scalar: Nat32): Bool is
+        case makeCodePoint(scalar) of
+            when Some(value as point: CodePoint) do
+                return codePointValue(point) = scalar;
+            when None do
+                return false;
+        end case;
+    end;
+
+    ---
+    --- The cases
+    ---
+
+    -- a CodePoint that exists is a valid one.
+    function testScalar(): Unit is
+        assertTrue(scalarAccepted(0), "U+0000");
+        assertTrue(scalarAccepted(65), "U+0041");
+        assertTrue(scalarAccepted(55295),
+            "U+D7FF, the scalar just below the surrogates");
+        assertFalse(scalarAccepted(55296), "U+D800, the first surrogate");
+        assertFalse(scalarAccepted(57343), "U+DFFF, the last surrogate");
+        assertTrue(scalarAccepted(57344),
+            "U+E000, the scalar just above them");
+        assertTrue(scalarAccepted(1114111), "U+10FFFF, the largest there is");
+        assertFalse(scalarAccepted(1114112), "one above the largest");
+        return nil;
+    end;
+
+    -- what decodes, and to what.
+    function testValid(): Unit is
+        assertTrue(textIsValid(makeEmpty()),
+            "the empty string is zero well-formed sequences");
+        assertTrue(countIs(makeEmpty(), 0), "and it counts zero");
+        assertTrue(firstIs(oneByte('A'), 65, 1), "one byte: U+0041");
+        assertTrue(firstIs(twoBytes(195, 164), 228, 2),
+            "two bytes: C3 A4 is U+00E4");
+        assertTrue(firstIs(threeBytes(226, 130, 172), 8364, 3),
+            "three bytes: E2 82 AC is U+20AC");
+        assertTrue(firstIs(fourBytes(240, 159, 146, 169), 128169, 4),
+            "four bytes: F0 9F 92 A9 is U+1F4A9");
+        assertTrue(firstIs(twoBytes(194, 128), 128, 2),
+            "C2 80 is U+0080, the smallest two-byte form");
+        assertTrue(firstIs(threeBytes(224, 160, 128), 2048, 3),
+            "E0 A0 80 is U+0800, the smallest three-byte form");
+        -- Counting walks by the width of what it decoded, so a string of
+        -- mixed widths is the case that catches a step of one.
+        assertTrue(countIs(fourBytes(65, 195, 164, 66), 3),
+            "A, U+00E4, B is three scalars in four bytes");
+        return nil;
+    end;
+
+    -- what is refused, and each has a valid twin above.
+    function testRefused(): Unit is
+        assertFalse(textIsValid(oneByte(128)),
+            "80 alone: a continuation byte where a leader belongs");
+        assertFalse(textIsValid(oneByte(248)),
+            "F8: no scalar value needs a five-byte leader");
+        assertFalse(textIsValid(oneByte(195)),
+            "C3 alone: a two-byte sequence cut short");
+        assertFalse(textIsValid(twoBytes(226, 130)),
+            "E2 82: a three-byte sequence cut short");
+        assertFalse(textIsValid(twoBytes(195, 65)),
+            "C3 41: the second byte is not a continuation");
+        assertFalse(textIsValid(twoBytes(192, 128)),
+            "C0 80: an overlong NUL, the classic one");
+        assertFalse(textIsValid(twoBytes(193, 191)),
+            "C1 BF: an overlong U+007F");
+        assertFalse(textIsValid(threeBytes(224, 128, 128)),
+            "E0 80 80: an overlong that two bytes would have held");
+        assertFalse(textIsValid(fourBytes(240, 128, 128, 128)),
+            "F0 80 80 80: an overlong that three would have held");
+        assertFalse(textIsValid(threeBytes(237, 160, 128)),
+            "ED A0 80: U+D800, a surrogate UTF-8 may not carry");
+        assertFalse(textIsValid(fourBytes(244, 144, 128, 128)),
+            "F4 90 80 80: U+110000, above the largest scalar");
+        assertTrue(textIsValid(fourBytes(244, 143, 191, 191)),
+            "F4 8F BF BF: U+10FFFF, which is the twin of the line above");
+        return nil;
+    end;
+
+    ---
+    --- Written and read back
+    ---
+
+    function roundTrips(scalar: Nat32, wantedWidth: Index): Bool is
+        var answer: Bool := false;
+        case makeCodePoint(scalar) of
+            when Some(value as point: CodePoint) do
+                var builder: StringBuilder := makeStringBuilder();
+                appendCodePoint(&!builder, point);
+                var written: String := finalize(builder);
+                var widthOk: Bool := false;
+                if length(&written) = wantedWidth then
+                    widthOk := encodedWidth(point) = wantedWidth;
+                end if;
+                if widthOk then
+                    let start: Index := 0;
+                    case decodeAt(asSpan(&written), start) of
+                        when Some(value as decoded: Decoded) do
+                            answer := codePointValue(decodedPoint(decoded))
+                                = scalar;
+                        when None do
+                            answer := false;
+                    end case;
+                end if;
+                destroyString(written);
+            when None do
+                answer := false;
+        end case;
+        return answer;
+    end;
+
+    -- written and read back.
+    function testRoundTrip(): Unit is
+        assertTrue(roundTrips(0, 1), "U+0000 in one byte");
+        assertTrue(roundTrips(65, 1), "U+0041 in one byte");
+        assertTrue(roundTrips(127, 1), "U+007F, the last one-byte scalar");
+        assertTrue(roundTrips(128, 2), "U+0080, the first two-byte scalar");
+        assertTrue(roundTrips(228, 2), "U+00E4 in two bytes");
+        assertTrue(roundTrips(2047, 2), "U+07FF, the last two-byte scalar");
+        assertTrue(roundTrips(2048, 3), "U+0800, the first three-byte scalar");
+        assertTrue(roundTrips(8364, 3), "U+20AC in three bytes");
+        assertTrue(roundTrips(65535, 3), "U+FFFF, the last three-byte scalar");
+        assertTrue(roundTrips(65536, 4), "U+10000, the first four-byte scalar");
+        assertTrue(roundTrips(128169, 4), "U+1F4A9 in four bytes");
+        assertTrue(roundTrips(1114111, 4), "U+10FFFF, the last scalar there is");
+        return nil;
+    end;
+end module body.

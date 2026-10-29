@@ -1,0 +1,240 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Buffer (
+    Buffer,
+    destroyFree,
+    destroyEmpty,
+    remove,
+    nth,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Hash (
+    Hashable
+);
+import Standard.Cache (
+    Cache,
+    Filled,
+    Ticket,
+    makeCache,
+    drainCache,
+    count,
+    totalSize,
+    put,
+    get,
+    getWith,
+    startFill,
+    finishFill,
+    clear,
+    flush,
+    expire
+);
+
+module body Standard.Cache.Test is
+    generic [R: Region]
+    function store(cache: &![Cache[Nat64, Nat64], R], key: Nat64, value: Nat64, weight: Nat64, now: Nat64): Buffer[Pair[Nat64, Nat64]] is
+        return put(cache, key, value, weight, now);
+    end;
+
+    generic [R: Region]
+    function storeText(cache: &![Cache[Nat64, String], R], key: Nat64, value: String, weight: Nat64, now: Nat64): Buffer[Pair[Nat64, String]] is
+        return put(cache, key, value, weight, now);
+    end;
+
+    generic [R: Region]
+    function finish(cache: &![Cache[Nat64, Nat64], R], ticket: Ticket, key: Nat64, value: Nat64, weight: Nat64, now: Nat64): Either[Pair[Nat64, Nat64], Buffer[Pair[Nat64, Nat64]]] is
+        return finishFill(cache, ticket, key, value, weight, now);
+    end;
+
+    generic [R: Region]
+    function through(cache: &![Cache[Nat64, Nat64], R], key: Nat64, now: Nat64): Option[Nat64] is
+        return getWith(cache, key, now, tenTimes);
+    end;
+
+    generic [R: Region]
+    function lookup(cache: &![Cache[Nat64, Nat64], R], key: Nat64, now: Nat64): Option[Nat64] is
+        return get(cache, &key, now);
+    end;
+
+    generic [R: Region]
+    function clearKey(cache: &![Cache[Nat64, Nat64], R], key: Nat64): Option[Pair[Nat64, Nat64]] is
+        return clear(cache, &key);
+    end;
+
+    function isSome(value: Option[Nat64], expected: Nat64): Bool is
+        case value of
+            when Some(value as v: Nat64) do
+                return v = expected;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNone(value: Option[Nat64]): Bool is
+        case value of
+            when Some(value as v: Nat64) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- The keys of the pairs given back, in order, as one number: 10 * the
+    -- first plus the second and so on, so that a test can compare the
+    -- whole list.
+    function keysOf(pairs: Buffer[Pair[Nat64, Nat64]]): Nat64 is
+        var list: Buffer[Pair[Nat64, Nat64]] := pairs;
+        var number: Nat64 := 0;
+        while bufferLength(&list) > 0 do
+            let pair: Pair[Nat64, Nat64] := remove(&!list, 0);
+            number := (number * 10) + pair.first;
+        end while;
+        destroyFree(list);
+        return number;
+    end;
+
+    -- At most three entries: a use makes an entry young again, and the
+    -- one used longest ago is pushed out.
+    function testLeastRecentlyUsed(): Unit is
+        var cache: Cache[Nat64, Nat64] := makeCache(3, 1000, 0);
+        assertTrue(keysOf(store(&!cache, 1, 10, 1, 0)) = 0, "put 1 pushes nothing out");
+        assertTrue(keysOf(store(&!cache, 2, 20, 1, 0)) = 0, "put 2 pushes nothing out");
+        assertTrue(keysOf(store(&!cache, 3, 30, 1, 0)) = 0, "put 3 pushes nothing out");
+        assertTrue(isSome(lookup(&!cache, 1, 0), 10), "1 is there");
+        assertTrue(keysOf(store(&!cache, 4, 40, 1, 0)) = 2, "4 pushes out 2, used longest ago");
+        assertTrue(count(&cache) = 3, "three entries");
+        assertTrue(isNone(lookup(&!cache, 2, 0)), "2 is gone");
+        assertTrue(isSome(lookup(&!cache, 1, 0), 10), "1 is still there");
+        assertTrue(keysOf(store(&!cache, 1, 11, 1, 0)) = 1, "a second put gives the old value back");
+        assertTrue(isSome(lookup(&!cache, 1, 0), 11), "1 holds the new value");
+        assertTrue(keysOf(drainCache(cache)) > 0, "drain gives the entries back");
+        return nil;
+    end;
+
+    -- A total size of at most 10: the oldest entries go until the new one
+    -- fits, and a value larger than the limit comes back itself.
+    function testSizeLimit(): Unit is
+        var cache: Cache[Nat64, Nat64] := makeCache(100, 10, 0);
+        assertTrue(keysOf(store(&!cache, 1, 10, 6, 0)) = 0, "6 fits");
+        assertTrue(keysOf(store(&!cache, 2, 20, 6, 0)) = 1, "the next 6 pushes out the first");
+        assertTrue(totalSize(&cache) = 6, "the total is 6");
+        assertTrue(keysOf(store(&!cache, 3, 30, 11, 0)) = 3, "11 does not fit and comes back");
+        assertTrue(totalSize(&cache) = 6, "the total is still 6");
+        assertTrue(keysOf(store(&!cache, 4, 40, 4, 0)) = 0, "4 fits beside 6");
+        assertTrue(totalSize(&cache) = 10, "the total is 10");
+        assertTrue(keysOf(drainCache(cache)) > 0, "drain");
+        return nil;
+    end;
+
+    -- A lifetime of 100: alive before it, gone at it, and expire takes it
+    -- out.
+    function testLifetime(): Unit is
+        var cache: Cache[Nat64, Nat64] := makeCache(10, 100, 100);
+        assertTrue(keysOf(store(&!cache, 5, 50, 1, 1000)) = 0, "put at 1000");
+        assertTrue(isSome(lookup(&!cache, 5, 1099), 50), "alive at 1099");
+        assertTrue(isNone(lookup(&!cache, 5, 1100)), "expired at 1100");
+        assertTrue(count(&cache) = 1, "still counted until it is taken out");
+        assertTrue(keysOf(expire(&!cache, 1100)) = 5, "expire gives it back");
+        assertTrue(count(&cache) = 0, "and it is gone");
+        assertTrue(keysOf(drainCache(cache)) = 0, "drain gives nothing");
+        return nil;
+    end;
+
+    function tenTimes(key: Nat64): Option[Filled[Nat64]] is
+        let seven: Nat64 := 7;
+        if key = seven then
+            return None();
+        end if;
+        let one: Nat64 := 1;
+        return Some(value => Filled(value => key * 10, size => one));
+    end;
+
+    -- getWith fills a miss and keeps the value; a fill that makes nothing
+    -- stores nothing.
+    function testReadThrough(): Unit is
+        var cache: Cache[Nat64, Nat64] := makeCache(10, 100, 0);
+        assertTrue(isSome(through(&!cache, 3, 0), 30), "filled with 30");
+        assertTrue(isSome(lookup(&!cache, 3, 0), 30), "kept");
+        assertTrue(isNone(through(&!cache, 7, 0)), "7 makes nothing");
+        assertTrue(count(&cache) = 1, "only 3 is stored");
+        assertTrue(keysOf(drainCache(cache)) = 3, "drain");
+        return nil;
+    end;
+
+    -- A fill begun before a clear does not store its value; one begun
+    -- after does.  flush gives everything back.
+    function testSerial(): Unit is
+        var cache: Cache[Nat64, Nat64] := makeCache(10, 100, 0);
+        let stale: Ticket := startFill(&cache);
+        case clearKey(&!cache, 9) of
+            when Some(value as pair: Pair[Nat64, Nat64]) do
+                assertTrue(false, "nothing was under 9");
+            when None do
+                skip;
+        end case;
+        case finish(&!cache, stale, 9, 90, 1, 0) of
+            when Left(left as given: Pair[Nat64, Nat64]) do
+                assertTrue(given.second = 90, "the stale fill comes back");
+            when Right(right as pushed: Buffer[Pair[Nat64, Nat64]]) do
+                destroyFree(pushed);
+                assertTrue(false, "the stale fill was stored");
+        end case;
+        let fresh: Ticket := startFill(&cache);
+        case finish(&!cache, fresh, 9, 91, 1, 0) of
+            when Left(left as given: Pair[Nat64, Nat64]) do
+                assertTrue(false, "the fresh fill came back");
+            when Right(right as pushed: Buffer[Pair[Nat64, Nat64]]) do
+                assertTrue(keysOf(pushed) = 0, "the fresh fill is stored");
+        end case;
+        assertTrue(isSome(lookup(&!cache, 9, 0), 91), "91 under 9");
+        assertTrue(keysOf(store(&!cache, 8, 80, 1, 0)) = 0, "put 8");
+        assertTrue(keysOf(flush(&!cache)) > 0, "flush gives both back");
+        assertTrue(count(&cache) = 0, "empty after flush");
+        assertTrue(keysOf(drainCache(cache)) = 0, "drain");
+        return nil;
+    end;
+
+    -- The length of the text of a pair given back, which is then ended.
+    function endPair(pair: Pair[Nat64, String]): Index is
+        let { first: Nat64, second: String } := pair;
+        let size: Index := length(&second);
+        destroyString(second);
+        return size;
+    end;
+
+    -- Linear values come back to the caller, who ends them.
+    function testLinearValues(): Unit is
+        var cache: Cache[Nat64, String] := makeCache(1, 100, 0);
+        let none: Buffer[Pair[Nat64, String]] := storeText(&!cache, 1, fromLiteral("one"), 3, 0);
+        assertTrue(bufferLength(&none) = 0, "nothing pushed out");
+        destroyEmpty(none);
+        var pushed: Buffer[Pair[Nat64, String]] := storeText(&!cache, 2, fromLiteral("three"), 5, 0);
+        assertTrue(bufferLength(&pushed) = 1, "one pushed out");
+        assertTrue(endPair(remove(&!pushed, 0)) = 3, "the text of the value pushed out");
+        destroyEmpty(pushed);
+        var rest: Buffer[Pair[Nat64, String]] := drainCache(cache);
+        assertTrue(bufferLength(&rest) = 1, "one left");
+        assertTrue(endPair(remove(&!rest, 0)) = 5, "the text of the value left");
+        destroyEmpty(rest);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,285 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The dynamic truncation of RFC 4226 section 5.3: the low
+-- four bits of the last byte of the HMAC say where four bytes start, whose
+-- 31 low bits taken modulo 10 to the power of digits are the code.
+import Standard.String (
+    String,
+    makeString,
+    storeNth,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    urlEncode,
+    constantTimeEqual
+);
+import Standard.Libcrypto (
+    hmacSha1,
+    hmacSha256,
+    hmacSha512,
+    randomBytes
+);
+import Standard.Base32 (
+    encodeBase32Unpadded
+);
+
+module body Standard.Otp is
+    constant twoFiftySix: Nat64 := 256;
+    constant ten: Nat64 := 10;
+    constant zeroNat: Nat64 := 0;
+    constant highBit: Nat64 := 2147483648;
+
+    function natOf(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                abort("Standard.Otp: a byte did not fit a Nat64");
+        end case;
+    end;
+
+    function byteOf(wide: Nat64): Nat8 is
+        case toNat8(wide) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                abort("Standard.Otp: a byte did not fit a Nat8");
+                let zero: Nat8 := 0;
+                return zero;
+        end case;
+    end;
+
+    -- The counter as eight bytes, most significant first.
+    function counterBytes(counter: Nat64): String is
+        var out: String := makeString(8, 0);
+        var rest: Nat64 := counter;
+        var i: Index := 8;
+        while i > 0 do
+            i := i - 1;
+            storeNth(&!out, i, byteOf(rest - ((rest / twoFiftySix) * twoFiftySix)));
+            rest := rest / twoFiftySix;
+        end while;
+        return out;
+    end;
+
+    generic [S: Region, M: Region]
+    function mac(secret: Span[Nat8, S], message: Span[Nat8, M], hash: OtpHash): Option[String] is
+        case hash of
+            when OtpSha1 do
+                return hmacSha1(secret, message);
+            when OtpSha256 do
+                return hmacSha256(secret, message);
+            when OtpSha512 do
+                return hmacSha512(secret, message);
+        end case;
+    end;
+
+    generic [S: Region]
+    function hotp(secret: Span[Nat8, S], counter: Nat64, digits: Nat8, hash: OtpHash): Option[String] is
+        if ((digits < 6) or (digits > 8)) or (spanLength(secret) = 0) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let message: String := counterBytes(counter);
+        let code: Option[String] := mac(secret, asSpan(&message), hash);
+        destroyString(message);
+        case code of
+            when Some(value as digest: String) do
+                let size: Index := length(&digest);
+                let offset: Index := indexOf(natOf(nthByte(&digest, size - 1)) - ((natOf(nthByte(&digest, size - 1)) / 16) * 16));
+                var value: Nat64 := zeroNat;
+                var i: Index := 0;
+                while i < 4 do
+                    value := (value * twoFiftySix) + natOf(nthByte(&digest, offset + i));
+                    i := i + 1;
+                end while;
+                destroyString(digest);
+                -- The 31 low bits.
+                let bits: Nat64 := value - ((value / highBit) * highBit);
+                var modulus: Nat64 := 1;
+                var d: Nat8 := 0;
+                while d < digits do
+                    modulus := modulus * ten;
+                    d := d + 1;
+                end while;
+                var number: Nat64 := bits - ((bits / modulus) * modulus);
+                var text: String := makeString(indexOfDigits(digits), '0');
+                var at: Index := indexOfDigits(digits);
+                while at > 0 do
+                    at := at - 1;
+                    storeNth(&!text, at, byteOf(number - ((number / ten) * ten)) + 48);
+                    number := number / ten;
+                end while;
+                let some: Option[String] := Some(value => text);
+                return some;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function indexOf(wide: Nat64): Index is
+        case toIndex(wide) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.Otp: an offset did not fit an Index");
+                let zero: Index := 0;
+                return zero;
+        end case;
+    end;
+
+    function indexOfDigits(digits: Nat8): Index is
+        case toIndex(digits) of
+            when Some(value as count: Index) do
+                return count;
+            when None do
+                abort("Standard.Otp: a count did not fit an Index");
+                let zero: Index := 0;
+                return zero;
+        end case;
+    end;
+
+    -- The step at seconds, or None for a time below 0 or a step of 0.
+    function stepAt(seconds: Int64, step: Nat32): Option[Nat64] is
+        if (seconds < 0) or (step = 0) then
+            let none: Option[Nat64] := None();
+            return none;
+        end if;
+        case toNat64(seconds) of
+            when Some(value as wide: Nat64) do
+                case toNat64(step) of
+                    when Some(value as width: Nat64) do
+                        let some: Option[Nat64] := Some(value => wide / width);
+                        return some;
+                    when None do
+                        let none: Option[Nat64] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Nat64] := None();
+                return none;
+        end case;
+    end;
+
+    generic [S: Region]
+    function totp(secret: Span[Nat8, S], seconds: Int64, step: Nat32, digits: Nat8, hash: OtpHash): Option[String] is
+        case stepAt(seconds, step) of
+            when Some(value as counter: Nat64) do
+                return hotp(secret, counter, digits, hash);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [S: Region, C: Region]
+    function verifyTotp(secret: Span[Nat8, S], code: Span[Nat8, C], seconds: Int64, step: Nat32, digits: Nat8,
+        hash: OtpHash, window: Nat8): Bool is
+        if spanLength(code) /= indexOfDigits(digits) then
+            return false;
+        end if;
+        case stepAt(seconds, step) of
+            when Some(value as now: Nat64) do
+                let reach: Nat64 := natOf(window);
+                var first: Nat64 := zeroNat;
+                if now > reach then
+                    first := now - reach;
+                end if;
+                -- Every step of the window is tried, so that the time taken
+                -- does not say which one matched.
+                var found: Bool := false;
+                var counter: Nat64 := first;
+                while counter <= (now + reach) do
+                    case hotp(secret, counter, digits, hash) of
+                        when Some(value as expected: String) do
+                            if constantTimeEqual(asSpan(&expected), code) then
+                                found := true;
+                            end if;
+                            destroyString(expected);
+                        when None do
+                            skip;
+                    end case;
+                    counter := counter + 1;
+                end while;
+                return found;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function newSecret(): Option[String] is
+        case randomBytes(20) of
+            when Some(value as raw: String) do
+                let encoded: String := encodeBase32Unpadded(asSpan(&raw));
+                destroyString(raw);
+                let some: Option[String] := Some(value => encoded);
+                return some;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [B: Region]
+    function writeNumber(out: &![StringBuilder, B], number: Nat64): Unit is
+        if number >= ten then
+            writeNumber(&~out, number / ten);
+        end if;
+        writeByte(&~out, byteOf(number - ((number / ten) * ten)) + 48);
+        return nil;
+    end;
+
+    generic [I: Region, A: Region, S: Region]
+    function otpauthUri(issuer: Span[Nat8, I], account: Span[Nat8, A], secretBase32: Span[Nat8, S],
+        hash: OtpHash, digits: Nat8, step: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        let issuerText: String := urlEncode(issuer);
+        let accountText: String := urlEncode(account);
+        writeString(&!out, "otpauth://totp/");
+        writeString(&!out, asSpan(&issuerText));
+        writeByte(&!out, ':');
+        writeString(&!out, asSpan(&accountText));
+        writeString(&!out, "?secret=");
+        writeString(&!out, secretBase32);
+        writeString(&!out, "&issuer=");
+        writeString(&!out, asSpan(&issuerText));
+        writeString(&!out, "&algorithm=");
+        case hash of
+            when OtpSha1 do
+                writeString(&!out, "SHA1");
+            when OtpSha256 do
+                writeString(&!out, "SHA256");
+            when OtpSha512 do
+                writeString(&!out, "SHA512");
+        end case;
+        writeString(&!out, "&digits=");
+        writeNumber(&!out, natOf(digits));
+        writeString(&!out, "&period=");
+        case toNat64(step) of
+            when Some(value as wide: Nat64) do
+                writeNumber(&!out, wide);
+            when None do
+                skip;
+        end case;
+        destroyString(issuerText);
+        destroyString(accountText);
+        return finalize(out);
+    end;
+end module body.

@@ -1,0 +1,324 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.Text (
+    substring,
+    trim
+);
+
+module body Standard.Http is
+    constant byteTab: Nat8 := 9;
+    constant byteLineFeed: Nat8 := 10;
+    constant byteReturn: Nat8 := 13;
+    constant byteSpace: Nat8 := 32;
+    constant byteComma: Nat8 := 44;
+    constant byteColon: Nat8 := 58;
+    constant byteUpperA: Nat8 := 65;
+    constant byteUpperZ: Nat8 := 90;
+    constant caseGap: Nat8 := 32;
+
+    constant zeroIndex: Index := 0;
+    constant oneIndex: Index := 1;
+
+    ---
+    --- Walking the block
+    ---
+
+    -- No list of headers is built: every question walks the block again
+    -- from its first line.
+
+    function isLineBreak(byte: Nat8): Bool is
+        return (byte = byteReturn) or (byte = byteLineFeed);
+    end;
+
+    function isOptionalWhitespace(byte: Nat8): Bool is
+        return (byte = byteSpace) or (byte = byteTab);
+    end;
+
+    -- One byte to compare with, whatever case it arrived in.  ASCII only,
+    -- which is all a header name is allowed to be.
+    function fold(byte: Nat8): Nat8 is
+        if (byte >= byteUpperA) and (byte <= byteUpperZ) then
+            return byte + caseGap;
+        end if;
+        return byte;
+    end;
+
+    -- The index of the first line break at or after at, or the end of the
+    -- string.
+    generic [R: Region]
+    function lineEnd(block: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(block);
+        var i: Index := at;
+        while i < size do
+            if isLineBreak(block[i]) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return size;
+    end;
+
+    -- Where the next line starts, given where this one stopped.  A CR
+    -- followed by an LF counts as one break, which is what a header block
+    -- carries; a bare LF is accepted too, because a hand-written test or a
+    -- local pipe produces one.
+    generic [R: Region]
+    function nextLine(block: Span[Nat8, R], stop: Index): Index is
+        let size: Index := spanLength(block);
+        if stop >= size then
+            return size;
+        end if;
+        if block[stop] = byteReturn then
+            if (stop + 1) < size then
+                if block[stop + 1] = byteLineFeed then
+                    return stop + 2;
+                end if;
+            end if;
+        end if;
+        return stop + 1;
+    end;
+
+    -- Where line n starts, or the size of the block when there is no such
+    -- line.  Counting stops at the first empty line: that is where the
+    -- headers end.
+    generic [R: Region]
+    function lineStart(block: Span[Nat8, R], n: Index): Index is
+        let size: Index := spanLength(block);
+        var at: Index := zeroIndex;
+        var seen: Index := zeroIndex;
+        var going: Bool := true;
+        while going do
+            if at >= size then
+                going := false;
+            else
+                let stop: Index := lineEnd(block, at);
+                if stop = at then
+                    -- An empty line: the end of the headers.
+                    going := false;
+                    at := size;
+                else
+                    if seen = n then
+                        return at;
+                    end if;
+                    seen := seen + 1;
+                    at := nextLine(block, stop);
+                end if;
+            end if;
+        end while;
+        return size;
+    end;
+
+    generic [R: Region]
+    function headerCount(block: Span[Nat8, R]): Index is
+        let size: Index := spanLength(block);
+        var at: Index := zeroIndex;
+        var count: Index := zeroIndex;
+        var going: Bool := true;
+        while going do
+            if at >= size then
+                going := false;
+            else
+                let stop: Index := lineEnd(block, at);
+                if stop = at then
+                    going := false;
+                else
+                    count := count + 1;
+                    at := nextLine(block, stop);
+                end if;
+            end if;
+        end while;
+        return count;
+    end;
+
+    -- The colon that separates the name from the value on the line running
+    -- from at to stop, or stop when there is none.
+    generic [R: Region]
+    function colonAt(block: Span[Nat8, R], at: Index, stop: Index): Index is
+        var i: Index := at;
+        while i < stop do
+            if block[i] = byteColon then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return stop;
+    end;
+
+    ---
+    --- Names and values
+    ---
+
+    generic [R: Region]
+    function nthHeaderName(block: Span[Nat8, R], n: Index): Option[String] is
+        let size: Index := spanLength(block);
+        let at: Index := lineStart(block, n);
+        if at >= size then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let stop: Index := lineEnd(block, at);
+        let colon: Index := colonAt(block, at, stop);
+        if colon >= stop then
+            -- A header line with no colon is not a header.
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let some: Option[String] := Some(value => fromSpan(trim(substring(block, at, colon))));
+        return some;
+    end;
+
+    generic [R: Region]
+    function nthHeaderValue(block: Span[Nat8, R], n: Index): Option[String] is
+        let size: Index := spanLength(block);
+        let at: Index := lineStart(block, n);
+        if at >= size then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let stop: Index := lineEnd(block, at);
+        let colon: Index := colonAt(block, at, stop);
+        if colon >= stop then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let some: Option[String] := Some(value => fromSpan(trim(substring(block, colon + 1, stop))));
+        return some;
+    end;
+
+    ---
+    --- Looking a header up by name
+    ---
+
+    -- Does the name on the line from at to colon, with its surrounding
+    -- whitespace ignored, match name without regard to case?
+    generic [R: Region, S: Region]
+    function nameMatches(block: Span[Nat8, R], at: Index, colon: Index,
+        name: Span[Nat8, S]): Bool is
+        var startAt: Index := at;
+        var endAt: Index := colon;
+        while (startAt < endAt) and isOptionalWhitespace(block[startAt]) do
+            startAt := startAt + 1;
+        end while;
+        while (endAt > startAt) and isOptionalWhitespace(block[endAt - 1]) do
+            endAt := endAt - 1;
+        end while;
+        let wanted: Index := spanLength(name);
+        if (endAt - startAt) /= wanted then
+            return false;
+        end if;
+        var i: Index := zeroIndex;
+        var same: Bool := true;
+        while i < wanted do
+            if fold(block[startAt + i]) /= fold(name[i]) then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    generic [R: Region, S: Region]
+    function headerValue(block: Span[Nat8, R], name: Span[Nat8, S]): Option[String] is
+        let size: Index := spanLength(block);
+        var at: Index := zeroIndex;
+        var going: Bool := true;
+        while going do
+            if at >= size then
+                going := false;
+            else
+                let stop: Index := lineEnd(block, at);
+                if stop = at then
+                    going := false;
+                else
+                    let colon: Index := colonAt(block, at, stop);
+                    if colon < stop then
+                        if nameMatches(block, at, colon, name) then
+                            let some: Option[String] := Some(value => fromSpan(trim(substring(block, colon + 1, stop))));
+                            return some;
+                        end if;
+                    end if;
+                    at := nextLine(block, stop);
+                end if;
+            end if;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    ---
+    --- A token in a comma-separated value
+    ---
+
+    generic [R: Region, S: Region]
+    function itemMatches(value: Span[Nat8, R], startAt: Index, endAt: Index,
+        token: Span[Nat8, S]): Bool is
+        var fromAt: Index := startAt;
+        var upto: Index := endAt;
+        while (fromAt < upto) and isOptionalWhitespace(value[fromAt]) do
+            fromAt := fromAt + 1;
+        end while;
+        while (upto > fromAt) and isOptionalWhitespace(value[upto - 1]) do
+            upto := upto - 1;
+        end while;
+        let wanted: Index := spanLength(token);
+        if (upto - fromAt) /= wanted then
+            return false;
+        end if;
+        var i: Index := zeroIndex;
+        var same: Bool := true;
+        while i < wanted do
+            if fold(value[fromAt + i]) /= fold(token[i]) then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    generic [R: Region, S: Region]
+    function valueHasToken(value: Span[Nat8, R], token: Span[Nat8, S]): Bool is
+        if spanLength(token) = zeroIndex then
+            -- An empty token is in no list.  Without this an empty item --
+            -- which a stray comma produces -- would match it.
+            return false;
+        end if;
+        let size: Index := spanLength(value);
+        var at: Index := zeroIndex;
+        var found: Bool := false;
+        var going: Bool := true;
+        while going do
+            if at > size then
+                going := false;
+            else
+                var stop: Index := at;
+                while (stop < size) and (value[stop] /= byteComma) do
+                    stop := stop + 1;
+                end while;
+                if itemMatches(value, at, stop, token) then
+                    found := true;
+                    going := false;
+                else
+                    if stop >= size then
+                        going := false;
+                    else
+                        at := stop + 1;
+                    end if;
+                end if;
+            end if;
+        end while;
+        return found;
+    end;
+end module body.

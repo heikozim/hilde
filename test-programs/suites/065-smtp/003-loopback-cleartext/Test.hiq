@@ -1,0 +1,299 @@
+-- Standard.Smtp: cleartext to a relay on loopback, without a login.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readExactly,
+    readAll,
+    closeFile
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Calendar (
+    Instant
+);
+import Standard.Smtp (
+    Security,
+    ImplicitTls,
+    StartTls,
+    LoopbackCleartext,
+    MailFailureKind,
+    BadInput,
+    NotResolved,
+    ConnectFailed,
+    TimedOut,
+    TlsFailed,
+    NoStartTls,
+    NotLoopback,
+    CleartextLogin,
+    LoginRefused,
+    Refused,
+    BadReply,
+    MailFailure,
+    Envelope,
+    makeEnvelope,
+    addRecipient,
+    destroyEnvelope,
+    composeMessage,
+    Relay,
+    makeRelay,
+    destroyRelay,
+    sendMail
+);
+
+module body Test is
+    -- A file of the tree, from HILDE_TREE.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    function kindName(kind: MailFailureKind): Span[Nat8, Static] is
+        case kind of
+            when BadInput do
+                return "BadInput";
+            when NotResolved do
+                return "NotResolved";
+            when ConnectFailed do
+                return "ConnectFailed";
+            when TimedOut do
+                return "TimedOut";
+            when TlsFailed do
+                return "TlsFailed";
+            when NoStartTls do
+                return "NoStartTls";
+            when NotLoopback do
+                return "NotLoopback";
+            when CleartextLogin do
+                return "CleartextLogin";
+            when LoginRefused do
+                return "LoginRefused";
+            when Refused do
+                return "Refused";
+            when BadReply do
+                return "BadReply";
+        end case;
+    end;
+
+    -- The words of a TLS failure are the library's, and differ between
+    -- OpenSSL and LibreSSL, so they are not printed.
+    function isTls(kind: MailFailureKind): Bool is
+        case kind of
+            when BadInput do
+                return false;
+            when NotResolved do
+                return false;
+            when ConnectFailed do
+                return false;
+            when TimedOut do
+                return false;
+            when TlsFailed do
+                return true;
+            when NoStartTls do
+                return false;
+            when NotLoopback do
+                return false;
+            when CleartextLogin do
+                return false;
+            when LoginRefused do
+                return false;
+            when Refused do
+                return false;
+            when BadReply do
+                return false;
+        end case;
+    end;
+
+    function report(result: Either[MailFailure, Unit]): Unit is
+        case result of
+            when Right(right as sent: Unit) do
+                printLn("sent");
+            when Left(left as failed: MailFailure) do
+                let { kind: MailFailureKind, detail: String } := failed;
+                print("failure: ");
+                printLn(kindName(kind));
+                if not isTls(kind) then
+                    print("detail: ");
+                    printText(&detail);
+                    printLn("");
+                end if;
+                destroyString(detail);
+        end case;
+        return nil;
+    end;
+
+    -- Whether the time from started to now is below three seconds; false
+    -- when there is no monotonic clock to say it.
+    function within(started: Option[Nat64]): Bool is
+        let limit: Nat64 := 3000000000;
+        case started of
+            when Some(value as first: Nat64) do
+                case monotonicNanos() of
+                    when Some(value as now: Nat64) do
+                        return (now - first) < limit;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function serverCommand(): Command is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/smtp/server.py");
+        let mode: String := fromLiteral("cleartext");
+        let command: Command := addArgument(addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script)), asSpan(&mode));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        destroyString(mode);
+        return command;
+    end;
+
+    -- The five digits the server printed, as a port.
+    generic [R: Region]
+    function portOf(text: &[String, R]): Nat16 is
+        var port: Nat16 := 0;
+        let ten: Nat16 := 10;
+        var i: Index := 0;
+        while i < 5 do
+            case toNat16(nthByte(text, i) - '0') of
+                when Some(value as digit: Nat16) do
+                    port := (port * ten) + digit;
+                when None do
+                    abort("Test: a digit did not fit a Nat16");
+            end case;
+            i := i + 1;
+        end while;
+        return port;
+    end;
+
+    generic [R: Region]
+    function relayed(relay: &[Relay, R]): Unit is
+        case makeEnvelope("sender@example.org") of
+            when Some(value as made: Envelope) do
+                var envelope: Envelope := made;
+                let added0: Bool := addRecipient(&!envelope, "first@example.org");
+                let seconds: Int64 := 1790000000;
+                let nanos: Nat32 := 0;
+                let at: Instant := Instant(seconds => seconds, nanos => nanos);
+                case composeMessage("sender@example.org", "first@example.org", "Local", "one line", at) of
+                    when Some(value as message: String) do
+                        let started: Option[Nat64] := monotonicNanos();
+                        let result: Either[MailFailure, Unit] := sendMail(relay, "", "", &envelope, asSpan(&message));
+                        let quick: Bool := within(started);
+                        report(result);
+                        destroyString(message);
+                    when None do
+                        printLn("the message could not be composed");
+                end case;
+                destroyEnvelope(envelope);
+            when None do
+                printLn("the envelope could not be made");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function talk(port: &[String, R]): Unit is
+        let total: Nat32 := 10000;
+        case makeRelay("localhost", portOf(port), LoopbackCleartext(), "", total) of
+            when Some(value as relay: Relay) do
+                relayed(&relay);
+                destroyRelay(relay);
+            when None do
+                printLn("the relay could not be made");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case spawnProcess(serverCommand()) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                var out: FileDescriptor := output;
+                var err: FileDescriptor := errors;
+                case readExactly(&!out, 6) of
+                    when Some(value as port: String) do
+                        talk(&port);
+                        destroyString(port);
+                    when None do
+                        printLn("the server printed no port");
+                end case;
+                let closedInput: Bool := closeFile(input);
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        printText(&text);
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's output failed)");
+                end case;
+                case readAll(&!err) of
+                    when Some(value as text: String) do
+                        if length(&text) > 0 then
+                            printLn("-- the server's error stream:");
+                            printText(&text);
+                        end if;
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's errors failed)");
+                end case;
+                let closedOut: Bool := closeFile(out);
+                let closedErr: Bool := closeFile(err);
+                let status: ProcessStatus := waitProcess(process);
+                print("server exited normally: ");
+                print(exitedNormally(status));
+                print(", code ");
+                printLn(exitCode(status));
+            when None do
+                printLn("the server could not be started");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

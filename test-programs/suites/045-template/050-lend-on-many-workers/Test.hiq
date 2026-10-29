@@ -1,0 +1,129 @@
+-- One page lent to eight tasks that render it at the same time, on eight
+-- workers (env.txt).  Every task renders the page 200 times and counts the
+-- renders that are byte for byte the text the page has to give.  Nothing
+-- of the page is written by a render, so there is no lock to take, and the
+-- ThreadSanitizer run of the checks holds that to be true.  The page is
+-- lent through a lending scope.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    finalize
+);
+import Standard.Task (
+    Lending,
+    openLending,
+    closeLending,
+    Task,
+    spawnLending,
+    join
+);
+import Standard.Template (
+    Render
+);
+
+module body Test is
+    record Page: Linear is
+        name: String;
+        numbers: Buffer[Index];
+    end;
+
+    generic [R: Region]
+    function render(page: &[Page, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    -- True when both strings hold the same bytes.
+    generic [R: Region, S: Region]
+    function same(a: &[String, R], b: &[String, S]): Bool is
+        let count: Index := length(a);
+        if count /= length(b) then
+            return false;
+        end if;
+        var at: Index := 0;
+        while at < count do
+            if nthByte(a, at) /= nthByte(b, at) then
+                return false;
+            end if;
+            at := at + 1;
+        end while;
+        return true;
+    end;
+
+    -- The work of one task: render the lent page 200 times and give back
+    -- how many renders were the expected text: 200.
+    generic [R: Region]
+    function renders(page: &[Page, R]): Int32 is
+        let expected: String := fromLiteral("<p class=\"a&lt;b\">a&lt;b: 1,2,3</p>");
+        var hits: Int32 := 0;
+        var round: Int32 := 0;
+        while round < 200 do
+            let text: String := render(page);
+            if same(&text, &expected) then
+                hits := hits + 1;
+            end if;
+            destroyString(text);
+            round := round + 1;
+        end while;
+        destroyString(expected);
+        return hits;
+    end;
+
+    function makePage(name: Span[Nat8, Static], start: Index): Page is
+        var numbers: Buffer[Index] := allocateEmpty();
+        insertBack(&!numbers, start);
+        insertBack(&!numbers, start + 1);
+        insertBack(&!numbers, start + 2);
+        return Page(name => fromLiteral(name), numbers => numbers);
+    end;
+
+    -- left tasks, all started before any is joined, and the sum of what
+    -- they give back; -1 when a task could not be started.
+    generic [R: Region, S: Region]
+    function many(scope: &![Lending[R], S], page: &[Page, R], left: Int32): Int32 is
+        if left = 0 then
+            return 0;
+        end if;
+        let work: Fn[&[Page, R], Int32] := renders;
+        case spawnLending(&~scope, work, page) of
+            when Right(right as task: Task[Int32]) do
+                let rest: Int32 := many(&~scope, page, left - 1);
+                return rest + join(task);
+            when Left(left as back: &[Page, R]) do
+                return -1;
+        end case;
+    end;
+
+    -- Eight tasks, 200 renders each: 8 * 200 = 1600.
+    function main(): ExitCode is
+        let page: Page := makePage("a<b", 1);
+        borrow p: &[Page, rho] := &page do
+            case openLending(p) of
+                when Some(value as opened: Lending[rho]) do
+                    var scope: Lending[rho] := opened;
+                    printLn(many(&!scope, p, 8));
+                    closeLending(scope);
+                when None do
+                    printLn(-2);
+            end case;
+        end borrow;
+        let { name: String, numbers: Buffer[Index] } := page;
+        destroyString(name);
+        destroyFree(numbers);
+        return ExitSuccess();
+    end;
+end module body.

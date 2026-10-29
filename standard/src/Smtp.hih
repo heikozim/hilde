@@ -1,0 +1,185 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Sending mail through a relay, by the dialogue of RFC 5321 over TLS, with plain messages of RFC 5322.
+
+- TLS is required: from the first byte as RFC 8314 has it for port 465, or by STARTTLS.
+- A relay that does not offer STARTTLS is refused, so nobody between the two can strip the offer.
+- Cleartext is only for a relay on a loopback address, and never with a login.
+- The login is AUTH PLAIN and is sent only over TLS.
+- One time limit holds for the whole dialogue.
+- Addresses are checked before anything is sent: nothing in them can end a line or a command.
+- Addresses with bytes beyond ASCII are refused.
+- A failure carries what the relay last said, never the password.
+
+    case makeRelay("mail.example.org", 587, StartTls(), "/etc/ssl/cert.pem", 30000) of
+        when Some(value as relay: Relay) do
+            let sent: Either[MailFailure, Unit] := sendMail(&relay, "app", asSpan(&password),
+                                                            &envelope, asSpan(&message));
+            reportMail(sent);
+            destroyRelay(relay);
+        when None do
+            reportBadHost();
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+import Standard.Calendar (
+    Instant
+);
+
+module Standard.Smtp is
+    """
+    How the relay is reached.
+    """
+    union Security: Free is
+        -- TLS from the first byte, usually port 465.
+        case ImplicitTls;
+        -- STARTTLS, which the relay must offer, usually port 587.
+        case StartTls;
+        -- No TLS, for a relay on a loopback address only, and no login.
+        case LoopbackCleartext;
+    end;
+
+    """
+    Why a mail was not sent.
+    """
+    union MailFailureKind: Free is
+        -- An address, the host, the user or the password was refused
+        -- before anything was sent.
+        case BadInput;
+        -- The host has no address.
+        case NotResolved;
+        -- No address of the host took the connection.
+        case ConnectFailed;
+        -- The time limit ran out.
+        case TimedOut;
+        -- The TLS handshake or a read or write through TLS failed.
+        case TlsFailed;
+        -- STARTTLS was asked for and the relay did not offer it, or sent
+        -- more after agreeing to it.
+        case NoStartTls;
+        -- Cleartext was asked for a relay that is not on a loopback
+        -- address.
+        case NotLoopback;
+        -- A login was asked for without TLS.
+        case CleartextLogin;
+        -- The relay refused the login.
+        case LoginRefused;
+        -- The relay answered a step with a refusal.
+        case Refused;
+        -- The relay's answer does not read as SMTP, or it closed the
+        -- connection.
+        case BadReply;
+    end;
+
+    """
+    A failure and what the relay last said, or what went wrong, with
+    control characters replaced.  The password is never part of it.
+    """
+    record MailFailure: Linear is
+        kind: MailFailureKind;
+        detail: String;
+    end;
+
+    """
+    Whether address is a mailbox this module sends to or from: one @, a
+    local part of at most 64 bytes of letters, digits, dots and the signs
+    RFC 5322 allows in an atom, and a domain of letters, digits, hyphens
+    and dots, at most 254 bytes in all.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function validAddress(address: Span[Nat8, R]): Bool;
+
+    """
+    The sender and the recipients of a mail.  Linear: destroyEnvelope
+    gives it back.
+    """
+    type Envelope: Linear;
+
+    """
+    An envelope from the address sender, with no recipient yet.  None
+    when the address is not valid.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function makeEnvelope(sender: Span[Nat8, R]): Option[Envelope];
+
+    """
+    Adds the address recipient.  Returns false, and adds nothing, when
+    the address is not valid.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function addRecipient(envelope: &![Envelope, R], recipient: Span[Nat8, S]): Bool;
+
+    """
+    How many recipients envelope has.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function recipientCount(envelope: &[Envelope, R]): Index;
+
+    """
+    Frees envelope.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyEnvelope(envelope: Envelope): Unit;
+
+    """
+    A plain message of RFC 5322 with CRLF line ends: Date at at in UTC,
+    From sender, To recipient, Subject, and the text as text/plain in
+    UTF-8 -- 7bit when it is ASCII with lines of at most 998 bytes, else
+    base64 of the text with CRLF line ends.  A subject beyond ASCII is
+    written as encoded words of RFC 2047.  The header that names the
+    message is not written; RFC 6409 lets the submission server add it.
+    None when sender or recipient is not a valid address, the subject
+    holds a control character, or the subject or the text is not
+    well-formed UTF-8.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [F: Region, T: Region, S: Region, X: Region]
+    function composeMessage(sender: Span[Nat8, F], recipient: Span[Nat8, T], subject: Span[Nat8, S], text: Span[Nat8, X], at: Instant): Option[String];
+
+    """
+    Where mail goes.  Linear: destroyRelay gives it back.
+    """
+    type Relay: Linear;
+
+    """
+    A relay at host and port, reached as security says, whose certificate
+    is checked against caFile, with milliseconds for the whole dialogue.
+    None when host is neither a host name by RFC 1123 nor an address
+    literal.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [H: Region, C: Region]
+    function makeRelay(host: Span[Nat8, H], port: Nat16, security: Security, caFile: Span[Nat8, C], milliseconds: Nat32): Option[Relay];
+
+    """
+    Frees relay.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyRelay(relay: Relay): Unit;
+
+    """
+    Sends message, a whole message of RFC 5322, to the recipients of
+    envelope through relay, logged in as user with password when user is
+    not empty.  Every line ends in CRLF on the wire: a line feed becomes
+    CRLF and a carriage return is dropped.  A line that begins with a dot
+    is sent with another one before it, as RFC 5321 asks.  Right when the
+    relay accepted the mail; the mail counts as sent even when QUIT then
+    fails.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, U: Region, P: Region, E: Region, M: Region]
+    function sendMail(relay: &[Relay, R], user: Span[Nat8, U], password: Span[Nat8, P], envelope: &[Envelope, E], message: Span[Nat8, M]): Either[MailFailure, Unit];
+end module.

@@ -1,0 +1,436 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+PostgreSQL through the system's libpq, with the types and the shape of Standard.Sqlite.
+
+- Every connection runs over TLS with sslmode verify-full; there is no way to open one without it.
+- A value never becomes part of the statement's text: it goes to the server apart, as $1, $2.
+- Values and columns travel in the binary form of their type; a text that looks like SQL stays text.
+- A column reader of the wrong type stops the programme: that is a mistake in it, not in the data.
+- A column that may be null is read with the OrNone reader.
+- A reading connection makes every transaction read only, so a write fails on the server as well.
+- The whole result arrives with the statement; a span from a column is valid for its row.
+- Connection, Transaction, Values and Cursor are Linear and must be ended.
+
+    case openWriter(host, 5432, "app", "app", asSpan(&password), caFile) of
+        when Right(right as made: Connection[Writing]) do
+            var db: Connection[Writing] := made;
+            let values: Values := withText(withInt64(noValues(), 42), "Ada");
+            let insert: Span[Nat8, Static] := "INSERT INTO people (id, name) VALUES ($1, $2)";
+            let changed: Either[PgError, Nat64] := execute(&!db, insert, values);
+            closeDatabase(db);
+        when Left(left as error: PgError) do
+            logLine(describe(error));
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+
+module Standard.Postgres is
+    """
+    The mode of a connection that may write.
+    """
+    record Writing: Free is
+    end;
+
+    """
+    The mode of a connection that only reads.
+    """
+    record Reading: Free is
+    end;
+
+    """
+    An open connection.  Linear: it must be closed.
+    """
+    type Connection[M: Free]: Linear;
+
+    """
+    What went wrong.  code is the SQLSTATE of the server read as a number
+    in base 36 (stateCode gives the number of a state written out), or one
+    of the negative codes below.
+    """
+    record PgError: Free is
+        code: Int32;
+    end;
+
+    """
+    The connection could not be made: the server is not there, the
+    certificate does not verify, the password is wrong, or a parameter held
+    a zero byte.  lastMessage does not apply, because there is no
+    connection; the server's own reason is in its log.
+    """
+    constant connectionFailed: Int32;
+
+    """
+    migrate found more migrations in the database than this programme has.
+    """
+    constant newerDatabase: Int32;
+
+    """
+    A value of 2 GiB or more, which the protocol cannot carry; nothing was
+    sent.
+    """
+    constant tooLarge: Int32;
+
+    """
+    The server gave no answer: the connection broke.
+    """
+    constant connectionLost: Int32;
+
+    """
+    begin found a transaction open on the connection already; SQLSTATE
+    25001.  Nothing was sent, and the open transaction goes on.
+    """
+    constant alreadyInTransaction: Int32;
+
+    """
+    The number of a SQLSTATE written as its five characters.
+    """
+    generic [R: Region]
+    function stateCode(text: Span[Nat8, R]): Int32
+        requires spanLength(text) = 5
+        ensures (result >= 0) and (result <= 60466175);
+
+    """
+    The class of an error, the number of the first two characters of its
+    SQLSTATE; -1 for the negative codes of this module.
+    """
+    function stateClass(error: PgError): Int32
+        ensures (result >= -1) and (result < 1296);
+
+    """
+    23505, a unique constraint.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isUniqueViolation(error: PgError): Bool;
+
+    """
+    Class 23, any integrity constraint: unique, foreign key, not null, check
+    or exclusion.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isConstraintViolation(error: PgError): Bool;
+
+    """
+    A conflict that may go away when tried again: 40001, a serialization
+    failure, 40P01, a deadlock, or 55P03, a lock not available.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isBusy(error: PgError): Bool;
+
+    """
+    A short English description of the code; for a SQLSTATE this module
+    does not name, a general one.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    function describe(error: PgError): Span[Nat8, Static];
+
+    """
+    Open a connection that may write, over TLS with sslmode verify-full.
+    host is a name, which the certificate must carry; caFile is the file
+    of CA certificates the server's certificate must chain to.  There is
+    no way to open a connection without this check.
+    """
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openWriter(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F]): Either[PgError, Connection[Writing]]
+        requires (spanLength(host) > 0) and (spanLength(database) > 0)
+        requires (spanLength(user) > 0) and (spanLength(caFile) > 0)
+        requires port > 0;
+
+    """
+    Open a connection whose transactions are all read only.
+    """
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openReader(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F]): Either[PgError, Connection[Reading]]
+        requires (spanLength(host) > 0) and (spanLength(database) > 0)
+        requires (spanLength(user) > 0) and (spanLength(caFile) > 0)
+        requires port > 0;
+
+    """
+    Close the connection.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [M: Free]
+    function closeDatabase(db: Connection[M]): Unit;
+
+    """
+    The last message of libpq for this connection, for a log: the server's
+    words for the last failure.
+    No contract: a text whose length follows its input.
+    """
+    generic [M: Free, R: Region]
+    function lastMessage(db: &[Connection[M], R]): String;
+
+    """
+    True when the connection runs over TLS, which every connection of this
+    module does.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [M: Free, R: Region]
+    function usesTls(db: &[Connection[M], R]): Bool;
+
+    """
+    Apply the migrations embedded by @migrations that the database has not
+    seen, each in a transaction of its own, and keep their numbers in the
+    table hilde_migrations.  Right carries how many were applied now.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function migrate(db: &![Connection[Writing], R], migrations: Span[Nat8, Static]): Either[PgError, Index];
+
+    """
+    A transaction that is open.  Linear: commit or rollback ends it.
+    """
+    type Transaction: Linear;
+
+    """
+    Begin a transaction.  Fails with alreadyInTransaction, before anything
+    is sent, when a transaction is open on the connection already, so that
+    an inner begin cannot commit an outer transaction early.
+    No contract: the state is the server's, an I/O result.
+    """
+    generic [M: Free, R: Region]
+    function begin(db: &![Connection[M], R]): Either[PgError, Transaction];
+
+    """
+    Commit.  A transaction in which a statement failed is rolled back and
+    the commit fails with 25P02; when the commit itself fails the
+    transaction is rolled back too, so either way it is over.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function commit(db: &![Connection[M], R], transaction: Transaction): Either[PgError, Unit];
+
+    """
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [M: Free, R: Region]
+    function rollback(db: &![Connection[M], R], transaction: Transaction): Unit;
+
+    """
+    A copy of borrowed text, as a String of its own.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): String;
+
+    """
+    The values of a statement, in the order of $1, $2 and so on.  Linear: a
+    text or bytes value is a copy the values own.
+    """
+    type Values: Linear;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function noValues(): Values;
+    """
+    Adds value, sent as int8.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withInt64(values: Values, value: Int64): Values;
+    """
+    Adds value, sent as float8.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withFloat64(values: Values, value: Float64): Values;
+    """
+    Adds value, sent as bool.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withBool(values: Values, value: Bool): Values;
+
+    """
+    A point in time as microseconds since 1970-01-01 UTC, sent as
+    timestamptz.  The largest and the smallest Int64 are the server's
+    infinity and minus infinity.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withTimestamp(values: Values, value: Int64): Values;
+    """
+    Adds a copy of value, sent as text.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values;
+    """
+    Adds a copy of value, sent as bytea.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values;
+    """
+    A null, whose type the server takes from the statement.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withNull(values: Values): Values;
+
+    """
+    Give back values that will not be sent.
+    No contract: it only frees or closes what it is given.
+    """
+    function dropValues(values: Values): Unit;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withInt64OrNull(values: Values, value: Option[Int64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withFloat64OrNull(values: Values, value: Option[Float64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withBoolOrNull(values: Values, value: Option[Bool]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withTimestampOrNull(values: Values, value: Option[Int64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withTextOrNull(values: Values, value: Option[Span[Nat8, R]]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withBytesOrNull(values: Values, value: Option[Span[Nat8, R]]): Values;
+
+    """
+    How many values there are.
+    No contract: a number the system or the build gives.
+    """
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index;
+
+    """
+    A statement that was run, its rows being read.  Linear: finish ends it.
+    """
+    type Cursor: Linear;
+
+    """
+    Run a statement that reads.  A failure is kept in the cursor and
+    reported by finish.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [M: Free, R: Region, S: Region]
+    function start(db: &![Connection[M], R], sql: Span[Nat8, S], values: Values): Cursor;
+
+    """
+    Run a statement that writes and returns rows, an insert with returning.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region, S: Region]
+    function startWrite(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Cursor;
+
+    """
+    Run a statement that writes.  Right carries the number of rows it
+    changed.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function execute(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Either[PgError, Nat64];
+
+    """
+    Go to the next row.  false at the end, and after a failure, which
+    finish then reports.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool;
+
+    """
+    The number of columns of the result; 0 after a failure.
+    """
+    generic [R: Region]
+    function columnCount(cursor: &[Cursor, R]): Int32
+        ensures result >= 0;
+
+    """
+    True when the column of the current row is null, whatever its type.
+    """
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool
+        requires index >= 0;
+
+    """
+    Reads a column of int2, int4 or int8.  A column of another type stops
+    the programme, because that is a mistake in it and not in the data.
+    """
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64
+        requires index >= 0;
+    """
+    Reads a column of float4 or float8; another type stops the programme.
+    """
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64
+        requires index >= 0;
+    """
+    Reads a column of bool; another type stops the programme.
+    """
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool
+        requires index >= 0;
+    """
+    Reads a column of timestamptz or timestamp as microseconds since
+    1970-01-01 UTC; another type stops the programme.
+    """
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64
+        requires index >= 0;
+    """
+    Reads a column of text, varchar, char or name; another type stops the
+    programme.  The span is valid for the row it was read from.
+    """
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R]
+        requires index >= 0;
+    """
+    Reads a column of bytea; another type stops the programme.  The span
+    is valid for the row it was read from.
+    """
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R]
+        requires index >= 0;
+    generic [R: Region]
+    function columnInt64OrNone(cursor: &[Cursor, R], index: Int32): Option[Int64]
+        requires index >= 0;
+    generic [R: Region]
+    function columnFloat64OrNone(cursor: &[Cursor, R], index: Int32): Option[Float64]
+        requires index >= 0;
+    generic [R: Region]
+    function columnBoolOrNone(cursor: &[Cursor, R], index: Int32): Option[Bool]
+        requires index >= 0;
+    generic [R: Region]
+    function columnTimestampOrNone(cursor: &[Cursor, R], index: Int32): Option[Int64]
+        requires index >= 0;
+    generic [R: Region]
+    function columnTextOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]]
+        requires index >= 0;
+    generic [R: Region]
+    function columnBytesOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]]
+        requires index >= 0;
+
+    """
+    End the cursor.  Some carries the failure of the statement.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function finish(db: &![Connection[M], R], cursor: Cursor): Option[PgError];
+
+    """
+    The version of libpq the programme runs with, as major.minor, for
+    version --full.
+    No contract: the library answers.
+    """
+    function libraryVersion(): String;
+end module.

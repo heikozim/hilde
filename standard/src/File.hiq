@@ -1,0 +1,1397 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: the calls into C are those of Bindings.File, in the
+-- kernel's numbers and on strings that end in a zero byte.  Here a
+-- descriptor is linear, and a path is checked before it is handed on.
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Bindings.File (
+    PipeNumbers,
+    Stream,
+    Spawned,
+    openRead as bindOpenRead,
+    openWrite as bindOpenWrite,
+    openAppend as bindOpenAppend,
+    reopenAppend as bindReopenAppend,
+    closeNumber,
+    readInto,
+    readWithinInto,
+    writeWithinNumber,
+    nonblockingNumber,
+    writeAll as bindWriteAll,
+    kindCode,
+    readLink,
+    makeLink,
+    openPipeNumbers,
+    seekNumber,
+    makeDirectory,
+    removeDirectory as bindRemoveDirectory,
+    openStream,
+    nextName,
+    closeStream,
+    spawnPacked as bindSpawnPacked,
+    terminatePid,
+    waitPid,
+    terminationSignal as bindTerminationSignal,
+    environmentInto,
+    removePath,
+    removePathIfThere,
+    secureRemovePath,
+    setModeNumber,
+    socketPathLimit as bindSocketPathLimit,
+    listenAt,
+    acceptNumber,
+    acceptNumberWithin,
+    connectTo,
+    closeListening,
+    connectTcpNumber,
+    listenTcpNumber,
+    tcpLocalPort,
+    StatusNumbers,
+    statusNumbers,
+    statusOpenNumbers,
+    setOwnerNumber,
+    syncNumber,
+    syncDirectoryPath,
+    renamePath,
+    linkPath,
+    makeTemporary,
+    createNewNumber,
+    openOverwriteNumber
+);
+
+module body Standard.File is
+    record FileDescriptor: Linear is
+        number: Int32;
+    end;
+
+    -- How much is asked for in one read(2).  A page, because that is what
+    -- the kernel copies anyway, and because the buffer is allocated once
+    -- per readAll and not once per call.
+    constant chunk: Index := 4096;
+
+    ---
+    --- The path check, which every call into the kernel goes through
+    ---
+
+    """
+    A copy of the path with a zero byte after it, or None if the path is
+    empty or already holds one.
+    """
+    generic [R: Region]
+    function terminated(path: Span[Nat8, R]): Option[String] is
+        let size: Index := spanLength(path);
+        if size = 0 then
+            -- The kernel would answer that the file does not exist, but an
+            -- empty path is a mistake of the programme, not a missing file.
+            let none: Option[String] := None();
+            return none;
+        end if;
+        -- A zero byte inside the path is refused rather than truncated:
+        -- the kernel stops reading at the first zero, so a truncating
+        -- implementation opens a name nobody checked.  The loop has no
+        -- early exit because it does not need one; the cost is the length
+        -- of a path.
+        var holdsZero: Bool := false;
+        for i from 0 to size - 1 do
+            if path[i] = 0 then
+                holdsZero := true;
+            end if;
+        end for;
+        if holdsZero then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        -- makeString fills with zero, so the byte after the copy is already
+        -- the terminator and is never written here.
+        var copy: String := makeString(size + 1, 0);
+        for i from 0 to size - 1 do
+            storeNth(&!copy, i, path[i]);
+        end for;
+        let some: Option[String] := Some(value => copy);
+        return some;
+    end;
+
+    function wrap(number: Int32): Option[FileDescriptor] is
+        if number < 0 then
+            let none: Option[FileDescriptor] := None();
+            return none;
+        end if;
+        let some: Option[FileDescriptor] :=
+            Some(value => FileDescriptor(number => number));
+        return some;
+    end;
+
+    ---
+    --- Opening and closing
+    ---
+
+    generic [R: Region]
+    function openRead(path: Span[Nat8, R]): Option[FileDescriptor] is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let number: Int32 := bindOpenRead(&name);
+                destroyString(name);
+                return wrap(number);
+            when None do
+                let none: Option[FileDescriptor] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function openWrite(path: Span[Nat8, R]): Option[FileDescriptor] is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let number: Int32 := bindOpenWrite(&name);
+                destroyString(name);
+                return wrap(number);
+            when None do
+                let none: Option[FileDescriptor] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function openAppend(path: Span[Nat8, R], mode: Nat32): Option[FileDescriptor] is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let number: Int32 := bindOpenAppend(&name, mode);
+                destroyString(name);
+                return wrap(number);
+            when None do
+                let none: Option[FileDescriptor] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function reopenAppend(file: &![FileDescriptor, R], path: Span[Nat8, S], mode: Nat32): Bool is
+        let number: Int32 := file->number;
+        case terminated(path) of
+            when Some(value as name: String) do
+                let done: Bool := bindReopenAppend(number, &name, mode);
+                destroyString(name);
+                return done;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function closeFile(file: FileDescriptor): Bool is
+        let { number: Int32 } := file;
+        return closeNumber(number);
+    end;
+
+    ---
+    --- Reading and writing
+    ---
+
+    generic [R: Region]
+    function readExactly(file: &![FileDescriptor, R], count: Index): Option[String] is
+        let number: Int32 := file->number;
+        var buffer: String := makeString(count, 0);
+        var have: Index := 0;
+        var failed: Bool := false;
+        while (not failed) and (have < count) do
+            let got: Int64 := readInto(number, &!buffer, have, count - have);
+            -- 0 is the end of the file, and it came too early.
+            if got <= 0 then
+                failed := true;
+            else
+                case toIndex(got) of
+                    when Some(value as taken: Index) do
+                        have := have + taken;
+                    when None do
+                        failed := true;
+                end case;
+            end if;
+        end while;
+        if failed then
+            destroyString(buffer);
+            let none: Option[String] := None();
+            return none;
+        else
+            let some: Option[String] := Some(value => buffer);
+            return some;
+        end if;
+    end;
+
+    -- Append the first count bytes of source to the builder.  count is what
+    -- read(2) returned, so it is an Int64 and it is converted rather than
+    -- trusted.
+    generic [R: Region, S: Region]
+    function appendPrefix(builder: &![StringBuilder, R],
+        source: Span[Nat8, S],
+        count: Int64): Unit is
+        case toIndex(count) of
+            when Some(value as taken: Index) do
+                if taken > 0 then
+                    for i from 0 to taken - 1 do
+                        writeByte(&~builder, source[i]);
+                    end for;
+                end if;
+            when None do
+                -- A read that returned more than an Index can hold cannot
+                -- have filled a buffer this module allocated.  Nothing is
+                -- appended, which shows up as a short answer rather than a
+                -- wrong one.
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function readAll(file: &![FileDescriptor, R]): Option[String] is
+        let number: Int32 := file->number;
+        var buffer: String := makeString(chunk, 0);
+        var builder: StringBuilder := makeStringBuilder();
+        var reading: Bool := true;
+        var failed: Bool := false;
+        while reading do
+            let got: Int64 := readInto(number, &!buffer, 0, chunk);
+            if got < 0 then
+                failed := true;
+                reading := false;
+            else
+                if got = 0 then
+                    -- End of file, which is the only way this loop ends
+                    -- well.
+                    reading := false;
+                else
+                    appendPrefix(&!builder, asSpan(&buffer), got);
+                end if;
+            end if;
+        end while;
+        destroyString(buffer);
+        let readSoFar: String := finalize(builder);
+        -- Both branches must consume readSoFar: the checker measures the
+        -- branches of an if against each other, not the path a return takes.
+        if failed then
+            -- What was read before the failure is thrown away rather than
+            -- returned: a caller cannot tell a short answer from a whole
+            -- one, and a half-read file that looks whole is worse than an
+            -- error.
+            destroyString(readSoFar);
+            let none: Option[String] := None();
+            return none;
+        else
+            let some: Option[String] := Some(value => readSoFar);
+            return some;
+        end if;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeAll(file: &![FileDescriptor, R], data: Span[Nat8, S]): Bool is
+        let number: Int32 := file->number;
+        return bindWriteAll(number, data);
+    end;
+
+    ---
+    --- What a name is
+    ---
+
+    record FileKind: Free is
+        code: Int32;
+    end;
+
+    -- The same five numbers the runtime uses.  They are ours rather than the
+    -- platform's: the runtime translates what stat(2) said into them.
+    constant kindUnknown: FileKind := FileKind(code => 0);
+    constant kindRegular: FileKind := FileKind(code => 1);
+    constant kindDirectory: FileKind := FileKind(code => 2);
+    constant kindSymlink: FileKind := FileKind(code => 3);
+    constant kindOther: FileKind := FileKind(code => 4);
+
+    function sameKind(left: FileKind, right: FileKind): Bool is
+        return left.code = right.code;
+    end;
+
+    function describeKind(kind: FileKind): String is
+        if kind.code = 1 then
+            return fromLiteral("regular file");
+        end if;
+        if kind.code = 2 then
+            return fromLiteral("directory");
+        end if;
+        if kind.code = 3 then
+            return fromLiteral("symbolic link");
+        end if;
+        if kind.code = 4 then
+            return fromLiteral("something else");
+        end if;
+        return fromLiteral("unknown");
+    end;
+
+    -- One body for both questions; the flag is the whole difference.
+    generic [R: Region]
+    function kindWith(path: Span[Nat8, R], follow: Int32): FileKind is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let code: Int32 := kindCode(&name, follow);
+                destroyString(name);
+                return FileKind(code => code);
+            when None do
+                return kindUnknown;
+        end case;
+    end;
+
+    generic [R: Region]
+    function kindOf(path: Span[Nat8, R]): FileKind is
+        return kindWith(path, 0);
+    end;
+
+    generic [R: Region]
+    function kindOfTarget(path: Span[Nat8, R]): FileKind is
+        return kindWith(path, 1);
+    end;
+
+    ---
+    --- Symbolic links
+    ---
+
+    -- As much of a link target as this module will read.  A target longer
+    -- than this is refused rather than shortened, because readlink(2) does
+    -- not say whether it truncated.
+    constant linkLimit: Index := 4096;
+
+    generic [R: Region]
+    function linkTarget(path: Span[Nat8, R]): Option[String] is
+        case terminated(path) of
+            when Some(value as name: String) do
+                var buffer: String := makeString(linkLimit, 0);
+                let got: Int64 := readLink(&name, &!buffer);
+                destroyString(name);
+                -- The answer is built first and the buffer given back after:
+                -- a borrow inside the call does not consume it, and returning
+                -- through it would leave it alive at the return.
+                let answer: Option[String] := linkOf(asSpan(&buffer), got);
+                destroyString(buffer);
+                return answer;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- Split out so that buffer is consumed on exactly one path.
+    generic [R: Region]
+    function linkOf(buffer: Span[Nat8, R], got: Int64): Option[String] is
+        -- Every refusal builds its own None: Option[String] is linear, and
+        -- one shared value would be consumed in one branch and not in the
+        -- others, which the checker measures against each other.
+        if got < 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case toIndex(got) of
+            when Some(value as taken: Index) do
+                if taken >= linkLimit then
+                    -- readlink(2) filled the buffer, so this may be part of
+                    -- a longer name and there is no way to ask which.
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+                -- Exactly as many bytes as readlink(2) reported: it writes
+                -- no terminator, so the count is the whole answer.
+                var exact: String := makeString(taken, 0);
+                if taken > 0 then
+                    for i from 0 to taken - 1 do
+                        storeNth(&!exact, i, buffer[i]);
+                    end for;
+                end if;
+                let some: Option[String] := Some(value => exact);
+                return some;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function createSymlink(target: Span[Nat8, R], name: Span[Nat8, S]): Bool is
+        case terminated(target) of
+            when Some(value as targetName: String) do
+                case terminated(name) of
+                    when Some(value as linkName: String) do
+                        let made: Bool := makeLink(&targetName, &linkName);
+                        destroyString(targetName);
+                        destroyString(linkName);
+                        return made;
+                    when None do
+                        destroyString(targetName);
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    constant separatorByte: Nat8 := '/';
+
+    generic [R: Region]
+    function containsSymlink(path: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(path);
+        if size = 0 then
+            return false;
+        end if;
+        var found: Bool := false;
+        -- Every prefix that ends at a separator, and then the whole path.
+        for i from 0 to size - 1 do
+            if path[i] = separatorByte then
+                if prefixIsLink(path, i) then
+                    found := true;
+                end if;
+            end if;
+        end for;
+        if wholeIsLink(path) then
+            found := true;
+        end if;
+        return found;
+    end;
+
+    -- The first upTo bytes of the path, asked with kindOf.  A prefix of
+    -- length zero is the empty path and is skipped: it is not a name.
+    generic [R: Region]
+    function prefixIsLink(path: Span[Nat8, R], upTo: Index): Bool is
+        if upTo = 0 then
+            return false;
+        end if;
+        var prefix: String := makeString(upTo, 0);
+        for i from 0 to upTo - 1 do
+            storeNth(&!prefix, i, path[i]);
+        end for;
+        let answer: Bool := sameKind(kindOf(asSpan(&prefix)), kindSymlink);
+        destroyString(prefix);
+        return answer;
+    end;
+
+    generic [R: Region]
+    function wholeIsLink(path: Span[Nat8, R]): Bool is
+        return sameKind(kindOf(path), kindSymlink);
+    end;
+
+    ---
+    --- A pipe
+    ---
+
+    record Pipe: Linear is
+        reading: FileDescriptor;
+        writing: FileDescriptor;
+    end;
+
+    function openPipe(): Option[Pipe] is
+        case openPipeNumbers() of
+            when Some(value as numbers: PipeNumbers) do
+                let pipe: Pipe := Pipe(
+                    reading => FileDescriptor(number => numbers.reading),
+                    writing => FileDescriptor(number => numbers.writing)
+                );
+                let some: Option[Pipe] := Some(value => pipe);
+                return some;
+            when None do
+                let none: Option[Pipe] := None();
+                return none;
+        end case;
+    end;
+
+    function closePipe(pipe: Pipe): Bool is
+        let { reading: FileDescriptor, writing: FileDescriptor } := pipe;
+        -- Both are closed whatever the first one answers: a descriptor left
+        -- open because its sibling failed is the leak this type exists to
+        -- prevent.
+        let closedRead: Bool := closeFile(reading);
+        let closedWrite: Bool := closeFile(writing);
+        if closedRead then
+            return closedWrite;
+        end if;
+        return false;
+    end;
+
+    generic [R: Region]
+    function readEnd(pipe: &[Pipe, R]): &[FileDescriptor, R] is
+        return &(pipe->reading);
+    end;
+
+    generic [R: Region]
+    function readEndMut(pipe: &![Pipe, R]): &![FileDescriptor, R] is
+        return &!(pipe->reading);
+    end;
+
+    generic [R: Region]
+    function writeEnd(pipe: &[Pipe, R]): &[FileDescriptor, R] is
+        return &(pipe->writing);
+    end;
+
+    generic [R: Region]
+    function writeEndMut(pipe: &![Pipe, R]): &![FileDescriptor, R] is
+        return &!(pipe->writing);
+    end;
+
+    ---
+    --- Moving the offset
+    ---
+
+    record SeekOrigin: Free is
+        code: Int32;
+    end;
+
+    -- Ours, not the platform's: the runtime translates them into SEEK_SET,
+    -- SEEK_CUR and SEEK_END, whose numbers are the header's business.
+    constant seekFromStart: SeekOrigin := SeekOrigin(code => 0);
+    constant seekFromHere: SeekOrigin := SeekOrigin(code => 1);
+    constant seekFromEnd: SeekOrigin := SeekOrigin(code => 2);
+
+    generic [R: Region]
+    function seekFile(file: &![FileDescriptor, R], offset: Int64,
+        origin: SeekOrigin): Option[Int64] is
+        let number: Int32 := file->number;
+        let where: Int64 := seekNumber(number, offset, origin.code);
+        if where < 0 then
+            let none: Option[Int64] := None();
+            return none;
+        end if;
+        let some: Option[Int64] := Some(value => where);
+        return some;
+    end;
+
+    ---
+    --- Directories
+    ---
+
+    generic [R: Region]
+    function createDirectory(path: Span[Nat8, R]): Bool is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let made: Bool := makeDirectory(&name);
+                destroyString(name);
+                return made;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function removeDirectory(path: Span[Nat8, R]): Bool is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let gone: Bool := bindRemoveDirectory(&name);
+                destroyString(name);
+                return gone;
+            when None do
+                return false;
+        end case;
+    end;
+
+    record Directory: Linear is
+        stream: Stream;
+        -- Set when the last None from nextEntry was a failure.
+        failed: Bool;
+    end;
+
+    -- NAME_MAX is 255 on both platforms this project names; the buffer is
+    -- four times that so that the limit is the file system's and not ours.
+    -- A longer name is reported as a failure, not shortened.
+    constant entryLimit: Index := 1024;
+
+    generic [R: Region]
+    function openDirectory(path: Span[Nat8, R]): Option[Directory] is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let opened: Option[Stream] := openStream(&name);
+                destroyString(name);
+                case opened of
+                    when Some(value as stream: Stream) do
+                        let some: Option[Directory] :=
+                            Some(value => Directory(stream => stream, failed => false));
+                        return some;
+                    when None do
+                        let none: Option[Directory] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Directory] := None();
+                return none;
+        end case;
+    end;
+
+    -- The next name through a read reference, so that the write reference
+    -- of nextEntry is only borrowed for the call and can set failed after.
+    generic [R: Region, S: Region]
+    function nextOf(directory: &[Directory, R], buffer: &![String, S]): Int64 is
+        return nextName(&(directory->stream), buffer);
+    end;
+
+    generic [R: Region]
+    function nextEntry(directory: &![Directory, R]): Option[String] is
+        var buffer: String := makeString(entryLimit, 0);
+        let got: Int64 := nextOf(&directory, &!buffer);
+        if got < -1 then
+            -- -2 is a failed read, -3 a name longer than the buffer; both
+            -- are failures and neither is the end.
+            directory->failed := true;
+        end if;
+        let answer: Option[String] := prefixOf(asSpan(&buffer), got);
+        destroyString(buffer);
+        return answer;
+    end;
+
+    -- The first got bytes as a string of their own, or None for any
+    -- negative count.
+    generic [R: Region]
+    function prefixOf(buffer: Span[Nat8, R], got: Int64): Option[String] is
+        if got < 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case toIndex(got) of
+            when Some(value as taken: Index) do
+                var exact: String := makeString(taken, 0);
+                if taken > 0 then
+                    for i from 0 to taken - 1 do
+                        storeNth(&!exact, i, buffer[i]);
+                    end for;
+                end if;
+                let some: Option[String] := Some(value => exact);
+                return some;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function directoryFailed(directory: &[Directory, R]): Bool is
+        return directory->failed;
+    end;
+
+    function closeDirectory(directory: Directory): Bool is
+        let { stream: Stream, failed: Bool } := directory;
+        return closeStream(stream);
+    end;
+
+    ---
+    --- A child process, and its three pipes
+    ---
+
+    record Command: Linear is
+        -- Every argument, the programme first, each followed by a zero byte:
+        -- the shape the runtime splits into argv without copying.
+        block: StringBuilder;
+        count: Index;
+        spoiled: Bool;
+    end;
+
+    -- Append text and a zero byte after it.  false, and nothing appended,
+    -- when the text holds a zero byte of its own.
+    generic [R: Region, S: Region]
+    function appendTerminated(builder: &![StringBuilder, R],
+        text: Span[Nat8, S]): Bool is
+        let size: Index := spanLength(text);
+        if size > 0 then
+            var holdsZero: Bool := false;
+            for i from 0 to size - 1 do
+                if text[i] = 0 then
+                    holdsZero := true;
+                end if;
+            end for;
+            if holdsZero then
+                return false;
+            end if;
+            for i from 0 to size - 1 do
+                writeByte(&~builder, text[i]);
+            end for;
+        end if;
+        writeByte(&~builder, 0);
+        return true;
+    end;
+
+    generic [R: Region]
+    function makeCommand(program: Span[Nat8, R]): Command is
+        var builder: StringBuilder := makeStringBuilder();
+        let appended: Bool := appendTerminated(&!builder, program);
+        -- An empty path is spoiled as well: execve would answer that the
+        -- file does not exist, but an empty programme name is the caller's
+        -- mistake and not a missing file.
+        var spoiled: Bool := not appended;
+        if spanLength(program) = 0 then
+            spoiled := true;
+        end if;
+        return Command(block => builder, count => 1, spoiled => spoiled);
+    end;
+
+    generic [R: Region]
+    function addArgument(command: Command, argument: Span[Nat8, R]): Command is
+        let { block: StringBuilder, count: Index, spoiled: Bool } := command;
+        var builder: StringBuilder := block;
+        let appended: Bool := appendTerminated(&!builder, argument);
+        var nowSpoiled: Bool := spoiled;
+        if not appended then
+            nowSpoiled := true;
+        end if;
+        return Command(block => builder, count => count + 1,
+            spoiled => nowSpoiled);
+    end;
+
+    function discardCommand(command: Command): Unit is
+        let { block: StringBuilder, count: Index, spoiled: Bool } := command;
+        destroyString(finalize(block));
+        return nil;
+    end;
+
+    record Process: Linear is
+        pid: Int32;
+    end;
+
+    function spawnProcess(command: Command): Option[Running] is
+        let { block: StringBuilder, count: Index, spoiled: Bool } := command;
+        let packed: String := finalize(block);
+        -- Both branches consume packed: the checker measures the branches
+        -- of an if against each other, not the path a return takes.
+        if spoiled then
+            destroyString(packed);
+            let none: Option[Running] := None();
+            return none;
+        else
+            let started: Option[Spawned] := bindSpawnPacked(&packed, count);
+            destroyString(packed);
+            case started of
+                when Some(value as numbers: Spawned) do
+                    let running: Running := Running(
+                        process => Process(pid => numbers.pid),
+                        input => FileDescriptor(number => numbers.input),
+                        output => FileDescriptor(number => numbers.output),
+                        errors => FileDescriptor(number => numbers.errors)
+                    );
+                    let some: Option[Running] := Some(value => running);
+                    return some;
+                when None do
+                    let none: Option[Running] := None();
+                    return none;
+            end case;
+        end if;
+    end;
+
+    generic [R: Region]
+    function processId(process: &[Process, R]): Int32 is
+        return process->pid;
+    end;
+
+    generic [R: Region]
+    function terminateProcess(process: &[Process, R]): Bool is
+        return terminatePid(process->pid);
+    end;
+
+    record ProcessStatus: Free is
+        -- The runtime's encoding: 0 to 255 an exit code, 256 plus a signal
+        -- number, -1 a failed wait.
+        code: Int32;
+    end;
+
+    function waitProcess(process: Process): ProcessStatus is
+        let { pid: Int32 } := process;
+        return ProcessStatus(code => waitPid(pid));
+    end;
+
+    function exitedNormally(status: ProcessStatus): Bool is
+        if status.code < 0 then
+            return false;
+        end if;
+        return status.code <= 255;
+    end;
+
+    function exitCode(status: ProcessStatus): Int32 is
+        if exitedNormally(status) then
+            return status.code;
+        end if;
+        return -1;
+    end;
+
+    function endedBySignal(status: ProcessStatus): Bool is
+        return status.code >= 256;
+    end;
+
+    function signalNumber(status: ProcessStatus): Int32 is
+        if endedBySignal(status) then
+            return status.code - 256;
+        end if;
+        return -1;
+    end;
+
+    function waitFailed(status: ProcessStatus): Bool is
+        return status.code < 0;
+    end;
+
+    function terminationSignal(): Int32 is
+        return bindTerminationSignal();
+    end;
+
+    ---
+    --- The environment
+    ---
+
+    constant environmentLimit: Index := 65536;
+
+    generic [R: Region]
+    function environmentValue(name: Span[Nat8, R]): Option[String] is
+        case terminated(name) of
+            when Some(value as zeroed: String) do
+                var buffer: String := makeString(environmentLimit, 0);
+                let got: Int64 := environmentInto(&zeroed, &!buffer);
+                destroyString(zeroed);
+                -- The answer first, the buffer given back after, as in
+                -- linkTarget.
+                let answer: Option[String] := valueOf(asSpan(&buffer), got);
+                destroyString(buffer);
+                return answer;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- Split out so that buffer is consumed on exactly one path.  Unlike
+    -- readlink(2), the C reports the whole length, so a value that fills
+    -- the buffer exactly is still whole; only a longer one is refused.
+    generic [R: Region]
+    function valueOf(buffer: Span[Nat8, R], got: Int64): Option[String] is
+        if got < 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case toIndex(got) of
+            when Some(value as taken: Index) do
+                if taken > environmentLimit then
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+                var exact: String := makeString(taken, 0);
+                if taken > 0 then
+                    for i from 0 to taken - 1 do
+                        storeNth(&!exact, i, buffer[i]);
+                    end for;
+                end if;
+                let some: Option[String] := Some(value => exact);
+                return some;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    ---
+    --- Asking, and removing
+    ---
+
+    generic [R: Region]
+    function fileNumber(file: &[FileDescriptor, R]): Int32 is
+        return file->number;
+    end;
+
+    generic [R: Region]
+    function removeFile(path: Span[Nat8, R]): Bool is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let gone: Bool := removePath(&name);
+                destroyString(name);
+                return gone;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function removeFileIfThere(path: Span[Nat8, R]): Bool is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let gone: Bool := removePathIfThere(&name);
+                destroyString(name);
+                return gone;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function secureDelete(path: Span[Nat8, R]): Erasure is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let code: Int32 := secureRemovePath(&name);
+                destroyString(name);
+                if code = 2 then
+                    return Overwritten();
+                end if;
+                if code = 3 then
+                    return OnlyUnlinked();
+                end if;
+                return NotErased();
+            when None do
+                return NotErased();
+        end case;
+    end;
+
+    generic [R: Region]
+    function setFileMode(file: &![FileDescriptor, R], mode: Nat32): Bool is
+        return setModeNumber(file->number, mode);
+    end;
+
+    ---
+    --- What a file is, renames, links and syncs
+    ---
+
+    -- The runtime's kind number as a FileKind; a number it does not use
+    -- reads as unknown.
+    function kindFromNumber(number: Nat32): FileKind is
+        if number = 1 then
+            return kindRegular;
+        end if;
+        if number = 2 then
+            return kindDirectory;
+        end if;
+        if number = 3 then
+            return kindSymlink;
+        end if;
+        if number = 4 then
+            return kindOther;
+        end if;
+        return kindUnknown;
+    end;
+
+    function statusFromNumbers(numbers: StatusNumbers): FileStatus is
+        return FileStatus(
+            kind => kindFromNumber(numbers.kind),
+            mode => numbers.mode,
+            owner => numbers.owner,
+            group => numbers.group,
+            size => numbers.size,
+            device => numbers.device,
+            inode => numbers.inode,
+            links => numbers.links
+        );
+    end;
+
+    generic [R: Region]
+    function statusOf(path: Span[Nat8, R]): FileLookup is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let numbers: StatusNumbers := statusNumbers(&name, 0);
+                destroyString(name);
+                if numbers.found = 1 then
+                    let found: FileLookup := FileFound(status => statusFromNumbers(numbers));
+                    return found;
+                end if;
+                if numbers.found = 0 then
+                    let missing: FileLookup := FileMissing();
+                    return missing;
+                end if;
+                let unreadable: FileLookup := FileUnreadable();
+                return unreadable;
+            when None do
+                let refused: FileLookup := FileUnreadable();
+                return refused;
+        end case;
+    end;
+
+    generic [R: Region]
+    function statusOfOpen(file: &[FileDescriptor, R]): Option[FileStatus] is
+        let numbers: StatusNumbers := statusOpenNumbers(file->number);
+        if numbers.found = 1 then
+            let some: Option[FileStatus] := Some(value => statusFromNumbers(numbers));
+            return some;
+        end if;
+        let none: Option[FileStatus] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function setFileOwner(file: &![FileDescriptor, R], owner: Nat32, group: Nat32): Bool is
+        return setOwnerNumber(file->number, owner, group);
+    end;
+
+    generic [R: Region]
+    function syncFile(file: &![FileDescriptor, R]): Bool is
+        return syncNumber(file->number);
+    end;
+
+    generic [R: Region]
+    function syncDirectory(path: Span[Nat8, R]): Bool is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let synced: Bool := syncDirectoryPath(&name);
+                destroyString(name);
+                return synced;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function renameFile(source: Span[Nat8, R], target: Span[Nat8, S]): Bool is
+        case terminated(source) of
+            when Some(value as a: String) do
+                case terminated(target) of
+                    when Some(value as b: String) do
+                        let renamed: Bool := renamePath(&a, &b);
+                        destroyString(a);
+                        destroyString(b);
+                        return renamed;
+                    when None do
+                        destroyString(a);
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function linkFile(existing: Span[Nat8, R], name: Span[Nat8, S]): Bool is
+        case terminated(existing) of
+            when Some(value as a: String) do
+                case terminated(name) of
+                    when Some(value as b: String) do
+                        let linked: Bool := linkPath(&a, &b);
+                        destroyString(a);
+                        destroyString(b);
+                        return linked;
+                    when None do
+                        destroyString(a);
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The template for mkstemp(3): the bytes of path up to and with its
+    -- last slash, which name its directory and are nothing when it has
+    -- none, then .atomic- and six X, which mkstemp(3) replaces, and a
+    -- zero byte.  None when path is empty, holds a zero byte or ends in a
+    -- slash, which names a directory and no file beside it.
+    generic [R: Region]
+    function temporaryTemplate(path: Span[Nat8, R]): Option[String] is
+        let size: Index := spanLength(path);
+        if size = 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if path[size - 1] = '/' then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var cut: Index := 0;
+        var holdsZero: Bool := false;
+        for i from 0 to size - 1 do
+            if path[i] = '/' then
+                cut := i + 1;
+            end if;
+            if path[i] = 0 then
+                holdsZero := true;
+            end if;
+        end for;
+        if holdsZero then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        if cut > 0 then
+            for i from 0 to cut - 1 do
+                writeByte(&!out, path[i]);
+            end for;
+        end if;
+        let stem: Span[Nat8, Static] := ".atomic-XXXXXX";
+        for i from 0 to spanLength(stem) - 1 do
+            writeByte(&!out, stem[i]);
+        end for;
+        writeByte(&!out, 0);
+        let some: Option[String] := Some(value => finalize(out));
+        return some;
+    end;
+
+    -- A copy of a string without its last byte, the zero byte C needed.
+    -- Only called on a string of at least one byte.
+    generic [R: Region]
+    function withoutLastByte(string: &[String, R]): String is
+        let size: Index := length(string) - 1;
+        var copy: String := makeString(size, 0);
+        if size > 0 then
+            for i from 0 to size - 1 do
+                storeNth(&!copy, i, nthByte(string, i));
+            end for;
+        end if;
+        return copy;
+    end;
+
+    generic [R: Region]
+    function createTemporaryBeside(path: Span[Nat8, R]): Option[Temporary] is
+        case temporaryTemplate(path) of
+            when Some(value as template: String) do
+                var name: String := template;
+                let number: Int32 := makeTemporary(&!name);
+                if number < 0 then
+                    destroyString(name);
+                    let none: Option[Temporary] := None();
+                    return none;
+                else
+                    let plain: String := withoutLastByte(&name);
+                    destroyString(name);
+                    let some: Option[Temporary] :=
+                        Some(value => Temporary(file => FileDescriptor(number => number), name => plain));
+                    return some;
+                end if;
+            when None do
+                let none: Option[Temporary] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function createNewFile(path: Span[Nat8, R], mode: Nat32): Option[FileDescriptor] is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let number: Int32 := createNewNumber(&name, mode);
+                destroyString(name);
+                return wrap(number);
+            when None do
+                let none: Option[FileDescriptor] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function openOverwrite(path: Span[Nat8, R]): Option[FileDescriptor] is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let number: Int32 := openOverwriteNumber(&name);
+                destroyString(name);
+                return wrap(number);
+            when None do
+                let none: Option[FileDescriptor] := None();
+                return none;
+        end case;
+    end;
+
+    ---
+    --- A Unix domain socket
+    ---
+
+    record Listener: Linear is
+        socket: FileDescriptor;
+        -- The path with its zero byte, kept for the unlink at close.
+        path: String;
+    end;
+
+    function socketPathLimit(): Index is
+        return bindSocketPathLimit();
+    end;
+
+    generic [R: Region]
+    function listenUnix(path: Span[Nat8, R], mode: Nat32): Option[Listener] is
+        let largest: Nat32 := #o777;
+        if mode > largest then
+            let none: Option[Listener] := None();
+            return none;
+        end if;
+        case terminated(path) of
+            when Some(value as name: String) do
+                let number: Int32 := listenAt(&name, mode);
+                if number < 0 then
+                    destroyString(name);
+                    let none: Option[Listener] := None();
+                    return none;
+                else
+                    let listener: Listener := Listener(
+                        socket => FileDescriptor(number => number),
+                        path => name
+                    );
+                    let some: Option[Listener] := Some(value => listener);
+                    return some;
+                end if;
+            when None do
+                let none: Option[Listener] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function acceptConnection(listener: &[Listener, R]): Option[FileDescriptor] is
+        let number: Int32 := listener->socket.number;
+        return wrap(acceptNumber(number));
+    end;
+
+    generic [R: Region]
+    function acceptWithin(listener: &[Listener, R], milliseconds: Nat32): Option[FileDescriptor] is
+        let largest: Nat32 := 2147483647;
+        if milliseconds > largest then
+            let none: Option[FileDescriptor] := None();
+            return none;
+        end if;
+        let number: Int32 := listener->socket.number;
+        return wrap(acceptNumberWithin(number, milliseconds));
+    end;
+
+    generic [R: Region]
+    function connectUnix(path: Span[Nat8, R]): Option[FileDescriptor] is
+        case terminated(path) of
+            when Some(value as name: String) do
+                let number: Int32 := connectTo(&name);
+                destroyString(name);
+                return wrap(number);
+            when None do
+                let none: Option[FileDescriptor] := None();
+                return none;
+        end case;
+    end;
+
+    function closeListener(listener: Listener): Bool is
+        let { socket: FileDescriptor, path: String } := listener;
+        let { number: Int32 } := socket;
+        let closed: Bool := closeListening(number, &path);
+        destroyString(path);
+        return closed;
+    end;
+
+    ---
+    --- A TCP listener
+    ---
+
+    record TcpListener: Linear is
+        socket: FileDescriptor;
+    end;
+
+    generic [R: Region]
+    function listenTcp(address: Span[Nat8, R], port: Nat16): Option[TcpListener] is
+        let number: Int32 := listenTcpNumber(address, port);
+        if number < 0 then
+            let none: Option[TcpListener] := None();
+            return none;
+        end if;
+        let some: Option[TcpListener] := Some(value => TcpListener(socket => FileDescriptor(number => number)));
+        return some;
+    end;
+
+    generic [R: Region]
+    function tcpListenerPort(listener: &[TcpListener, R]): Nat16 is
+        return tcpLocalPort(listener->socket.number);
+    end;
+
+    generic [R: Region]
+    function acceptTcpWithin(listener: &[TcpListener, R], milliseconds: Nat32): Option[FileDescriptor] is
+        let largest: Nat32 := 2147483647;
+        if milliseconds > largest then
+            let none: Option[FileDescriptor] := None();
+            return none;
+        end if;
+        let number: Int32 := listener->socket.number;
+        return wrap(acceptNumberWithin(number, milliseconds));
+    end;
+
+    function closeTcpListener(listener: TcpListener): Bool is
+        let { socket: FileDescriptor } := listener;
+        return closeFile(socket);
+    end;
+
+    ---
+    --- A TCP connection
+    ---
+
+    -- The largest wait poll(2) takes here: the runtime hands the
+    -- milliseconds to C as an int.
+    constant largestWait: Nat32 := 2147483647;
+
+    generic [R: Region]
+    function connectTcp(address: Span[Nat8, R], port: Nat16, milliseconds: Nat32): Either[ConnectFailure, FileDescriptor] is
+        if milliseconds > largestWait then
+            let refused: Either[ConnectFailure, FileDescriptor] := Left(left => ConnectError());
+            return refused;
+        end if;
+        let number: Int32 := connectTcpNumber(address, port, milliseconds);
+        if number >= 0 then
+            let made: Either[ConnectFailure, FileDescriptor] := Right(right => FileDescriptor(number => number));
+            return made;
+        end if;
+        if number = -1 then
+            let refused: Either[ConnectFailure, FileDescriptor] := Left(left => ConnectRefused());
+            return refused;
+        end if;
+        if number = -2 then
+            let late: Either[ConnectFailure, FileDescriptor] := Left(left => ConnectTimedOut());
+            return late;
+        end if;
+        if number = -3 then
+            let unreachable: Either[ConnectFailure, FileDescriptor] := Left(left => ConnectUnreachable());
+            return unreachable;
+        end if;
+        let failed: Either[ConnectFailure, FileDescriptor] := Left(left => ConnectError());
+        return failed;
+    end;
+
+    generic [R: Region]
+    function makeNonblocking(file: &![FileDescriptor, R]): Bool is
+        return nonblockingNumber(file->number);
+    end;
+
+    function waitFailureOf(code: Int64): WaitFailure is
+        if code = -2 then
+            return WaitTimedOut();
+        end if;
+        return WaitFailed();
+    end;
+
+    generic [R: Region]
+    function readWithin(file: &![FileDescriptor, R], most: Index, milliseconds: Nat32): Either[WaitFailure, String] is
+        if most = 0 then
+            let refused: Either[WaitFailure, String] := Left(left => WaitFailed());
+            return refused;
+        end if;
+        let number: Int32 := file->number;
+        var buffer: String := makeString(most, 0);
+        let got: Int64 := readWithinInto(number, &!buffer, 0, most, milliseconds);
+        if got < 0 then
+            destroyString(buffer);
+            let failed: Either[WaitFailure, String] := Left(left => waitFailureOf(got));
+            return failed;
+        else
+            var out: StringBuilder := makeStringBuilder();
+            appendPrefix(&!out, asSpan(&buffer), got);
+            destroyString(buffer);
+            let read: Either[WaitFailure, String] := Right(right => finalize(out));
+            return read;
+        end if;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeWithin(file: &![FileDescriptor, R], data: Span[Nat8, S], milliseconds: Nat32): Either[WaitFailure, Unit] is
+        let code: Int32 := writeWithinNumber(file->number, data, milliseconds);
+        if code = 1 then
+            let done: Either[WaitFailure, Unit] := Right(right => nil);
+            return done;
+        end if;
+        if code = -2 then
+            let late: Either[WaitFailure, Unit] := Left(left => WaitTimedOut());
+            return late;
+        end if;
+        let failed: Either[WaitFailure, Unit] := Left(left => WaitFailed());
+        return failed;
+    end;
+end module body.

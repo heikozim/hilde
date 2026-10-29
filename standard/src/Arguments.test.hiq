@@ -1,0 +1,1407 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Arguments.  Every test declares its own command and builds its
+-- own argument vector; processArguments and the environment are the e2e
+-- suite's.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    nthRef,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFileIfThere
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Order (
+    equal
+);
+import Standard.Text (
+    contains
+);
+import Standard.Arguments (
+    Command,
+    Spec,
+    FlagKey,
+    TextKey,
+    WholeKey,
+    BoolKey,
+    ChoiceKey,
+    PathKey,
+    PositionalKey,
+    SubcommandKey,
+    ErrorKind,
+    UnknownOption,
+    UnknownSubcommand,
+    MissingValue,
+    UnexpectedValue,
+    InvalidNumber,
+    OutOfRange,
+    NotAllowed,
+    InvalidUtf8,
+    EmptyPath,
+    MissingRequired,
+    Repeated,
+    Conflict,
+    MissingDependency,
+    MissingSubcommand,
+    ArgumentFileUnreadable,
+    ArgumentFileTooLarge,
+    ArgumentFileCycle,
+    ArgumentFileTooDeep,
+    ArgumentFileSyntax,
+    ArgumentError,
+    Outcome,
+    Run,
+    Help,
+    Version,
+    Matches,
+    Shell,
+    Bash,
+    Zsh,
+    Fish,
+    makeCommand,
+    destroyCommand,
+    setVersion,
+    setCopyright,
+    setFullVersion,
+    addVerbose,
+    addConfig,
+    addEnv,
+    addPepper,
+    addSocket,
+    addJson,
+    setInfo,
+    addSandbox,
+    addCompletion,
+    addManual,
+    addAlias,
+    option,
+    required,
+    repeatable,
+    global,
+    fromEnvironment,
+    valueName,
+    addFlag,
+    addText,
+    addWhole,
+    addBool,
+    addChoice,
+    addPath,
+    addPositional,
+    addPositionalPath,
+    addSubcommand,
+    requireSubcommand,
+    anyFlag,
+    anyText,
+    addConflict,
+    addDependency,
+    destroyArguments,
+    expandArgumentFiles,
+    parse,
+    destroyMatches,
+    errorKind,
+    errorPosition,
+    describeError,
+    destroyError,
+    flagCount,
+    textOf,
+    wholeOf,
+    boolOf,
+    choiceOf,
+    pathOf,
+    positionalOf,
+    textCount,
+    textAt,
+    pathCount,
+    pathAt,
+    positionalCount,
+    positionalAt,
+    chosen,
+    helpText,
+    usageLine,
+    manPage,
+    completionScript
+);
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertFailure
+);
+
+module body Standard.Arguments.Test is
+    function args(a: Span[Nat8, Static]): Buffer[String] is
+        var b: Buffer[String] := allocateEmpty();
+        if spanLength(a) > 0 then
+            insertBack(&!b, fromLiteral(a));
+        end if;
+        return b;
+    end;
+
+    function more(b: Buffer[String], a: Span[Nat8, Static]): Buffer[String] is
+        var v: Buffer[String] := b;
+        insertBack(&!v, fromLiteral(a));
+        return v;
+    end;
+
+    generic [R: Region]
+    function valueIs(found: Option[&[String, R]], text: Span[Nat8, Static]): Bool is
+        case found of
+            when Some(value as r: &[String, R]) do
+                let expected: String := fromLiteral(text);
+                let same: Bool := equal(r, &expected);
+                destroyString(expected);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function noValue(found: Option[&[String, R]]): Bool is
+        case found of
+            when Some(value as r: &[String, R]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function wholeIs(found: Option[Int64], want: Int64): Bool is
+        case found of
+            when Some(value as w: Int64) do
+                return w = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function kindNumber(kind: ErrorKind): Index is
+        case kind of
+            when UnknownOption do
+                return 0;
+            when UnknownSubcommand do
+                return 1;
+            when MissingValue do
+                return 2;
+            when UnexpectedValue do
+                return 3;
+            when InvalidNumber do
+                return 4;
+            when OutOfRange do
+                return 5;
+            when NotAllowed do
+                return 6;
+            when InvalidUtf8 do
+                return 7;
+            when EmptyPath do
+                return 8;
+            when MissingRequired do
+                return 9;
+            when Repeated do
+                return 10;
+            when Conflict do
+                return 11;
+            when MissingDependency do
+                return 12;
+            when MissingSubcommand do
+                return 13;
+            when ArgumentFileUnreadable do
+                return 14;
+            when ArgumentFileTooLarge do
+                return 15;
+            when ArgumentFileCycle do
+                return 16;
+            when ArgumentFileTooDeep do
+                return 17;
+            when ArgumentFileSyntax do
+                return 18;
+        end case;
+    end;
+
+    generic [R: Region]
+    function textIs(text: &[String, R], want: Span[Nat8, Static]): Bool is
+        let expected: String := fromLiteral(want);
+        let same: Bool := equal(text, &expected);
+        destroyString(expected);
+        return same;
+    end;
+
+    -- Parses a against c and checks that it failed with kind at position
+    -- (maximum_index for none) and that its message is message.
+    generic [R: Region]
+    function failsWith(c: &[Command, R], a: Buffer[String], kind: ErrorKind, position: Index, message: Span[Nat8, Static]): Bool is
+        let result: Either[ArgumentError, Outcome] := parse(c, &a);
+        destroyArguments(a);
+        case result of
+            when Left(left as e: ArgumentError) do
+                var at: Index := maximum_index;
+                case errorPosition(&e) of
+                    when Some(value as p: Index) do
+                        at := p;
+                    when None do
+                        skip;
+                end case;
+                let text: String := describeError(c, &e);
+                let good: Bool := ((kindNumber(errorKind(&e)) = kindNumber(kind)) and (at = position)) and textIs(&text, message);
+                if not good then
+                    printLn(asSpan(&text));
+                end if;
+                destroyString(text);
+                destroyError(e);
+                return good;
+            when Right(right as o: Outcome) do
+                destroyOutcome(o);
+                return false;
+        end case;
+    end;
+
+    function destroyOutcome(o: Outcome): Unit is
+        case o of
+            when Run(matches as m: Matches) do
+                destroyMatches(m);
+            when Help(text as t: String) do
+                destroyString(t);
+            when Version(text as t: String) do
+                destroyString(t);
+        end case;
+        return nil;
+    end;
+
+    -- Parses a against c and gives back the text of a Help or a Version,
+    -- or an empty string.
+    generic [R: Region]
+    function textOfOutcome(c: &[Command, R], a: Buffer[String]): String is
+        let result: Either[ArgumentError, Outcome] := parse(c, &a);
+        destroyArguments(a);
+        case result of
+            when Left(left as e: ArgumentError) do
+                destroyError(e);
+                return fromLiteral("");
+            when Right(right as o: Outcome) do
+                case o of
+                    when Run(matches as m: Matches) do
+                        destroyMatches(m);
+                        return fromLiteral("");
+                    when Help(text as t: String) do
+                        return t;
+                    when Version(text as t: String) do
+                        return t;
+                end case;
+        end case;
+    end;
+
+    -- flags, alone, clustered and long; a repeatable one is counted.
+    function testFlags(): Unit is
+        var c: Command := makeCommand("tool", "Does things.");
+        let verbose: FlagKey := addVerbose(&!c, "More output");
+        let quiet: FlagKey := addFlag(&!c, option("quiet", 'q', "Less output"));
+        let dry: FlagKey := addFlag(&!c, option("dry-run", 0, "Change nothing"));
+        let a: Buffer[String] := more(more(args("-vqv"), "--verbose"), "--dry-run");
+        case parse(&c, &a) of
+            when Right(right as o: Outcome) do
+                case o of
+                    when Run(matches as m: Matches) do
+                        assertTrue(flagCount(&m, verbose) = 3, "verbose: two in a cluster and one long");
+                        assertTrue(flagCount(&m, quiet) = 1, "quiet once");
+                        assertTrue(flagCount(&m, dry) = 1, "dry-run once");
+                        destroyMatches(m);
+                    when Help(text as t: String) do
+                        destroyString(t);
+                        assertTrue(false, "runs");
+                    when Version(text as t: String) do
+                        destroyString(t);
+                        assertTrue(false, "runs");
+                end case;
+            when Left(left as e: ArgumentError) do
+                destroyError(e);
+                assertTrue(false, "parses");
+        end case;
+        destroyArguments(a);
+        assertTrue(failsWith(&c, args("-qq"), Repeated(), 0, "tool: --quiet is given more than once\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a flag not repeatable given twice");
+        assertTrue(failsWith(&c, args("--quiet=yes"), UnexpectedValue(), 0, "tool: option --quiet takes no value\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a value given to a flag");
+        assertTrue(failsWith(&c, args("--quite"), UnknownOption(), 0, "tool: unknown option --quite, did you mean --quiet?\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a long option misspelt");
+        assertTrue(failsWith(&c, args("-x"), UnknownOption(), 0, "tool: unknown option -x\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a short option unknown");
+        assertTrue(failsWith(&c, args("--verbsoe"), UnknownOption(), 0, "tool: unknown option --verbsoe, did you mean --verbose?\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "two letters swapped are one step away");
+        assertTrue(failsWith(&c, args("--zzzzzzz"), UnknownOption(), 0, "tool: unknown option --zzzzzzz\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "nothing near: no suggestion");
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- Parses a against c; the matches of a Run, else None.
+    generic [R: Region]
+    function runOf(c: &[Command, R], a: Buffer[String]): Option[Matches] is
+        let result: Either[ArgumentError, Outcome] := parse(c, &a);
+        destroyArguments(a);
+        case result of
+            when Left(left as e: ArgumentError) do
+                let text: String := describeError(c, &e);
+                printLn(asSpan(&text));
+                destroyString(text);
+                destroyError(e);
+                let none: Option[Matches] := None();
+                return none;
+            when Right(right as o: Outcome) do
+                case o of
+                    when Run(matches as m: Matches) do
+                        return Some(value => m);
+                    when Help(text as t: String) do
+                        destroyString(t);
+                        let none: Option[Matches] := None();
+                        return none;
+                    when Version(text as t: String) do
+                        destroyString(t);
+                        let none: Option[Matches] := None();
+                        return none;
+                end case;
+        end case;
+    end;
+
+    -- Whether got is want; prints got when not.
+    function sameText(got: String, want: Span[Nat8, Static]): Bool is
+        let good: Bool := textIs(&got, want);
+        if not good then
+            printLn(asSpan(&got));
+        end if;
+        destroyString(got);
+        return good;
+    end;
+
+    function hasText(got: String, want: Span[Nat8, Static]): Bool is
+        let good: Bool := contains(asSpan(&got), want);
+        if not good then
+            printLn(asSpan(&got));
+        end if;
+        destroyString(got);
+        return good;
+    end;
+
+    -- The kind and the position of a failure, not its message.
+    generic [R: Region]
+    function failsAs(c: &[Command, R], a: Buffer[String], kind: ErrorKind, position: Index): Bool is
+        let result: Either[ArgumentError, Outcome] := parse(c, &a);
+        destroyArguments(a);
+        case result of
+            when Left(left as e: ArgumentError) do
+                var at: Index := maximum_index;
+                case errorPosition(&e) of
+                    when Some(value as p: Index) do
+                        at := p;
+                    when None do
+                        skip;
+                end case;
+                let good: Bool := (kindNumber(errorKind(&e)) = kindNumber(kind)) and (at = position);
+                destroyError(e);
+                return good;
+            when Right(right as o: Outcome) do
+                destroyOutcome(o);
+                return false;
+        end case;
+    end;
+
+    -- A command with one option of every kind of value.
+    function valueCommand(): Command is
+        var c: Command := makeCommand("tool", "Does things.");
+        let name: TextKey := addText(&!c, option("name", 'n', "Who to greet"), "");
+        let count: WholeKey := addWhole(&!c, option("count", 'q', "How often"), 1, 5, "");
+        let color: BoolKey := addBool(&!c, option("color", 0, "Use colour"), "");
+        let mode: ChoiceKey := addChoice(&!c, option("mode", 'm', "How to work"), "fast|safe|small", "");
+        let out: PathKey := addPath(&!c, option("output", 'o', "Where to write"));
+        return c;
+    end;
+
+    -- values after =, in the next argument and attached to a letter, each
+    -- checked by its kind.
+    function testValues(): Unit is
+        var c: Command := makeCommand("tool", "Does things.");
+        let name: TextKey := addText(&!c, option("name", 'n', "Who to greet"), "");
+        let count: WholeKey := addWhole(&!c, option("count", 'q', "How often"), 1, 5, "");
+        let color: BoolKey := addBool(&!c, option("color", 0, "Use colour"), "");
+        let mode: ChoiceKey := addChoice(&!c, option("mode", 'm', "How to work"), "fast|safe|small", "");
+        let out: PathKey := addPath(&!c, option("output", 'o', "Where to write"));
+        let a: Buffer[String] := more(more(more(more(more(more(more(args("--name=Ann"), "-q"), "3"), "--color"), "yes"), "-msmall"), "--output"), "out.txt");
+        case runOf(&c, a) of
+            when Some(value as m: Matches) do
+                assertTrue(valueIs(textOf(&m, name), "Ann"), "name after =");
+                assertTrue(wholeIs(wholeOf(&m, count), 3), "count in the next argument");
+                case boolOf(&m, color) of
+                    when Some(value as b: Bool) do
+                        assertTrue(b, "yes is true");
+                    when None do
+                        assertTrue(false, "color given");
+                end case;
+                case choiceOf(&m, mode) of
+                    when Some(value as i: Index) do
+                        assertTrue(i = 2, "small is the third word");
+                    when None do
+                        assertTrue(false, "mode given");
+                end case;
+                assertTrue(valueIs(pathOf(&m, out), "out.txt"), "output");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        case runOf(&c, args("")) of
+            when Some(value as m: Matches) do
+                assertTrue(noValue(textOf(&m, name)), "no name, no default: None");
+                case wholeOf(&m, count) of
+                    when Some(value as w: Int64) do
+                        assertTrue(false, "no count");
+                    when None do
+                        assertTrue(true, "no count, no default: None");
+                end case;
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "an empty line parses");
+        end case;
+        assertTrue(failsWith(&c, more(args("-q"), "9"), OutOfRange(), 1, "tool: 9 is out of range for --count, which takes 1 to 5\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a number above the range");
+        assertTrue(failsWith(&c, args("--count=x"), InvalidNumber(), 0, "tool: x is not a whole number, for --count\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a number that is none");
+        assertTrue(failsWith(&c, args("-q99999999999999999999"), InvalidNumber(), 0, "tool: 99999999999999999999 is not a whole number, for --count\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a number past Int64");
+        assertTrue(failsWith(&c, more(args("--color"), "maybe"), NotAllowed(), 1, "tool: maybe is not allowed for --color, which takes true, false, yes, no, on, off, 1 or 0\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a Bool word unknown");
+        assertTrue(failsWith(&c, more(args("--mode"), "fats"), NotAllowed(), 1, "tool: fats is not allowed for --mode, which takes fast, safe, small, did you mean fast?\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a choice misspelt");
+        assertTrue(failsWith(&c, args("--output="), EmptyPath(), 0, "tool: --output needs a path that is not empty\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "an empty path");
+        assertTrue(failsWith(&c, args("--name"), MissingValue(), 0, "tool: option --name needs a value\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a value missing at the end");
+        assertTrue(failsWith(&c, more(more(args("-n"), "a"), "--name=b"), Repeated(), 2, "tool: --name is given more than once\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a value given twice");
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- a value that is not UTF-8: refused as text, kept as a path.
+    function testInvalidUtf8(): Unit is
+        var c: Command := makeCommand("tool", "Does things.");
+        let name: TextKey := addText(&!c, option("name", 'n', "Who to greet"), "");
+        let out: PathKey := addPath(&!c, option("output", 'o', "Where to write"));
+        var a: Buffer[String] := args("--name");
+        insertBack(&!a, makeString(1, 255));
+        assertTrue(failsWith(&c, a, InvalidUtf8(), 1, "tool: the value \\xff for --name is not UTF-8\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "text must be UTF-8");
+        var b: Buffer[String] := args("-o");
+        insertBack(&!b, makeString(2, 254));
+        case runOf(&c, b) of
+            when Some(value as m: Matches) do
+                assertTrue(pathCount(&m, out) = 1, "a path of bytes");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "a path may be any bytes");
+        end case;
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- an argument of 100,000 bytes is no reason to stop.
+    function testLongWord(): Unit is
+        let c: Command := valueCommand();
+        var a: Buffer[String] := allocateEmpty();
+        insertBack(&!a, makeString(100000, '-'));
+        assertTrue(failsAs(&c, a, UnknownOption(), 0), "a long word of dashes is an unknown option");
+        var b: Buffer[String] := args("--name");
+        insertBack(&!b, makeString(100000, 'x'));
+        case runOf(&c, b) of
+            when Some(value as m: Matches) do
+                destroyMatches(m);
+                assertTrue(true, "a long value is kept");
+            when None do
+                assertTrue(false, "a long value parses");
+        end case;
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- a repeatable option keeps every value in order.
+    function testRepeatable(): Unit is
+        var c: Command := makeCommand("tool", "");
+        let include: TextKey := addText(&!c, repeatable(option("include", 'I', "A directory to search")), "");
+        let a: Buffer[String] := more(more(more(more(args("-Ia"), "--include"), "b"), "-I"), "c");
+        case runOf(&c, a) of
+            when Some(value as m: Matches) do
+                assertTrue(textCount(&m, include) = 3, "three values");
+                assertTrue(valueIs(textAt(&m, include, 0), "a"), "a first");
+                assertTrue(valueIs(textAt(&m, include, 1), "b"), "b second");
+                assertTrue(valueIs(textAt(&m, include, 2), "c"), "c third");
+                assertTrue(noValue(textAt(&m, include, 3)), "none past the last");
+                assertTrue(noValue(textAt(&m, include, maximum_index)), "none at the largest index");
+                assertTrue(valueIs(textOf(&m, include), "c"), "textOf gives the last");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- a default is used when nothing is given, and only then.
+    function testDefaults(): Unit is
+        var c: Command := makeCommand("tool", "");
+        let name: TextKey := addText(&!c, option("name", 'n', "Who"), "world");
+        let count: WholeKey := addWhole(&!c, option("count", 'q', "How often"), 1, 5, "2");
+        let color: BoolKey := addBool(&!c, option("color", 0, "Colour"), "false");
+        let mode: ChoiceKey := addChoice(&!c, option("mode", 'm', "How"), "fast|safe", "safe");
+        case runOf(&c, args("")) of
+            when Some(value as m: Matches) do
+                assertTrue(valueIs(textOf(&m, name), "world"), "the default text");
+                assertTrue(wholeIs(wholeOf(&m, count), 2), "the default number");
+                case boolOf(&m, color) of
+                    when Some(value as b: Bool) do
+                        assertFalse(b, "the default Bool");
+                    when None do
+                        assertTrue(false, "a default Bool");
+                end case;
+                case choiceOf(&m, mode) of
+                    when Some(value as i: Index) do
+                        assertTrue(i = 1, "the default choice");
+                    when None do
+                        assertTrue(false, "a default choice");
+                end case;
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        case runOf(&c, more(args("--count"), "4")) of
+            when Some(value as m: Matches) do
+                assertTrue(wholeIs(wholeOf(&m, count), 4), "a value given wins over the default");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- what is required must be there, an option or a positional argument.
+    function testRequired(): Unit is
+        var c: Command := makeCommand("tool", "");
+        let config: TextKey := addText(&!c, required(option("settings", 'f', "The configuration")), "");
+        let input: PositionalKey := addPositional(&!c, "input", "The file to read", true, false);
+        assertTrue(failsWith(&c, args("in.txt"), MissingRequired(), maximum_index, "tool: --settings is required\nUsage: tool [OPTIONS] --settings <SETTINGS> <INPUT>\nTry tool --help for more information.\n"), "a required option missing");
+        assertTrue(failsWith(&c, more(args("-f"), "x"), MissingRequired(), maximum_index, "tool: <INPUT> is required\nUsage: tool [OPTIONS] --settings <SETTINGS> <INPUT>\nTry tool --help for more information.\n"), "a required positional argument missing");
+        case runOf(&c, more(more(args("-f"), "x"), "in.txt")) of
+            when Some(value as m: Matches) do
+                assertTrue(valueIs(positionalOf(&m, input), "in.txt"), "the input");
+                assertTrue(valueIs(textOf(&m, config), "x"), "the configuration");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        assertTrue(sameText(usageLine(&c), "Usage: tool [OPTIONS] --settings <SETTINGS> <INPUT>"), "the usage line");
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- positional arguments in order; -- and - are positional.
+    function testPositionals(): Unit is
+        var c: Command := makeCommand("tool", "");
+        let first: PositionalKey := addPositional(&!c, "first", "", true, false);
+        let rest: PositionalKey := addPositional(&!c, "rest", "", false, true);
+        let v: FlagKey := addVerbose(&!c, "");
+        case runOf(&c, more(more(more(args("a"), "-v"), "b"), "c")) of
+            when Some(value as m: Matches) do
+                assertTrue(valueIs(positionalOf(&m, first), "a"), "first");
+                assertTrue(positionalCount(&m, rest) = 2, "two more");
+                assertTrue(valueIs(positionalAt(&m, rest, 0), "b"), "b");
+                assertTrue(valueIs(positionalAt(&m, rest, 1), "c"), "c");
+                assertTrue(noValue(positionalAt(&m, rest, 2)), "none past the last");
+                assertTrue(flagCount(&m, v) = 1, "the flag between them");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        case runOf(&c, more(more(args("--"), "-v"), "-")) of
+            when Some(value as m: Matches) do
+                assertTrue(valueIs(positionalOf(&m, first), "-v"), "after -- an option is positional");
+                assertTrue(valueIs(positionalAt(&m, rest, 0), "-"), "- alone is positional");
+                assertTrue(flagCount(&m, v) = 0, "no flag");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        destroyCommand(c);
+        var one: Command := makeCommand("tool", "");
+        let only: PositionalKey := addPositional(&!one, "one", "", true, false);
+        assertTrue(failsWith(&one, more(args("a"), "b"), Repeated(), 1, "tool: unexpected argument b\nUsage: tool [OPTIONS] <ONE>\nTry tool --help for more information.\n"), "one positional too many");
+        destroyCommand(one);
+        return nil;
+    end;
+
+    -- The command of the subcommand tests: vcs with add (alias a) and
+    -- remote, remote with show, a global verbose flag.
+    function vcs(): Command is
+        var root: Command := makeCommand("vcs", "A version control tool.");
+        let verbose: FlagKey := addVerbose(&!root, "More output");
+        var add: Command := makeCommand("add", "Add files.");
+        let force: FlagKey := addFlag(&!add, option("force", 'f', "Add ignored files"));
+        let files: PathKey := addPositionalPath(&!add, "file", "Files to add", true, true);
+        addAlias(&!add, "a");
+        var remote: Command := makeCommand("remote", "Manage remotes.");
+        var show: Command := makeCommand("show", "Show a remote.");
+        let which: PositionalKey := addPositional(&!show, "name", "The remote", true, false);
+        let showKey: SubcommandKey := addSubcommand(&!remote, show);
+        requireSubcommand(&!remote);
+        let addKey: SubcommandKey := addSubcommand(&!root, add);
+        let remoteKey: SubcommandKey := addSubcommand(&!root, remote);
+        return root;
+    end;
+
+    -- subcommands, nested, with an alias and a global option.
+    function testSubcommands(): Unit is
+        var root: Command := makeCommand("vcs", "A version control tool.");
+        let verbose: FlagKey := addVerbose(&!root, "More output");
+        var add: Command := makeCommand("add", "Add files.");
+        let force: FlagKey := addFlag(&!add, option("force", 'f', "Add ignored files"));
+        let files: PathKey := addPositionalPath(&!add, "file", "Files to add", true, true);
+        addAlias(&!add, "a");
+        var remote: Command := makeCommand("remote", "Manage remotes.");
+        var show: Command := makeCommand("show", "Show a remote.");
+        let which: PositionalKey := addPositional(&!show, "name", "The remote", true, false);
+        let showKey: SubcommandKey := addSubcommand(&!remote, show);
+        requireSubcommand(&!remote);
+        let addKey: SubcommandKey := addSubcommand(&!root, add);
+        let remoteKey: SubcommandKey := addSubcommand(&!root, remote);
+        case runOf(&root, more(more(more(more(more(args("-v"), "a"), "-f"), "x.txt"), "y.txt"), "-v")) of
+            when Some(value as m: Matches) do
+                assertTrue(chosen(&m, addKey), "add chosen by its alias");
+                assertFalse(chosen(&m, remoteKey), "remote not chosen");
+                assertTrue(flagCount(&m, verbose) = 2, "the global flag before and after the subcommand");
+                assertTrue(flagCount(&m, force) = 1, "add's own flag");
+                assertTrue(pathCount(&m, files) = 2, "two files");
+                assertTrue(valueIs(pathAt(&m, files, 1), "y.txt"), "the second file");
+                assertTrue(noValue(positionalOf(&m, which)), "a key of a subcommand not chosen: None");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        case runOf(&root, more(more(args("remote"), "show"), "origin")) of
+            when Some(value as m: Matches) do
+                assertTrue(chosen(&m, remoteKey), "remote chosen");
+                assertTrue(chosen(&m, showKey), "show chosen");
+                assertTrue(valueIs(positionalOf(&m, which), "origin"), "show's argument");
+                assertTrue(flagCount(&m, verbose) = 0, "no verbose");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        assertTrue(failsWith(&root, args("remote"), MissingSubcommand(), maximum_index, "vcs: a subcommand is required\nUsage: vcs remote [OPTIONS] <COMMAND>\nTry vcs remote --help for more information.\n"), "remote needs a subcommand");
+        assertTrue(failsWith(&root, args("ad"), UnknownSubcommand(), 0, "vcs: unknown subcommand ad, did you mean add?\nUsage: vcs [OPTIONS] [COMMAND]\nTry vcs --help for more information.\n"), "a subcommand misspelt");
+        assertTrue(failsWith(&root, args("add"), MissingRequired(), maximum_index, "vcs: <FILE> is required\nUsage: vcs add [OPTIONS] <FILE>...\nTry vcs add --help for more information.\n"), "add needs a file");
+        assertTrue(failsWith(&root, args("-f"), UnknownOption(), 0, "vcs: unknown option -f\nUsage: vcs [OPTIONS] [COMMAND]\nTry vcs --help for more information.\n"), "a subcommand's option is not the root's");
+        assertTrue(failsWith(&root, more(args("help"), "remtoe"), UnknownSubcommand(), 1, "vcs: unknown subcommand remtoe, did you mean remote?\nUsage: vcs [OPTIONS] [COMMAND]\nTry vcs --help for more information.\n"), "help of a subcommand misspelt");
+        destroyCommand(root);
+        return nil;
+    end;
+
+    -- help, as an option and as a subcommand, for the root and below.
+    function testHelp(): Unit is
+        let root: Command := vcs();
+        let rootHelp: Span[Nat8, Static] := "A version control tool.\n\nUsage: vcs [OPTIONS] [COMMAND]\n\nOptions:\n  -v, --verbose  More output [repeatable]\n  -h, --help     Print help\n\nCommands:\n  add     Add files. [aliases: a]\n  remote  Manage remotes.\n  help    Print the help of a command\n";
+        let addHelp: Span[Nat8, Static] := "Add files.\n\nUsage: vcs add [OPTIONS] <FILE>...\n\nArguments:\n  <FILE>...  Files to add\n\nOptions:\n  -v, --verbose  More output [repeatable]\n  -f, --force    Add ignored files\n  -h, --help     Print help\n";
+        assertTrue(sameText(helpText(&root), rootHelp), "the root's help");
+        assertTrue(sameText(textOfOutcome(&root, args("--help")), rootHelp), "--help");
+        assertTrue(sameText(textOfOutcome(&root, args("-h")), rootHelp), "-h");
+        assertTrue(sameText(textOfOutcome(&root, args("help")), rootHelp), "help alone");
+        assertTrue(sameText(textOfOutcome(&root, more(args("help"), "add")), addHelp), "help add");
+        assertTrue(sameText(textOfOutcome(&root, more(args("add"), "--help")), addHelp), "add --help");
+        assertTrue(sameText(textOfOutcome(&root, more(more(args("a"), "x"), "-h")), addHelp), "help after a value, by the alias");
+        destroyCommand(root);
+        return nil;
+    end;
+
+    -- -V and --version where a version is set, and only there.
+    function testVersion(): Unit is
+        var c: Command := makeCommand("tool", "Does things.");
+        setVersion(&!c, "1.2.3");
+        assertTrue(sameText(textOfOutcome(&c, args("-V")), "tool 1.2.3\n"), "-V");
+        assertTrue(sameText(textOfOutcome(&c, args("--version")), "tool 1.2.3\n"), "--version");
+        assertTrue(hasText(helpText(&c), "  -V, --version  Print version\n"), "the help names -V");
+        destroyCommand(c);
+        let plain: Command := makeCommand("tool", "");
+        assertTrue(failsAs(&plain, args("-V"), UnknownOption(), 0), "no version: -V is unknown");
+        assertTrue(failsAs(&plain, args("--version"), UnknownOption(), 0), "no version: --version is unknown");
+        destroyCommand(plain);
+        return nil;
+    end;
+
+    -- The copyright on the version line, version as a word, and --full.
+    function testFullVersion(): Unit is
+        var c: Command := makeCommand("tool", "Does things.");
+        setVersion(&!c, "1.2.3");
+        setCopyright(&!c, "2026 Example");
+        assertTrue(sameText(textOfOutcome(&c, args("--version")), "tool 1.2.3, Copyright (C) 2026 Example\n"), "the copyright");
+        assertTrue(sameText(textOfOutcome(&c, args("version")), "tool 1.2.3, Copyright (C) 2026 Example\n"), "version as a word");
+        assertTrue(sameText(textOfOutcome(&c, more(args("version"), "--full")), "tool 1.2.3, Copyright (C) 2026 Example\n"), "--full without a full text");
+        setFullVersion(&!c, fromLiteral("version     1.2.3\n"));
+        assertTrue(sameText(textOfOutcome(&c, more(args("version"), "--full")), "version     1.2.3\n"), "version --full");
+        assertTrue(sameText(textOfOutcome(&c, more(args("--version"), "--full")), "version     1.2.3\n"), "--version --full");
+        assertTrue(sameText(textOfOutcome(&c, more(args("-V"), "--full")), "version     1.2.3\n"), "-V --full");
+        assertTrue(sameText(textOfOutcome(&c, args("-V")), "tool 1.2.3, Copyright (C) 2026 Example\n"), "-V alone is the line");
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- The reserved names, each declared by its own function.
+    function testReserved(): Unit is
+        var c: Command := makeCommand("tool", "");
+        let verbose: FlagKey := addVerbose(&!c, "Say more");
+        let config: PathKey := addConfig(&!c);
+        let env: PathKey := addEnv(&!c);
+        let pepper: PathKey := addPepper(&!c);
+        let socket: PathKey := addSocket(&!c);
+        let json: FlagKey := addJson(&!c);
+        let line: Buffer[String] := more(more(more(more(more(more(more(more(more(more(more(args("-v"), "-v"), "-c"), "c.yaml"), "-e"), ".env"), "--pepper"), "p"), "--socket"), "s.sock"), "--json"), "-v");
+        case runOf(&c, line) of
+            when Some(value as m: Matches) do
+                assertTrue(flagCount(&m, verbose) = 3, "-v three times");
+                assertTrue(flagCount(&m, json) = 1, "--json");
+                destroyMatches(m);
+            when None do
+                assertFailure("the reserved names did not parse");
+        end case;
+        assertTrue(hasText(helpText(&c), "-c, --config"), "the help names -c");
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- --config is global: a subcommand takes it after its name.
+    function testConfigAfterSubcommand(): Unit is
+        var c: Command := makeCommand("tool", "");
+        let config: PathKey := addConfig(&!c);
+        var serve: Command := makeCommand("serve", "Serve");
+        let serveKey: SubcommandKey := addSubcommand(&!c, serve);
+        case runOf(&c, more(more(args("serve"), "--config"), "c.conf")) of
+            when Some(value as m: Matches) do
+                assertTrue(chosen(&m, serveKey), "serve is chosen");
+                destroyMatches(m);
+            when None do
+                assertFailure("--config after the subcommand did not parse");
+        end case;
+        case runOf(&c, more(more(args("-c"), "c.conf"), "serve")) of
+            when Some(value as m: Matches) do
+                assertTrue(chosen(&m, serveKey), "the control: before the subcommand");
+                destroyMatches(m);
+            when None do
+                assertFailure("-c before the subcommand did not parse");
+        end case;
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- conflicts and dependencies between options.
+    function testRules(): Unit is
+        var c: Command := makeCommand("tool", "");
+        let json: FlagKey := addJson(&!c);
+        let text: FlagKey := addFlag(&!c, option("text", 't', "Print text"));
+        let key: TextKey := addText(&!c, option("key", 'k', "The key"), "");
+        let secret: TextKey := addText(&!c, option("secret", 'x', "The secret"), "");
+        addConflict(&!c, anyFlag(json), anyFlag(text));
+        addDependency(&!c, anyText(key), anyText(secret));
+        assertTrue(failsWith(&c, more(args("--json"), "-t"), Conflict(), maximum_index, "tool: --json cannot be given together with --text\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a conflict");
+        assertTrue(failsWith(&c, more(args("-k"), "a"), MissingDependency(), maximum_index, "tool: --key needs --secret\nUsage: tool [OPTIONS]\nTry tool --help for more information.\n"), "a dependency missing");
+        case runOf(&c, more(more(more(more(args("-k"), "a"), "-x"), "b"), "--json")) of
+            when Some(value as m: Matches) do
+                assertTrue(flagCount(&m, json) = 1, "json alone");
+                assertTrue(valueIs(textOf(&m, secret), "b"), "the secret");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- a key of another command answers as an option not given.
+    function testForeignKey(): Unit is
+        var c: Command := makeCommand("one", "");
+        let mine: FlagKey := addVerbose(&!c, "");
+        var other: Command := makeCommand("two", "");
+        let theirs: FlagKey := addVerbose(&!other, "");
+        case runOf(&c, args("-v")) of
+            when Some(value as m: Matches) do
+                assertTrue(flagCount(&m, mine) = 1, "the own key");
+                assertTrue(flagCount(&m, theirs) = 0, "the other command's key: not given");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "parses");
+        end case;
+        destroyCommand(c);
+        destroyCommand(other);
+        return nil;
+    end;
+
+    function oneByte(prefix: Span[Nat8, Static], byte: Nat8): Buffer[String] is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, prefix);
+        writeByte(&!b, byte);
+        var a: Buffer[String] := allocateEmpty();
+        insertBack(&!a, finalize(b));
+        return a;
+    end;
+
+    -- no command line stops the programme: each of these comes back as a
+    -- value, most of them as an error.
+    function testNothingStops(): Unit is
+        let root: Command := vcs();
+        assertTrue(failsWith(&root, args("--help=x"), UnexpectedValue(), 0, "vcs: option --help takes no value\nUsage: vcs [OPTIONS] [COMMAND]\nTry vcs --help for more information.\n"), "help given a value");
+        var empty: Buffer[String] := allocateEmpty();
+        insertBack(&!empty, fromLiteral(""));
+        assertTrue(failsAs(&root, empty, UnknownSubcommand(), 0), "an empty word");
+        assertTrue(failsAs(&root, args("--="), UnknownOption(), 0), "--= alone");
+        assertTrue(failsAs(&root, args("---"), UnknownOption(), 0), "three dashes");
+        assertTrue(failsAs(&root, args("-"), UnknownSubcommand(), 0), "a dash where a subcommand belongs");
+        assertTrue(failsWith(&root, args("-v="), UnknownOption(), 0, "vcs: unknown option -=\nUsage: vcs [OPTIONS] [COMMAND]\nTry vcs --help for more information.\n"), "an = in a cluster");
+        assertTrue(failsWith(&root, oneByte("", 255), UnknownSubcommand(), 0, "vcs: unknown subcommand \\xff\nUsage: vcs [OPTIONS] [COMMAND]\nTry vcs --help for more information.\n"), "a subcommand not UTF-8");
+        assertTrue(failsWith(&root, oneByte("-", 255), UnknownOption(), 0, "vcs: unknown option -\\xff\nUsage: vcs [OPTIONS] [COMMAND]\nTry vcs --help for more information.\n"), "a letter not UTF-8");
+        assertTrue(failsWith(&root, oneByte("--", 200), UnknownOption(), 0, "vcs: unknown option --\\xc8\nUsage: vcs [OPTIONS] [COMMAND]\nTry vcs --help for more information.\n"), "a long name not UTF-8");
+        assertTrue(failsAs(&root, more(args("remote"), "show"), MissingRequired(), maximum_index), "show without its name");
+        assertTrue(sameText(textOfOutcome(&root, more(args("help"), "help")), "A version control tool.\n\nUsage: vcs [OPTIONS] [COMMAND]\n\nOptions:\n  -v, --verbose  More output [repeatable]\n  -h, --help     Print help\n\nCommands:\n  add     Add files. [aliases: a]\n  remote  Manage remotes.\n  help    Print the help of a command\n"), "help help");
+        case runOf(&root, more(more(args("add"), "--"), "--")) of
+            when Some(value as m: Matches) do
+                destroyMatches(m);
+                assertTrue(true, "-- after -- is a file");
+            when None do
+                assertTrue(false, "-- after -- parses");
+        end case;
+        destroyCommand(root);
+        return nil;
+    end;
+
+    -- the manual page in mdoc.
+    function testManPage(): Unit is
+        var c: Command := makeCommand("greet", "print a greeting");
+        let name: TextKey := addText(&!c, valueName(fromEnvironment(option("name", 'n', "Who to greet"), "GREET_NAME"), "who"), "");
+        let loud: FlagKey := addFlag(&!c, option("loud", 0, "Shout"));
+        let file: PathKey := addPositionalPath(&!c, "file", "Where to write", false, false);
+        let want: Span[Nat8, Static] := ".Dd September 28, 2026\n.Dt GREET 1\n.Os\n.Sh NAME\n.Nm greet\n.Nd print a greeting\n.Sh SYNOPSIS\n.Nm\n.Op Fl n Ar who\n.Op Fl -loud\n.Op Ar file\n.Sh DESCRIPTION\nprint a greeting\n.Pp\nThe options are as follows:\n.Bl -tag -width Ds\n.It Fl n Ar who , Fl -name Ns = Ns Ar who\nWho to greet [env: GREET_NAME]\n.It Fl -loud\nShout\n.El\n.Sh ENVIRONMENT\n.Bl -tag -width Ds\n.It Ev GREET_NAME\nThe value of\n.Fl n Ar who\nwhen it is not given.\n.El\n.Sh EXIT STATUS\n.Ex -std\n";
+        assertTrue(sameText(manPage(&c, "September 28, 2026"), want), "the page");
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- the completion scripts name every subcommand and option.
+    function testCompletion(): Unit is
+        let root: Command := vcs();
+        assertTrue(hasText(completionScript(&root, Bash()), "complete -F _vcs vcs\n"), "bash: registered");
+        assertTrue(hasText(completionScript(&root, Bash()), "\"vcs:add\"|\"vcs:a\") path_=\"vcs add\" ;;"), "bash: add and its alias");
+        assertTrue(hasText(completionScript(&root, Bash()), "\"vcs add\")\n            COMPREPLY=( $(compgen -W \"--verbose -v --force -f --help\" -- \"$cur\") ) ;;"), "bash: the words of add");
+        assertTrue(hasText(completionScript(&root, Zsh()), "#compdef vcs\n"), "zsh: the head");
+        assertTrue(hasText(completionScript(&root, Zsh()), "(\"vcs remote:show\") path_=\"vcs remote show\" ;;"), "zsh: a nested subcommand");
+        assertTrue(hasText(completionScript(&root, Fish()), "complete -c vcs -n \"test (_vcs_path) = 'vcs'\" -a add -d 'Add files.'\n"), "fish: add");
+        destroyCommand(root);
+        return nil;
+    end;
+
+    -- The word info gives the text of setInfo.
+    function testInfoWord(): Unit is
+        let plain: Command := vcs();
+        assertTrue(failsAs(&plain, args("info"), UnknownSubcommand(), 0), "info is no word by itself");
+        destroyCommand(plain);
+        var c: Command := vcs();
+        setInfo(&!c, fromLiteral("name        vcs\n"));
+        assertTrue(sameText(textOfOutcome(&c, args("info")), "name        vcs\n"), "the word");
+        assertTrue(hasText(helpText(&c), "info"), "the help names it");
+        destroyCommand(c);
+        var one: Command := makeCommand("one", "");
+        setInfo(&!one, fromLiteral("one\n"));
+        assertTrue(sameText(textOfOutcome(&one, args("info")), "one\n"), "a command without subcommands");
+        assertTrue(hasText(helpText(&one), "Commands:"), "its help lists info");
+        destroyCommand(one);
+        return nil;
+    end;
+
+    -- -s, --sandbox and the word sandbox give the flag of addSandbox.
+    function testSandbox(): Unit is
+        let plain: Command := vcs();
+        assertTrue(failsAs(&plain, args("sandbox"), UnknownSubcommand(), 0), "sandbox is no word by itself");
+        destroyCommand(plain);
+        var c: Command := vcs();
+        let sandbox: FlagKey := addSandbox(&!c);
+        assertTrue(flagGiven(&c, args("sandbox"), sandbox), "the word");
+        assertTrue(flagGiven(&c, args("--sandbox"), sandbox), "--sandbox");
+        assertTrue(flagGiven(&c, more(more(args("add"), "-s"), "f.txt"), sandbox), "-s after a subcommand: global");
+        assertTrue(failsAs(&c, more(args("sandbox"), "-s"), Repeated(), 1), "given twice");
+        assertTrue(hasText(helpText(&c), "-s, --sandbox"), "the help names it");
+        destroyCommand(c);
+        return nil;
+    end;
+
+    -- Whether the line a parses with flag given once.
+    generic [R: Region]
+    function flagGiven(c: &[Command, R], a: Buffer[String], flag: FlagKey): Bool is
+        case runOf(c, a) of
+            when Some(value as m: Matches) do
+                let good: Bool := flagCount(&m, flag) = 1;
+                destroyMatches(m);
+                return good;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- setup completion and setup manual, only when switched on.
+    function testSetupWords(): Unit is
+        let plain: Command := vcs();
+        assertTrue(failsAs(&plain, more(args("setup"), "manual"), UnknownSubcommand(), 0), "setup is no word by itself");
+        destroyCommand(plain);
+        var c: Command := vcs();
+        addCompletion(&!c);
+        addManual(&!c, "October 17, 2026");
+        assertTrue(hasText(textOfOutcome(&c, more(more(args("setup"), "completion"), "bash")), "complete -F _vcs vcs\n"), "setup completion bash");
+        assertTrue(hasText(textOfOutcome(&c, more(more(args("setup"), "completion"), "zsh")), "#compdef vcs\n"), "setup completion zsh");
+        assertTrue(hasText(textOfOutcome(&c, more(more(args("setup"), "completion"), "fish")), "# fish completion for vcs\n"), "setup completion fish");
+        assertTrue(failsAs(&c, more(more(args("setup"), "completion"), "ksh"), UnknownSubcommand(), 2), "a shell not known");
+        assertTrue(failsAs(&c, more(args("setup"), "completion"), MissingSubcommand(), 1), "no shell");
+        assertTrue(failsAs(&c, args("setup"), MissingSubcommand(), 0), "setup alone");
+        assertTrue(failsAs(&c, more(args("setup"), "wipe"), UnknownSubcommand(), 1), "a word setup does not have");
+        assertTrue(failsAs(&c, args("completion"), UnknownSubcommand(), 0), "completion is no word of the root");
+        assertTrue(hasText(textOfOutcome(&c, more(args("setup"), "manual")), ".Dd October 17, 2026\n.Dt VCS 1\n"), "setup manual");
+        assertTrue(hasText(helpText(&c), "setup"), "the help names setup");
+        assertTrue(hasText(helpText(&c), "(completion SHELL) or the manual page (manual)"), "and its words");
+        destroyCommand(c);
+        var one: Command := makeCommand("one", "");
+        addCompletion(&!one);
+        assertTrue(failsAs(&one, more(args("setup"), "manual"), UnknownSubcommand(), 1), "manual not switched on");
+        assertTrue(hasText(textOfOutcome(&one, more(more(args("setup"), "completion"), "bash")), "complete -F _one one\n"), "a command without subcommands");
+        assertTrue(hasText(helpText(&one), "Commands:"), "its help lists setup");
+        destroyCommand(one);
+        return nil;
+    end;
+
+    ---
+    --- Argument files
+    ---
+
+    -- The file at path holds text; false when it could not be made.
+    generic [R: Region]
+    function putFile(path: Span[Nat8, Static], text: Span[Nat8, R]): Bool is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The file at path holds piece, times over.
+    function putRepeated(path: Span[Nat8, Static], piece: Span[Nat8, Static], times: Index): Bool is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var good: Bool := true;
+                var i: Index := 0;
+                while i < times do
+                    if not writeAll(&!file, piece) then
+                        good := false;
+                    end if;
+                    i := i + 1;
+                end while;
+                let closed: Bool := closeFile(file);
+                return good and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The file at path holds size spaces.
+    function putBlank(path: Span[Nat8, Static], size: Index): Bool is
+        var b: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 4096 do
+            writeByte(&!b, ' ');
+            i := i + 1;
+        end while;
+        let chunk: String := finalize(b);
+        var good: Bool := false;
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                good := true;
+                var remaining: Index := size;
+                while remaining > 0 do
+                    var piece: Index := 4096;
+                    if remaining < piece then
+                        piece := remaining;
+                    end if;
+                    if not writeAll(&!file, getSpan(&chunk, 0, piece - 1)) then
+                        good := false;
+                    end if;
+                    remaining := remaining - piece;
+                end while;
+                let closed: Bool := closeFile(file);
+                good := good and closed;
+            when None do
+                skip;
+        end case;
+        destroyString(chunk);
+        return good;
+    end;
+
+    -- The words of an expansion, joined with | between them; the word failed,
+    -- in capitals, when the expansion failed.
+    function expandedText(a: Buffer[String]): String is
+        let result: Either[ArgumentError, Buffer[String]] := expandArgumentFiles(&a);
+        destroyArguments(a);
+        case result of
+            when Left(left as e: ArgumentError) do
+                destroyError(e);
+                return fromLiteral("FAILED");
+            when Right(right as words: Buffer[String]) do
+                var out: StringBuilder := makeStringBuilder();
+                var i: Index := 0;
+                while i < bufferLength(&words) do
+                    if i > 0 then
+                        writeByte(&!out, '|');
+                    end if;
+                    writeString(&!out, asSpan(nthRef(&words, i)));
+                    i := i + 1;
+                end while;
+                destroyArguments(words);
+                return finalize(out);
+        end case;
+    end;
+
+    -- The words of an expansion as a vector to parse; an empty one when it
+    -- failed.
+    function expanded(a: Buffer[String]): Buffer[String] is
+        let result: Either[ArgumentError, Buffer[String]] := expandArgumentFiles(&a);
+        destroyArguments(a);
+        case result of
+            when Left(left as e: ArgumentError) do
+                destroyError(e);
+                return allocateEmpty();
+            when Right(right as words: Buffer[String]) do
+                return words;
+        end case;
+    end;
+
+    -- The text up to the first line feed.
+    generic [R: Region]
+    function firstLine(text: &[String, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        var going: Bool := true;
+        while going and (i < stringLength(text)) do
+            let b: Nat8 := nthByte(text, i);
+            if b = 10 then
+                going := false;
+            else
+                writeByte(&!out, b);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Expands a and checks that it failed with kind at position and that the
+    -- first line of its message is line.
+    function expandFails(a: Buffer[String], kind: ErrorKind, position: Index, line: Span[Nat8, Static]): Bool is
+        let c: Command := makeCommand("tool", "Does things.");
+        let result: Either[ArgumentError, Buffer[String]] := expandArgumentFiles(&a);
+        destroyArguments(a);
+        case result of
+            when Left(left as e: ArgumentError) do
+                var at: Index := maximum_index;
+                case errorPosition(&e) of
+                    when Some(value as p: Index) do
+                        at := p;
+                    when None do
+                        skip;
+                end case;
+                let text: String := describeError(&c, &e);
+                let first: String := firstLine(&text);
+                let good: Bool := ((kindNumber(errorKind(&e)) = kindNumber(kind)) and (at = position)) and textIs(&first, line);
+                if not good then
+                    printLn(asSpan(&text));
+                end if;
+                destroyString(first);
+                destroyString(text);
+                destroyError(e);
+                destroyCommand(c);
+                return good;
+            when Right(right as words: Buffer[String]) do
+                destroyArguments(words);
+                destroyCommand(c);
+                return false;
+        end case;
+    end;
+
+    -- gcc's splitting of a file into words: white space separates, quotes
+    -- group and are not kept, a backslash takes the next byte as it is.
+    function testArgumentFileWords(): Unit is
+        assertTrue(putFile("argfile-w1.txt", "one two\tthree\nfour\r\nfive  \n"), "the first file is made");
+        assertTrue(sameText(expandedText(args("@argfile-w1.txt")), "one|two|three|four|five"), "space, tab, line feed and carriage return separate");
+        assertTrue(putFile("argfile-w2.txt", "'a b' \"c d\" e'f g'h \"i'j\" 'k\"l'"), "the second file is made");
+        assertTrue(sameText(expandedText(args("@argfile-w2.txt")), "a b|c d|ef gh|i'j|k\"l"), "quotes group, are not kept, and one kind holds the other");
+        assertTrue(putFile("argfile-w3.txt", "a\\ b \"c\\\"d\" 'e\\'f' g\\\\h x\\\ny \"\" '' a\"\"b"), "the third file is made");
+        assertTrue(sameText(expandedText(args("@argfile-w3.txt")), "a b|c\"d|e'f|g\\h|x\ny|||ab"), "a backslash takes the next byte, in quotes too; empty quotes are an empty word");
+        assertTrue(putFile("argfile-w4.txt", ""), "the empty file is made");
+        assertTrue(sameText(expandedText(args("@argfile-w4.txt")), ""), "an empty file has no words");
+        assertTrue(putFile("argfile-w5.txt", " \n\t \r\n "), "the blank file is made");
+        assertTrue(sameText(expandedText(args("@argfile-w5.txt")), ""), "a blank file has no words");
+        assertTrue(sameText(expandedText(more(more(args("first"), "@argfile-w1.txt"), "last")), "first|one|two|three|four|five|last"), "the words stand where the file was named");
+        assertTrue(sameText(expandedText(more(args("@argfile-w4.txt"), "x")), "x"), "an empty file takes its word away");
+        let gone: Bool := removeFileIfThere("argfile-w1.txt");
+        let gone2: Bool := removeFileIfThere("argfile-w2.txt");
+        let gone3: Bool := removeFileIfThere("argfile-w3.txt");
+        let gone4: Bool := removeFileIfThere("argfile-w4.txt");
+        let gone5: Bool := removeFileIfThere("argfile-w5.txt");
+        return nil;
+    end;
+
+    -- files that name files, the escape for a word that begins with @, and
+    -- the -- that ends the expansion.
+    function testArgumentFileNesting(): Unit is
+        assertTrue(putFile("argfile-n1.txt", "a @argfile-n2.txt d"), "the outer file is made");
+        assertTrue(putFile("argfile-n2.txt", "b c"), "the inner file is made");
+        assertTrue(sameText(expandedText(more(more(args("x"), "@argfile-n1.txt"), "y")), "x|a|b|c|d|y"), "a file names a file");
+        assertTrue(sameText(expandedText(more(more(args("@argfile-n2.txt"), "@argfile-n2.txt"), "z")), "b|c|b|c|z"), "a file named twice side by side is no cycle");
+        assertTrue(putFile("argfile-n3.txt", "\"@argfile-n2.txt\" '@argfile-n2.txt'"), "the quoted file is made");
+        assertTrue(sameText(expandedText(args("@argfile-n3.txt")), "b|c|b|c"), "a word in quotes that begins with @ is a file, as in gcc");
+        assertTrue(sameText(expandedText(more(more(args("@@argfile-n2.txt"), "@"), "@@")), "@argfile-n2.txt|@|@"), "@@name is @name, @ alone stays, @@ is @");
+        assertTrue(putFile("argfile-n4.txt", "@@x @ @@ a@b"), "the file with escapes is made");
+        assertTrue(sameText(expandedText(args("@argfile-n4.txt")), "@x|@|@|a@b"), "the same in a file; an @ inside a word is nothing");
+        assertTrue(sameText(expandedText(more(more(more(args("-v"), "--"), "@argfile-n2.txt"), "@@y")), "-v|--|@argfile-n2.txt|@@y"), "after -- nothing is expanded or unescaped");
+        assertTrue(putFile("argfile-n5.txt", "p -- q @argfile-n2.txt"), "the file with -- is made");
+        assertTrue(sameText(expandedText(more(args("@argfile-n5.txt"), "@argfile-n2.txt")), "p|--|q|@argfile-n2.txt|@argfile-n2.txt"), "a -- in a file ends the expansion for the rest of the line");
+        assertTrue(sameText(expandedText(args("")), ""), "no words, no file");
+        let gone1: Bool := removeFileIfThere("argfile-n1.txt");
+        let gone2: Bool := removeFileIfThere("argfile-n2.txt");
+        let gone3: Bool := removeFileIfThere("argfile-n3.txt");
+        let gone4: Bool := removeFileIfThere("argfile-n4.txt");
+        let gone5: Bool := removeFileIfThere("argfile-n5.txt");
+        return nil;
+    end;
+
+    -- every mistake with a file is a value, with the place it was named.
+    function testArgumentFileErrors(): Unit is
+        assertTrue(expandFails(more(args("-v"), "@argfile-missing.txt"), ArgumentFileUnreadable(), 1, "tool: cannot read the argument file argfile-missing.txt"), "a file that is not there");
+        assertTrue(expandFails(args("@."), ArgumentFileUnreadable(), 0, "tool: cannot read the argument file ."), "a directory is no argument file");
+        assertTrue(putFile("argfile-e1.txt", "a\nb @argfile-missing.txt"), "the naming file is made");
+        assertTrue(expandFails(more(more(args("a"), "b"), "@argfile-e1.txt"), ArgumentFileUnreadable(), 2, "tool: cannot read the argument file argfile-missing.txt, named in argfile-e1.txt at line 2"), "a file named in a file: its place and its line");
+        assertTrue(putFile("argfile-e2.txt", "a\n'b c"), "the quote file is made");
+        assertTrue(expandFails(args("@argfile-e2.txt"), ArgumentFileSyntax(), 0, "tool: the argument file argfile-e2.txt has a quote that is never closed, at line 2"), "a quote never closed");
+        assertTrue(putFile("argfile-e3.txt", "a b\\"), "the backslash file is made");
+        assertTrue(expandFails(args("@argfile-e3.txt"), ArgumentFileSyntax(), 0, "tool: the argument file argfile-e3.txt ends in a backslash, at line 1"), "a backslash at the end");
+        assertTrue(putFile("argfile-e4.txt", "x\n\"y\ny\" "), "the multi-line quote file is made");
+        assertTrue(sameText(expandedText(args("@argfile-e4.txt")), "x|y\ny"), "a quote may span lines");
+        var zero: StringBuilder := makeStringBuilder();
+        writeString(&!zero, "x\ny");
+        writeByte(&!zero, 0);
+        writeByte(&!zero, '\n');
+        let zeroText: String := finalize(zero);
+        assertTrue(putFile("argfile-e5.txt", asSpan(&zeroText)), "the file with a zero byte is made");
+        destroyString(zeroText);
+        assertTrue(expandFails(args("@argfile-e5.txt"), ArgumentFileSyntax(), 0, "tool: the argument file argfile-e5.txt holds a zero byte, at line 2"), "a zero byte");
+        assertTrue(putFile("argfile-c1.txt", "@argfile-c1.txt"), "the self-naming file is made");
+        assertTrue(expandFails(more(args("a"), "@argfile-c1.txt"), ArgumentFileCycle(), 1, "tool: the argument file argfile-c1.txt names itself, directly or through others, named in argfile-c1.txt at line 1"), "a file that names itself");
+        assertTrue(putFile("argfile-c2.txt", "x @argfile-c3.txt"), "the first of two is made");
+        assertTrue(putFile("argfile-c3.txt", "\n@argfile-c2.txt"), "the second of two is made");
+        assertTrue(expandFails(args("@argfile-c2.txt"), ArgumentFileCycle(), 0, "tool: the argument file argfile-c2.txt names itself, directly or through others, named in argfile-c3.txt at line 2"), "two files that name each other");
+        assertTrue(putFile("argfile-c4.txt", "@./argfile-c4.txt"), "the file that names itself another way is made");
+        assertTrue(expandFails(args("@argfile-c4.txt"), ArgumentFileCycle(), 0, "tool: the argument file ./argfile-c4.txt names itself, directly or through others, named in argfile-c4.txt at line 1"), "the same file under another spelling");
+        assertTrue(expandFails(args("@/dev/null"), ArgumentFileUnreadable(), 0, "tool: cannot read the argument file /dev/null"), "only a regular file is an argument file");
+        assertTrue(putFile("argfile-e6.txt", "a\n'b\nc' d\n@argfile-missing.txt"), "the file with a quote over two lines is made");
+        assertTrue(expandFails(args("@argfile-e6.txt"), ArgumentFileUnreadable(), 0, "tool: cannot read the argument file argfile-missing.txt, named in argfile-e6.txt at line 4"), "the lines of a quote are counted");
+        let gone1: Bool := removeFileIfThere("argfile-e1.txt");
+        let gone2: Bool := removeFileIfThere("argfile-e2.txt");
+        let gone3: Bool := removeFileIfThere("argfile-e3.txt");
+        let gone4: Bool := removeFileIfThere("argfile-e4.txt");
+        let gone5: Bool := removeFileIfThere("argfile-e5.txt");
+        let gone6: Bool := removeFileIfThere("argfile-c1.txt");
+        let gone7: Bool := removeFileIfThere("argfile-c2.txt");
+        let gone8: Bool := removeFileIfThere("argfile-c3.txt");
+        let gone9: Bool := removeFileIfThere("argfile-c4.txt");
+        let goneA: Bool := removeFileIfThere("argfile-e6.txt");
+        return nil;
+    end;
+
+    -- the limits: each is held at its value and refused one beyond it.
+    function testArgumentFileLimits(): Unit is
+        assertTrue(putFile("argfile-d0.txt", "@argfile-d1.txt"), "d0");
+        assertTrue(putFile("argfile-d1.txt", "@argfile-d2.txt"), "d1");
+        assertTrue(putFile("argfile-d2.txt", "@argfile-d3.txt"), "d2");
+        assertTrue(putFile("argfile-d3.txt", "@argfile-d4.txt"), "d3");
+        assertTrue(putFile("argfile-d4.txt", "@argfile-d5.txt"), "d4");
+        assertTrue(putFile("argfile-d5.txt", "@argfile-d6.txt"), "d5");
+        assertTrue(putFile("argfile-d6.txt", "@argfile-d7.txt"), "d6");
+        assertTrue(putFile("argfile-d7.txt", "@argfile-d8.txt"), "d7");
+        assertTrue(putFile("argfile-d8.txt", "@argfile-d9.txt"), "d8");
+        assertTrue(putFile("argfile-d9.txt", "@argfile-d10.txt"), "d9");
+        assertTrue(putFile("argfile-d10.txt", "end"), "d10");
+        assertTrue(sameText(expandedText(args("@argfile-d1.txt")), "end"), "ten files nested are allowed");
+        assertTrue(expandFails(args("@argfile-d0.txt"), ArgumentFileTooDeep(), 0, "tool: argument files are nested more than 10 deep, at argfile-d10.txt, named in argfile-d9.txt at line 1"), "eleven are not");
+        assertTrue(putBlank("argfile-l1.txt", 4194304), "the file of 4 MiB is made");
+        assertTrue(sameText(expandedText(args("@argfile-l1.txt")), ""), "a file of 4 MiB is allowed");
+        assertTrue(putBlank("argfile-l2.txt", 4194305), "the file of 4 MiB and a byte is made");
+        assertTrue(expandFails(args("@argfile-l2.txt"), ArgumentFileTooLarge(), 0, "tool: the argument file argfile-l2.txt is larger than 4 MiB"), "a byte more is not");
+        assertTrue(sameText(expandedText(more(more(more(args("@argfile-l1.txt"), "@argfile-l1.txt"), "@argfile-l1.txt"), "@argfile-l1.txt")), ""), "four files of 4 MiB are 16 MiB, allowed");
+        assertTrue(expandFails(more(more(more(more(args("@argfile-l1.txt"), "@argfile-l1.txt"), "@argfile-l1.txt"), "@argfile-l1.txt"), "@argfile-l1.txt"), ArgumentFileTooLarge(), 4, "tool: the argument files hold more than 16 MiB, at argfile-l1.txt"), "a fifth is not");
+        assertTrue(putFile("argfile-l3.txt", ""), "the empty file is made");
+        assertTrue(putRepeated("argfile-l4.txt", "@argfile-l3.txt ", 1023), "the file of 1023 names is made");
+        assertTrue(sameText(expandedText(args("@argfile-l4.txt")), ""), "1024 files are allowed");
+        assertTrue(putRepeated("argfile-l5.txt", "@argfile-l3.txt ", 1024), "the file of 1024 names is made");
+        assertTrue(expandFails(args("@argfile-l5.txt"), ArgumentFileTooLarge(), 0, "tool: more than 1024 argument files, at argfile-l3.txt, named in argfile-l5.txt at line 1"), "a 1025th is not");
+        assertTrue(putRepeated("argfile-l6.txt", "a a a a a a a a a a ", 25000), "the file of 250000 words is made");
+        assertTrue(expandedCount(args("@argfile-l6.txt")) = 250000, "250000 words are allowed");
+        assertTrue(putRepeated("argfile-l7.txt", "a a a a a a a a a a ", 25001), "the file of 250010 words is made");
+        assertTrue(expandFails(args("@argfile-l7.txt"), ArgumentFileTooLarge(), 0, "tool: more than 250000 arguments, at the argument file argfile-l7.txt"), "a word more is not");
+        assertTrue(expandedCount(manyWords(250000)) = 250000, "a line of 250000 words alone is allowed");
+        assertTrue(expandFails(manyWords(250001), ArgumentFileTooLarge(), 250000, "tool: more than 250000 arguments"), "and one of 250001 is not");
+        let gone0: Bool := removeFileIfThere("argfile-d0.txt");
+        let gone1: Bool := removeFileIfThere("argfile-d1.txt");
+        let gone2: Bool := removeFileIfThere("argfile-d2.txt");
+        let gone3: Bool := removeFileIfThere("argfile-d3.txt");
+        let gone4: Bool := removeFileIfThere("argfile-d4.txt");
+        let gone5: Bool := removeFileIfThere("argfile-d5.txt");
+        let gone6: Bool := removeFileIfThere("argfile-d6.txt");
+        let gone7: Bool := removeFileIfThere("argfile-d7.txt");
+        let gone8: Bool := removeFileIfThere("argfile-d8.txt");
+        let gone9: Bool := removeFileIfThere("argfile-d9.txt");
+        let gone10: Bool := removeFileIfThere("argfile-d10.txt");
+        let goneA: Bool := removeFileIfThere("argfile-l1.txt");
+        let goneB: Bool := removeFileIfThere("argfile-l2.txt");
+        let goneC: Bool := removeFileIfThere("argfile-l3.txt");
+        let goneD: Bool := removeFileIfThere("argfile-l4.txt");
+        let goneE: Bool := removeFileIfThere("argfile-l5.txt");
+        let goneF: Bool := removeFileIfThere("argfile-l6.txt");
+        let goneG: Bool := removeFileIfThere("argfile-l7.txt");
+        return nil;
+    end;
+
+    -- A line of count words a.
+    function manyWords(count: Index): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        while i < count do
+            insertBack(&!out, fromLiteral("a"));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- How many words an expansion has; maximum_index when it failed.
+    function expandedCount(a: Buffer[String]): Index is
+        let result: Either[ArgumentError, Buffer[String]] := expandArgumentFiles(&a);
+        destroyArguments(a);
+        case result of
+            when Left(left as e: ArgumentError) do
+                destroyError(e);
+                return maximum_index;
+            when Right(right as words: Buffer[String]) do
+                let count: Index := bufferLength(&words);
+                destroyArguments(words);
+                return count;
+        end case;
+    end;
+
+    -- Expands a and checks that it failed with kind at position, not its
+    -- message.
+    function failsAsExpand(a: Buffer[String], kind: ErrorKind, position: Index): Bool is
+        let result: Either[ArgumentError, Buffer[String]] := expandArgumentFiles(&a);
+        destroyArguments(a);
+        case result of
+            when Left(left as e: ArgumentError) do
+                var at: Index := maximum_index;
+                case errorPosition(&e) of
+                    when Some(value as p: Index) do
+                        at := p;
+                    when None do
+                        skip;
+                end case;
+                let good: Bool := (kindNumber(errorKind(&e)) = kindNumber(kind)) and (at = position);
+                destroyError(e);
+                return good;
+            when Right(right as words: Buffer[String]) do
+                destroyArguments(words);
+                return false;
+        end case;
+    end;
+
+    -- the words of a file are parsed like the words of the line, and an
+    -- error is placed in the expanded vector.
+    function testArgumentFileParse(): Unit is
+        var c: Command := makeCommand("tool", "Does things.");
+        let verbose: FlagKey := addVerbose(&!c, "More output");
+        let output: TextKey := addText(&!c, option("output", 'o', "Where to write"), "");
+        let files: PositionalKey := addPositional(&!c, "file", "What to read", false, true);
+        assertTrue(putFile("argfile-p1.txt", "-v --output \"my file.txt\"\na.c b.c"), "the file of options is made");
+        case runOf(&c, expanded(more(more(args("-v"), "@argfile-p1.txt"), "c.c"))) of
+            when Some(value as m: Matches) do
+                assertTrue(flagCount(&m, verbose) = 2, "-v on the line and -v in the file");
+                assertTrue(valueIs(textOf(&m, output), "my file.txt"), "a quoted value with a space");
+                assertTrue(positionalCount(&m, files) = 3, "three files, from the file and the line");
+                assertTrue(valueIs(positionalAt(&m, files, 0), "a.c"), "the first");
+                assertTrue(valueIs(positionalAt(&m, files, 2), "c.c"), "the last, from the line");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "the expanded line parses");
+        end case;
+        assertTrue(putFile("argfile-p2.txt", "-v --nope"), "the file with a mistake is made");
+        assertTrue(failsWith(&c, expanded(more(args("x"), "@argfile-p2.txt")), UnknownOption(), 2, "tool: unknown option --nope\nUsage: tool [OPTIONS] [FILE]...\nTry tool --help for more information.\n"), "the place is the index in the expanded vector");
+        assertTrue(putFile("argfile-p3.txt", "--output -v"), "the file with an option value that begins with a dash is made");
+        case runOf(&c, expanded(args("@argfile-p3.txt"))) of
+            when Some(value as m: Matches) do
+                assertTrue(valueIs(textOf(&m, output), "-v"), "an option takes the next word, as on the line");
+                assertTrue(flagCount(&m, verbose) = 0, "and it is not a flag");
+                destroyMatches(m);
+            when None do
+                assertTrue(false, "that parses");
+        end case;
+        destroyCommand(c);
+        let gone1: Bool := removeFileIfThere("argfile-p1.txt");
+        let gone2: Bool := removeFileIfThere("argfile-p2.txt");
+        let gone3: Bool := removeFileIfThere("argfile-p3.txt");
+        return nil;
+    end;
+
+    -- no word stops the programme: a path of 100000 bytes, a zero byte or a byte
+    -- that is no UTF-8 in a name, an @ alone.
+    function testArgumentFilesNothingStops(): Unit is
+        var wide: StringBuilder := makeStringBuilder();
+        writeByte(&!wide, '@');
+        var i: Index := 0;
+        while i < 100000 do
+            writeByte(&!wide, 'x');
+            i := i + 1;
+        end while;
+        var a: Buffer[String] := allocateEmpty();
+        insertBack(&!a, finalize(wide));
+        assertTrue(failsAsExpand(a, ArgumentFileUnreadable(), 0), "a path of 100000 bytes");
+        assertTrue(expandFails(oneByte("@", 255), ArgumentFileUnreadable(), 0, "tool: cannot read the argument file \\xff"), "a name that is no UTF-8, shown as bytes");
+        var nul: StringBuilder := makeStringBuilder();
+        writeString(&!nul, "@a");
+        writeByte(&!nul, 0);
+        writeString(&!nul, "b");
+        var z: Buffer[String] := allocateEmpty();
+        insertBack(&!z, finalize(nul));
+        assertTrue(failsAsExpand(z, ArgumentFileUnreadable(), 0), "a zero byte in a name");
+        assertTrue(sameText(expandedText(args("@")), "@"), "@ alone");
+        assertTrue(sameText(expandedText(args("--")), "--"), "-- alone");
+        assertTrue(sameText(expandedText(args("-@x")), "-@x"), "an @ that does not begin the word");
+        return nil;
+    end;
+end module body.

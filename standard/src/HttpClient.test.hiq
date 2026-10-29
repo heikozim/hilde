@@ -1,0 +1,341 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.HttpClient (
+    Method,
+    Get,
+    Post,
+    Limits,
+    FailureKind,
+    BadUrl,
+    BadRequest,
+    NotResolved,
+    NotPublic,
+    ConnectFailed,
+    TimedOut,
+    TlsFailed,
+    TooLarge,
+    BadResponse,
+    Failure,
+    Response,
+    Target,
+    defaultLimits,
+    parseUrl,
+    destroyTarget,
+    validHeaderLines,
+    request,
+    destroyResponse
+);
+import Standard.Ip (
+    IpAddress,
+    ipFromBytes,
+    ipToString,
+    isIpv6
+);
+
+module body Standard.HttpClient.Test is
+    ---
+    --- Helpers
+    ---
+
+    generic [R: Region]
+    function sameText(text: &[String, R], other: Span[Nat8, Static]): Bool is
+        let size: Index := stringLength(text);
+        if size /= spanLength(other) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= other[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether url is read as host, port and path.
+    function parsesAs(url: Span[Nat8, Static], host: Span[Nat8, Static], port: Nat16, path: Span[Nat8, Static]): Bool is
+        case parseUrl(url) of
+            when Some(value as target: Target) do
+                let { host as found: String, port as foundPort: Nat16, path as foundPath: String } := target;
+                let same: Bool := sameText(&found, host) and ((foundPort = port) and sameText(&foundPath, path));
+                destroyString(found);
+                destroyString(foundPath);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether url is refused.
+    function refusedUrl(url: Span[Nat8, Static]): Bool is
+        case parseUrl(url) of
+            when Some(value as target: Target) do
+                destroyTarget(target);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function kindCode(kind: FailureKind): Int32 is
+        case kind of
+            when BadUrl do
+                return 1;
+            when BadRequest do
+                return 2;
+            when NotResolved do
+                return 3;
+            when NotPublic do
+                return 4;
+            when ConnectFailed do
+                return 5;
+            when TimedOut do
+                return 6;
+            when TlsFailed do
+                return 7;
+            when TooLarge do
+                return 8;
+            when BadResponse do
+                return 9;
+        end case;
+    end;
+
+    -- The kind of failure of a request with the default limits, 0 when it
+    -- had an answer.  None of these reaches the network: each is refused
+    -- before a connection is tried.
+    function failureOf(verb: Method, url: Span[Nat8, Static], headers: Span[Nat8, Static], payload: Span[Nat8, Static]): Int32 is
+        case request(verb, url, headers, payload, "no-such-ca.pem", defaultLimits()) of
+            when Left(left as failed: Failure) do
+                let { kind: FailureKind, detail: String } := failed;
+                destroyString(detail);
+                return kindCode(kind);
+            when Right(right as answer: Response) do
+                destroyResponse(answer);
+                return 0;
+        end case;
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    function testDefaultLimits(): Unit is
+        let limits: Limits := defaultLimits();
+        let connect: Nat32 := 10000;
+        let total: Nat32 := 30000;
+        let most: Index := 104857600;
+        assertTrue(limits.connectMillis = connect, "ten seconds to connect");
+        assertTrue(limits.totalMillis = total, "thirty seconds in all");
+        assertTrue(limits.maximumBytes = most, "100 MiB at most");
+        assertTrue(limits.publicOnly, "only public addresses");
+        return nil;
+    end;
+
+    function testUrlsRead(): Unit is
+        let standard: Nat16 := 443;
+        let other: Nat16 := 8443;
+        let last: Nat16 := 65535;
+        let v6port: Nat16 := 444;
+        assertTrue(parsesAs("https://example.com", "example.com", standard, "/"), "no path gives a slash");
+        assertTrue(parsesAs("https://example.com:8443/a/b?c=d#frag", "example.com", other, "/a/b?c=d"), "port, path, query, the fragment dropped");
+        assertTrue(parsesAs("HTTPS://Example.COM/x", "Example.COM", standard, "/x"), "the scheme in any case, the host as written");
+        assertTrue(parsesAs("https://[2001:db8::1]:444/p", "2001:db8::1", v6port, "/p"), "an IPv6 literal without its brackets");
+        assertTrue(parsesAs("https://[::1]/", "::1", standard, "/"), "the IPv6 loopback address");
+        assertTrue(parsesAs("https://192.0.2.1?q", "192.0.2.1", standard, "/?q"), "a query without a path gets a slash");
+        assertTrue(parsesAs("https://example.com:65535/", "example.com", last, "/"), "the highest port");
+        assertTrue(parsesAs("https://localhost:08443/", "localhost", other, "/"), "a port with a leading zero");
+        return nil;
+    end;
+
+    function testUrlsRefused(): Unit is
+        assertTrue(refusedUrl("http://example.com/"), "http is refused");
+        assertTrue(refusedUrl("https://"), "no host");
+        assertTrue(refusedUrl("https:///path"), "an empty host");
+        assertTrue(refusedUrl("https://user@example.com/"), "user information before the host");
+        assertTrue(refusedUrl("https://example.com:0/"), "port 0");
+        assertTrue(refusedUrl("https://example.com:65536/"), "a port above 65535");
+        assertTrue(refusedUrl("https://example.com:/"), "an empty port");
+        assertTrue(refusedUrl("https://example.com:44a/"), "a port that is not a number");
+        assertTrue(refusedUrl("https://example.com:123456/"), "a port of six digits");
+        assertTrue(refusedUrl("https://[2001:db8::1/"), "no closing bracket");
+        assertTrue(refusedUrl("https://[]/"), "empty brackets");
+        assertTrue(refusedUrl("https://[192.0.2.1]/"), "an IPv4 address in brackets");
+        assertTrue(refusedUrl("https://[::1]x/"), "something after the bracket that is not a port");
+        assertTrue(refusedUrl("https://exa mple.com/"), "a space in the host");
+        assertTrue(refusedUrl("https://-example.com/"), "a label that begins with a hyphen");
+        assertTrue(refusedUrl("https://example.com/a b"), "a space in the path");
+        assertTrue(refusedUrl("ftp://example.com/"), "another scheme");
+        return nil;
+    end;
+
+    function testHeaderLinesTaken(): Unit is
+        assertTrue(validHeaderLines(""), "no header lines");
+        assertTrue(validHeaderLines("X-Test: 1"), "one line without a line end");
+        assertTrue(validHeaderLines("X-Test: 1\r\nAccept: text/html"), "two lines, CRLF between them");
+        assertTrue(validHeaderLines("A: b\nC: d\n"), "LF alone, and a line end after the last");
+        assertTrue(validHeaderLines("X-Tab:\tvalue with spaces"), "a tab and spaces in the value");
+        assertTrue(validHeaderLines("X-Marks!#$%&'*+-.^_`|~: v"), "every mark RFC 9110 allows in a name");
+        return nil;
+    end;
+
+    function testHeaderLinesRefused(): Unit is
+        assertFalse(validHeaderLines("X Test: 1"), "a space in the name");
+        assertFalse(validHeaderLines(": v"), "an empty name");
+        assertFalse(validHeaderLines("NoColon"), "no colon");
+        assertFalse(validHeaderLines("Host: example.com"), "Host is the client's");
+        assertFalse(validHeaderLines("host: example.com"), "in any case");
+        assertFalse(validHeaderLines("Content-Length: 3"), "Content-Length is the client's");
+        assertFalse(validHeaderLines("Transfer-Encoding: chunked"), "Transfer-Encoding is the client's");
+        assertFalse(validHeaderLines("Connection: keep-alive"), "Connection is the client's");
+        assertFalse(validHeaderLines("X-A: 1\r\nHost: evil.example"), "a reserved name on a later line");
+        assertFalse(validHeaderLines("X-A: a\rb"), "a carriage return inside a line");
+        assertFalse(validHeaderLines("X-A: a\n\nbody"), "an empty line between lines");
+        assertFalse(validWithByte(1), "a control byte in the value");
+        assertFalse(validWithByte(127), "the delete byte in the value");
+        assertTrue(validWithByte(200), "a byte above 127 in the value");
+        return nil;
+    end;
+
+    -- Whether the line X-A: a, byte, b is taken.
+    function validWithByte(byte: Nat8): Bool is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "X-A: a");
+        writeByte(&!out, byte);
+        writeByte(&!out, 'b');
+        let line: String := finalize(out);
+        let valid: Bool := validHeaderLines(asSpan(&line));
+        destroyString(line);
+        return valid;
+    end;
+
+    function testRefusedBeforeConnecting(): Unit is
+        let get: Method := Get();
+        let post: Method := Post();
+        assertTrue(failureOf(get, "https://example.com/", "Host: other.example", "") = 2, "a reserved header line is BadRequest");
+        assertTrue(failureOf(get, "https://example.com/", "", "body") = 2, "a GET with a body is BadRequest");
+        assertTrue(failureOf(post, "http://example.com/", "", "body") = 1, "http is BadUrl");
+        return nil;
+    end;
+
+    -- The bytes of the IPv4 address a.b.c.d.
+    function v4(a: Nat8, b: Nat8, c: Nat8, d: Nat8): String is
+        var bytes: StringBuilder := makeStringBuilder();
+        writeByte(&!bytes, a);
+        writeByte(&!bytes, b);
+        writeByte(&!bytes, c);
+        writeByte(&!bytes, d);
+        return finalize(bytes);
+    end;
+
+    -- The bytes of an IPv6 address whose first group is high and low,
+    -- whose last group is 1 and whose other groups are zero.
+    function v6(high: Nat8, low: Nat8): String is
+        var bytes: StringBuilder := makeStringBuilder();
+        writeByte(&!bytes, high);
+        writeByte(&!bytes, low);
+        var i: Index := 0;
+        while i < 13 do
+            writeByte(&!bytes, 0);
+            i := i + 1;
+        end while;
+        writeByte(&!bytes, 1);
+        return finalize(bytes);
+    end;
+
+    -- The bytes of the IPv6 address that maps the IPv4 address a.b.c.d.
+    function mapped(a: Nat8, b: Nat8, c: Nat8, d: Nat8): String is
+        var bytes: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 10 do
+            writeByte(&!bytes, 0);
+            i := i + 1;
+        end while;
+        writeByte(&!bytes, 255);
+        writeByte(&!bytes, 255);
+        writeByte(&!bytes, a);
+        writeByte(&!bytes, b);
+        writeByte(&!bytes, c);
+        writeByte(&!bytes, d);
+        return finalize(bytes);
+    end;
+
+    -- The URL of the address the bytes make, an IPv6 address in brackets;
+    -- the empty string when the bytes are no address.  The private
+    -- addresses are given as bytes, so that none stands in the text of
+    -- the tests.
+    function urlOf(bytes: String): String is
+        var url: StringBuilder := makeStringBuilder();
+        case ipFromBytes(asSpan(&bytes)) of
+            when Some(value as address: IpAddress) do
+                let text: String := ipToString(address);
+                if isIpv6(address) then
+                    writeString(&!url, "https://[");
+                    writeString(&!url, asSpan(&text));
+                    writeString(&!url, "]/");
+                else
+                    writeString(&!url, "https://");
+                    writeString(&!url, asSpan(&text));
+                    writeString(&!url, "/");
+                end if;
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        destroyString(bytes);
+        return finalize(url);
+    end;
+
+    -- The code of the failure of a GET of url, without headers or
+    -- payload, as failureOf gives it.
+    function failureAt(url: String): Int32 is
+        var code: Int32 := 0;
+        case request(Get(), asSpan(&url), "", "", "no-such-ca.pem", defaultLimits()) of
+            when Left(left as failed: Failure) do
+                let { kind: FailureKind, detail: String } := failed;
+                destroyString(detail);
+                code := kindCode(kind);
+            when Right(right as answer: Response) do
+                destroyResponse(answer);
+        end case;
+        destroyString(url);
+        return code;
+    end;
+
+    function testNotPublic(): Unit is
+        let get: Method := Get();
+        assertTrue(failureOf(get, "https://127.0.0.1/", "", "") = 4, "the IPv4 loopback address");
+        assertTrue(failureOf(get, "https://[::1]/", "", "") = 4, "the IPv6 loopback address");
+        assertTrue(failureAt(urlOf(v4(10, 0, 0, 1))) = 4, "a private address");
+        assertTrue(failureAt(urlOf(v4(169, 254, 169, 254))) = 4, "the metadata address of cloud hosts");
+        assertTrue(failureOf(get, "https://[::ffff:7f00:1]/", "", "") = 4, "a mapped IPv4 loopback address");
+        assertTrue(failureAt(urlOf(mapped(10, 0, 0, 1))) = 4, "a mapped private address");
+        assertTrue(failureAt(urlOf(v6(253, 0))) = 4, "a unique local address");
+        assertTrue(failureOf(get, "https://localhost/", "", "") = 4, "a name that resolves to loopback");
+        assertTrue(failureOf(get, "https://[::ffff:127.0.0.1]/", "", "") = 1, "the dotted mapped form, which Standard.Ip does not read, is refused as a URL");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,417 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A directed graph whose nodes and edges each carry a value.
+
+- A NodeId or EdgeId of a removed node or edge, or of another graph, gets None, false or Left.
+- Such a number never reaches another node or edge.
+- Values may be linear and nothing is dropped: whatever leaves the graph comes back to the caller.
+- A graph is destroyed only empty, with destroyEmpty, or with free values, with destroyFree.
+- Every walk and search has a fixed order, the same on every run and every platform.
+- The instances of Weight and of TotalOrder for NodeId and EdgeId come with any import from here.
+
+    var graph: Graph[Nat32, Nat64] := makeGraph();
+    let from: NodeId := addNode(&!graph, 1);
+    let to: NodeId := addNode(&!graph, 2);
+    let added: Either[Nat64, EdgeId] := addEdge(&!graph, from, to, 5);
+    let reached: Bool := hasPath(&graph, from, to);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.Tuples (
+    Pair
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.Order (
+    TotalOrder
+);
+
+module Standard.Graph is
+    """
+    The graph type.  N is the type of the node values, E the type of the
+    edge values.
+    """
+    type Graph[N: Type, E: Type]: Linear;
+
+    """
+    The number of a node: the graph that gave it out, a slot, and the
+    generation of that slot.
+    """
+    type NodeId: Free;
+
+    """
+    The number of an edge: the graph that gave it out, a slot, and the
+    generation of that slot.
+    """
+    type EdgeId: Free;
+
+    """
+    Numbers are ordered by slot, then by generation, then by the graph that
+    gave them out.  So they can be compared with equal from Standard.Order,
+    sorted, and used as the keys of a Standard.Map, and two numbers of
+    different graphs are never equal.
+    """
+    instance TotalOrder(NodeId);
+
+    """
+    Edge numbers are ordered as node numbers are.
+    """
+    instance TotalOrder(EdgeId);
+
+    """
+    The weight of an edge value, which lightestPath adds up.  It is a
+    Nat64, so a weight is never negative.
+    """
+    typeclass Weight(E: Type) is
+        """
+        No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+        """
+        generic [R: Region]
+        method weightOf(edge: &[E, R]): Nat64;
+    end;
+
+    instance Weight(Nat8);
+    instance Weight(Nat16);
+    instance Weight(Nat32);
+    instance Weight(Nat64);
+
+    """
+    Why lightestPath hands back no path.  UnknownNode: start or goal names
+    no node of the graph.  Unreachable: no path leads from start to goal.
+    TooHeavy: paths lead there, and every one weighs more than a Nat64
+    holds, so no sum can be given.
+    """
+    union NoPath: Free is
+        case UnknownNode;
+        case Unreachable;
+        case TooHeavy;
+    end;
+
+    ---
+    --- Lifecycle
+    ---
+
+    """
+    An empty graph.  Aborts when memory runs out, as Standard.Buffer does,
+    or when the process has made as many graphs as a Nat64 counts.
+    """
+    generic [N: Type, E: Type]
+    function makeGraph(): Graph[N, E]
+        ensures (nodeCount(&result) = 0) and (edgeCount(&result) = 0);
+
+    """
+    An empty graph whose slots retire at lastGeneration instead of at the
+    largest Nat32.  A slot freed while its generation is lastGeneration is
+    never taken again, so no number can come to name a second node.  A
+    small value reaches this after a few removals instead of about four
+    billion; nothing else differs from makeGraph.  Aborts as makeGraph does.
+    """
+    generic [N: Type, E: Type]
+    function makeGraphRetiringAt(lastGeneration: Nat32): Graph[N, E]
+        ensures (nodeCount(&result) = 0) and (edgeCount(&result) = 0);
+
+    """
+    Destroy a graph that holds no node.  The graph must hold no node and no
+    edge: that is the duty of the caller, a requires, because the value of a
+    node would be lost, and a linear value must not be lost.  A call on a
+    graph that holds one stops the programme with the line of the call.
+    """
+    generic [N: Type, E: Type]
+    function destroyEmpty(graph: Graph[N, E]): Unit
+        requires (nodeCount(&graph) = 0) and (edgeCount(&graph) = 0);
+
+    """
+    Destroy a graph whose node and edge values are free, whatever it
+    holds.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [N: Free, E: Free]
+    function destroyFree(graph: Graph[N, E]): Unit;
+
+    ---
+    --- Numbers
+    ---
+
+    """
+    The slot a node number names.  Two nodes that are in one graph at the
+    same time never share a slot.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function nodeSlot(node: NodeId): Index;
+
+    """
+    The generation a node number names.  It counts up each time the slot
+    is freed.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function nodeGeneration(node: NodeId): Nat32;
+
+    """
+    The slot an edge number names.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function edgeSlot(edge: EdgeId): Index;
+
+    """
+    The generation an edge number names.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function edgeGeneration(edge: EdgeId): Nat32;
+
+    ---
+    --- Asking
+    ---
+
+    """
+    The number of nodes.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function nodeCount(graph: &[Graph[N, E], R]): Index;
+
+    """
+    The number of edges.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function edgeCount(graph: &[Graph[N, E], R]): Index;
+
+    """
+    Whether the number names a node of the graph.  False for a number whose
+    node was removed, even when another node took its slot, and for a
+    number of another graph.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function containsNode(graph: &[Graph[N, E], R], node: NodeId): Bool;
+
+    """
+    Whether the number names an edge of the graph, with the same meaning as
+    containsNode.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function containsEdge(graph: &[Graph[N, E], R], edge: EdgeId): Bool;
+
+    """
+    A copy of the value of a node, for a free value.  None when the number
+    names no node of the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Free, E: Type, R: Region]
+    function nodeValue(graph: &[Graph[N, E], R], node: NodeId): Option[N];
+
+    """
+    A reference to the value of a node, for any value.  It lives as long as
+    the borrow of the graph.  None when the number names no node of the
+    graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function nodeRef(graph: &[Graph[N, E], R], node: NodeId): Option[&[N, R]];
+
+    """
+    A copy of the value of an edge, for a free value.  None when the number
+    names no edge of the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Free, R: Region]
+    function edgeValue(graph: &[Graph[N, E], R], edge: EdgeId): Option[E];
+
+    """
+    A reference to the value of an edge, for any value.  None when the
+    number names no edge of the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function edgeRef(graph: &[Graph[N, E], R], edge: EdgeId): Option[&[E, R]];
+
+    """
+    The node an edge leaves.  None when the number names no edge of the
+    graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function edgeSource(graph: &[Graph[N, E], R], edge: EdgeId): Option[NodeId];
+
+    """
+    The node an edge enters.  None when the number names no edge of the
+    graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function edgeTarget(graph: &[Graph[N, E], R], edge: EdgeId): Option[NodeId];
+
+    ---
+    --- Changing
+    ---
+
+    """
+    Add a node with value and return its number.  The node takes the slot
+    freed last, or a new slot at the end.  Aborts when memory runs out.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function addNode(graph: &![Graph[N, E], R], value: N): NodeId
+        ensures nodeCount(&graph) = (old(nodeCount(&graph)) + 1);
+
+    """
+    Add an edge with value from source to target and return its number in
+    Right.  An edge may lead from a node to itself, and two nodes may be
+    joined by several edges.  Left hands value back when source or target
+    names no node of the graph.  Left is the failure and Right the success,
+    as everywhere in the standard library.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function addEdge(graph: &![Graph[N, E], R], source: NodeId, target: NodeId, value: E): Either[E, EdgeId];
+
+    """
+    Replace the value of a node.  Right carries the old value.  Left hands
+    value back when the number names no node of the graph.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function replaceNodeValue(graph: &![Graph[N, E], R], node: NodeId, value: N): Either[N, N];
+
+    """
+    Replace the value of an edge.  Right carries the old value.  Left hands
+    value back when the number names no edge of the graph.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function replaceEdgeValue(graph: &![Graph[N, E], R], edge: EdgeId, value: E): Either[E, E];
+
+    """
+    Take an edge out of the graph and return its value.  None when the
+    number names no edge of the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function removeEdge(graph: &![Graph[N, E], R], edge: EdgeId): Option[E];
+
+    """
+    Take a node and every edge that leaves or enters it out of the graph.
+    The pair holds the value of the node and the values of the edges: first
+    the edges that left it, in their order, then the edges that entered it,
+    in theirs; an edge from the node to itself is among the first.  None
+    when the number names no node of the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function removeNode(graph: &![Graph[N, E], R], node: NodeId): Option[Pair[N, Buffer[E]]];
+
+    ---
+    --- Walking
+    ---
+
+    """
+    The numbers of all nodes, in the order of their slots.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function nodes(graph: &[Graph[N, E], R]): Buffer[NodeId];
+
+    """
+    The numbers of all edges, in the order of their slots.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function edges(graph: &[Graph[N, E], R]): Buffer[EdgeId];
+
+    """
+    The edges that leave a node, in the order they were added.  None when
+    the number names no node of the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function outEdges(graph: &[Graph[N, E], R], node: NodeId): Option[Buffer[EdgeId]];
+
+    """
+    The edges that enter a node, in the order they were added.  None when
+    the number names no node of the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function inEdges(graph: &[Graph[N, E], R], node: NodeId): Option[Buffer[EdgeId]];
+
+    ---
+    --- Searching
+    ---
+
+    """
+    The nodes reachable from start, start first, in breadth first order:
+    the nodes one edge away, then two, and so on, each node where the
+    search first passes an edge into it.  None when start names no node of
+    the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function breadthFirst(graph: &[Graph[N, E], R], start: NodeId): Option[Buffer[NodeId]];
+
+    """
+    The nodes reachable from start, in depth first preorder: start, then
+    everything reachable through its first edge that was not seen before,
+    then through its second edge, and so on.  None when start names no
+    node of the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function depthFirst(graph: &[Graph[N, E], R], start: NodeId): Option[Buffer[NodeId]];
+
+    """
+    Whether a path of edges leads from start to goal.  A node reaches
+    itself.  False when either number names no node of the graph.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function hasPath(graph: &[Graph[N, E], R], start: NodeId, goal: NodeId): Bool;
+
+    """
+    A path from start to goal with the fewest edges, as its edges in order.
+    Of several such paths it is the one the breadth first search meets
+    first.  From a node to itself the path is empty.  None when there is no
+    path, or when either number names no node of the graph.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function shortestPath(graph: &[Graph[N, E], R], start: NodeId, goal: NodeId): Option[Buffer[EdgeId]];
+
+    """
+    A path from start to goal whose weights add up to the least, with that
+    sum, in Right.  The nodes are settled in the order of their distance
+    from start; of several such paths it is the one found first.  From a
+    node to itself the path is empty and weighs 0.  Left says why there is
+    none: UnknownNode, Unreachable or TooHeavy, as NoPath describes them.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type(Weight), R: Region]
+    function lightestPath(graph: &[Graph[N, E], R], start: NodeId, goal: NodeId): Either[NoPath, Pair[Nat64, Buffer[EdgeId]]];
+
+    """
+    A cycle, as its edges in order: each edge enters the node the next one
+    leaves, and the last enters the node the first leaves.  No node is
+    passed twice.  An edge from a node to itself is a cycle of one edge.
+    None when the graph has no cycle.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function findCycle(graph: &[Graph[N, E], R]): Option[Buffer[EdgeId]];
+
+    """
+    Every node, each before the nodes its edges lead to, in Right.  First
+    come the nodes that no edge enters, in the order of their slots; then
+    the placed nodes are taken in turn, their leaving edges in order, and a
+    node is placed when the last edge entering it has been passed.  When
+    the graph has a cycle there is no such order, and Left holds one cycle
+    as findCycle gives it.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [N: Type, E: Type, R: Region]
+    function topologicalOrder(graph: &[Graph[N, E], R]): Either[Buffer[EdgeId], Buffer[NodeId]];
+end module.

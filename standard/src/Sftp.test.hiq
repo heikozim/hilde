@@ -1,0 +1,252 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The time limit of a session,
+-- against servers that are small shell scripts: one that answers late, one
+-- that says hello and then nothing, one that sends a reply a byte at a time,
+-- one that never reads, and one that goes away.  The packets of the protocol
+-- are tested end to end against a recorded server.
+--
+-- Each script begins by printing the reply to INIT: the length 5, the type 2
+-- and the version 3.  The scripts that stay silent end in exec sleep 30,
+-- which only a signal ends before the test does.
+import Standard.Testing (
+    assertTrue,
+    underValgrind
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.File (
+    Command,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    exitedNormally,
+    exitCode,
+    endedBySignal,
+    signalNumber,
+    terminationSignal
+);
+import Standard.Sftp (
+    Session,
+    SftpError,
+    timedOut,
+    serverGone,
+    sessionSpoiled,
+    startSession,
+    endSession,
+    sizeOf
+);
+
+module body Standard.Sftp.Test is
+    -- Nothing here may take longer than plainBound milliseconds, or
+    -- valgrindFactor times that under valgrind, which slows the write of a
+    -- megabyte in testRequestNotTakenTimesOut beyond the plain bound.  The
+    -- factor is twice what was measured.
+    constant plainBound: Nat64 := 8000;
+    constant valgrindFactor: Nat64 := 4;
+    constant nanosPerMilli: Nat64 := 1000000;
+
+    function shell(script: Span[Nat8, Static]): Command is
+        let sh: String := fromLiteral("/bin/sh");
+        let flag: String := fromLiteral("-c");
+        let text: String := fromLiteral(script);
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&sh)), asSpan(&flag)), asSpan(&text));
+        destroyString(sh);
+        destroyString(flag);
+        destroyString(text);
+        return command;
+    end;
+
+    function nowNanos(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                return now;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function millisSince(began: Nat64): Nat64 is
+        return (nowNanos() - began) / nanosPerMilli;
+    end;
+
+    -- The bound of this run: plainBound, times valgrindFactor under valgrind.
+    function bound(): Nat64 is
+        if underValgrind() then
+            return plainBound * valgrindFactor;
+        end if;
+        return plainBound;
+    end;
+
+    function sizeCode(result: Either[SftpError, Nat64]): Int32 is
+        case result of
+            when Left(left as error: SftpError) do
+                return error.code;
+            when Right(right as size: Nat64) do
+                return 0;
+        end case;
+    end;
+
+    -- A server that says nothing: no session, in about the time given, and
+    -- the child is gone.
+    function testSilentServerGivesNoSession(): Unit is
+        let began: Nat64 := nowNanos();
+        case startSession(shell("exec sleep 30"), 1000) of
+            when Some(value as opened: Session) do
+                let status: ProcessStatus := endSession(opened);
+                assertTrue(false, "a server that says nothing gave a session");
+            when None do
+                assertTrue(true, "no session");
+        end case;
+        let took: Nat64 := millisSince(began);
+        assertTrue(took >= 950, "the start did not wait for the limit");
+        assertTrue(took < 1700, "the start waited for the child to end by itself, not only for the limit");
+        return nil;
+    end;
+
+    -- The control of the test above: a server that answers after 400
+    -- milliseconds is waited for when the limit is longer, and the wait
+    -- is seen on the clock.
+    function testSlowServerIsWaitedFor(): Unit is
+        let began: Nat64 := nowNanos();
+        case startSession(shell("sleep 0.4; printf '\\000\\000\\000\\005\\002\\000\\000\\000\\003'; cat > /dev/null"), 4000) of
+            when Some(value as opened: Session) do
+                let took: Nat64 := millisSince(began);
+                let status: ProcessStatus := endSession(opened);
+                assertTrue(took >= 350, "the answer came sooner than the server gave it");
+                assertTrue(exitedNormally(status), "the server did not end by itself");
+                assertTrue(exitCode(status) = 0, "the server did not end with 0");
+            when None do
+                assertTrue(false, "a server that answers in time gave no session");
+        end case;
+        assertTrue(millisSince(began) < bound(), "the slow server took far too long");
+        return nil;
+    end;
+
+    -- A server that says hello and then nothing: the call ends with timedOut
+    -- as a value, the next call says the session is spoiled, and the child was
+    -- sent SIGTERM.
+    function testStalledServerTimesOut(): Unit is
+        case startSession(shell("printf '\\000\\000\\000\\005\\002\\000\\000\\000\\003'; exec sleep 30"), 1500) of
+            when Some(value as opened: Session) do
+                var session: Session := opened;
+                let began: Nat64 := nowNanos();
+                let first: Int32 := sizeCode(sizeOf(&!session, "a"));
+                let took: Nat64 := millisSince(began);
+                let second: Int32 := sizeCode(sizeOf(&!session, "a"));
+                let ending: Nat64 := nowNanos();
+                let status: ProcessStatus := endSession(session);
+                assertTrue(millisSince(ending) < 1000, "endSession waited for a child that had been told to end");
+                assertTrue(first = timedOut, "a silent server did not give timedOut");
+                assertTrue(took >= 1450, "the call did not wait for the limit");
+                assertTrue(took < bound(), "the call waited far beyond the limit");
+                assertTrue(second = sessionSpoiled, "the session was not spoiled by the timeout");
+                assertTrue(endedBySignal(status), "the child was not ended by a signal");
+                assertTrue(signalNumber(status) = terminationSignal(), "the signal was not SIGTERM");
+            when None do
+                assertTrue(false, "the server said hello and gave no session");
+        end case;
+        return nil;
+    end;
+
+    -- A server that sends a reply a byte at a time, each byte well within the
+    -- limit: the limit is for the whole exchange, and the call ends with
+    -- timedOut although no single wait was long.
+    function testTrickleTimesOut(): Unit is
+        case startSession(shell("printf '\\000\\000\\000\\005\\002\\000\\000\\000\\003'; sleep 0.2; printf '\\000\\000\\001\\000'; i=0; while [ $i -lt 300 ]; do printf x; sleep 0.1; i=$((i+1)); done"), 1500) of
+            when Some(value as opened: Session) do
+                var session: Session := opened;
+                let began: Nat64 := nowNanos();
+                let first: Int32 := sizeCode(sizeOf(&!session, "a"));
+                let took: Nat64 := millisSince(began);
+                let status: ProcessStatus := endSession(session);
+                assertTrue(first = timedOut, "a reply sent a byte at a time did not give timedOut");
+                assertTrue(took >= 1400, "the call ended before the limit");
+                assertTrue(took < bound(), "the call waited far beyond the limit");
+            when None do
+                assertTrue(false, "the server said hello and gave no session");
+        end case;
+        return nil;
+    end;
+
+    -- A server that never reads: a request longer than a pipe holds is not
+    -- taken, and the call ends with timedOut.  That the time ran out in the
+    -- write, and not in the wait for the reply that would follow, is shown by
+    -- the tests of a write to a pipe in standard/src/File.test.hiq.
+    function testRequestNotTakenTimesOut(): Unit is
+        var path: StringBuilder := makeStringBuilder();
+        for i from 0 to 1048575 do
+            writeByte(&!path, 97);
+        end for;
+        let long: String := finalize(path);
+        case startSession(shell("printf '\\000\\000\\000\\005\\002\\000\\000\\000\\003'; exec sleep 30"), 1500) of
+            when Some(value as opened: Session) do
+                var session: Session := opened;
+                let began: Nat64 := nowNanos();
+                let first: Int32 := sizeCode(sizeOf(&!session, asSpan(&long)));
+                let took: Nat64 := millisSince(began);
+                let status: ProcessStatus := endSession(session);
+                assertTrue(first = timedOut, "a server that never reads did not give timedOut");
+                assertTrue(took >= 1450, "the write ended before the limit");
+                assertTrue(took < bound(), "the write waited far beyond the limit");
+            when None do
+                assertTrue(false, "the server said hello and gave no session");
+        end case;
+        destroyString(long);
+        return nil;
+    end;
+
+    -- A server that goes away is not a timeout: the call ends with
+    -- serverGone long before the limit.
+    function testGoneServerIsNotATimeout(): Unit is
+        case startSession(shell("printf '\\000\\000\\000\\005\\002\\000\\000\\000\\003'; sleep 1"), 6000) of
+            when Some(value as opened: Session) do
+                var session: Session := opened;
+                let began: Nat64 := nowNanos();
+                let first: Int32 := sizeCode(sizeOf(&!session, "a"));
+                let took: Nat64 := millisSince(began);
+                let status: ProcessStatus := endSession(session);
+                assertTrue(first = serverGone, "a server that went away did not give serverGone");
+                assertTrue(took < 4000, "the call waited for the limit though the server was gone");
+            when None do
+                assertTrue(false, "the server said hello and gave no session");
+        end case;
+        return nil;
+    end;
+
+    -- endSession does not wait for ever for a child that ignores the end of
+    -- its input: after the limit it is sent SIGTERM.
+    function testEndSessionStopsAChildThatStays(): Unit is
+        case startSession(shell("printf '\\000\\000\\000\\005\\002\\000\\000\\000\\003'; exec sleep 30"), 1500) of
+            when Some(value as opened: Session) do
+                let began: Nat64 := nowNanos();
+                let status: ProcessStatus := endSession(opened);
+                let took: Nat64 := millisSince(began);
+                assertTrue(endedBySignal(status), "the child that stayed was not ended by a signal");
+                assertTrue(took >= 1450, "endSession did not wait for the child to end by itself");
+                assertTrue(took < bound(), "endSession waited far beyond the limit");
+            when None do
+                assertTrue(false, "the server said hello and gave no session");
+        end case;
+        return nil;
+    end;
+end module body.

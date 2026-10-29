@@ -1,0 +1,168 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+IP addresses, IPv4 and IPv6: parse, render, mask, match and anonymise.
+
+- An address is a Free value: it copies, compares and sits in a record like a number.
+- Nothing here touches the network: no lookup, no socket and no name resolution.
+- Parsing is strict and gives None for anything outside the forms each parser names.
+- Text comes out in the form RFC 5952 asks for an IPv6 address, and as a dotted quad for IPv4.
+- Addresses of different families are never the same and never in one subnet.
+- Anonymising cuts an address to its /24 or /48; there is no way back.
+
+    case parseIp(asSpan(&peer)) of
+        when Some(value as address: IpAddress) do
+            let inside: Bool := inSubnet(address, office, 24);
+            let logged: String := ipToString(anonymise(address));
+        when None do
+            printLn("not an address");
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.String (
+    String,
+    length
+);
+
+module Standard.Ip is
+    """
+    An IPv4 or an IPv6 address.  Free, so it copies.
+    """
+    type IpAddress: Free;
+
+    ---
+    --- Parsing
+    ---
+
+    """
+    A dotted-quad IPv4 address: exactly four decimal groups, each 0 to 255,
+    each of one to three digits.  None for anything else -- a fifth group
+    is not accepted, and neither is a group above 255.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function parseIpv4(string: Span[Nat8, R]): Option[IpAddress];
+
+    """
+    An IPv6 address in the usual text form, with at most one ::.  Groups
+    are one to four hexadecimal digits, either case.
+
+    None for anything else.  not accepted, and named rather than left to
+    be discovered: the IPv4-mapped text form ::ffff:1.2.3.4, and a zone
+    identifier such as %eth0.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function parseIpv6(string: Span[Nat8, R]): Option[IpAddress];
+
+    """
+    Either form.  A string holding a colon is tried as IPv6, anything else
+    as IPv4.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function parseIp(string: Span[Nat8, R]): Option[IpAddress];
+
+    """
+    The address held in bytes, in network byte order: 4 bytes are an IPv4
+    address, 16 an IPv6 one.  None for any other length.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function ipFromBytes(bytes: Span[Nat8, R]): Option[IpAddress];
+
+    """
+    The address as bytes in network byte order: 4 for an IPv4 address, 16
+    for an IPv6 one.  ipFromBytes reads them back.
+    """
+    function ipToBytes(address: IpAddress): String
+        ensures (length(&result) = 4) or (length(&result) = 16);
+
+    ---
+    --- Asking
+    ---
+
+    """
+    Is this an IPv6 address?
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isIpv6(address: IpAddress): Bool;
+
+    """
+    Are the two the same address?  Two addresses of different families are
+    never the same, whatever their bits.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function sameIp(left: IpAddress, right: IpAddress): Bool;
+
+    """
+    Whether the address is not a public one a request should go to.  For
+    IPv4: 0.0.0.0/8, the three private networks of RFC 1918, the shared
+    address space of RFC 6598, 127.0.0.0/8, link-local of RFC 3927,
+    192.0.0.0/24, 192.0.2.0/24, 198.18.0.0/15, 198.51.100.0/24,
+    203.0.113.0/24, and all of 224.0.0.0/4 and 240.0.0.0/4.  For IPv6:
+    ::/96, 64:ff9b:1::/48, 100::/64, 2001::/23, 2001:db8::/32, 2002::/16,
+    3fff::/20, unique local of RFC 4193, link-local of RFC 4291,
+    fec0::/10 and ff00::/8; an address in ::ffff:0:0/96 or in
+    64:ff9b::/96 is judged as the IPv4 address in its last 32 bits.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isPrivateOrReserved(address: IpAddress): Bool;
+
+    ---
+    --- Rendering
+    ---
+
+    """
+    The address as text: dotted quad for IPv4, and for IPv6 the form RFC
+    5952 asks for -- lower case, no leading zeros in a group, and the
+    longest run of two or more zero groups written ::, the leftmost run
+    when two are equally long.
+    No contract: a text whose length follows its input.
+    """
+    function ipToString(address: IpAddress): String;
+
+    ---
+    --- Masks and matching
+    ---
+
+    """
+    The address with everything below the top bits bits cleared.
+
+    None when bits is larger than the address has: 32 for IPv4, 128 for
+    IPv6.  A mask of 0 gives the all-zero address, which is what it means.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    function applyMask(address: IpAddress, bits: Index): Option[IpAddress];
+
+    """
+    Is address inside the subnet subnet/bits?
+
+    false when the two are of different families, and false when bits
+    is too large -- a question that cannot be asked is not answered true.
+    The subnet is masked too, so a caller that wrote 198.51.100.3/24 gets
+    the answer for 198.51.100.0/24 rather than a silent false.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function inSubnet(address: IpAddress, subnet: IpAddress, bits: Index): Bool;
+
+    ---
+    --- Anonymising
+    ---
+
+    """
+    The address with the part that identifies a household removed: the low
+    8 bits of an IPv4 address, the low 80 of an IPv6 one.
+
+    That is /24 and /48.  It is a reduction and not
+    a hash: two addresses in the same /24 become the same value, and there
+    is no way back to the original.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function anonymise(address: IpAddress): IpAddress;
+end module.

@@ -1,0 +1,1 @@
+Test that a status carries the device and inode of the file: the open file and its name agree, a hard link is the same file, a symbolic link looked at without following is another, and a file renamed over the name is another while the old file stays under its hard link.

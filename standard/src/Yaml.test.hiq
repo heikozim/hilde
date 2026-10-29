@@ -1,0 +1,185 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Json (
+    Json,
+    integerAt,
+    stringAt,
+    destroyJson
+);
+import Standard.Yaml (
+    YamlProblem,
+    YamlError,
+    yamlToJson,
+    readYaml
+);
+
+module body Standard.Yaml.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The JSON of yaml is expected.
+    generic [R: Region]
+    function gives(yaml: Span[Nat8, R], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case yamlToJson(yaml) of
+            when Right(right as json: String) do
+                if not same(&json, expected) then
+                    printLn(asSpan(&json));
+                end if;
+                assertTrue(same(&json, expected), message);
+                destroyString(json);
+            when Left(left as error: YamlError) do
+                printLn(error.line);
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function problemNumber(problem: YamlProblem): Int32 is
+        case problem of
+            when NotYaml do
+                return 1;
+            when YamlUnsupported do
+                return 2;
+            when YamlTooDeep do
+                return 3;
+            when YamlNotJson do
+                return 4;
+        end case;
+    end;
+
+    -- yaml is refused with the problem numbered expected at line.
+    generic [R: Region]
+    function refused(yaml: Span[Nat8, R], expected: Int32, line: Index, message: Span[Nat8, Static]): Unit is
+        case yamlToJson(yaml) of
+            when Right(right as json: String) do
+                destroyString(json);
+                assertFailure(message);
+            when Left(left as error: YamlError) do
+                if (problemNumber(error.problem) /= expected) or (error.line /= line) then
+                    printLn(problemNumber(error.problem));
+                    printLn(error.line);
+                end if;
+                assertTrue(problemNumber(error.problem) = expected, message);
+                assertTrue(error.line = line, message);
+        end case;
+        return nil;
+    end;
+
+    function testConfiguration(): Unit is
+        gives("# a service\nname: demo\nport: 8080\nratio: 0.75\ndebug: false\nnothing:\ntilde: ~\nhosts:\n  - a.example.org\n  - \"b.example.org\"\ndatabase:\n  path: /var/db/demo.db   # the file\n  pool: 4\n",
+            "{\"name\":\"demo\",\"port\":8080,\"ratio\":0.75,\"debug\":false,\"nothing\":null,\"tilde\":null,\"hosts\":[\"a.example.org\",\"b.example.org\"],\"database\":{\"path\":\"/var/db/demo.db\",\"pool\":4}}",
+            "a configuration of mappings, a sequence, scalars and comments");
+        gives("users:\n- name: ann\n  roles: [admin, \"ops\"]\n- name: bob\n  roles: []\n",
+            "{\"users\":[{\"name\":\"ann\",\"roles\":[\"admin\",\"ops\"]},{\"name\":\"bob\",\"roles\":[]}]}",
+            "a sequence of mappings at the column of its key, flow sequences");
+        gives("- - 1\n  - 2\n- {a: 1, b: [x, y]}\n", "[[1,2],{\"a\":1,\"b\":[\"x\",\"y\"]}]", "nested sequences and a flow mapping");
+        gives("---\nplain text\n...\n", "\"plain text\"", "a document of one scalar between the markers");
+        gives("", "null", "an empty document");
+        return nil;
+    end;
+
+    function testScalars(): Unit is
+        gives("a: 1_000\nb: 0x1F\nc: yes\nd: on\ne: 007\nf: -0.5e3\ng: True\nh: 'it''s'\ni: \"tab\\there \\u0041\"\n",
+            "{\"a\":\"1_000\",\"b\":\"0x1F\",\"c\":\"yes\",\"d\":\"on\",\"e\":\"007\",\"f\":-0.5e3,\"g\":true,\"h\":\"it's\",\"i\":\"tab\\there A\"}",
+            "the scalars of YAML 1.2: numbers only as JSON writes them");
+        gives("url: http://example.org/a#b\ntime: 12:30\n", "{\"url\":\"http://example.org/a#b\",\"time\":\"12:30\"}", "a colon and a number sign inside a plain scalar");
+        return nil;
+    end;
+
+    function testBlockScalars(): Unit is
+        gives("text: |\n  one\n  two\n\n  three\nnext: x\n", "{\"text\":\"one\\ntwo\\n\\nthree\\n\",\"next\":\"x\"}", "a literal block scalar keeps the breaks");
+        gives("text: >\n  one\n  two\n\n  three\n", "{\"text\":\"one two\\nthree\\n\"}", "a folded block scalar joins the lines");
+        gives("text: |-\n  one\n\n", "{\"text\":\"one\"}", "a minus drops the final break");
+        gives("text: |+\n  one\n\n", "{\"text\":\"one\\n\\n\"}", "a plus keeps them all");
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        refused("base: &b {a: 1}\ncopy: *b\n", 2, 1, "an anchor");
+        refused("a: *b\n", 2, 1, "an alias");
+        refused("a: !!python/object x\n", 2, 1, "a tag");
+        refused("%YAML 1.2\n---\na: 1\n", 2, 1, "a directive");
+        refused("a: 1\n---\nb: 2\n", 2, 2, "a second document");
+        refused("a: 1\n\tb: 2\n", 1, 2, "a tab in the indentation");
+        refused("a: 1\na: 2\n", 4, 3, "a key twice");
+        refused("a: b: c\n", 1, 1, "a mapping on the line of a key");
+        refused("a: 1\n  b: 2\n", 1, 2, "an indentation that belongs to nothing");
+        refused("a: \"open\n", 1, 1, "a quoted scalar over the end of its line");
+        refused("a: [1, 2\n", 1, 1, "a flow sequence over its line");
+        refused("a: \"\\q\"\n", 1, 1, "an unknown escape");
+        refused("a: \"\\ud800\"\n", 1, 1, "a surrogate");
+        return nil;
+    end;
+
+    function testDepth(): Unit is
+        var deep: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 70 do
+            writeString(&!deep, "- ");
+            i := i + 1;
+        end while;
+        writeString(&!deep, "x\n");
+        let text: String := finalize(deep);
+        refused(asSpan(&text), 3, 1, "70 sequences in each other");
+        destroyString(text);
+        return nil;
+    end;
+
+    function testJson(): Unit is
+        case readYaml("server:\n  port: 8443\n  name: \"demo\"\n") of
+            when Right(right as document: Json) do
+                case integerAt(&document, "/server/port") of
+                    when Some(value as port: Int64) do
+                        assertTrue(port = 8443, "a number by its JSON pointer");
+                    when None do
+                        assertFailure("the port");
+                end case;
+                case stringAt(&document, "/server/name") of
+                    when Some(value as name: String) do
+                        assertTrue(same(&name, "demo"), "a string by its JSON pointer");
+                        destroyString(name);
+                    when None do
+                        assertFailure("the name");
+                end case;
+                destroyJson(document);
+            when Left(left as error: YamlError) do
+                assertFailure("a document for Standard.Json");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,181 @@
+-- Standard.Tls: a TLS connection to a server started as
+-- a child (scripts/tls/server.py, Python's ssl module), which makes its
+-- certificate when it starts and prints its port.  The client trusts that
+-- certificate, sends a line and reads the server's answer.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readExactly,
+    readAll,
+    closeFile
+);
+import Standard.Tls (
+    Client,
+    connect,
+    send,
+    receive,
+    closeClient
+);
+
+module body Test is
+    -- A file of the tree, from HILDE_TREE.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        let tail: String := fromLiteral(rest);
+        writeString(&!out, asSpan(&tail));
+        destroyString(tail);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    function serverCommand(): Command is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/tls/server.py");
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        return command;
+    end;
+
+    -- Read until the answer holds a newline, or the server has closed.
+    generic [R: Region]
+    function answer(client: &![Client, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var going: Bool := true;
+        while going do
+            case receive(&~client, 1024) of
+                when Right(right as got: String) do
+                    let size: Index := length(&got);
+                    if size = 0 then
+                        going := false;
+                    else if nthByte(&got, size - 1) = 10 then
+                        going := false;
+                    end if;
+                    writeString(&!out, asSpan(&got));
+                    destroyString(got);
+                when Left(left as message: String) do
+                    printLn("receive failed");
+                    destroyString(message);
+                    going := false;
+            end case;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function talk(port: &[String, R]): Unit is
+        case connect("localhost", getSpan(port, 0, 4), "server-cert.pem") of
+            when Right(right as opened: Client) do
+                printLn("connected, the certificate verified");
+                var client: Client := opened;
+                let line: String := fromLiteral("hello over TLS\n");
+                case send(&!client, asSpan(&line)) of
+                    when Right(right as sent: Unit) do
+                        printLn("sent");
+                    when Left(left as message: String) do
+                        printLn("send failed");
+                        destroyString(message);
+                end case;
+                destroyString(line);
+                let reply: String := answer(&!client);
+                print("received: ");
+                printText(&reply);
+                destroyString(reply);
+                closeClient(client);
+            when Left(left as message: String) do
+                print("connect failed: ");
+                printText(&message);
+                printLn("");
+                destroyString(message);
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case spawnProcess(serverCommand()) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                var out: FileDescriptor := output;
+                var err: FileDescriptor := errors;
+                case readExactly(&!out, 6) of
+                    when Some(value as port: String) do
+                        talk(&port);
+                        destroyString(port);
+                    when None do
+                        printLn("the server printed no port");
+                end case;
+                let closedInput: Bool := closeFile(input);
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        printText(&text);
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's output failed)");
+                end case;
+                case readAll(&!err) of
+                    when Some(value as text: String) do
+                        if length(&text) > 0 then
+                            printLn("-- the server's error stream:");
+                            printText(&text);
+                        end if;
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's errors failed)");
+                end case;
+                let closedOut: Bool := closeFile(out);
+                let closedErr: Bool := closeFile(err);
+                let status: ProcessStatus := waitProcess(process);
+                print("server exited normally: ");
+                print(exitedNormally(status));
+                print(", code ");
+                printLn(exitCode(status));
+            when None do
+                printLn("the server could not be started");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

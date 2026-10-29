@@ -1,0 +1,256 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Xml (
+    XmlKind,
+    XmlProblem,
+    XmlError,
+    XmlDocument,
+    parseXml,
+    destroyXmlDocument,
+    xmlTokenCount,
+    xmlTokenKind,
+    xmlTokenText,
+    xmlAttributeCount,
+    xmlAttributeName,
+    xmlAttributeValue,
+    xmlAttributeOf,
+    xmlElementEnd,
+    xmlInnerText,
+    xmlFindStart,
+    escapeXml
+);
+
+module body Standard.Xml.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function sameSpan(text: Span[Nat8, R], expected: Span[Nat8, Static]): Bool is
+        if spanLength(text) /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function kindNumber(kind: Option[XmlKind]): Int32 is
+        case kind of
+            when Some(value as found: XmlKind) do
+                case found of
+                    when XmlStart do
+                        return 1;
+                    when XmlEnd do
+                        return 2;
+                    when XmlText do
+                        return 3;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function problemNumber(problem: XmlProblem): Int32 is
+        case problem of
+            when NotWellFormed do
+                return 1;
+            when NotUtf8 do
+                return 2;
+            when DoctypeRefused do
+                return 3;
+            when UnknownEntity do
+                return 4;
+            when TooDeep do
+                return 5;
+        end case;
+    end;
+
+    -- text is refused with the problem numbered expected.
+    generic [R: Region]
+    function refused(text: Span[Nat8, R], expected: Int32, message: Span[Nat8, Static]): Unit is
+        case parseXml(text) of
+            when Right(right as document: XmlDocument) do
+                destroyXmlDocument(document);
+                assertFailure(message);
+            when Left(left as error: XmlError) do
+                assertTrue(problemNumber(error.problem) = expected, message);
+        end case;
+        return nil;
+    end;
+
+    function testTokens(): Unit is
+        let text: Span[Nat8, Static] := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- a feed -->\n<feed xmlns=\"http://www.w3.org/2005/Atom\" lang='de'>\n  <title type=\"text\">Fish &amp; chips &#x20AC;&#33;</title>\n  <entry id=\"1\"/>\n  <summary><![CDATA[<b>bold</b>]]> and more</summary>\n</feed>\n";
+        case parseXml(text) of
+            when Right(right as document: XmlDocument) do
+                assertTrue(kindNumber(xmlTokenKind(&document, 0)) = 1, "the root first");
+                assertTrue(sameSpan(xmlTokenText(&document, 0), "feed"), "its name");
+                assertTrue(xmlAttributeCount(&document, 0) = 2, "two attributes");
+                assertTrue(sameSpan(xmlAttributeName(&document, 0, 1), "lang"), "the second attribute");
+                assertTrue(sameSpan(xmlAttributeValue(&document, 0, 1), "de"), "in single quotes");
+                case xmlFindStart(&document, 0, "title") of
+                    when Some(value as title: Index) do
+                        let inner: String := xmlInnerText(&document, title);
+                        assertTrue(length(&inner) = 17, "references decoded: Fish & chips, the euro sign of three bytes, an exclamation mark");
+                        destroyString(inner);
+                        case xmlAttributeOf(&document, title, "type") of
+                            when Some(value as kind: String) do
+                                assertTrue(same(&kind, "text"), "an attribute by name");
+                                destroyString(kind);
+                            when None do
+                                assertFailure("an attribute by name");
+                        end case;
+                    when None do
+                        assertFailure("the title");
+                end case;
+                case xmlFindStart(&document, 0, "entry") of
+                    when Some(value as entry: Index) do
+                        assertTrue(kindNumber(xmlTokenKind(&document, entry + 1)) = 2, "an empty element is a start and an end");
+                        case xmlElementEnd(&document, entry) of
+                            when Some(value as stop: Index) do
+                                assertTrue(stop = (entry + 1), "its end");
+                            when None do
+                                assertFailure("its end");
+                        end case;
+                    when None do
+                        assertFailure("the entry");
+                end case;
+                case xmlFindStart(&document, 0, "summary") of
+                    when Some(value as summary: Index) do
+                        let inner: String := xmlInnerText(&document, summary);
+                        assertTrue(same(&inner, "<b>bold</b> and more"), "a CDATA section is text as it stands");
+                        destroyString(inner);
+                    when None do
+                        assertFailure("the summary");
+                end case;
+                case xmlFindStart(&document, 1, "feed") of
+                    when Some(value as again: Index) do
+                        assertFailure("no second feed");
+                    when None do
+                        assertTrue(true, "no second feed");
+                end case;
+                case xmlElementEnd(&document, 0) of
+                    when Some(value as stop: Index) do
+                        assertTrue(stop = (xmlTokenCount(&document) - 1), "the root ends last");
+                    when None do
+                        assertFailure("the root ends");
+                end case;
+                destroyXmlDocument(document);
+            when Left(left as error: XmlError) do
+                assertFailure("a well-formed feed");
+        end case;
+        return nil;
+    end;
+
+    function testAttributeSpaces(): Unit is
+        case parseXml("<a b=\"x\ty\nz\"/>") of
+            when Right(right as document: XmlDocument) do
+                assertTrue(sameSpan(xmlAttributeValue(&document, 0, 0), "x y z"), "white space in a value becomes spaces");
+                destroyXmlDocument(document);
+            when Left(left as error: XmlError) do
+                assertFailure("a value with a tab and a newline");
+        end case;
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        refused("<!DOCTYPE x [<!ENTITY e SYSTEM \"file:///etc/passwd\">]><x>&e;</x>", 3, "an external entity: the document type is refused");
+        refused("<!DOCTYPE lolz [<!ENTITY a \"aaaa\"><!ENTITY b \"&a;&a;&a;\">]><x>&b;</x>", 3, "expanding entities: the document type is refused");
+        refused("<x>&nbsp;</x>", 4, "an entity of HTML is unknown");
+        refused("<x>&#0;</x>", 1, "the character 0");
+        refused("<x>&#xD800;</x>", 1, "a surrogate");
+        refused("<x>a & b</x>", 1, "a bare ampersand");
+        refused("<x><y></x></y>", 1, "crossed elements");
+        refused("<x></X>", 1, "an end of another name");
+        refused("<x>", 1, "an element not closed");
+        refused("", 1, "no root");
+        refused("<x/><y/>", 1, "two roots");
+        refused("text<x/>", 1, "text before the root");
+        refused("<x a=\"1\" a=\"2\"/>", 1, "an attribute twice");
+        refused("<x a=1/>", 1, "a value without quotes");
+        refused("<x a=\"<\"/>", 1, "an angle bracket in a value");
+        refused("<x>]]></x>", 1, "the end of a CDATA section in text");
+        refused("<x><!-- -- --></x>", 1, "two dashes in a comment");
+        refused("<x a=\"1\"b=\"2\"/>", 1, "attributes without space between");
+        return nil;
+    end;
+
+    function testDepth(): Unit is
+        var deep: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 256 do
+            writeString(&!deep, "<a>");
+            i := i + 1;
+        end while;
+        i := 0 : Index;
+        while i < 256 do
+            writeString(&!deep, "</a>");
+            i := i + 1;
+        end while;
+        let fits: String := finalize(deep);
+        case parseXml(asSpan(&fits)) of
+            when Right(right as document: XmlDocument) do
+                assertTrue(xmlTokenCount(&document) = 512, "256 levels read");
+                destroyXmlDocument(document);
+            when Left(left as error: XmlError) do
+                assertFailure("256 levels read");
+        end case;
+        destroyString(fits);
+        var deeper: StringBuilder := makeStringBuilder();
+        i := 0 : Index;
+        while i < 257 do
+            writeString(&!deeper, "<a>");
+            i := i + 1;
+        end while;
+        let tooDeep: String := finalize(deeper);
+        refused(asSpan(&tooDeep), 5, "257 levels refused");
+        destroyString(tooDeep);
+        return nil;
+    end;
+
+    function testEscape(): Unit is
+        let text: String := escapeXml("<a href=\"x\">'&'</a>");
+        assertTrue(same(&text, "&lt;a href=&quot;x&quot;&gt;&apos;&amp;&apos;&lt;/a&gt;"), "the five characters escaped");
+        destroyString(text);
+        return nil;
+    end;
+end module body.

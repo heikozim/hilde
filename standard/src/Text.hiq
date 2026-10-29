@@ -1,0 +1,903 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    destroyFree,
+    insertBack,
+    storeNth,
+    length as bufferLength,
+    nth as bufferNth,
+    nthMut as bufferNthMut
+);
+
+module body Standard.Text is
+    -- Byte values by name.  A bare 48 in the middle of a parser is right
+    -- until somebody changes it.
+    constant byteTab: Nat8 := 9;
+    constant byteLineFeed: Nat8 := 10;
+    constant byteReturn: Nat8 := 13;
+    constant byteSpace: Nat8 := 32;
+    constant byteQuote: Nat8 := 34;
+    constant byteHash: Nat8 := 35;
+    constant bytePercent: Nat8 := 37;
+    constant byteAmpersand: Nat8 := 38;
+    constant byteApostrophe: Nat8 := 39;
+    constant bytePlus: Nat8 := 43;
+    constant byteHyphen: Nat8 := 45;
+    constant byteZero: Nat8 := 48;
+    constant byteNine: Nat8 := 57;
+    constant byteColon: Nat8 := 58;
+    constant byteLess: Nat8 := 60;
+    constant byteGreater: Nat8 := 62;
+    constant byteQuestion: Nat8 := 63;
+    constant byteUpperA: Nat8 := 65;
+    constant byteUpperF: Nat8 := 70;
+    constant byteUpperH: Nat8 := 72;
+    constant byteUpperP: Nat8 := 80;
+    constant byteUpperT: Nat8 := 84;
+    constant byteUpperZ: Nat8 := 90;
+    constant byteUnderscore: Nat8 := 95;
+    constant byteLowerA: Nat8 := 97;
+    constant byteLowerD: Nat8 := 100;
+    constant byteLowerF: Nat8 := 102;
+    constant byteLowerH: Nat8 := 104;
+    constant byteLowerM: Nat8 := 109;
+    constant byteLowerZ: Nat8 := 122;
+    constant byteTilde: Nat8 := 126;
+    -- An integer literal is an Int32 unless a declaration says otherwise, so
+    -- the two step widths an assignment uses are named.
+    constant stepOne: Index := 1;
+    constant zeroIndex: Index := 0;
+    constant byteZero0: Nat8 := 0;
+    -- How much of a text isBinary looks at, as grep and diff do.
+    constant binaryWindow: Index := 512;
+    -- parseInt reads the digits as a Nat64 and puts the sign on after: the
+    -- largest Int64, and the magnitude of the smallest, one more.
+    constant intPositiveCeiling: Nat64 := 9223372036854775807;
+    constant intMagnitudeCeiling: Nat64 := 9223372036854775808;
+    constant stepEscape: Index := 3;
+    constant caseGap: Nat8 := 32;
+    constant hexLetterGap: Nat8 := 87;
+
+    -- The exact decimal guard, and it takes two numbers, not one.
+    -- maximum_nat64 is 18446744073709551615, so a running total above
+    -- 1844674407370955161 cannot take another digit at all, and a total
+    -- exactly equal to it can take a digit of 5 but not of 6.  A single
+    -- ceiling of ...160 was the first version and it refused the largest
+    -- Nat64 there is; the test suite is what found that.
+    constant natDecimalCeiling: Nat64 := 1844674407370955161;
+    constant natDecimalLastDigit: Nat64 := 5;
+    -- The same for hexadecimal.
+    constant natHexCeiling: Nat64 := 1152921504606846975;
+
+    constant secondsPerMinute: Nat64 := 60;
+    constant secondsPerHour: Nat64 := 3600;
+    constant secondsPerDay: Nat64 := 86400;
+    -- A day is the largest multiplier, so a value above this cannot be
+    -- scaled and stay inside Nat64.  Checked before the multiplication.
+    constant durationCeiling: Nat64 := 213503982334601;
+
+    ---
+    --- Widening, which cannot fail and still has to say so
+    ---
+
+    function natOfByte(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value: Nat64) do
+                return value;
+            when None do
+                -- Every Nat8 fits in a Nat64.  If this is ever reached the
+                -- conversion is broken, and a wrong number would be worse
+                -- than a stop.
+                abort("Standard.Text: a Nat8 did not fit in a Nat64.");
+        end case;
+    end;
+
+    function natOfIndex(index: Index): Nat64 is
+        case toNat64(index) of
+            when Some(value: Nat64) do
+                return value;
+            when None do
+                abort("Standard.Text: an Index did not fit in a Nat64.");
+        end case;
+    end;
+
+    ---
+    --- Classification
+    ---
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= byteZero) and (byte <= byteNine);
+    end;
+
+    function isSpace(byte: Nat8): Bool is
+        -- The grammar does not chain or without parentheses, and a guard
+        -- reads better than three levels of them.
+        if (byte = byteSpace) or (byte = byteTab) then
+            return true;
+        end if;
+        return (byte = byteReturn) or (byte = byteLineFeed);
+    end;
+
+    function hexDigitValue(byte: Nat8): Option[Nat8] is
+        if (byte >= byteZero) and (byte <= byteNine) then
+            let digit: Option[Nat8] := Some(value => byte - byteZero);
+            return digit;
+        end if;
+        if (byte >= byteUpperA) and (byte <= byteUpperF) then
+            let digit: Option[Nat8] := Some(value => (byte - byteUpperA) + 10);
+            return digit;
+        end if;
+        if (byte >= byteLowerA) and (byte <= byteLowerF) then
+            let digit: Option[Nat8] := Some(value => (byte - byteLowerA) + 10);
+            return digit;
+        end if;
+        let none: Option[Nat8] := None();
+        return none;
+    end;
+
+    function hexDigit(value: Nat8): Nat8 is
+        if value < 10 then
+            return byteZero + value;
+        end if;
+        return hexLetterGap + value;
+    end;
+
+    function isReservedUrlByte(byte: Nat8): Bool is
+        if (byte = byteQuote) or (byte = byteHash) then
+            return true;
+        end if;
+        if (byte = bytePercent) or (byte = byteAmpersand) then
+            return true;
+        end if;
+        if (byte = byteApostrophe) or (byte = bytePlus) then
+            return true;
+        end if;
+        if (byte = byteColon) or (byte = byteLess) then
+            return true;
+        end if;
+        return (byte = byteGreater) or (byte = byteQuestion);
+    end;
+
+    function needsEncoding(byte: Nat8): Bool is
+        if (byte <= byteSpace) or (byte >= byteTilde) then
+            return true;
+        end if;
+        return isReservedUrlByte(byte);
+    end;
+
+    ---
+    --- Parsing
+    ---
+
+    -- The one place the decimal guard lives.  It answers None rather than
+    -- trapping, because a string that is too long is an answer and not a
+    -- crash.
+    function stepDecimal(total: Nat64, digit: Nat64): Option[Nat64] is
+        if total > natDecimalCeiling then
+            let none: Option[Nat64] := None();
+            return none;
+        end if;
+        if (total = natDecimalCeiling) and (digit > natDecimalLastDigit) then
+            let none: Option[Nat64] := None();
+            return none;
+        end if;
+        let some: Option[Nat64] := Some(value => (total * 10) + digit);
+        return some;
+    end;
+
+    generic [R: Region]
+    function parseNatUpTo(string: Span[Nat8, R], upto: Index): Option[Nat64] is
+        var total: Nat64 := 0;
+        var good: Bool := upto > 0;
+        var i: Index := 0;
+        while (i < upto) and good do
+            let byte: Nat8 := string[i];
+            if isDigit(byte) then
+                case stepDecimal(total, natOfByte(byte - byteZero)) of
+                    when Some(value: Nat64) do
+                        total := value;
+                    when None do
+                        good := false;
+                end case;
+            else
+                good := false;
+            end if;
+            i := i + 1;
+        end while;
+        if good then
+            let some: Option[Nat64] := Some(value => total);
+            return some;
+        end if;
+        let none: Option[Nat64] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function parseNat(string: Span[Nat8, R]): Option[Nat64] is
+        return parseNatUpTo(string, spanLength(string));
+    end;
+
+    -- The value inside answer, or fallback when answer is None.
+    generic [T: Free]
+    function valueOr(answer: Option[T], fallback: T): T is
+        case answer of
+            when Some(value as inner: T) do
+                return inner;
+            when None do
+                return fallback;
+        end case;
+    end;
+
+    -- The digits of value, the most significant first, written to out.
+    generic [B: Region]
+    function writeDigits(out: &![StringBuilder, B], value: Nat64): Unit is
+        let ten: Nat64 := 10;
+        if value >= ten then
+            writeDigits(&~out, value / ten);
+        end if;
+        let digit: Nat64 := value - ((value / ten) * ten);
+        let zero: Nat8 := '0';
+        let fallback: Nat8 := 0;
+        writeByte(&~out, zero + valueOr(toNat8(digit), fallback));
+        return nil;
+    end;
+
+    function formatNat(value: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeDigits(&!out, value);
+        return finalize(out);
+    end;
+
+    function formatInt(value: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        let zero: Int64 := 0;
+        let one: Int64 := 1;
+        let fallback: Nat64 := 0;
+        if value < zero then
+            writeByte(&!out, '-');
+            -- The magnitude as -(value + 1) + 1, so that the smallest Int64,
+            -- whose negation does not fit, is written whole.
+            let below: Nat64 := valueOr(toNat64(-(value + one)), fallback);
+            writeDigits(&!out, below + 1);
+        else
+            writeDigits(&!out, valueOr(toNat64(value), fallback));
+        end if;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function parseInt(string: Span[Nat8, R]): Option[Int64] is
+        let size: Index := spanLength(string);
+        let none: Option[Int64] := None();
+        if size = 0 then
+            return none;
+        end if;
+        var negative: Bool := false;
+        var start: Index := 0;
+        if string[zeroIndex] = byteHyphen then
+            negative := true;
+            start := stepOne;
+        end if;
+        case parseNat(spanPart(string, start, size - start)) of
+            when None do
+                return none;
+            when Some(value as magnitude: Nat64) do
+                if negative and (magnitude = intMagnitudeCeiling) then
+                    let smallest: Option[Int64] := Some(value => minimum_int64);
+                    return smallest;
+                end if;
+                if magnitude > intPositiveCeiling then
+                    return none;
+                end if;
+                case toInt64(magnitude) of
+                    when None do
+                        return none;
+                    when Some(value as wide: Int64) do
+                        if negative then
+                            let zero: Int64 := 0;
+                            let result: Option[Int64] := Some(value => zero - wide);
+                            return result;
+                        end if;
+                        let result: Option[Int64] := Some(value => wide);
+                        return result;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region]
+    function parseHex(string: Span[Nat8, R]): Option[Nat64] is
+        let size: Index := spanLength(string);
+        var total: Nat64 := 0;
+        var good: Bool := size > 0;
+        var i: Index := 0;
+        while (i < size) and good do
+            case hexDigitValue(string[i]) of
+                when Some(value: Nat8) do
+                    if total <= natHexCeiling then
+                        total := (total * 16) + natOfByte(value);
+                    else
+                        good := false;
+                    end if;
+                when None do
+                    good := false;
+            end case;
+            i := i + 1;
+        end while;
+        if good then
+            let some: Option[Nat64] := Some(value => total);
+            return some;
+        end if;
+        let none: Option[Nat64] := None();
+        return none;
+    end;
+
+    function scaleDuration(parsed: Option[Nat64], scale: Nat64): Option[Nat64] is
+        let none: Option[Nat64] := None();
+        case parsed of
+            when Some(value: Nat64) do
+                if (scale > 1) and (value > durationCeiling) then
+                    return none;
+                end if;
+                let some: Option[Nat64] := Some(value => value * scale);
+                return some;
+            when None do
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function parseDuration(string: Span[Nat8, R]): Option[Nat64] is
+        let size: Index := spanLength(string);
+        let none: Option[Nat64] := None();
+        if size = 0 then
+            return none;
+        end if;
+        let last: Nat8 := string[size - 1];
+        var scale: Nat64 := 1;
+        var digits: Index := size;
+        if last = byteLowerM then
+            scale := secondsPerMinute;
+            digits := size - 1;
+        end if;
+        if last = byteLowerH then
+            scale := secondsPerHour;
+            digits := size - 1;
+        end if;
+        if last = byteLowerD then
+            scale := secondsPerDay;
+            digits := size - 1;
+        end if;
+        return scaleDuration(parseNatUpTo(string, digits), scale);
+    end;
+
+    ---
+    --- Taking apart
+    ---
+
+    generic [R: Region]
+    function indexOfByte(string: Span[Nat8, R], byte: Nat8): Option[Index] is
+        let size: Index := spanLength(string);
+        var i: Index := 0;
+        var found: Bool := false;
+        var at: Index := 0;
+        while (i < size) and (not found) do
+            if string[i] = byte then
+                found := true;
+                at := i;
+            end if;
+            i := i + 1;
+        end while;
+        if found then
+            let some: Option[Index] := Some(value => at);
+            return some;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function substring(string: Span[Nat8, R], start: Index, stop: Index): Span[Nat8, R] is
+        let size: Index := spanLength(string);
+        var startAt: Index := start;
+        var upto: Index := stop;
+        if startAt > size then
+            startAt := size;
+        end if;
+        if upto > size then
+            upto := size;
+        end if;
+        if upto <= startAt then
+            return spanPart(string, startAt, zeroIndex);
+        end if;
+        return spanPart(string, startAt, upto - startAt);
+    end;
+
+    generic [R: Region]
+    function trim(string: Span[Nat8, R]): Span[Nat8, R] is
+        let size: Index := spanLength(string);
+        var startAt: Index := 0;
+        while (startAt < size) and isSpace(string[startAt]) do
+            startAt := startAt + 1;
+        end while;
+        var upto: Index := size;
+        while (upto > startAt) and isSpace(string[upto - 1]) do
+            upto := upto - 1;
+        end while;
+        return substring(string, startAt, upto);
+    end;
+
+    -- Whether part stands in text at at.  False, not an index out of
+    -- bounds, when part would reach past the end, so callers need not
+    -- guard the call.
+    generic [R: Region, S: Region]
+    function matchesAt(text: Span[Nat8, R], at: Index, part: Span[Nat8, S]): Bool is
+        let size: Index := spanLength(text);
+        let wanted: Index := spanLength(part);
+        if at > size then
+            return false;
+        end if;
+        if wanted > (size - at) then
+            return false;
+        end if;
+        var k: Index := 0;
+        while k < wanted do
+            if text[at + k] /= part[k] then
+                return false;
+            end if;
+            k := k + 1;
+        end while;
+        return true;
+    end;
+
+    -- The search is Knuth, Morris and Pratt's.  The table holds, for each
+    -- length k of a prefix of part, the length of the longest proper
+    -- prefix of it that is also a suffix of it; position 0 is unused.
+    -- Built in time linear in the length of part.
+    generic [S: Region]
+    function borderTable(part: Span[Nat8, S]): Buffer[Index] is
+        let wanted: Index := spanLength(part);
+        var table: Buffer[Index] := initialize(wanted + 1, zeroIndex);
+        var k: Index := 0;
+        var i: Index := 1;
+        while i < wanted do
+            while (k > 0) and (part[i] /= part[k]) do
+                k := bufferNthMut(&!table, k);
+            end while;
+            if part[i] = part[k] then
+                k := k + 1;
+            end if;
+            storeNth(&!table, i + 1, k);
+            i := i + 1;
+        end while;
+        return table;
+    end;
+
+    -- The first occurrence of part in text at start or after it, or None.
+    -- part is not empty and table is its border table.  After a mismatch
+    -- the table says how much of part still matches, so no byte of text
+    -- is read again: time linear in the length of text after start.
+    generic [R: Region, S: Region, Q: Region]
+    function findFrom(text: Span[Nat8, R], start: Index, part: Span[Nat8, S], table: &[Buffer[Index], Q]): Option[Index] is
+        let size: Index := spanLength(text);
+        let wanted: Index := spanLength(part);
+        var k: Index := 0;
+        var i: Index := start;
+        while i < size do
+            while (k > 0) and (text[i] /= part[k]) do
+                k := bufferNth(table, k);
+            end while;
+            if text[i] = part[k] then
+                k := k + 1;
+            end if;
+            if k = wanted then
+                let found: Option[Index] := Some(value => (i + 1) - wanted);
+                return found;
+            end if;
+            i := i + 1;
+        end while;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region, S: Region]
+    function indexOf(text: Span[Nat8, R], part: Span[Nat8, S]): Option[Index] is
+        if spanLength(part) = 0 then
+            let first: Option[Index] := Some(value => zeroIndex);
+            return first;
+        end if;
+        let table: Buffer[Index] := borderTable(part);
+        let found: Option[Index] := findFrom(text, zeroIndex, part, &table);
+        destroyFree(table);
+        return found;
+    end;
+
+    generic [R: Region, S: Region]
+    function contains(text: Span[Nat8, R], part: Span[Nat8, S]): Bool is
+        case indexOf(text, part) of
+            when Some(value as at: Index) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function startsWith(text: Span[Nat8, R], prefix: Span[Nat8, S]): Bool is
+        return matchesAt(text, zeroIndex, prefix);
+    end;
+
+    generic [R: Region, S: Region]
+    function endsWith(text: Span[Nat8, R], suffix: Span[Nat8, S]): Bool is
+        let size: Index := spanLength(text);
+        let wanted: Index := spanLength(suffix);
+        if wanted > size then
+            return false;
+        end if;
+        return matchesAt(text, size - wanted, suffix);
+    end;
+
+    generic [R: Region, S: Region]
+    function countOf(text: Span[Nat8, R], part: Span[Nat8, S]): Index is
+        let size: Index := spanLength(text);
+        let wanted: Index := spanLength(part);
+        var count: Index := 0;
+        if wanted = 0 then
+            return count;
+        end if;
+        let table: Buffer[Index] := borderTable(part);
+        var at: Index := 0;
+        var searching: Bool := true;
+        while searching do
+            case findFrom(text, at, part, &table) of
+                when Some(value as hit: Index) do
+                    count := count + 1;
+                    at := hit + wanted;
+                when None do
+                    searching := false;
+            end case;
+        end while;
+        destroyFree(table);
+        return count;
+    end;
+
+    generic [R: Region, S: Region]
+    function split(text: Span[Nat8, R], separator: Span[Nat8, S]): Buffer[Span[Nat8, R]] is
+        var pieces: Buffer[Span[Nat8, R]] := allocateEmpty();
+        let size: Index := spanLength(text);
+        let wanted: Index := spanLength(separator);
+        if wanted = 0 then
+            insertBack(&!pieces, text);
+        else
+            let table: Buffer[Index] := borderTable(separator);
+            var pieceStart: Index := 0;
+            var searching: Bool := true;
+            while searching do
+                case findFrom(text, pieceStart, separator, &table) of
+                    when Some(value as hit: Index) do
+                        insertBack(&!pieces, spanPart(text, pieceStart, hit - pieceStart));
+                        pieceStart := hit + wanted;
+                    when None do
+                        searching := false;
+                end case;
+            end while;
+            destroyFree(table);
+            insertBack(&!pieces, spanPart(text, pieceStart, size - pieceStart));
+        end if;
+        return pieces;
+    end;
+
+    generic [R: Region]
+    function lines(text: Span[Nat8, R]): Buffer[Span[Nat8, R]] is
+        var found: Buffer[Span[Nat8, R]] := allocateEmpty();
+        let size: Index := spanLength(text);
+        var pieceStart: Index := 0;
+        var i: Index := 0;
+        while i < size do
+            if text[i] = byteLineFeed then
+                var stop: Index := i;
+                if stop > pieceStart then
+                    if text[stop - 1] = byteReturn then
+                        stop := stop - 1;
+                    end if;
+                end if;
+                insertBack(&!found, spanPart(text, pieceStart, stop - pieceStart));
+                pieceStart := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        if pieceStart < size then
+            insertBack(&!found, spanPart(text, pieceStart, size - pieceStart));
+        end if;
+        return found;
+    end;
+
+    generic [R: Region]
+    function isBinary(text: Span[Nat8, R]): Bool is
+        var upto: Index := spanLength(text);
+        if upto > binaryWindow then
+            upto := binaryWindow;
+        end if;
+        var i: Index := 0;
+        while i < upto do
+            if text[i] = byteZero0 then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region]
+    function toLower(string: Span[Nat8, R]): String is
+        let size: Index := spanLength(string);
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := string[i];
+            if (byte >= byteUpperA) and (byte <= byteUpperZ) then
+                writeByte(&!builder, byte + caseGap);
+            else
+                writeByte(&!builder, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    generic [R: Region]
+    function toUpper(string: Span[Nat8, R]): String is
+        let size: Index := spanLength(string);
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := string[i];
+            if (byte >= byteLowerA) and (byte <= byteLowerZ) then
+                writeByte(&!builder, byte - caseGap);
+            else
+                writeByte(&!builder, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    generic [R: Region, P: Region, S: Region]
+    function join(pieces: &[Buffer[Span[Nat8, R]], P], separator: Span[Nat8, S]): String is
+        var builder: StringBuilder := makeStringBuilder();
+        let count: Index := bufferLength(pieces);
+        var i: Index := 0;
+        while i < count do
+            if i > 0 then
+                writeString(&!builder, separator);
+            end if;
+            writeString(&!builder, bufferNth(pieces, i));
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    generic [R: Region, O: Region, N: Region]
+    function replace(text: Span[Nat8, R], old: Span[Nat8, O], new: Span[Nat8, N]): String is
+        var builder: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(text);
+        let wanted: Index := spanLength(old);
+        if wanted = 0 then
+            writeString(&!builder, text);
+        else
+            let table: Buffer[Index] := borderTable(old);
+            var at: Index := 0;
+            var searching: Bool := true;
+            while searching do
+                case findFrom(text, at, old, &table) of
+                    when Some(value as hit: Index) do
+                        writeString(&!builder, spanPart(text, at, hit - at));
+                        writeString(&!builder, new);
+                        at := hit + wanted;
+                    when None do
+                        searching := false;
+                end case;
+            end while;
+            destroyFree(table);
+            writeString(&!builder, spanPart(text, at, size - at));
+        end if;
+        return finalize(builder);
+    end;
+
+    ---
+    --- Encoding
+    ---
+
+    generic [R: Region]
+    function urlEncode(string: Span[Nat8, R]): String is
+        let size: Index := spanLength(string);
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := string[i];
+            if needsEncoding(byte) then
+                writeByte(&!builder, bytePercent);
+                writeByte(&!builder, hexDigit(byte / 16));
+                writeByte(&!builder, hexDigit(byte - ((byte / 16) * 16)));
+            else
+                writeByte(&!builder, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    generic [R: Region]
+    function lowNibbleOfEscape(string: Span[Nat8, R], at: Index, high: Nat8): Option[Nat8] is
+        let none: Option[Nat8] := None();
+        case hexDigitValue(string[at + 2]) of
+            when Some(value: Nat8) do
+                let byte: Option[Nat8] := Some(value => (high * 16) + value);
+                return byte;
+            when None do
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function escapeAt(string: Span[Nat8, R], at: Index): Option[Nat8] is
+        let size: Index := spanLength(string);
+        let none: Option[Nat8] := None();
+        if (at + 2) >= size then
+            return none;
+        end if;
+        case hexDigitValue(string[at + 1]) of
+            when Some(value: Nat8) do
+                return lowNibbleOfEscape(string, at, value);
+            when None do
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function urlDecode(string: Span[Nat8, R]): String is
+        let size: Index := spanLength(string);
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := string[i];
+            var taken: Index := stepOne;
+            if byte = bytePercent then
+                case escapeAt(string, i) of
+                    when Some(value: Nat8) do
+                        writeByte(&!builder, value);
+                        taken := stepEscape;
+                    when None do
+                        -- A % that is not followed by two hexadecimal
+                        -- digits stays as it is.  A decoder that drops bytes
+                        -- it does not understand is a decoder that changes
+                        -- the message.
+                        writeByte(&!builder, byte);
+                end case;
+            else
+                writeByte(&!builder, byte);
+            end if;
+            i := i + taken;
+        end while;
+        return finalize(builder);
+    end;
+
+    generic [R: Region]
+    function bytesToHex(string: Span[Nat8, R]): String is
+        let size: Index := spanLength(string);
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := string[i];
+            writeByte(&!builder, hexDigit(byte / 16));
+            writeByte(&!builder, hexDigit(byte - ((byte / 16) * 16)));
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    generic [R: Region]
+    function hexToBytes(text: Span[Nat8, R]): Option[String] is
+        let size: Index := spanLength(text);
+        if (size - ((size / 2) * 2)) /= 0 then
+            return None();
+        end if;
+        var good: Bool := true;
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while good and (i < size) do
+            case hexDigitValue(text[i]) of
+                when Some(value as high: Nat8) do
+                    case hexDigitValue(text[i + 1]) of
+                        when Some(value as low: Nat8) do
+                            writeByte(&!builder, (high * 16) + low);
+                        when None do
+                            good := false;
+                    end case;
+                when None do
+                    good := false;
+            end case;
+            i := i + 2;
+        end while;
+        let made: String := finalize(builder);
+        if good then
+            return Some(value => made);
+        else
+            destroyString(made);
+            return None();
+        end if;
+    end;
+
+    ---
+    --- Comparison
+    ---
+
+    function wrapIndex(i: Index, size: Index): Index is
+        return rem(i, size);
+    end;
+
+    generic [R: Region, S: Region]
+    function equal(left: Span[Nat8, R], right: Span[Nat8, S]): Bool is
+        let size: Index := spanLength(left);
+        if size /= spanLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if left[i] /= right[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function constantTimeEqual(left: Span[Nat8, R], right: Span[Nat8, S]): Bool is
+        let leftSize: Index := spanLength(left);
+        let rightSize: Index := spanLength(right);
+        if (leftSize = 0) or (rightSize = 0) then
+            -- The one branch visible from outside, and it has to be: there
+            -- is no byte to read, so there is nothing to fold a length
+            -- difference into.  An empty secret is not a secret.
+            return leftSize = rightSize;
+        end if;
+        var longest: Index := leftSize;
+        if rightSize > longest then
+            longest := rightSize;
+        end if;
+        -- The lengths go into the same accumulator as the bytes, so a
+        -- difference in length is not decided sooner than one in content.
+        var accumulator: Nat64 := bitwiseXor(natOfIndex(leftSize),
+            natOfIndex(rightSize));
+        var i: Index := 0;
+        while i < longest do
+            let leftByte: Nat8 := left[wrapIndex(i, leftSize)];
+            let rightByte: Nat8 := right[wrapIndex(i, rightSize)];
+            accumulator := bitwiseOr(accumulator,
+                natOfByte(bitwiseXor(leftByte, rightByte)));
+            i := i + 1;
+        end while;
+        return accumulator = 0;
+    end;
+end module body.

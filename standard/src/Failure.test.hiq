@@ -1,0 +1,159 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The chains are built as a module and the modules that call it would
+-- build them: a failure made where it happens, wrapped under each
+-- operation it passes.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte
+);
+import Standard.Failure (
+    FailureKind,
+    Unclassified,
+    NotFound,
+    NoPermission,
+    Invalid,
+    Failure,
+    makeFailure,
+    wrapFailure,
+    wrapFailureAs,
+    kindOf,
+    hasKind,
+    operationOf,
+    messageOf,
+    chainLength,
+    describeFailure,
+    httpStatus,
+    destroyFailure
+);
+
+module body Standard.Failure.Test is
+    generic [R: Region]
+    function spanIs(span: Span[Nat8, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := spanLength(span);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var same: Bool := true;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if span[i] /= expected[i] then
+                    same := false;
+                end if;
+            end for;
+        end if;
+        return same;
+    end;
+
+    generic [R: Region]
+    function stringIs(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var same: Bool := true;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if nthByte(text, i) /= expected[i] then
+                    same := false;
+                end if;
+            end for;
+        end if;
+        return same;
+    end;
+
+    function number(kind: FailureKind): Int32 is
+        case kind of
+            when Unclassified do
+                return 0;
+            when NotFound do
+                return 1;
+            when NoPermission do
+                return 2;
+            when Invalid do
+                return 3;
+        end case;
+    end;
+
+    generic [R: Region]
+    function describesAs(failure: &[Failure, R], expected: Span[Nat8, Static]): Bool is
+        let text: String := describeFailure(failure);
+        let same: Bool := stringIs(&text, expected);
+        destroyString(text);
+        return same;
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    function testWrapsAndTraces(): Unit is
+        let base: Failure := makeFailure("", Unclassified(), "sql: no rows");
+        let failure: Failure := wrapFailure("models.UserModel.FindByID", base);
+        assertTrue(describesAs(&failure, "models.UserModel.FindByID: sql: no rows"), "the chain reads operation, then message");
+        assertTrue(spanIs(operationOf(&failure), "models.UserModel.FindByID"), "the operation is the outermost one");
+        assertTrue(spanIs(messageOf(&failure), "sql: no rows"), "the message is the first cause's");
+        assertTrue(chainLength(&failure) = 2, "the chain holds two failures");
+        destroyFailure(failure);
+        return nil;
+    end;
+
+    function testKindWalksChain(): Unit is
+        let inner: Failure := makeFailure("repo.Get", NotFound(), "boom");
+        let middle: Failure := wrapFailure("service", inner);
+        let outer: Failure := wrapFailure("handler.Show", middle);
+        assertTrue(number(kindOf(&outer)) = 1, "the kind is found three failures down");
+        assertTrue(describesAs(&outer, "handler.Show: service: repo.Get: boom"), "every operation is named");
+        assertTrue(chainLength(&outer) = 3, "the chain holds three failures");
+        destroyFailure(outer);
+        return nil;
+    end;
+
+    function testOuterKindWins(): Unit is
+        let inner: Failure := makeFailure("repo.Get", NotFound(), "no such row");
+        let outer: Failure := wrapFailureAs("auth.Check", NoPermission(), inner);
+        assertTrue(number(kindOf(&outer)) = 2, "the outermost kind is the chain's");
+        assertTrue(hasKind(&outer, NotFound()), "the inner kind is still in the chain");
+        assertTrue(hasKind(&outer, NoPermission()), "the outer kind is in the chain");
+        assertTrue(not hasKind(&outer, Invalid()), "a kind nobody gave is not");
+        let again: Failure := wrapFailureAs("handler", Unclassified(), outer);
+        assertTrue(number(kindOf(&again)) = 2, "an unclassified wrapper leaves the kind to its cause");
+        destroyFailure(again);
+        return nil;
+    end;
+
+    function testUnclassified(): Unit is
+        let alone: Failure := makeFailure("op", Unclassified(), "x");
+        assertTrue(number(kindOf(&alone)) = 0, "a failure without a kind is unclassified");
+        let wrapped: Failure := wrapFailure("outer", alone);
+        assertTrue(number(kindOf(&wrapped)) = 0, "a chain without a kind is unclassified");
+        assertTrue(describesAs(&wrapped, "outer: op: x"), "the chain reads both operations");
+        destroyFailure(wrapped);
+        let empty: Failure := makeFailure("", Unclassified(), "");
+        assertTrue(describesAs(&empty, ""), "a failure without operation and message reads empty");
+        assertTrue(chainLength(&empty) = 1, "a failure alone is a chain of one");
+        destroyFailure(empty);
+        return nil;
+    end;
+
+    function testHttpStatus(): Unit is
+        assertTrue(httpStatus(NotFound()) = 404, "not found is 404");
+        assertTrue(httpStatus(NoPermission()) = 403, "no permission is 403");
+        assertTrue(httpStatus(Invalid()) = 400, "invalid is 400");
+        assertTrue(httpStatus(Unclassified()) = 500, "unclassified is 500");
+        let failure: Failure := wrapFailure("handler", makeFailure("form.Read", Invalid(), "bad date"));
+        assertTrue(httpStatus(kindOf(&failure)) = 400, "a chain's status is its kind's");
+        destroyFailure(failure);
+        return nil;
+    end;
+end module body.

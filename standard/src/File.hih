@@ -1,0 +1,947 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Files, pipes, directories, child processes, the environment and sockets of Unix and TCP.
+
+- A FileDescriptor is linear: it cannot be copied, and it cannot be dropped without closing it.
+- Every path is checked before it reaches the kernel; a path that holds a zero byte is refused.
+- Every descriptor is opened close-on-exec.
+- A child process runs a binary given by its path; there is no search of PATH.
+- In a child every descriptor above the standard three is closed first.
+- An environment value longer than environmentLimit is refused, not shortened.
+- secureDelete overwrites once; on flash memory and copy-on-write file systems old blocks may survive.
+
+    case openRead("notes.txt") of
+        when Some(value as opened: FileDescriptor) do
+            var file: FileDescriptor := opened;
+            let text: Option[String] := readAll(&!file);
+            let closed: Bool := closeFile(file);
+        when None do
+            skip;
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.String (
+    String
+);
+
+module Standard.File is
+    """
+    An open file.  It cannot be copied, and it must be closed with
+    closeFile.
+    """
+    type FileDescriptor: Linear;
+
+    ---
+    --- Opening and closing
+    ---
+
+    """
+    Opens an existing file for reading.
+
+    Returns None when the path is empty, holds a zero byte, or the kernel
+    refused.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function openRead(path: Span[Nat8, R]): Option[FileDescriptor];
+
+    """
+    Creates or empties a file and opens it for writing.  A new file is
+    readable and writable by its owner only, mode 0600.
+
+    Returns None when the path is empty, holds a zero byte, or the kernel
+    refused.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function openWrite(path: Span[Nat8, R]): Option[FileDescriptor];
+
+    """
+    Creates the file if it is missing and opens it for appending: every
+    write goes to its end, also when other processes append to it.  A file
+    made here is then set to mode, since a new file is created with the
+    mode less the umask; a file that was there keeps its mode.  Setting the
+    mode is a fchmod, so under pledge on OpenBSD the programme needs the
+    promise fattr.
+
+    Returns None when the path is empty, holds a zero byte, names a
+    symbolic link, the kernel refused, or the mode could not be set.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function openAppend(path: Span[Nat8, R], mode: Nat32): Option[FileDescriptor];
+
+    """
+    Opens path as openAppend does and puts the new file in place of file,
+    under the same descriptor, so that a write through file never finds
+    it closed.  This is what a log needs after a rotation renamed its
+    file.  Returns false when path could not be opened; file then still
+    names the file it named before.  It returns false as well when the new
+    file could not be kept from programmes this one starts; file then
+    names the new file.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function reopenAppend(file: &![FileDescriptor, R], path: Span[Nat8, S], mode: Nat32): Bool;
+
+    """
+    Closes the file, and returns true when the kernel reported no error.
+
+    The descriptor is gone either way: the kernel releases the number even
+    when it reports an error.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeFile(file: FileDescriptor): Bool;
+
+    ---
+    --- Reading and writing
+    ---
+
+    """
+    Reads to the end of the file and returns everything read.
+
+    Returns None when a read failed; what was read before is thrown away.
+    An empty file gives an empty string.  In a task, a read that finds
+    nothing to read yet waits while the other tasks run.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function readAll(file: &![FileDescriptor, R]): Option[String];
+
+    """
+    Reads exactly count bytes, in as many reads as that takes.
+
+    Returns None when a read failed or the file ended before count bytes;
+    what was read before is thrown away.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function readExactly(file: &![FileDescriptor, R], count: Index): Option[String];
+
+    """
+    Writes the whole string, in as many writes as that takes.  Returns true
+    only when every byte was written.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function writeAll(file: &![FileDescriptor, R], data: Span[Nat8, S]): Bool;
+
+    ---
+    --- What a name is
+    ---
+
+    """
+    What a name turned out to be.
+    """
+    type FileKind: Free;
+
+    """
+    The name could not be looked at.  This is not the same as there being
+    nothing there: a name under a directory the process may not search
+    answers this as well.
+    """
+    constant kindUnknown: FileKind;
+
+    """
+    An ordinary file.
+    """
+    constant kindRegular: FileKind;
+
+    """
+    A directory.
+    """
+    constant kindDirectory: FileKind;
+
+    """
+    A symbolic link itself, which only kindOf sees.
+    """
+    constant kindSymlink: FileKind;
+
+    """
+    Something else: a device, a socket, a fifo.
+    """
+    constant kindOther: FileKind;
+
+    """
+    Returns true when the two are the same kind.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function sameKind(left: FileKind, right: FileKind): Bool;
+
+    """
+    A word for the kind, for a message a person reads.
+    No contract: a text whose length follows its input.
+    """
+    function describeKind(kind: FileKind): String;
+
+    """
+    What the name is, without following a symbolic link.  A check that
+    refuses links asks this; kindOfTarget asks the other question.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function kindOf(path: Span[Nat8, R]): FileKind;
+
+    """
+    What the name leads to, following symbolic links.  A link to a file is
+    kindRegular here and kindSymlink in kindOf; a link to nothing is
+    kindUnknown.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function kindOfTarget(path: Span[Nat8, R]): FileKind;
+
+    ---
+    --- Symbolic links
+    ---
+
+    """
+    Where the link points, as it was written, which may be relative.
+
+    Returns None when the name is not a link, cannot be read, or points at
+    a target longer than 4096 bytes; a longer target is refused and not
+    shortened.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function linkTarget(path: Span[Nat8, R]): Option[String];
+
+    """
+    Makes a symbolic link called name that points at target.  Returns true
+    on success.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function createSymlink(target: Span[Nat8, R], name: Span[Nat8, S]): Bool;
+
+    """
+    Returns true when any part of the path is a symbolic link: every prefix
+    that ends at a slash, and the whole path, is asked with kindOf.
+
+    The answer can be out of date by the time the caller acts on it.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function containsSymlink(path: Span[Nat8, R]): Bool;
+
+    ---
+    --- A pipe
+    ---
+
+    """
+    A pipe: two descriptors made together, and what is written into one
+    comes out of the other.  It holds both ends.
+    """
+    type Pipe: Linear;
+
+    """
+    Opens a pipe, both ends close-on-exec.  Returns None when the kernel
+    refused, which in practice means the process is out of descriptors.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    function openPipe(): Option[Pipe];
+
+    """
+    Closes both ends.  Returns true only when both closes succeeded.
+    No contract: it only frees or closes what it is given.
+    """
+    function closePipe(pipe: Pipe): Bool;
+
+    """
+    The reading end, to hand to a poller.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function readEnd(pipe: &[Pipe, R]): &[FileDescriptor, R];
+
+    """
+    The reading end, to read from.  A read moves the file offset, so it
+    needs a write reference.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function readEndMut(pipe: &![Pipe, R]): &![FileDescriptor, R];
+
+    """
+    The writing end.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function writeEnd(pipe: &[Pipe, R]): &[FileDescriptor, R];
+
+    """
+    The writing end, to write into.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function writeEndMut(pipe: &![Pipe, R]): &![FileDescriptor, R];
+
+    ---
+    --- Moving the offset
+    ---
+
+    """
+    Where a seek counts from.
+    """
+    type SeekOrigin: Free;
+
+    """
+    From the start of the file.
+    """
+    constant seekFromStart: SeekOrigin;
+
+    """
+    From where the offset is now.
+    """
+    constant seekFromHere: SeekOrigin;
+
+    """
+    From the end of the file.
+    """
+    constant seekFromEnd: SeekOrigin;
+
+    """
+    Moves the offset of the file and returns where it now is, counted from
+    the start.
+
+    Returns None when the kernel refused: a pipe cannot seek, and an offset
+    before the start is refused.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function seekFile(file: &![FileDescriptor, R], offset: Int64,
+        origin: SeekOrigin): Option[Int64];
+
+    ---
+    --- Directories
+    ---
+
+    """
+    Makes a directory that only its owner can read, write and search, mode
+    0700.  Returns true on success.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function createDirectory(path: Span[Nat8, R]): Bool;
+
+    """
+    Removes an empty directory.  Returns false for a directory that holds
+    anything; nothing here removes a tree.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function removeDirectory(path: Span[Nat8, R]): Bool;
+
+    """
+    An open directory, read one name at a time.  It must be closed with
+    closeDirectory.
+    """
+    type Directory: Linear;
+
+    """
+    Opens a directory to read its names.  Returns None when it cannot be
+    opened.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function openDirectory(path: Span[Nat8, R]): Option[Directory];
+
+    """
+    The next name, or None when there are no more or reading failed, which
+    directoryFailed then tells.
+
+    Dot and dot-dot are never returned.  The order is the file system's.  A
+    name is the bytes the file system stores, not checked for UTF-8.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function nextEntry(directory: &![Directory, R]): Option[String];
+
+    """
+    Returns true when the last None from nextEntry was a failure and not
+    the end.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function directoryFailed(directory: &[Directory, R]): Bool;
+
+    """
+    Closes the directory.  Returns true when the C library reported no
+    error; the directory is closed either way.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeDirectory(directory: Directory): Bool;
+
+    ---
+    --- A child process, and its three pipes
+    ---
+    --- The process must be waited for, and each pipe end closed; all of
+    --- them are linear.  A child that writes more into one pipe than the
+    --- pipe holds waits until somebody reads it, so a caller that reads the
+    --- output to the end before it reads the errors can wait forever.
+    ---
+
+    """
+    A programme and its arguments, not yet started.
+    """
+    type Command: Linear;
+
+    """
+    Starts describing a command.  program is the path of the binary, such
+    as /bin/sh: there is no search of PATH.  It is also the name the child
+    sees as its own.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function makeCommand(program: Span[Nat8, R]): Command;
+
+    """
+    Adds one argument.  An argument that holds a zero byte, or an empty
+    programme path, spoils the command, and spawnProcess refuses it.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addArgument(command: Command, argument: Span[Nat8, R]): Command;
+
+    """
+    Throws away a command that is not going to be run.
+    No contract: it only frees or closes what it is given.
+    """
+    function discardCommand(command: Command): Unit;
+
+    """
+    A child that has been started and not yet waited for.
+    """
+    type Process: Linear;
+
+    """
+    What spawnProcess returns: the process, and the parent's ends of its
+    three pipes.  Closing input tells the child there is nothing more to
+    read.
+    """
+    record Running: Linear is
+        -- Waited for with waitProcess.
+        process: Process;
+        -- Write into this; the child reads it as its standard input.
+        input: FileDescriptor;
+        -- Read from this; it is the child's standard output.
+        output: FileDescriptor;
+        -- Read from this; it is the child's standard error.
+        errors: FileDescriptor;
+    end;
+
+    """
+    Starts the command, and consumes it.
+
+    Returns None when the command was spoiled, the pipes or the process
+    could not be made, or the programme could not be executed.  In the
+    child every descriptor above the standard three is closed first.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    function spawnProcess(command: Command): Option[Running];
+
+    """
+    The process id.
+    No contract: a number the system or the build gives.
+    """
+    generic [R: Region]
+    function processId(process: &[Process, R]): Int32;
+
+    """
+    Sends the child SIGTERM.  Returns true when the signal was delivered;
+    the child still has to be waited for.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function terminateProcess(process: &[Process, R]): Bool;
+
+    """
+    Waits for the child to end and says how, and consumes the process.
+    Close input first when the child reads its input to the end.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function waitProcess(process: Process): ProcessStatus;
+
+    """
+    How a child ended.
+    """
+    type ProcessStatus: Free;
+
+    """
+    Returns true when the child called exit or returned from main.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function exitedNormally(status: ProcessStatus): Bool;
+
+    """
+    The exit code, 0 to 255, when the child exited normally; -1 otherwise.
+    No contract: a number the system or the build gives.
+    """
+    function exitCode(status: ProcessStatus): Int32;
+
+    """
+    Returns true when a signal ended the child.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function endedBySignal(status: ProcessStatus): Bool;
+
+    """
+    The number of the signal that ended the child; -1 otherwise.
+    No contract: a number the system or the build gives.
+    """
+    function signalNumber(status: ProcessStatus): Int32;
+
+    """
+    Returns true when the child could not be waited for at all.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function waitFailed(status: ProcessStatus): Bool;
+
+    """
+    The number of SIGTERM on this platform, what terminateProcess sends.
+    No contract: a number the system or the build gives.
+    """
+    function terminationSignal(): Int32;
+
+    ---
+    --- The environment
+    ---
+
+    """
+    The most bytes environmentValue returns.
+    """
+    constant environmentLimit: Index;
+
+    """
+    The value of the environment variable name, as the process was started
+    with it.
+
+    Returns None when the variable is not set, the name holds a zero byte,
+    or the value is longer than environmentLimit; a longer value is refused
+    and not shortened.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function environmentValue(name: Span[Nat8, R]): Option[String];
+
+    ---
+    --- Asking, and removing
+    ---
+
+    """
+    The number the kernel gave the descriptor, for a message or a foreign
+    call.  It is a copy of the number, not a second descriptor.
+    No contract: a number the system or the build gives.
+    """
+    generic [R: Region]
+    function fileNumber(file: &[FileDescriptor, R]): Int32;
+
+    """
+    Removes a name from the file system.  Returns true when the name is
+    gone; a path with a zero byte is refused.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function removeFile(path: Span[Nat8, R]): Bool;
+
+    """
+    Removes a name from the file system.  Returns true when the name is
+    gone afterwards, also when it was not there; false when it could not
+    be removed or the path is refused.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function removeFileIfThere(path: Span[Nat8, R]): Bool;
+
+    """
+    What secureDelete did with a name.
+    """
+    union Erasure: Free is
+        """
+        The file was overwritten once with random bytes, written to the
+        disk, and its name removed.
+        """
+        case Overwritten;
+        """
+        The file had more than one link, so only this name was removed and
+        nothing was overwritten: the other names still hold the contents.
+        """
+        case OnlyUnlinked;
+        """
+        Nothing was removed: the name is not a regular file, is a symbolic
+        link, may not be written, changed while it was opened, or a write,
+        the sync or the removal failed.
+        """
+        case NotErased;
+    end;
+
+    """
+    Overwrites a regular file once with random bytes, syncs it and removes
+    its name, as rm -P does.  A symbolic link is refused, not followed.  On
+    flash memory and on a file system that copies on write the old blocks
+    may survive; this cannot reach them.
+    No contract: the result is I/O.
+    """
+    generic [R: Region]
+    function secureDelete(path: Span[Nat8, R]): Erasure;
+
+    """
+    Sets the mode of the open file, as fchmod(2) does, so under pledge on
+    OpenBSD the programme needs the promise fattr.  Returns false when the
+    kernel refused.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function setFileMode(file: &![FileDescriptor, R], mode: Nat32): Bool;
+
+    ---
+    --- What a file is, renames, links and syncs
+    ---
+
+    """
+    What stat(2) says of a file: its kind, the permission bits of its mode
+    from 0 to octal 7777, its owner and group by number, its size in
+    bytes, the device and inode number that name the file on this
+    machine, and how many hard links name it.  Two statuses with the same
+    device and inode are the same file; a log file that was rotated has
+    another inode under its name.  A file of one link has no second name
+    that could be written through.
+    """
+    record FileStatus: Free is
+        kind: FileKind;
+        mode: Nat32;
+        owner: Nat32;
+        group: Nat32;
+        size: Nat64;
+        device: Nat64;
+        inode: Nat64;
+        links: Nat64;
+    end;
+
+    """
+    What was found at a name.
+    """
+    union FileLookup: Free is
+        """
+        Nothing is there, nor at the directory the path names before it.
+        """
+        case FileMissing;
+        """
+        The name could not be looked at, as under a directory the process
+        may not search, or the path is empty or holds a zero byte.
+        """
+        case FileUnreadable;
+        """
+        Something is there.
+        """
+        case FileFound is
+            status: FileStatus;
+    end;
+
+    """
+    What is at path, without following a symbolic link: a link is found
+    as kindSymlink.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function statusOf(path: Span[Nat8, R]): FileLookup;
+
+    """
+    What the open file is.  None when the kernel refused.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function statusOfOpen(file: &[FileDescriptor, R]): Option[FileStatus];
+
+    """
+    Sets the owner and group of the open file, as fchown(2) does.  Giving
+    a file to another owner needs privilege.  Returns false when the
+    kernel refused.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function setFileOwner(file: &![FileDescriptor, R], owner: Nat32, group: Nat32): Bool;
+
+    """
+    Writes what the kernel holds of the open file to the disk, as fsync(2)
+    does.  Returns true when the disk has it.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function syncFile(file: &![FileDescriptor, R]): Bool;
+
+    """
+    Writes the directory at path to the disk, which makes a name made or
+    renamed in it survive a crash.  Returns false when the directory could
+    not be opened or synced.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function syncDirectory(path: Span[Nat8, R]): Bool;
+
+    """
+    Renames source to target, as rename(2) does: a file at target is
+    replaced in one step, so that whoever opens target finds the old file
+    or the new one and never a part of either.  Both must be on the same
+    file system.  Returns false when the kernel refused or a path is
+    refused.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function renameFile(source: Span[Nat8, R], target: Span[Nat8, S]): Bool;
+
+    """
+    Makes name a second name of the file at existing, a hard link, as
+    link(2) does.  Returns false when name is taken, the two are on
+    different file systems, or the kernel refused otherwise.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region, S: Region]
+    function linkFile(existing: Span[Nat8, R], name: Span[Nat8, S]): Bool;
+
+    """
+    A new file beside another: its descriptor, open for writing, and its
+    name.  Linear: the file is closed with closeFile and the name is
+    renamed or removed.
+    """
+    record Temporary: Linear is
+        file: FileDescriptor;
+        name: String;
+    end;
+
+    """
+    Makes a new empty file in the directory of path, named .atomic- and
+    six characters nobody holds, with mode 0600, as mkstemp(3) does.  The
+    name keeps the directory part of path; path itself need not exist.
+    None when the path is empty, holds a zero byte or ends in a slash, or
+    the kernel refused.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function createTemporaryBeside(path: Span[Nat8, R]): Option[Temporary];
+
+    """
+    Makes a new file at path and opens it for writing, only when nothing
+    is at that name: a file there, or a link, is never replaced.  The mode
+    is set on the open file, so the umask does not change it; that is a
+    fchmod, and under pledge on OpenBSD the programme needs the promise
+    fattr.  None when the name is taken, the path is refused, or the kernel
+    refused.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function createNewFile(path: Span[Nat8, R], mode: Nat32): Option[FileDescriptor];
+
+    """
+    Opens an existing file for writing from its first byte, without
+    truncating it, so that a write replaces the bytes it had.  None when
+    there is no file, the path is refused, or the kernel refused.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function openOverwrite(path: Span[Nat8, R]): Option[FileDescriptor];
+
+    ---
+    --- A Unix domain socket
+    ---
+    --- A connection is a FileDescriptor, read with readExactly and written
+    --- with writeAll like a pipe.
+    ---
+
+    """
+    A stream socket bound to a path and listening on it.  It must be closed,
+    and closing it removes the file.
+    """
+    type Listener: Linear;
+
+    """
+    The longest path a socket can be bound to, in bytes, as the kernel's
+    address structure holds it.  A longer path is refused, not cut.
+    No contract: a number the system or the build gives.
+    """
+    function socketPathLimit(): Index;
+
+    """
+    Binds a stream socket to path, gives the file mode, and listens.  mode
+    is permission bits, #o0 to #o777, and is set before the socket listens.
+    Setting the mode is a chmod, so under pledge on OpenBSD the programme
+    needs the promise fattr besides unix and cpath.
+
+    A stale socket at path, one nobody accepts on, is removed first.
+    Returns None when anything else is there, when mode is larger, and for
+    a path that is empty, holds a zero byte or is longer than
+    socketPathLimit.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function listenUnix(path: Span[Nat8, R], mode: Nat32): Option[Listener];
+
+    """
+    The next connection, waiting until there is one.  Close it with
+    closeFile.  Returns None when accept failed.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function acceptConnection(listener: &[Listener, R]): Option[FileDescriptor];
+
+    """
+    As acceptConnection, waiting at most milliseconds; 0 asks without
+    waiting.  Returns None when nobody connected in that time, and for more
+    than 2147483647.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function acceptWithin(listener: &[Listener, R], milliseconds: Nat32): Option[FileDescriptor];
+
+    """
+    Connects to the socket at path.  Returns None when there is no socket
+    there, nobody accepts on it, or the path is too long.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function connectUnix(path: Span[Nat8, R]): Option[FileDescriptor];
+
+    """
+    Stops listening and removes the socket file.  Returns true when both
+    worked.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeListener(listener: Listener): Bool;
+
+    ---
+    --- A TCP listener
+    ---
+    --- A connection it accepts is a FileDescriptor like the ones above, or
+    --- handed to Standard.Tls.acceptOver.
+    ---
+
+    """
+    A TCP socket bound to an address and port and listening.  It must be
+    closed with closeTcpListener.
+    """
+    type TcpListener: Linear;
+
+    """
+    Binds a TCP socket to address, 4 bytes of IPv4 or 16 of IPv6 in
+    network byte order, at port, and listens.  Port 0 lets the kernel
+    choose one; tcpListenerPort tells which.  An IPv6 address takes IPv6
+    connections only.  None when the address has another size, the port
+    is taken, or the kernel refused.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function listenTcp(address: Span[Nat8, R], port: Nat16): Option[TcpListener];
+
+    """
+    The port the listener is bound to.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function tcpListenerPort(listener: &[TcpListener, R]): Nat16;
+
+    """
+    The next connection, waiting at most milliseconds; 0 asks without
+    waiting.  The connection is blocking; close it with closeFile.  None
+    when nobody connected in that time, and for more than 2147483647.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function acceptTcpWithin(listener: &[TcpListener, R], milliseconds: Nat32): Option[FileDescriptor];
+
+    """
+    Stops listening.  Returns true when the socket was closed.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeTcpListener(listener: TcpListener): Bool;
+
+    ---
+    --- A TCP connection
+    ---
+    --- A connection is a FileDescriptor like the socket above, read with
+    --- readExactly and written with writeAll, or handed to
+    --- Standard.Tls.connectOver.
+    ---
+
+    """
+    Why connectTcp made no connection.
+    """
+    union ConnectFailure: Free is
+        """
+        The host answered that nobody listens at the port.
+        """
+        case ConnectRefused;
+        """
+        No answer came within the time given.
+        """
+        case ConnectTimedOut;
+        """
+        There is no route to the address, or no network for its family.
+        """
+        case ConnectUnreachable;
+        """
+        Anything else, an address that is neither 4 nor 16 bytes among it.
+        """
+        case ConnectError;
+    end;
+
+    """
+    Connects a TCP socket to address, 4 bytes of IPv4 or 16 of IPv6 in
+    network byte order, at port, waiting at most milliseconds for the
+    connection.  The socket is blocking and close-on-exec; close it with
+    closeFile.  Returns the reason in Left when no connection was made, and
+    ConnectError for more than 2147483647 milliseconds.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function connectTcp(address: Span[Nat8, R], port: Nat16, milliseconds: Nat32): Either[ConnectFailure, FileDescriptor];
+
+    """
+    Why readWithin or writeWithin did not finish.
+    """
+    union WaitFailure: Free is
+        """
+        The time ran out.
+        """
+        case WaitTimedOut;
+        """
+        The kernel refused the read or the write.
+        """
+        case WaitFailed;
+    end;
+
+    """
+    Makes a socket's or a pipe's reads and writes return at once when they
+    cannot go on, as readWithin and writeWithin need.  Returns false when the
+    kernel refused.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function makeNonblocking(file: &![FileDescriptor, R]): Bool;
+
+    """
+    At most most bytes from a non-blocking socket or pipe, waiting at most
+    milliseconds in all for some to come.  An empty string is the end of
+    the stream.  Left WaitTimedOut when nothing came in time, WaitFailed
+    when the kernel refused, or most is 0.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function readWithin(file: &![FileDescriptor, R], most: Index, milliseconds: Nat32): Either[WaitFailure, String];
+
+    """
+    All of data to a non-blocking socket or pipe within milliseconds in all.
+    Left WaitTimedOut when the time ran out first, WaitFailed when the
+    kernel refused, or when the reader of a pipe was already gone.  A reader
+    that goes while the write is made raises SIGPIPE, as every write to a
+    pipe does.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function writeWithin(file: &![FileDescriptor, R], data: Span[Nat8, S], milliseconds: Nat32): Either[WaitFailure, Unit];
+end module.

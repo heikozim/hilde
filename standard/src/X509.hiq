@@ -1,0 +1,973 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module over Bindings.X509 and Standard.MlDsa.  What reaches
+-- libcrypto as text in the syntax of its configuration, the DNS names, is
+-- checked here first, so that a name cannot add an extension or another
+-- kind of name.  An ML-DSA key never reaches libcrypto: its PKCS 8 and
+-- SubjectPublicKeyInfo forms are written and read here, byte for byte
+-- those of OpenSSL, and a certificate with such a key is not offered.
+import Standard.String (
+    String,
+    destroyString,
+    destroyWiped,
+    length,
+    fromSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    indexOf,
+    startsWith,
+    hexToBytes,
+    constantTimeEqual
+);
+import Standard.Base64 (
+    encode as base64Encode,
+    decode as base64Decode
+);
+import Standard.MlDsa (
+    MlDsaKey,
+    ParameterSet,
+    Level44,
+    Level65,
+    Level87,
+    publicKeyBytes,
+    secretKeyBytes,
+    keypairFromSeed,
+    generateKeyPair,
+    parameterSetOf,
+    publicKeyOf,
+    seedOf,
+    expandedSecretOf,
+    sign as mlDsaSign,
+    verify as mlDsaVerify,
+    destroyMlDsaKey
+);
+import Bindings.X509 (
+    Key,
+    Cert,
+    Parts,
+    newKey,
+    kindOfKey,
+    pemOfKey,
+    keyOfPem,
+    publicDerOfKey,
+    signWith,
+    verify,
+    kindOfPublicDer,
+    dropKey,
+    certOfPem,
+    certOfDer,
+    pemOfCert,
+    derOfCert,
+    nameOf,
+    namesOf,
+    timeOf,
+    serialOf,
+    fingerprintOf,
+    keyMatches,
+    authorityOf,
+    dropCert,
+    selfSignedCert,
+    issuedCert,
+    requestFor,
+    readRequest,
+    verifyChain as bindVerifyChain
+);
+
+module body Standard.X509 is
+    constant longestName: Index := 253;
+    constant noBytes: Index := 0;
+    constant longestLabel: Index := 63;
+    constant longestCommonName: Index := 64;
+    constant mostDays: Nat32 := 36500;
+
+    -- A key of libcrypto, or an ML-DSA key of Standard.MlDsa.
+    union PrivateKey: Linear is
+        case Classic is
+            inner: Key;
+        case Lattice is
+            lattice: MlDsaKey;
+    end;
+
+    record Certificate: Linear is
+        inner: Cert;
+    end;
+
+    function kindNumber(kind: KeyKind): Int32 is
+        case kind of
+            when EcP256 do
+                return 1;
+            when EcP384 do
+                return 2;
+            when Ed25519Key do
+                return 3;
+            when Rsa2048 do
+                return 4;
+            when Rsa3072 do
+                return 5;
+            when Rsa4096 do
+                return 6;
+            when EcP521 do
+                return 7;
+            when MlDsa44 do
+                return 8;
+            when MlDsa65 do
+                return 9;
+            when MlDsa87 do
+                return 10;
+        end case;
+    end;
+
+    ---
+    --- ML-DSA keys in the forms of PKCS 8 and of a SubjectPublicKeyInfo
+    ---
+
+    -- The bytes of a hex constant of this module.
+    function fromHex(hex: Span[Nat8, Static]): String is
+        case hexToBytes(hex) of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                abort("Standard.X509: a constant is no hex");
+        end case;
+    end;
+
+    function setOfKind(kind: KeyKind): Option[ParameterSet] is
+        case kind of
+            when MlDsa44 do
+                let some: Option[ParameterSet] := Some(value => Level44());
+                return some;
+            when MlDsa65 do
+                let some: Option[ParameterSet] := Some(value => Level65());
+                return some;
+            when MlDsa87 do
+                let some: Option[ParameterSet] := Some(value => Level87());
+                return some;
+            when EcP256 | EcP384 | EcP521 | Ed25519Key | Rsa2048 | Rsa3072 | Rsa4096 do
+                let none: Option[ParameterSet] := None();
+                return none;
+        end case;
+    end;
+
+    function kindOfSet(set: ParameterSet): KeyKind is
+        case set of
+            when Level44 do
+                return MlDsa44();
+            when Level65 do
+                return MlDsa65();
+            when Level87 do
+                return MlDsa87();
+        end case;
+    end;
+
+    -- The SubjectPublicKeyInfo before the raw public key: the algorithm with
+    -- its object identifier, 2.16.840.1.101.3.4.3.17, 18 or 19, and the head
+    -- of the bit string.
+    function spkiPrefix(set: ParameterSet): String is
+        case set of
+            when Level44 do
+                return fromHex("30820532300b06096086480165030403110382052100");
+            when Level65 do
+                return fromHex("308207b2300b0609608648016503040312038207a100");
+            when Level87 do
+                return fromHex("30820a32300b060960864801650304031303820a2100");
+        end case;
+    end;
+
+    -- PKCS 8 in the form OpenSSL writes by default, both the seed and the
+    -- expanded key: the version, the algorithm and the heads of the octet
+    -- string and the sequence, up to the seed.
+    function bothPrefix(set: ParameterSet): String is
+        case set of
+            when Level44 do
+                return fromHex("30820a3e020100300b060960864801650304031104820a2a30820a260420");
+            when Level65 do
+                return fromHex("30820ffe020100300b060960864801650304031204820fea30820fe60420");
+            when Level87 do
+                return fromHex("3082135e020100300b06096086480165030403130482134a308213460420");
+        end case;
+    end;
+
+    -- The head of the octet string of the expanded key, after the seed.
+    function bothMiddle(set: ParameterSet): String is
+        case set of
+            when Level44 do
+                return fromHex("04820a00");
+            when Level65 do
+                return fromHex("04820fc0");
+            when Level87 do
+                return fromHex("04821320");
+        end case;
+    end;
+
+    -- PKCS 8 with the seed alone, the form OpenSSL writes as seed-only.
+    function seedPrefix(set: ParameterSet): String is
+        case set of
+            when Level44 do
+                return fromHex("3034020100300b060960864801650304031104228020");
+            when Level65 do
+                return fromHex("3034020100300b060960864801650304031204228020");
+            when Level87 do
+                return fromHex("3034020100300b060960864801650304031304228020");
+        end case;
+    end;
+
+    -- The DER of key in the form both.  It holds the secret: the caller
+    -- wipes it.
+    generic [R: Region]
+    function latticeDer(key: &[MlDsaKey, R]): String is
+        let set: ParameterSet := parameterSetOf(key);
+        var builder: StringBuilder := makeStringBuilder();
+        let prefix: String := bothPrefix(set);
+        let seed: String := seedOf(key);
+        let middle: String := bothMiddle(set);
+        let secret: String := expandedSecretOf(key);
+        writeString(&!builder, asSpan(&prefix));
+        writeString(&!builder, asSpan(&seed));
+        writeString(&!builder, asSpan(&middle));
+        writeString(&!builder, asSpan(&secret));
+        destroyWiped(secret);
+        destroyString(middle);
+        destroyWiped(seed);
+        destroyString(prefix);
+        return finalize(builder);
+    end;
+
+    -- PEM text of der with label, as OpenSSL writes it: lines of 64 bytes
+    -- of Base64 between the two marks, each line ended by a line feed.
+    generic [D: Region]
+    function pemOf(der: Span[Nat8, D], label: Span[Nat8, Static]): String is
+        let encoded: String := base64Encode(der);
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, "-----BEGIN ");
+        writeString(&!builder, label);
+        writeString(&!builder, "-----\n");
+        let size: Index := length(&encoded);
+        var at: Index := 0;
+        while at < size do
+            writeString(&!builder, substring(asSpan(&encoded), at, at + 64));
+            writeByte(&!builder, 10);
+            at := at + 64;
+        end while;
+        writeString(&!builder, "-----END ");
+        writeString(&!builder, label);
+        writeString(&!builder, "-----\n");
+        destroyWiped(encoded);
+        return finalize(builder);
+    end;
+
+    -- The DER of the first block of pem that holds a private key, or None when there is
+    -- none or its Base64 does not decode.  Line ends and blanks inside the
+    -- block are left out.  It may hold a secret: the caller wipes it.
+    generic [R: Region]
+    function derOfPem(pem: Span[Nat8, R]): Option[String] is
+        let begin: Span[Nat8, Static] := "-----BEGIN PRIVATE KEY-----";
+        case indexOf(pem, begin) of
+            when Some(value as start: Index) do
+                let after: Index := start + spanLength(begin);
+                let rest: Span[Nat8, R] := substring(pem, after, spanLength(pem));
+                case indexOf(rest, "-----END PRIVATE KEY-----") of
+                    when Some(value as stop: Index) do
+                        let inside: Span[Nat8, R] := substring(rest, 0, stop);
+                        var builder: StringBuilder := makeStringBuilder();
+                        var i: Index := 0;
+                        while i < spanLength(inside) do
+                            let byte: Nat8 := inside[i];
+                            if (((byte /= 10) and (byte /= 13)) and (byte /= 32)) and (byte /= 9) then
+                                writeByte(&!builder, byte);
+                            end if;
+                            i := i + 1;
+                        end while;
+                        let text: String := finalize(builder);
+                        let der: Option[String] := base64Decode(asSpan(&text));
+                        destroyWiped(text);
+                        return der;
+                    when None do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- Whether der is PKCS 8 of an ML-DSA key: its algorithm, at the place
+    -- of every form of PrivateKeyInfo with a short or a two-byte length,
+    -- names one of the three sets.
+    generic [D: Region]
+    function namesLattice(der: Span[Nat8, D]): Bool is
+        let oid: String := fromHex("06096086480165030403");
+        var found: Bool := false;
+        var at: Index := 0;
+        while (at < 24) and (not found) do
+            if startsWith(substring(der, at, spanLength(der)), asSpan(&oid)) then
+                let last: Index := at + 10;
+                if last < spanLength(der) then
+                    found := ((der[last] = 17) or (der[last] = 18)) or (der[last] = 19);
+                end if;
+            end if;
+            at := at + 1;
+        end while;
+        destroyString(oid);
+        return found;
+    end;
+
+    -- What PKCS 8 text gave: no ML-DSA key, an ML-DSA key, or one in a
+    -- form this module does not read, or whose two halves disagree.
+    union LatticeRead: Linear is
+        case NotLattice;
+        case LatticeKey is
+            key: MlDsaKey;
+        case LatticeRefused;
+    end;
+
+    -- The key of der in the form both, when der is that form of set: the
+    -- seed makes the key, and the expanded key in der must be the one it
+    -- makes.
+    generic [D: Region]
+    function readBoth(set: ParameterSet, der: Span[Nat8, D]): Option[LatticeRead] is
+        let prefix: String := bothPrefix(set);
+        let middle: String := bothMiddle(set);
+        let head: Index := length(&prefix);
+        let seedEnd: Index := head + 32;
+        let secretStart: Index := seedEnd + length(&middle);
+        let fits: Bool := (startsWith(der, asSpan(&prefix)) and startsWith(substring(der, seedEnd, spanLength(der)), asSpan(&middle)))
+            and (spanLength(der) = (secretStart + secretKeyBytes(set)));
+        destroyString(middle);
+        destroyString(prefix);
+        if not fits then
+            let none: Option[LatticeRead] := None();
+            return none;
+        end if;
+        case keypairFromSeed(set, substring(der, head, seedEnd)) of
+            when Some(value as key: MlDsaKey) do
+                let secret: String := expandedSecretOf(&key);
+                let same: Bool := constantTimeEqual(asSpan(&secret), substring(der, secretStart, spanLength(der)));
+                destroyWiped(secret);
+                if same then
+                    let some: Option[LatticeRead] := Some(value => LatticeKey(key => key));
+                    return some;
+                end if;
+                destroyMlDsaKey(key);
+                let refused: Option[LatticeRead] := Some(value => LatticeRefused());
+                return refused;
+            when None do
+                let refused: Option[LatticeRead] := Some(value => LatticeRefused());
+                return refused;
+        end case;
+    end;
+
+    -- The key of der in the form with the seed alone.
+    generic [D: Region]
+    function readSeed(set: ParameterSet, der: Span[Nat8, D]): Option[LatticeRead] is
+        let prefix: String := seedPrefix(set);
+        let head: Index := length(&prefix);
+        let fits: Bool := startsWith(der, asSpan(&prefix)) and (spanLength(der) = (head + 32));
+        destroyString(prefix);
+        if not fits then
+            let none: Option[LatticeRead] := None();
+            return none;
+        end if;
+        case keypairFromSeed(set, substring(der, head, head + 32)) of
+            when Some(value as key: MlDsaKey) do
+                let some: Option[LatticeRead] := Some(value => LatticeKey(key => key));
+                return some;
+            when None do
+                let refused: Option[LatticeRead] := Some(value => LatticeRefused());
+                return refused;
+        end case;
+    end;
+
+    -- One set: both, then seed alone.
+    generic [D: Region]
+    function readSet(set: ParameterSet, der: Span[Nat8, D]): Option[LatticeRead] is
+        case readBoth(set, der) of
+            when Some(value as read: LatticeRead) do
+                let some: Option[LatticeRead] := Some(value => read);
+                return some;
+            when None do
+                return readSeed(set, der);
+        end case;
+    end;
+
+    -- PKCS 8 der as an ML-DSA key.  The form with the expanded key alone
+    -- carries no seed and is refused, as is any other form of these sets.
+    generic [D: Region]
+    function latticeOfDer(der: Span[Nat8, D]): LatticeRead is
+        if not namesLattice(der) then
+            return NotLattice();
+        end if;
+        case readSet(Level44(), der) of
+            when Some(value as read: LatticeRead) do
+                return read;
+            when None do
+                skip;
+        end case;
+        case readSet(Level65(), der) of
+            when Some(value as read: LatticeRead) do
+                return read;
+            when None do
+                skip;
+        end case;
+        case readSet(Level87(), der) of
+            when Some(value as read: LatticeRead) do
+                return read;
+            when None do
+                skip;
+        end case;
+        return LatticeRefused();
+    end;
+
+    -- The set and the raw public key of an ML-DSA SubjectPublicKeyInfo.
+    generic [P: Region]
+    function latticePublic(publicDer: Span[Nat8, P]): Option[ParameterSet] is
+        case latticeIn(Level44(), publicDer) of
+            when Some(value as set: ParameterSet) do
+                let some: Option[ParameterSet] := Some(value => set);
+                return some;
+            when None do
+                skip;
+        end case;
+        case latticeIn(Level65(), publicDer) of
+            when Some(value as set: ParameterSet) do
+                let some: Option[ParameterSet] := Some(value => set);
+                return some;
+            when None do
+                skip;
+        end case;
+        return latticeIn(Level87(), publicDer);
+    end;
+
+    generic [P: Region]
+    function latticeIn(set: ParameterSet, publicDer: Span[Nat8, P]): Option[ParameterSet] is
+        let prefix: String := spkiPrefix(set);
+        let fits: Bool := startsWith(publicDer, asSpan(&prefix)) and (spanLength(publicDer) = (length(&prefix) + publicKeyBytes(set)));
+        destroyString(prefix);
+        if fits then
+            let some: Option[ParameterSet] := Some(value => set);
+            return some;
+        end if;
+        let none: Option[ParameterSet] := None();
+        return none;
+    end;
+
+    ---
+    --- Keys
+    ---
+
+    function generateKey(kind: KeyKind): Option[PrivateKey] is
+        case setOfKind(kind) of
+            when Some(value as set: ParameterSet) do
+                case generateKeyPair(set) of
+                    when Some(value as made: MlDsaKey) do
+                        let some: Option[PrivateKey] := Some(value => Lattice(lattice => made));
+                        return some;
+                    when None do
+                        let none: Option[PrivateKey] := None();
+                        return none;
+                end case;
+            when None do
+                skip;
+        end case;
+        case newKey(kindNumber(kind)) of
+            when Some(value as key: Key) do
+                let some: Option[PrivateKey] := Some(value => Classic(inner => key));
+                return some;
+            when None do
+                let none: Option[PrivateKey] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function keyKindOf(key: &[PrivateKey, R]): KeyKind is
+        case key of
+            when Classic(inner: &[Key, R]) do
+                return kindOfNumber(kindOfKey(inner));
+            when Lattice(lattice: &[MlDsaKey, R]) do
+                return kindOfSet(parameterSetOf(lattice));
+        end case;
+    end;
+
+    generic [R: Region]
+    function privateKeyToPem(key: &[PrivateKey, R]): Option[String] is
+        case key of
+            when Classic(inner: &[Key, R]) do
+                return pemOfKey(inner);
+            when Lattice(lattice: &[MlDsaKey, R]) do
+                let der: String := latticeDer(lattice);
+                let pem: String := pemOf(asSpan(&der), "PRIVATE KEY");
+                destroyWiped(der);
+                let some: Option[String] := Some(value => pem);
+                return some;
+        end case;
+    end;
+
+    -- What the first block of pem that holds a private key holds of ML-DSA.
+    generic [R: Region]
+    function latticeOfPem(pem: Span[Nat8, R]): LatticeRead is
+        case derOfPem(pem) of
+            when Some(value as der: String) do
+                let read: LatticeRead := latticeOfDer(asSpan(&der));
+                destroyWiped(der);
+                return read;
+            when None do
+                return NotLattice();
+        end case;
+    end;
+
+    generic [R: Region]
+    function privateKeyFromPem(pem: Span[Nat8, R]): Option[PrivateKey] is
+        case latticeOfPem(pem) of
+            when LatticeKey(key: MlDsaKey) do
+                let some: Option[PrivateKey] := Some(value => Lattice(lattice => key));
+                return some;
+            when LatticeRefused do
+                let none: Option[PrivateKey] := None();
+                return none;
+            when NotLattice do
+                skip;
+        end case;
+        case keyOfPem(pem) of
+            when Some(value as key: Key) do
+                let some: Option[PrivateKey] := Some(value => Classic(inner => key));
+                return some;
+            when None do
+                let none: Option[PrivateKey] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function publicKeyDer(key: &[PrivateKey, R]): Option[String] is
+        case key of
+            when Classic(inner: &[Key, R]) do
+                return publicDerOfKey(inner);
+            when Lattice(lattice: &[MlDsaKey, R]) do
+                let prefix: String := spkiPrefix(parameterSetOf(lattice));
+                let public: String := publicKeyOf(lattice);
+                var builder: StringBuilder := makeStringBuilder();
+                writeString(&!builder, asSpan(&prefix));
+                writeString(&!builder, asSpan(&public));
+                destroyString(public);
+                destroyString(prefix);
+                let some: Option[String] := Some(value => finalize(builder));
+                return some;
+        end case;
+    end;
+
+    generic [R: Region, M: Region]
+    function signMessage(key: &[PrivateKey, R], message: Span[Nat8, M]): Option[String] is
+        case key of
+            when Classic(inner: &[Key, R]) do
+                return signWith(inner, message);
+            when Lattice(lattice: &[MlDsaKey, R]) do
+                return mlDsaSign(lattice, message, "");
+        end case;
+    end;
+
+    generic [P: Region, M: Region, S: Region]
+    function verifyMessage(publicDer: Span[Nat8, P], message: Span[Nat8, M], signature: Span[Nat8, S]): Bool is
+        case latticePublic(publicDer) of
+            when Some(value as set: ParameterSet) do
+                let prefix: String := spkiPrefix(set);
+                let raw: Span[Nat8, P] := substring(publicDer, length(&prefix), spanLength(publicDer));
+                destroyString(prefix);
+                return mlDsaVerify(set, raw, message, "", signature);
+            when None do
+                return verify(publicDer, message, signature);
+        end case;
+    end;
+
+    generic [P: Region]
+    function publicKeyKind(publicDer: Span[Nat8, P]): Option[KeyKind] is
+        case latticePublic(publicDer) of
+            when Some(value as set: ParameterSet) do
+                let some: Option[KeyKind] := Some(value => kindOfSet(set));
+                return some;
+            when None do
+                skip;
+        end case;
+        let number: Int32 := kindOfPublicDer(publicDer);
+        if (number < 1) or (number > 10) then
+            let none: Option[KeyKind] := None();
+            return none;
+        end if;
+        let some: Option[KeyKind] := Some(value => kindOfNumber(number));
+        return some;
+    end;
+
+    function isLatticeNumber(number: Int32): Bool is
+        return (number >= 8) and (number <= 10);
+    end;
+
+    function kindOfNumber(number: Int32): KeyKind is
+        if number = 2 then
+            return EcP384();
+        end if;
+        if number = 3 then
+            return Ed25519Key();
+        end if;
+        if number = 4 then
+            return Rsa2048();
+        end if;
+        if number = 5 then
+            return Rsa3072();
+        end if;
+        if number = 6 then
+            return Rsa4096();
+        end if;
+        if number = 7 then
+            return EcP521();
+        end if;
+        if number = 8 then
+            return MlDsa44();
+        end if;
+        if number = 9 then
+            return MlDsa65();
+        end if;
+        if number = 10 then
+            return MlDsa87();
+        end if;
+        return EcP256();
+    end;
+
+    function destroyPrivateKey(key: PrivateKey): Unit is
+        case key of
+            when Classic(inner: Key) do
+                dropKey(inner);
+            when Lattice(lattice: MlDsaKey) do
+                destroyMlDsaKey(lattice);
+        end case;
+        return nil;
+    end;
+
+    function wrap(made: Option[Cert]): Option[Certificate] is
+        case made of
+            when Some(value as inner: Cert) do
+                let some: Option[Certificate] := Some(value => Certificate(inner => inner));
+                return some;
+            when None do
+                let none: Option[Certificate] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function certificateFromPem(pem: Span[Nat8, R]): Option[Certificate] is
+        return wrap(certOfPem(pem));
+    end;
+
+    generic [R: Region]
+    function certificateFromDer(der: Span[Nat8, R]): Option[Certificate] is
+        return wrap(certOfDer(der));
+    end;
+
+    generic [R: Region]
+    function certificateToPem(certificate: &[Certificate, R]): Option[String] is
+        return pemOfCert(&(certificate->inner));
+    end;
+
+    generic [R: Region]
+    function certificateToDer(certificate: &[Certificate, R]): Option[String] is
+        return derOfCert(&(certificate->inner));
+    end;
+
+    generic [R: Region]
+    function subjectName(certificate: &[Certificate, R]): Option[String] is
+        return nameOf(&(certificate->inner), false);
+    end;
+
+    generic [R: Region]
+    function issuerName(certificate: &[Certificate, R]): Option[String] is
+        return nameOf(&(certificate->inner), true);
+    end;
+
+    generic [R: Region]
+    function dnsNamesOf(certificate: &[Certificate, R]): String is
+        return namesOf(&(certificate->inner));
+    end;
+
+    generic [R: Region]
+    function validFrom(certificate: &[Certificate, R]): Option[Int64] is
+        return timeOf(&(certificate->inner), false);
+    end;
+
+    generic [R: Region]
+    function validUntil(certificate: &[Certificate, R]): Option[Int64] is
+        return timeOf(&(certificate->inner), true);
+    end;
+
+    generic [R: Region]
+    function serialNumber(certificate: &[Certificate, R]): Option[String] is
+        return serialOf(&(certificate->inner));
+    end;
+
+    generic [R: Region]
+    function fingerprintSha256(certificate: &[Certificate, R]): Option[String] is
+        return fingerprintOf(&(certificate->inner));
+    end;
+
+    generic [R: Region, K: Region]
+    function belongsTo(certificate: &[Certificate, R], key: &[PrivateKey, K]): Bool is
+        case key of
+            when Classic(inner: &[Key, K]) do
+                return keyMatches(&(certificate->inner), inner);
+            when Lattice(lattice: &[MlDsaKey, K]) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function isAuthority(certificate: &[Certificate, R]): Bool is
+        return authorityOf(&(certificate->inner));
+    end;
+
+    function destroyCertificate(certificate: Certificate): Unit is
+        let { inner: Cert } := certificate;
+        dropCert(inner);
+        return nil;
+    end;
+
+    ---
+    --- Names
+    ---
+
+    function isLabelByte(byte: Nat8): Bool is
+        if (byte >= 'a') and (byte <= 'z') then
+            return true;
+        end if;
+        if (byte >= 'A') and (byte <= 'Z') then
+            return true;
+        end if;
+        if (byte >= '0') and (byte <= '9') then
+            return true;
+        end if;
+        return byte = '-';
+    end;
+
+    -- Whether the bytes of names from start up to, not with, stop are one
+    -- DNS name.
+    generic [R: Region]
+    function isDnsName(names: Span[Nat8, R], start: Index, stop: Index): Bool is
+        if (stop <= start) or ((stop - start) > longestName) then
+            return false;
+        end if;
+        var at: Index := start;
+        -- A star alone as the first label.
+        if ((stop - start) >= 2) and ((names[start] = '*') and (names[start + 1] = '.')) then
+            at := start + 2;
+        end if;
+        var label: Index := 0;
+        while at < stop do
+            let byte: Nat8 := names[at];
+            if byte = '.' then
+                if label = 0 then
+                    return false;
+                end if;
+                if names[at - 1] = '-' then
+                    return false;
+                end if;
+                label := noBytes;
+            else if isLabelByte(byte) then
+                if (label = 0) and (byte = '-') then
+                    return false;
+                end if;
+                label := label + 1;
+                if label > longestLabel then
+                    return false;
+                end if;
+            else
+                return false;
+            end if;
+            at := at + 1;
+        end while;
+        return (label > 0) and (names[stop - 1] /= '-');
+    end;
+
+    generic [R: Region]
+    function isDnsNameList(names: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(names);
+        if size = 0 then
+            return false;
+        end if;
+        var start: Index := 0;
+        var at: Index := 0;
+        while at <= size do
+            if (at = size) or (names[at] = ',') then
+                if not isDnsName(names, start, at) then
+                    return false;
+                end if;
+                start := at + 1;
+            end if;
+            at := at + 1;
+        end while;
+        return true;
+    end;
+
+    -- Names as selfSigned takes them: empty or a list, checked before
+    -- libcrypto sees them.
+    generic [R: Region]
+    function namesFit(names: Span[Nat8, R]): Bool is
+        return (spanLength(names) = 0) or isDnsNameList(names);
+    end;
+
+    generic [R: Region]
+    function commonNameFits(name: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(name);
+        if (size = 0) or (size > longestCommonName) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if (name[i] < 32) or (name[i] = 127) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function daysOf(days: Nat32): Option[Int32] is
+        if (days = 0) or (days > mostDays) then
+            let none: Option[Int32] := None();
+            return none;
+        end if;
+        return toInt32(days);
+    end;
+
+    generic [K: Region, C: Region, N: Region]
+    function selfSigned(key: &[PrivateKey, K], commonName: Span[Nat8, C], names: Span[Nat8, N], days: Nat32, authority: Bool): Option[Certificate] is
+        if (not commonNameFits(commonName)) or (not namesFit(names)) then
+            let none: Option[Certificate] := None();
+            return none;
+        end if;
+        case daysOf(days) of
+            when Some(value as span: Int32) do
+                case key of
+                    when Classic(inner: &[Key, K]) do
+                        return wrap(selfSignedCert(inner, commonName, names, span, authority));
+                    when Lattice(lattice: &[MlDsaKey, K]) do
+                        let none: Option[Certificate] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Certificate] := None();
+                return none;
+        end case;
+    end;
+
+    generic [A: Region, K: Region, S: Region, C: Region, N: Region]
+    function issue(authority: &[Certificate, A], authorityKey: &[PrivateKey, K], subjectKey: &[PrivateKey, S],
+        commonName: Span[Nat8, C], names: Span[Nat8, N], days: Nat32, isCa: Bool): Option[Certificate] is
+        if (not commonNameFits(commonName)) or (not namesFit(names)) then
+            let none: Option[Certificate] := None();
+            return none;
+        end if;
+        if (not authorityOf(&(authority->inner))) or (not belongsTo(authority, authorityKey)) then
+            let none: Option[Certificate] := None();
+            return none;
+        end if;
+        case daysOf(days) of
+            when Some(value as span: Int32) do
+                case authorityKey of
+                    when Classic(inner as signer: &[Key, K]) do
+                        case subjectKey of
+                            when Classic(inner as subject: &[Key, S]) do
+                                return wrap(issuedCert(&(authority->inner), signer, subject, commonName, names, span, isCa));
+                            when Lattice(lattice: &[MlDsaKey, S]) do
+                                let none: Option[Certificate] := None();
+                                return none;
+                        end case;
+                    when Lattice(lattice: &[MlDsaKey, K]) do
+                        let none: Option[Certificate] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Certificate] := None();
+                return none;
+        end case;
+    end;
+
+    generic [K: Region, C: Region, N: Region]
+    function certificateRequest(key: &[PrivateKey, K], commonName: Span[Nat8, C], names: Span[Nat8, N]): Option[String] is
+        let nameGood: Bool := (spanLength(commonName) = 0) or commonNameFits(commonName);
+        if (not nameGood) or (not namesFit(names)) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case key of
+            when Classic(inner: &[Key, K]) do
+                return requestFor(inner, commonName, names);
+            when Lattice(lattice: &[MlDsaKey, K]) do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [A: Region, K: Region, R: Region]
+    function issueFromRequest(authority: &[Certificate, A], authorityKey: &[PrivateKey, K], request: Span[Nat8, R], days: Nat32): Option[Certificate] is
+        case readRequest(request) of
+            when Some(value as parts: Parts) do
+                let { key: Key, commonName: String, names: String } := parts;
+                -- A request for an ML-DSA key is refused: such a key is
+                -- used only through Standard.MlDsa.
+                if isLatticeNumber(kindOfKey(&key)) then
+                    dropKey(key);
+                    destroyString(commonName);
+                    destroyString(names);
+                    let refused: Option[Certificate] := None();
+                    return refused;
+                end if;
+                let subject: PrivateKey := Classic(inner => key);
+                let issued: Option[Certificate] := issueNamed(authority, authorityKey, &subject, &commonName, &names, days);
+                destroyPrivateKey(subject);
+                destroyString(commonName);
+                destroyString(names);
+                return issued;
+            when None do
+                let none: Option[Certificate] := None();
+                return none;
+        end case;
+    end;
+
+    -- issue with the names of a request; a request without a common name
+    -- gets its first DNS name as one.
+    generic [A: Region, K: Region, S: Region, C: Region, N: Region]
+    function issueNamed(authority: &[Certificate, A], authorityKey: &[PrivateKey, K], subject: &[PrivateKey, S],
+        commonName: &[String, C], names: &[String, N], days: Nat32): Option[Certificate] is
+        let list: Span[Nat8, N] := asSpan(names);
+        if spanLength(asSpan(commonName)) > 0 then
+            return issue(authority, authorityKey, subject, asSpan(commonName), list, days, false);
+        end if;
+        var first: Index := 0;
+        while (first < spanLength(list)) and (list[first] /= ',') do
+            first := first + 1;
+        end while;
+        if first = 0 then
+            let none: Option[Certificate] := None();
+            return none;
+        end if;
+        return issue(authority, authorityKey, subject, substring(list, 0, first), list, days, false);
+    end;
+
+    generic [C: Region, T: Region, H: Region]
+    function verifyChain(chain: Span[Nat8, C], trusted: Span[Nat8, T], host: Span[Nat8, H], at: Int64): Option[String] is
+        return bindVerifyChain(chain, trusted, host, at);
+    end;
+end module body.

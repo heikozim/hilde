@@ -1,0 +1,1 @@
+A parse error after a string that spans three lines is placed on its own line, line 6.  A lexer that did not count the two line breaks inside the string would put the error on line 4, a line too short for its column, and the compiler would die writing its HTML report.

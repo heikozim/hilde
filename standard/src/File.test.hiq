@@ -1,0 +1,153 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A write with a time limit to the pipe of a child process
+--: a pipe that nobody reads
+-- takes only what it holds, and the write then ends with WaitTimedOut after
+-- the time given; a pipe whose reader has gone is a failure and not the end
+-- of the programme; a pipe that is read takes a small write at once.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.File (
+    Command,
+    Running,
+    Process,
+    FileDescriptor,
+    ProcessStatus,
+    WaitFailure,
+    WaitTimedOut,
+    WaitFailed,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    terminateProcess,
+    closeFile,
+    makeNonblocking,
+    writeWithin
+);
+
+module body Standard.File.Test is
+    constant nanosPerMilli: Nat64 := 1000000;
+
+    function shell(script: Span[Nat8, Static]): Command is
+        let sh: String := fromLiteral("/bin/sh");
+        let flag: String := fromLiteral("-c");
+        let text: String := fromLiteral(script);
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&sh)), asSpan(&flag)), asSpan(&text));
+        destroyString(sh);
+        destroyString(flag);
+        destroyString(text);
+        return command;
+    end;
+
+    function nowNanos(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                return now;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function millisSince(began: Nat64): Nat64 is
+        return (nowNanos() - began) / nanosPerMilli;
+    end;
+
+    -- 1 when the write ended with WaitTimedOut, 2 with WaitFailed, 0 when it
+    -- was done.
+    generic [R: Region, S: Region]
+    function writeCode(pipe: &![FileDescriptor, R], data: Span[Nat8, S], milliseconds: Nat32): Int32 is
+        case writeWithin(pipe, data, milliseconds) of
+            when Right(right as done: Unit) do
+                return 0;
+            when Left(left as why: WaitFailure) do
+                case why of
+                    when WaitTimedOut do
+                        return 1;
+                    when WaitFailed do
+                        return 2;
+                end case;
+        end case;
+    end;
+
+    -- A child that reads nothing takes what the pipe holds and no more: a
+    -- megabyte does not go in, and the write ends with WaitTimedOut after
+    -- the time given, not before and not long after.  The control: a few
+    -- bytes to the same pipe go in at once.
+    function testPipeNobodyReadsTimesOut(): Unit is
+        case spawnProcess(shell("exec sleep 30")) of
+            when None do
+                assertTrue(false, "the child did not start");
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                var pipe: FileDescriptor := input;
+                assertTrue(makeNonblocking(&!pipe), "the pipe could not be made non-blocking");
+                let small: String := fromLiteral("hello");
+                assertTrue(writeCode(&!pipe, asSpan(&small), 1000) = 0, "a few bytes did not go into a pipe");
+                destroyString(small);
+                var big: StringBuilder := makeStringBuilder();
+                for i from 0 to 1048575 do
+                    writeByte(&!big, 97);
+                end for;
+                let megabyte: String := finalize(big);
+                let began: Nat64 := nowNanos();
+                let code: Int32 := writeCode(&!pipe, asSpan(&megabyte), 600);
+                let took: Nat64 := millisSince(began);
+                destroyString(megabyte);
+                assertTrue(code = 1, "a megabyte into a pipe nobody reads did not end with WaitTimedOut");
+                assertTrue(took >= 550, "the write ended before the time given");
+                assertTrue(took < 5000, "the write waited far beyond the time given");
+                let told: Bool := terminateProcess(&process);
+                let a: Bool := closeFile(pipe);
+                let b: Bool := closeFile(output);
+                let c: Bool := closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+        end case;
+        return nil;
+    end;
+
+    -- A pipe whose reader has gone: the child has ended and been waited for,
+    -- so nobody holds the other end.  Writing to it is a failure the caller
+    -- is told of; without the look at the pipe, write(2) would raise SIGPIPE
+    -- and this test, with the programme, would end by the signal.
+    function testPipeReaderGoneFails(): Unit is
+        case spawnProcess(shell("exit 0")) of
+            when None do
+                assertTrue(false, "the child did not start");
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                var pipe: FileDescriptor := input;
+                assertTrue(makeNonblocking(&!pipe), "the pipe could not be made non-blocking");
+                let status: ProcessStatus := waitProcess(process);
+                let small: String := fromLiteral("hello");
+                assertTrue(writeCode(&!pipe, asSpan(&small), 1000) = 2, "a write to a pipe whose reader had gone did not fail");
+                destroyString(small);
+                let a: Bool := closeFile(pipe);
+                let b: Bool := closeFile(output);
+                let c: Bool := closeFile(errors);
+        end case;
+        return nil;
+    end;
+end module body.

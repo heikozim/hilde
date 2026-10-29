@@ -1,0 +1,161 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Binds the mutexes and the atomic words of the runtime.  The value a
+-- mutex guards lives in one raw cell beside the lock: acquire moves it out
+-- after the lock is held, release moves it back before the lock is let
+-- go, so the cell is read only by the task that holds the lock.  The key
+-- names the lock it came from, and release refuses a key of another lock.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullCheck,
+    allocate,
+    load,
+    store,
+    deallocate
+);
+
+module body Bindings.Shared is
+    record Mutex[T: Type]: Linear is
+        lock: Pointer[Nat8];
+        slot: Pointer[T];
+    end;
+
+    record Key: Linear is
+        lock: Pointer[Nat8];
+    end;
+
+    generic [T: Type]
+    function makeMutex(value: T): Either[T, Mutex[T]] is
+        let address: Address[Nat8] := @embed(Address[Nat8], "hilde_mutex_open()");
+        case nullCheck(address) of
+            when Some(value as lock: Pointer[Nat8]) do
+                let slotAddress: Address[T] := allocate();
+                case nullCheck(slotAddress) of
+                    when Some(value as slot: Pointer[T]) do
+                        store(slot, value);
+                        let made: Either[T, Mutex[T]] := Right(right => Mutex(lock => lock, slot => slot));
+                        return made;
+                    when None do
+                        @embed(Unit, "hilde_mutex_free($1)", lock);
+                        let back: Either[T, Mutex[T]] := Left(left => value);
+                        return back;
+                end case;
+            when None do
+                let back: Either[T, Mutex[T]] := Left(left => value);
+                return back;
+        end case;
+    end;
+
+    generic [T: Type, R: Region]
+    function acquire(mutex: &[Mutex[T], R]): Held[T] is
+        let lock: Pointer[Nat8] := mutex->lock;
+        let slot: Pointer[T] := mutex->slot;
+        @embed(Unit, "hilde_mutex_acquire($1)", lock);
+        let taken: T := load(slot);
+        let held: Held[T] := Held(value => taken, key => Key(lock => lock));
+        return held;
+    end;
+
+    generic [T: Type, R: Region]
+    function tryAcquire(mutex: &[Mutex[T], R]): Option[Held[T]] is
+        let lock: Pointer[Nat8] := mutex->lock;
+        let slot: Pointer[T] := mutex->slot;
+        if @embed(Int32, "hilde_mutex_try($1)", lock) = 1 then
+            let taken: T := load(slot);
+            let held: Option[Held[T]] := Some(value => Held(value => taken, key => Key(lock => lock)));
+            return held;
+        else
+            let none: Option[Held[T]] := None();
+            return none;
+        end if;
+    end;
+
+    generic [T: Type, R: Region]
+    function release(mutex: &[Mutex[T], R], value: T, key: Key): Unit is
+        let lock: Pointer[Nat8] := mutex->lock;
+        let slot: Pointer[T] := mutex->slot;
+        let { lock as given: Pointer[Nat8] } := key;
+        if @embed(Int32, "((void*) ($1) == (void*) ($2))", lock, given) /= 1 then
+            abort("Standard.Shared: a key was given back to a mutex it does not belong to");
+        end if;
+        store(slot, value);
+        @embed(Unit, "hilde_mutex_release($1)", lock);
+        return nil;
+    end;
+
+    generic [T: Type, R: Region]
+    function mutexHeld(mutex: &[Mutex[T], R]): Bool is
+        let lock: Pointer[Nat8] := mutex->lock;
+        return @embed(Int32, "hilde_mutex_held($1)", lock) = 1;
+    end;
+
+    generic [T: Type]
+    function destroyMutex(mutex: Mutex[T]): T is
+        let { lock: Pointer[Nat8], slot: Pointer[T] } := mutex;
+        if @embed(Int32, "hilde_mutex_held($1)", lock) = 1 then
+            abort("Standard.Shared: a mutex was destroyed while it was held");
+        end if;
+        let value: T := load(slot);
+        deallocate(slot);
+        @embed(Unit, "hilde_mutex_free($1)", lock);
+        return value;
+    end;
+
+    record Atomic: Linear is
+        word: Pointer[Int64];
+    end;
+
+    function makeAtomic(initial: Int64): Option[Atomic] is
+        let address: Address[Int64] := allocate();
+        case nullCheck(address) of
+            when Some(value as word: Pointer[Int64]) do
+                @embed(Unit, "hilde_atomic_store($1, $2)", word, initial);
+                let some: Option[Atomic] := Some(value => Atomic(word => word));
+                return some;
+            when None do
+                let none: Option[Atomic] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function atomicLoad(atomic: &[Atomic, R]): Int64 is
+        let word: Pointer[Int64] := atomic->word;
+        return @embed(Int64, "hilde_atomic_load($1)", word);
+    end;
+
+    generic [R: Region]
+    function atomicStore(atomic: &[Atomic, R], value: Int64): Unit is
+        let word: Pointer[Int64] := atomic->word;
+        @embed(Unit, "hilde_atomic_store($1, $2)", word, value);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function atomicExchange(atomic: &[Atomic, R], value: Int64): Int64 is
+        let word: Pointer[Int64] := atomic->word;
+        return @embed(Int64, "hilde_atomic_exchange($1, $2)", word, value);
+    end;
+
+    generic [R: Region]
+    function atomicCompareSwap(atomic: &[Atomic, R], expected: Int64, desired: Int64): Bool is
+        let word: Pointer[Int64] := atomic->word;
+        return @embed(Int32, "hilde_atomic_compare_swap($1, $2, $3)", word, expected, desired) = 1;
+    end;
+
+    function destroyAtomic(atomic: Atomic): Int64 is
+        let { word: Pointer[Int64] } := atomic;
+        let last: Int64 := @embed(Int64, "hilde_atomic_load($1)", word);
+        deallocate(word);
+        return last;
+    end;
+end module body.

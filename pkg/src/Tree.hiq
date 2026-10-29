@@ -1,0 +1,421 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A directory is read whole before anything below it is opened, so that
+-- no more than one directory is open at a time, however deep the tree.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nthRef,
+    insertBack
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Sort (
+    sort
+);
+import Standard.Text (
+    equal,
+    bytesToHex
+);
+import Standard.Base64 (
+    encode
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.Failure (
+    Failure,
+    describeFailure,
+    destroyFailure
+);
+import Standard.File (
+    FileDescriptor,
+    FileKind,
+    Directory,
+    kindRegular,
+    kindDirectory,
+    kindUnknown,
+    sameKind,
+    kindOf,
+    openRead,
+    readAll,
+    closeFile,
+    openDirectory,
+    nextEntry,
+    directoryFailed,
+    closeDirectory,
+    createDirectory,
+    removeDirectory,
+    removeFile
+);
+import Standard.FileHelpers (
+    copyFile
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf
+);
+
+module body Pkg.Tree is
+    function mostDepth(): Index is
+        return 64;
+    end;
+
+    generic [A: Region, B: Region]
+    function joined(a: Span[Nat8, A], b: Span[Nat8, B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        if (spanLength(a) > 0) and (spanLength(b) > 0) then
+            writeByte(&!out, '/');
+        end if;
+        writeString(&!out, b);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function problemAt(code: Int64, what: Span[Nat8, Static], path: Span[Nat8, P], suggestion: Span[Nat8, Static]): Problem is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, what);
+        writeString(&!out, ": ");
+        writeString(&!out, path);
+        return problemOf(code, finalize(out), fromLiteral(suggestion));
+    end;
+
+    -- The names a directory holds, or None when it cannot be read.
+    generic [P: Region]
+    function namesIn(path: Span[Nat8, P]): Option[Buffer[String]] is
+        case openDirectory(path) of
+            when Some(value as opened: Directory) do
+                var directory: Directory := opened;
+                var names: Buffer[String] := allocateEmpty();
+                var more: Bool := true;
+                while more do
+                    case nextEntry(&!directory) of
+                        when Some(value as name: String) do
+                            insertBack(&!names, name);
+                        when None do
+                            more := false;
+                    end case;
+                end while;
+                let failed: Bool := directoryFailed(&directory);
+                let closed: Bool := closeDirectory(directory);
+                if failed or (not closed) then
+                    destroyArguments(names);
+                    return None();
+                end if;
+                return Some(value => names);
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [N: Region]
+    function leftOut(name: Span[Nat8, N]): Bool is
+        return (((equal(name, ".git") or equal(name, "signatures")) or equal(name, "vendor")) or equal(name, ".hilde-cache")) or equal(name, "dist");
+    end;
+
+    generic [R: Region, L: Region, B: Region]
+    function walk(root: Span[Nat8, R], rel: Span[Nat8, L], depth: Index, out: &![Buffer[String], B]): Option[Problem] is
+        let here: String := joined(root, rel);
+        case namesIn(asSpan(&here)) of
+            when Some(value as names: Buffer[String]) do
+                let found: Option[Problem] := walkNames(root, rel, depth, &names, &~out);
+                destroyArguments(names);
+                destroyString(here);
+                return found;
+            when None do
+                let p: Problem := problemAt(1518, "a directory cannot be read", asSpan(&here), "check that it is there and may be read");
+                destroyString(here);
+                return Some(value => p);
+        end case;
+    end;
+
+    generic [R: Region, L: Region, M: Region, B: Region]
+    function walkNames(root: Span[Nat8, R], rel: Span[Nat8, L], depth: Index, names: &[Buffer[String], M], out: &![Buffer[String], B]): Option[Problem] is
+        var i: Index := 0;
+        while i < bufferLength(names) do
+            let name: Span[Nat8, M] := asSpan(nthRef(names, i));
+            if (depth > 0) or (not leftOut(name)) then
+                let child: String := joined(rel, name);
+                let full: String := joined(root, asSpan(&child));
+                let kind: FileKind := kindOf(asSpan(&full));
+                if sameKind(kind, kindRegular) then
+                    insertBack(&~out, child);
+                    destroyString(full);
+                else if sameKind(kind, kindDirectory) then
+                    if depth >= mostDepth() then
+                        let p: Problem := problemAt(1517, "the tree is deeper than 64 directories at", asSpan(&full), "a package tree is flatter than that");
+                        destroyString(full);
+                        destroyString(child);
+                        return Some(value => p);
+                    end if;
+                    let below: Option[Problem] := walk(root, asSpan(&child), depth + 1, &~out);
+                    destroyString(full);
+                    destroyString(child);
+                    case below of
+                        when Some(value as p: Problem) do
+                            return Some(value => p);
+                        when None do
+                            skip;
+                    end case;
+                else
+                    let p: Problem := problemAt(1510, "a package holds only files and directories, not a link or a special file", asSpan(&full), "replace the link by the file, or leave it out");
+                    destroyString(full);
+                    destroyString(child);
+                    return Some(value => p);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    generic [R: Region]
+    function treeFiles(root: Span[Nat8, R]): Either[Problem, Buffer[String]] is
+        var out: Buffer[String] := allocateEmpty();
+        case walk(root, "", 0, &!out) of
+            when Some(value as p: Problem) do
+                destroyArguments(out);
+                return Left(left => p);
+            when None do
+                return Right(right => sort(out));
+        end case;
+    end;
+
+    -- The bytes of a file, or None.
+    generic [P: Region]
+    function fileBytes(path: Span[Nat8, P]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let bytes: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return bytes;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The line of one file in the summary, or None when it cannot be read.
+    generic [R: Region, F: Region, B: Region]
+    function writeLine(root: Span[Nat8, R], file: Span[Nat8, F], out: &![StringBuilder, B]): Bool is
+        let full: String := joined(root, file);
+        let bytes: Option[String] := fileBytes(asSpan(&full));
+        destroyString(full);
+        case bytes of
+            when Some(value as content: String) do
+                let digest: Option[String] := sha256(asSpan(&content));
+                destroyString(content);
+                case digest of
+                    when Some(value as d: String) do
+                        let hex: String := bytesToHex(asSpan(&d));
+                        destroyString(d);
+                        writeString(&~out, asSpan(&hex));
+                        destroyString(hex);
+                        writeString(&~out, "  ");
+                        writeString(&~out, file);
+                        writeByte(&~out, '\n');
+                        return true;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The lines of all files into out, or the problem of the first file
+    -- that cannot be read.
+    generic [R: Region, F: Region, B: Region]
+    function summarise(root: Span[Nat8, R], files: &[Buffer[String], F], out: &![StringBuilder, B]): Option[Problem] is
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            if not writeLine(root, file, &~out) then
+                return Some(value => problemAt(1518, "a file cannot be read", file, "check that it may be read"));
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    -- Copies every file, making the directories on the way.
+    generic [S: Region, T: Region, F: Region]
+    function copyFiles(source: Span[Nat8, S], target: Span[Nat8, T], files: &[Buffer[String], F]): Option[Problem] is
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            if not makeParents(target, file) then
+                return Some(value => problemAt(1519, "a directory cannot be made for", file, "check that the target may be written"));
+            end if;
+            let origin: String := joined(source, file);
+            let dest: String := joined(target, file);
+            let copied: Either[Failure, Unit] := copyFile(asSpan(&origin), asSpan(&dest));
+            destroyString(origin);
+            case copied of
+                when Right(right as done: Unit) do
+                    destroyString(dest);
+                when Left(left as failure: Failure) do
+                    let why: String := describeFailure(&failure);
+                    destroyFailure(failure);
+                    let p: Problem := problemOf(1519, joined("a file cannot be copied:", asSpan(&why)), fromLiteral("check that the target may be written"));
+                    destroyString(why);
+                    destroyString(dest);
+                    return Some(value => p);
+            end case;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    generic [R: Region]
+    function treeSum(root: Span[Nat8, R]): Either[Problem, String] is
+        case treeFiles(root) of
+            when Right(right as files: Buffer[String]) do
+                var summary: StringBuilder := makeStringBuilder();
+                let bad: Option[Problem] := summarise(root, &files, &!summary);
+                destroyArguments(files);
+                case bad of
+                    when Some(value as p: Problem) do
+                        let partial: String := finalize(summary);
+                        destroyString(partial);
+                        return Left(left => p);
+                    when None do
+                        skip;
+                end case;
+                let text: String := finalize(summary);
+                let digest: Option[String] := sha256(asSpan(&text));
+                destroyString(text);
+                case digest of
+                    when Some(value as d: String) do
+                        let b64: String := encode(asSpan(&d));
+                        destroyString(d);
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, "h1:");
+                        writeString(&!out, asSpan(&b64));
+                        destroyString(b64);
+                        return Right(right => finalize(out));
+                    when None do
+                        return Left(left => problemOf(1518, fromLiteral("SHA-256 failed in the crypto library"), fromLiteral("check the installation of libcrypto")));
+                end case;
+            when Left(left as p: Problem) do
+                return Left(left => p);
+        end case;
+    end;
+
+    -- Makes every directory on the way to the file, below base.
+    generic [T: Region, F: Region]
+    function makeParents(base: Span[Nat8, T], file: Span[Nat8, F]): Bool is
+        var i: Index := 0;
+        while i < spanLength(file) do
+            if file[i] = '/' then
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, base);
+                writeByte(&!out, '/');
+                var j: Index := 0;
+                while j < i do
+                    writeByte(&!out, file[j]);
+                    j := j + 1;
+                end while;
+                let dir: String := finalize(out);
+                if not sameKind(kindOf(asSpan(&dir)), kindDirectory) then
+                    if not createDirectory(asSpan(&dir)) then
+                        destroyString(dir);
+                        return false;
+                    end if;
+                end if;
+                destroyString(dir);
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [S: Region, T: Region]
+    function copyTree(source: Span[Nat8, S], target: Span[Nat8, T]): Either[Problem, Unit] is
+        if not sameKind(kindOf(target), kindUnknown) then
+            return Left(left => problemAt(1519, "the target of a copy is there already", target, "remove it first"));
+        end if;
+        case treeFiles(source) of
+            when Right(right as files: Buffer[String]) do
+                if not createDirectory(target) then
+                    destroyArguments(files);
+                    return Left(left => problemAt(1519, "a directory cannot be made", target, "check that its parent may be written"));
+                end if;
+                let bad: Option[Problem] := copyFiles(source, target, &files);
+                destroyArguments(files);
+                case bad of
+                    when Some(value as p: Problem) do
+                        return Left(left => p);
+                    when None do
+                        return Right(right => nil);
+                end case;
+            when Left(left as p: Problem) do
+                return Left(left => p);
+        end case;
+    end;
+
+    generic [P: Region]
+    function removeTree(path: Span[Nat8, P]): Either[Problem, Unit] is
+        let kind: FileKind := kindOf(path);
+        if sameKind(kind, kindUnknown) then
+            return Right(right => nil);
+        end if;
+        if not sameKind(kind, kindDirectory) then
+            if removeFile(path) then
+                return Right(right => nil);
+            end if;
+            return Left(left => problemAt(1519, "a file cannot be removed", path, "check that its directory may be written"));
+        end if;
+        case namesIn(path) of
+            when Some(value as names: Buffer[String]) do
+                var i: Index := 0;
+                while i < bufferLength(&names) do
+                    let child: String := joined(path, asSpan(nthRef(&names, i)));
+                    let removed: Either[Problem, Unit] := removeTree(asSpan(&child));
+                    destroyString(child);
+                    case removed of
+                        when Right(right as done: Unit) do
+                            skip;
+                        when Left(left as p: Problem) do
+                            destroyArguments(names);
+                            return Left(left => p);
+                    end case;
+                    i := i + 1;
+                end while;
+                destroyArguments(names);
+                if removeDirectory(path) then
+                    return Right(right => nil);
+                end if;
+                return Left(left => problemAt(1519, "a directory cannot be removed", path, "check that its parent may be written"));
+            when None do
+                return Left(left => problemAt(1518, "a directory cannot be read", path, "check that it may be read"));
+        end case;
+    end;
+end module body.

@@ -1,0 +1,480 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.SperliWire: the frames of docs/sperli-vectors.txt that a rank
+-- uses (hello, data, heartbeat, abort, bye) encoded again from their
+-- fields and checked, the negative headers refused with their codes, the
+-- host rule, and the join tokens with every refusal.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    startsWith
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile
+);
+import Standard.CompositeSig (
+    CompositeKey,
+    generateKeyPair,
+    publicKeyOf,
+    destroyCompositeKey
+);
+import Standard.SperliError (
+    badCertificate,
+    refusedHost,
+    tokenExpired,
+    tokenForeignJob,
+    tokenWrongRank,
+    tokenBadSignature,
+    oversizedFrame,
+    staleIncarnation,
+    badFrame,
+    badHello,
+    describe
+);
+import Standard.SperliWire (
+    headerBytes,
+    maxPayload,
+    helloKind,
+    dataKind,
+    heartbeatKind,
+    abortKind,
+    byeKind,
+    frameHeader,
+    headerLength,
+    headerKind,
+    headerTag,
+    checkHeader,
+    helloPayload,
+    checkHello,
+    helloToken,
+    abortPayload,
+    abortReason,
+    signJoinToken,
+    verifyJoinToken,
+    hostRefused,
+    hostListed,
+    refusedHostsVariable,
+    hexOf,
+    certificateName,
+    subjectIs
+);
+
+module body Standard.SperliWire.Test is
+    function jobId(): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Nat8 := 0;
+        while i < 16 do
+            writeByte(&!out, i);
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function hexDigit(byte: Nat8): Nat8 is
+        if (byte >= 48) and (byte <= 57) then
+            return byte - 48;
+        end if;
+        return (byte - 97) + 10;
+    end;
+
+    -- The bytes a line of the vector file spells after "hex: ": pairs of
+    -- digits behind blanks, and hh*n for n times the byte.
+    generic [R: Region]
+    function decodeHex(text: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] = 32 then
+                i := i + 1;
+            else
+                let byte: Nat8 := (hexDigit(text[i]) * 16) + hexDigit(text[i + 1]);
+                i := i + 2;
+                var times: Index := 1;
+                if (i < spanLength(text)) and (text[i] = 42) then
+                    i := i + 1;
+                    times := 0;
+                    while (i < spanLength(text)) and (text[i] /= 32) do
+                        times := (times * 10) + toIndexDigit(text[i]);
+                        i := i + 1;
+                    end while;
+                end if;
+                var k: Index := 0;
+                while k < times do
+                    writeByte(&!out, byte);
+                    k := k + 1;
+                end while;
+            end if;
+        end while;
+        return finalize(out);
+    end;
+
+    function toIndexDigit(byte: Nat8): Index is
+        case toIndex(byte - 48) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("a digit did not fit an Index");
+        end case;
+    end;
+
+    function readVectors(): String is
+        case openRead("docs/sperli-vectors.txt") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var text: String := fromLiteral("");
+                case readAll(&!file) of
+                    when Some(value as read: String) do
+                        destroyString(text);
+                        text := read;
+                    when None do
+                        skip;
+                end case;
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return fromLiteral("");
+        end case;
+    end;
+
+    -- The little endian number of width bytes at at.
+    generic [R: Region]
+    function readLe(bytes: &[String, R], at: Index, width: Index): Nat64 is
+        var value: Nat64 := 0;
+        var i: Index := width;
+        while i > 0 do
+            i := i - 1;
+            let byte: Nat8 := nthByte(bytes, at + i);
+            case toNat64(byte) of
+                when Some(value as widened: Nat64) do
+                    value := (value * 256) + widened;
+                when None do
+                    skip;
+            end case;
+        end while;
+        return value;
+    end;
+
+    function narrow32(value: Nat64): Nat32 is
+        case toNat32(value) of
+            when Some(value as at: Nat32) do
+                return at;
+            when None do
+                abort("a number did not fit a Nat32");
+        end case;
+    end;
+
+    generic [V: Region]
+    function expectedCode(verdict: Span[Nat8, V]): Int32 is
+        if equal(verdict, "ok") or equal(verdict, "ok-length") then
+            return 0;
+        end if;
+        if equal(verdict, "reject-oversized") then
+            return oversizedFrame();
+        end if;
+        if equal(verdict, "drop-old-incarnation") then
+            return staleIncarnation();
+        end if;
+        return badFrame();
+    end;
+
+    -- Whether a record of the vector file is one of the frames a rank
+    -- uses, or a refused header.
+    generic [N: Region]
+    function used(name: Span[Nat8, N]): Bool is
+        return (((equal(name, "hello") or equal(name, "data")) or (equal(name, "data-empty") or equal(name, "heartbeat"))) or (equal(name, "abort") or equal(name, "bye"))) or ((startsWith(name, "neg-") and (not startsWith(name, "neg-ckpt"))) and (not startsWith(name, "neg-reduce"))) or (startsWith(name, "collective-") or equal(name, "data-largest-tag"));
+    end;
+
+    -- The header of the record checked as the rank that the frame is for
+    -- reads it, at the incarnation of the frame or the one the record
+    -- names.
+    generic [R: Region, V: Region, N: Region]
+    function checkHeaderOf(bytes: &[String, R], verdict: Span[Nat8, V], receiver: Nat64, name: Span[Nat8, N]): Unit is
+        let job: String := jobId();
+        var incarnation: Nat32 := narrow32(readLe(bytes, 24, 4));
+        if receiver > 0 then
+            incarnation := narrow32(receiver);
+        end if;
+        let own: Nat32 := narrow32(readLe(bytes, 44, 4));
+        let peer: Nat32 := narrow32(readLe(bytes, 40, 4));
+        let header: Span[Nat8, R] := getSpan(bytes, 0, 51);
+        let held: Bool := checkHeader(header, asSpan(&job), incarnation, own, peer) = expectedCode(verdict);
+        if not held then
+            print(name);
+        end if;
+        assertTrue(held, "the header of a record gets the code the file expects");
+        destroyString(job);
+        return nil;
+    end;
+
+    -- A frame that is accepted is made again from its fields, byte for byte.
+    generic [R: Region, N: Region]
+    function rebuildHeader(bytes: &[String, R], name: Span[Nat8, N]): Unit is
+        let job: String := jobId();
+        let length: Index := headerLength(getSpan(bytes, 0, 51));
+        let built: String := frameHeader(nthByte(bytes, 4), length, asSpan(&job), narrow32(readLe(bytes, 24, 4)), readLe(bytes, 32, 8), narrow32(readLe(bytes, 40, 4)), narrow32(readLe(bytes, 44, 4)), narrow32(readLe(bytes, 48, 4)));
+        let same: Bool := equal(asSpan(&built), getSpan(bytes, 0, 51));
+        if not same then
+            print(name);
+        end if;
+        assertTrue(same, "an accepted header is made again byte for byte");
+        destroyString(built);
+        destroyString(job);
+        return nil;
+    end;
+
+    -- The payloads that the layer builds itself.
+    generic [R: Region, N: Region]
+    function checkPayload(bytes: &[String, R], name: Span[Nat8, N]): Unit is
+        if equal(name, "hello") then
+            let payload: Span[Nat8, R] := getSpan(bytes, 52, length(bytes) - 1);
+            assertTrue(checkHello(payload) = 0, "the HELLO of the vector is acceptable");
+            let token: String := helloToken(payload);
+            let again: String := helloPayload(1, 3, asSpan(&token));
+            assertTrue(equal(asSpan(&again), payload), "the HELLO is made again byte for byte");
+            destroyString(again);
+            destroyString(token);
+        end if;
+        if equal(name, "abort") then
+            let payload: Span[Nat8, R] := getSpan(bytes, 52, length(bytes) - 1);
+            assertTrue(abortReason(payload) = 1, "the reason of the ABORT of the vector");
+            let again: String := abortPayload(1, "heartbeat lost from rank 2");
+            assertTrue(equal(asSpan(&again), payload), "the ABORT is made again byte for byte");
+            destroyString(again);
+        end if;
+        if equal(name, "data") then
+            assertTrue(headerTag(getSpan(bytes, 0, 51)) = 7, "the tag of the DATA of the vector");
+        end if;
+        return nil;
+    end;
+
+    function aKey(): CompositeKey is
+        case generateKeyPair() of
+            when Some(value as key: CompositeKey) do
+                return key;
+            when None do
+                abort("no key pair");
+        end case;
+    end;
+
+    -- The message that the vector file names as the signed part of its
+    -- token, against the token the layer signs for the same fields.
+    generic [R: Region]
+    function checkTokenMessage(bytes: &[String, R]): Unit is
+        let job: String := jobId();
+        let key: CompositeKey := aKey();
+        case signJoinToken(&key, asSpan(&job), 1, 3, 2, 1790000000, "node1") of
+            when Some(value as token: String) do
+                assertTrue(length(&token) = (length(bytes) + 2 + 2484), "the token is the message, a length and the signature");
+                assertTrue(equal(getSpan(&token, 0, length(bytes) - 1), asSpan(bytes)), "the signed message is the one of the vector");
+                destroyString(token);
+            when None do
+                assertTrue(false, "the token was signed");
+        end case;
+        destroyCompositeKey(key);
+        destroyString(job);
+        return nil;
+    end;
+
+    -- Whether the line from start to final of text begins with prefix.
+    generic [R: Region]
+    function lineHas(text: &[String, R], start: Index, final: Index, prefix: Span[Nat8, Static]): Bool is
+        return startsWith(getSpan(text, start, final), prefix);
+    end;
+
+    function testVectorFile(): Unit is
+        let text: String := readVectors();
+        assertTrue(length(&text) > 0, "the vector file was read");
+        var name: Index := 0;
+        var nameEnd: Index := 0;
+        var verdict: Index := 0;
+        var verdictEnd: Index := 0;
+        var receiver: Nat64 := 0;
+        var checked: Index := 0;
+        var lineStart: Index := 0;
+        while lineStart < length(&text) do
+            var lineEnd: Index := lineStart;
+            while (lineEnd < length(&text)) and (nthByte(&text, lineEnd) /= 10) do
+                lineEnd := lineEnd + 1;
+            end while;
+            if lineEnd > lineStart then
+                if lineHas(&text, lineStart, lineEnd - 1, "name: ") then
+                    name := lineStart + 6;
+                    nameEnd := lineEnd - 1;
+                    receiver := 0;
+                end if;
+                if lineHas(&text, lineStart, lineEnd - 1, "expect: ") then
+                    verdict := lineStart + 8;
+                    verdictEnd := lineEnd - 1;
+                end if;
+                if lineHas(&text, lineStart, lineEnd - 1, "receiver-incarnation: ") then
+                    receiver := readLe(&text, lineEnd - 1, 1) - 48;
+                end if;
+                if lineHas(&text, lineStart, lineEnd - 1, "token-message: ") then
+                    let message: String := decodeHex(getSpan(&text, lineStart + 15, lineEnd - 1));
+                    checkTokenMessage(&message);
+                    destroyString(message);
+                end if;
+                if lineHas(&text, lineStart, lineEnd - 1, "hex: ") then
+                    if used(getSpan(&text, name, nameEnd)) then
+                        let bytes: String := decodeHex(getSpan(&text, lineStart + 5, lineEnd - 1));
+                        checkHeaderOf(&bytes, getSpan(&text, verdict, verdictEnd), receiver, getSpan(&text, name, nameEnd));
+                        if expectedCode(getSpan(&text, verdict, verdictEnd)) = 0 then
+                            if length(&bytes) >= 52 then
+                                rebuildHeader(&bytes, getSpan(&text, name, nameEnd));
+                                checkPayload(&bytes, getSpan(&text, name, nameEnd));
+                            end if;
+                        end if;
+                        destroyString(bytes);
+                        checked := checked + 1;
+                    end if;
+                end if;
+            end if;
+            lineStart := lineEnd + 1;
+        end while;
+        assertTrue(checked = 26, "twenty-six records of the file were checked");
+        destroyString(text);
+        return nil;
+    end;
+
+    function testConstants(): Unit is
+        assertTrue(headerBytes() = 52, "a header has 52 bytes");
+        assertTrue(maxPayload() = 16777216, "a payload has at most 16 MiB");
+        assertTrue(helloKind() = 1, "HELLO is 1");
+        assertTrue(dataKind() = 2, "DATA is 2");
+        assertTrue(heartbeatKind() = 4, "HEARTBEAT is 4");
+        assertTrue(abortKind() = 5, "ABORT is 5");
+        assertTrue(byeKind() = 11, "BYE is 11");
+        assertTrue(badCertificate() = 1601, "the first code");
+        assertTrue(equal(describe(1608), "the frame is larger than the limit"), "a code has its words");
+        assertTrue(equal(describe(1), ""), "a number that is no code has none");
+        return nil;
+    end;
+
+    function testHelloRefusals(): Unit is
+        let none: String := fromLiteral("");
+        let good: String := helloPayload(0, 1, "token");
+        assertTrue(checkHello(asSpan(&good)) = 0, "a HELLO with point-to-point service");
+        assertTrue(checkHello(getSpan(&good, 0, 14)) = badHello(), "a HELLO that is too short");
+        assertTrue(checkHello(getSpan(&good, 0, 17)) = badHello(), "a HELLO whose token is cut");
+        let noService: String := helloPayload(0, 2, "token");
+        assertTrue(checkHello(asSpan(&noService)) = badHello(), "a HELLO without point-to-point service");
+        assertTrue(length(&none) = 0, "the empty string is empty");
+        destroyString(noService);
+        destroyString(good);
+        destroyString(none);
+        return nil;
+    end;
+
+    function testHosts(): Unit is
+        assertTrue(hostRefused("host-a.invalid"), "host-a.invalid");
+        assertTrue(hostRefused("HOST-A.INVALID"), "HOST-A.INVALID");
+        assertTrue(hostRefused("host-b.invalid"), "host-b.invalid");
+        assertTrue(hostRefused("host-a.invalid.example.org"), "a name that starts with host-a.invalid");
+        assertTrue(hostRefused("node.Host-B.Invalid"), "host-b.invalid as a domain");
+        assertFalse(hostRefused("host-a.invalidity"), "host-a.invalidity is another host");
+        assertFalse(hostRefused("localhost"), "localhost");
+        assertFalse(hostRefused("node1"), "node1");
+        assertFalse(hostRefused(""), "the empty name");
+        assertTrue(spanLength(refusedHostsVariable()) = 20, "the name of the variable");
+        return nil;
+    end;
+
+    function testHostListed(): Unit is
+        let names: Span[Nat8, Static] := "host-c, Host-D\tnode7";
+        assertTrue(hostListed("host-c", "host-c"), "a list of one name");
+        assertTrue(hostListed("host-c", "host-c,host-d"), "the first of two");
+        assertTrue(hostListed("HOST-D", "host-c,host-d"), "the second of two, in capitals");
+        assertTrue(hostListed("box.host-d", "host-c host-d"), "a name below one, blank separated");
+        assertTrue(hostListed("host-d.example.org", "host-c\nhost-d\n"), "a name that starts with one");
+        assertTrue(hostListed("node7", names), "behind a comma, a blank and a tab");
+        assertFalse(hostListed("host-cc", "host-c,host-d"), "a longer name is another host");
+        assertFalse(hostListed("host", "host-c,host-d"), "a shorter name is another host");
+        assertFalse(hostListed("host-c", ""), "an empty list");
+        assertFalse(hostListed("host-c", " , ,"), "a list of separators");
+        assertFalse(hostListed("", "host-c"), "the empty name");
+        return nil;
+    end;
+
+    function testNames(): Unit is
+        let job: String := jobId();
+        let name: String := certificateName(asSpan(&job), 12);
+        assertTrue(equal(asSpan(&name), "sperli-000102030405060708090a0b0c0d0e0f-12"), "the name of rank 12");
+        assertTrue(subjectIs("/CN=sperli-000102030405060708090a0b0c0d0e0f-12", asSpan(&job), 12), "its subject");
+        assertFalse(subjectIs("/CN=sperli-000102030405060708090a0b0c0d0e0f-1", asSpan(&job), 12), "another rank");
+        assertFalse(subjectIs("/CN=sperli-000102030405060708090a0b0c0d0e0e-12", asSpan(&job), 12), "another job");
+        assertFalse(subjectIs("/CN=client.example", asSpan(&job), 12), "a stranger");
+        assertFalse(subjectIs("", asSpan(&job), 12), "no subject");
+        let hex: String := hexOf("\x00\xff");
+        destroyString(hex);
+        destroyString(name);
+        destroyString(job);
+        return nil;
+    end;
+
+    function testTokens(): Unit is
+        let job: String := jobId();
+        let other: String := makeString(16, 9);
+        let key: CompositeKey := aKey();
+        let stranger: CompositeKey := aKey();
+        let publicKey: String := publicKeyOf(&key);
+        let strangerKey: String := publicKeyOf(&stranger);
+        case signJoinToken(&key, asSpan(&job), 1, 3, 2, 2000, "node1") of
+            when Some(value as token: String) do
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&publicKey), asSpan(&job), 1, 3, 2, "node1", 1000) = 0, "a token that holds");
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&publicKey), asSpan(&job), 1, 3, 2, "node1", 2000) = tokenExpired(), "an expired token");
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&publicKey), asSpan(&other), 1, 3, 2, "node1", 1000) = tokenForeignJob(), "a token of another job");
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&publicKey), asSpan(&job), 2, 3, 2, "node1", 1000) = tokenWrongRank(), "a token of another rank");
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&publicKey), asSpan(&job), 1, 4, 2, "node1", 1000) = tokenWrongRank(), "a token of another size");
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&publicKey), asSpan(&job), 1, 3, 3, "node1", 1000) = tokenWrongRank(), "a token of another incarnation");
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&publicKey), asSpan(&job), 1, 3, 2, "node2", 1000) = tokenWrongRank(), "a token of another host");
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&strangerKey), asSpan(&job), 1, 3, 2, "node1", 1000) = tokenBadSignature(), "a token of another launcher");
+                assertTrue(verifyJoinToken(getSpan(&token, 0, length(&token) - 2), asSpan(&publicKey), asSpan(&job), 1, 3, 2, "node1", 1000) = tokenBadSignature(), "a token that is cut");
+                assertTrue(verifyJoinToken("", asSpan(&publicKey), asSpan(&job), 1, 3, 2, "node1", 1000) = tokenBadSignature(), "no token");
+                destroyString(token);
+            when None do
+                assertTrue(false, "the token was signed");
+        end case;
+        case signJoinToken(&key, asSpan(&other), 1, 3, 2, 2000, "node1") of
+            when Some(value as token: String) do
+                assertTrue(verifyJoinToken(asSpan(&token), asSpan(&publicKey), asSpan(&job), 1, 3, 2, "node1", 1000) = tokenForeignJob(), "a signed token of another job");
+                destroyString(token);
+            when None do
+                assertTrue(false, "the other token was signed");
+        end case;
+        destroyString(strangerKey);
+        destroyString(publicKey);
+        destroyCompositeKey(stranger);
+        destroyCompositeKey(key);
+        destroyString(other);
+        destroyString(job);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,2647 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Regex.  A parser for RE2's syntax, the
+-- Thompson construction into a small program, and a Pike VM that runs it:
+-- every thread of the automaton advances one code point at a time, and a
+-- program counter is never live twice in one step, so the work per byte of
+-- input is bounded by the size of the program.  That is the whole of the
+-- linear-time guarantee, and it is why backreferences and lookaround -- which
+-- need a thread to remember more than its position -- are refused.  No
+-- foreign library is used.  A search only reads the compiled program and
+-- keeps no cache in it, which is why tasks may share one without a lock.
+--
+-- Written from the published description (Russ Cox, "Regular Expression
+-- Matching: the Virtual Machine Approach").  Go's regexp and RE2's sources
+-- are BSD-licensed and were not read for this file.
+import Standard.Buffer (
+    Buffer,
+    initialize,
+    allocateEmpty,
+    destroyFree,
+    length as bufferLength,
+    nth,
+    storeNth,
+    insertBack,
+    removeLast,
+    lengthMut,
+    nthMut
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth as storeByte,
+    asSpan
+);
+import Standard.UnicodeProperties (
+    appendProperty,
+    nextInFoldOrbit,
+    appendFoldPartners
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+
+module body Standard.Regex is
+    ---
+    --- Numbers that mean something
+    ---
+
+    -- "Nothing here": no node, no position, no end.  Far above any index
+    -- this module will ever hand out.
+    constant none: Index := 4294967295;
+
+    -- The number one as an Index, for a subtraction whose literal would
+    -- otherwise be typed Int32 on the left of the operator.
+    constant zero: Index := 0;
+    constant one: Index := 1;
+
+    -- The largest Unicode scalar value.
+    constant maxRune: Index := #x10FFFF;
+
+    -- U+fffd, which is what a byte that is not UTF-8 reads as (runeAt).
+    constant replacementRune: Index := #xFFFD;
+    constant ten: Index := 10;
+    constant sixtyFour: Index := 64;
+
+    -- The most instructions a program may have.  A pattern whose program
+    -- would be larger is refused, not truncated: (a{1000}){1000} would
+    -- otherwise be a million instructions.
+    constant programLimit: Index := 100000;
+
+    -- The most entries the capture table of one search may have: two
+    -- threads per instruction, each with a slot for every group's start
+    -- and end.  Each is an Index, so this is 128 MiB.  A pattern whose table
+    -- would be larger is refused at compile, where the pattern is still
+    -- the only input: 49,000 empty groups stay under programLimit and
+    -- would otherwise ask every search for some 150 gigabytes.
+    constant captureLimit: Index := 16777216;
+
+    -- The most a counted repetition may say, as in RE2.
+    constant repeatLimit: Index := 1000;
+
+    -- How deeply groups may nest before the parser stops rather than the
+    -- stack does.
+    constant depthLimit: Index := 500;
+
+    -- Node kinds.
+    constant kLiteral: Index := 1;
+    constant kClass: Index := 2;
+    constant kDot: Index := 3;
+    constant kConcat: Index := 4;
+    constant kAlternate: Index := 5;
+    constant kRepeat: Index := 6;
+    constant kCapture: Index := 7;
+    constant kAssert: Index := 8;
+    constant kEmpty: Index := 9;
+
+    -- Instructions.
+    constant opRanges: Index := 1;
+    constant opAny: Index := 2;
+    constant opSplit: Index := 3;
+    constant opJump: Index := 4;
+    constant opSave: Index := 5;
+    constant opMatch: Index := 6;
+    constant opAssert: Index := 7;
+
+    -- Assertions.
+    constant aBeginLine: Index := 1;
+    constant aEndLine: Index := 2;
+    constant aBeginText: Index := 3;
+    constant aEndText: Index := 4;
+    constant aWord: Index := 5;
+    constant aNotWord: Index := 6;
+
+    -- What went wrong.  The messages are in messageFor.
+    constant eMissingParen: Index := 1;
+    constant eUnexpectedParen: Index := 2;
+    constant eMissingRepeatArgument: Index := 3;
+    constant eBadRepeat: Index := 4;
+    constant eBadRepeatCount: Index := 5;
+    constant eMissingBracket: Index := 6;
+    constant eBadRange: Index := 7;
+    constant eBadEscape: Index := 8;
+    constant eTrailingBackslash: Index := 9;
+    constant eBadGroup: Index := 10;
+    constant eBadFlag: Index := 11;
+    constant eBadUtf8: Index := 12;
+    constant eTooLarge: Index := 13;
+    constant eBadHex: Index := 14;
+    constant eAnyByte: Index := 16;
+    constant eBadPosix: Index := 17;
+    constant eTooDeep: Index := 18;
+    constant eBackreference: Index := 20;
+    constant eLookaround: Index := 21;
+    constant eAtomic: Index := 22;
+    constant ePcreOnly: Index := 23;
+
+    ---
+    --- The parts
+    ---
+
+    -- A node of the parsed pattern.  Children of a concatenation or an
+    -- alternation are chained through next, so the tree needs no second
+    -- buffer.  What a, b, c and d mean depends on the kind:
+    --   literal    a = the code point
+    --   class      a = first pair in the range buffer, b = pairs, c = 1 if negated
+    --   dot        a = 1 if it also matches a newline
+    --   concat     a = first child
+    --   alternate  a = first child
+    --   repeat     a = child, b = minimum, c = maximum (none: no maximum),
+    --              d = 1 if greedy
+    --   capture    a = child, b = group number
+    --   assert     a = which assertion
+    record Node: Free is
+        kind: Index;
+        a: Index;
+        b: Index;
+        c: Index;
+        d: Index;
+        next: Index;
+    end;
+
+    -- One instruction of the program.
+    --   ranges   a = first pair, b = pairs, c = 1 if negated
+    --   any      a = 1 if it also matches a newline
+    --   split    a = preferred target, b = the other
+    --   jump     a = target
+    --   save     a = capture slot
+    --   assert   a = which assertion
+    record Inst: Free is
+        op: Index;
+        a: Index;
+        b: Index;
+        c: Index;
+    end;
+
+    -- The parser's position and its flags.  Free, so that its fields can be
+    -- written through a reference.
+    record State: Free is
+        pos: Index;
+        groups: Index;
+        fold: Bool;
+        multi: Bool;
+        dotall: Bool;
+        ungreedy: Bool;
+        failed: Bool;
+        failCode: Index;
+        failAt: Index;
+    end;
+
+    record Regex: Linear is
+        program: Buffer[Inst];
+        ranges: Buffer[Index];
+        slotCount: Index;
+        -- Every match begins with these bytes; empty when that cannot be
+        -- said.  Used to skip ahead to where a match can start.
+        prefix: String;
+        -- Every match contains these bytes somewhere after its start; empty
+        -- when that cannot be said, or when they are the prefix.  A text
+        -- without them has no match, and nothing else is looked at.
+        required: String;
+        -- The bytes a match can begin with, 256 of them, each 0 or 1; empty
+        -- when any byte can.  Used when there is no prefix.
+        firstBytes: String;
+        -- Every match begins at offset 0 (\A, or ^ without the m flag,
+        -- on every way into the pattern).
+        anchored: Bool;
+    end;
+
+    record Found: Linear is
+        slots: Buffer[Index];
+    end;
+
+    -- One code point read from the text, and how many bytes it took.
+    record Rune: Free is
+        value: Index;
+        width: Index;
+    end;
+
+    ---
+    --- Small helpers
+    ---
+
+    function byteValue(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as v: Index) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function indexByte(value: Index): Nat8 is
+        case toNat8(value) of
+            when Some(value as v: Nat8) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [T: Region]
+    function byteIs(text: Span[Nat8, T], at: Index, byte: Nat8): Bool is
+        if at >= spanLength(text) then
+            return false;
+        end if;
+        return text[at] = byte;
+    end;
+
+    generic [T: Region]
+    function byteAt(text: Span[Nat8, T], at: Index): Index is
+        if at >= spanLength(text) then
+            return none;
+        end if;
+        return byteValue(text[at]);
+    end;
+
+    function isAsciiDigit(value: Index): Bool is
+        if value < 48 then
+            return false;
+        end if;
+        return value <= 57;
+    end;
+
+    function hexValue(value: Index): Index is
+        if isAsciiDigit(value) then
+            return value - 48;
+        end if;
+        if (value >= 97) and (value <= 102) then
+            return value - 87;
+        end if;
+        if (value >= 65) and (value <= 70) then
+            return value - 55;
+        end if;
+        return none;
+    end;
+
+    function isWordByte(value: Index): Bool is
+        if isAsciiDigit(value) then
+            return true;
+        end if;
+        if (value >= 65) and (value <= 90) then
+            return true;
+        end if;
+        if (value >= 97) and (value <= 122) then
+            return true;
+        end if;
+        return value = 95;
+    end;
+
+    -- The UTF-8 sequence at at.  An end gives value none and width 0.
+    -- A byte that does not begin a valid sequence is U+fffd, one byte wide:
+    -- the text is searched, not judged, and a search must move on.
+    generic [T: Region]
+    function runeAt(text: Span[Nat8, T], at: Index): Rune is
+        let size: Index := spanLength(text);
+        if at >= size then
+            return Rune(value => none, width => 0);
+        end if;
+        let b0: Index := byteAt(text, at);
+        if b0 < #x80 then
+            return Rune(value => b0, width => 1);
+        end if;
+        let bad: Rune := Rune(value => #xFFFD, width => 1);
+        if (b0 >= #xC2) and (b0 <= #xDF) then
+            let b1: Index := byteAt(text, at + 1);
+            if not isContinuation(b1) then
+                return bad;
+            end if;
+            return Rune(value => ((b0 - #xC0) * 64) + (b1 - #x80), width => 2);
+        end if;
+        if (b0 >= #xE0) and (b0 <= #xEF) then
+            let b1: Index := byteAt(text, at + 1);
+            let b2: Index := byteAt(text, at + 2);
+            if not (isContinuation(b1) and isContinuation(b2)) then
+                return bad;
+            end if;
+            -- Overlong forms and surrogates are not code points.
+            if (b0 = #xE0) and (b1 < #xA0) then
+                return bad;
+            end if;
+            if (b0 = #xED) and (b1 > #x9F) then
+                return bad;
+            end if;
+            let value: Index := (((b0 - #xE0) * 4096) + ((b1 - #x80) * 64)) + (b2 - #x80);
+            return Rune(value => value, width => 3);
+        end if;
+        if (b0 >= #xF0) and (b0 <= #xF4) then
+            let b1: Index := byteAt(text, at + 1);
+            let b2: Index := byteAt(text, at + 2);
+            let b3: Index := byteAt(text, at + 3);
+            if not ((isContinuation(b1) and isContinuation(b2)) and isContinuation(b3)) then
+                return bad;
+            end if;
+            if (b0 = #xF0) and (b1 < #x90) then
+                return bad;
+            end if;
+            if (b0 = #xF4) and (b1 > #x8F) then
+                return bad;
+            end if;
+            let value: Index :=
+                ((((b0 - #xF0) * 262144) + ((b1 - #x80) * 4096)) + ((b2 - #x80) * 64)) + (b3 - #x80);
+            return Rune(value => value, width => 4);
+        end if;
+        return bad;
+    end;
+
+    function isContinuation(value: Index): Bool is
+        if value = none then
+            return false;
+        end if;
+        return (value >= #x80) and (value <= #xBF);
+    end;
+
+    -- Append the UTF-8 form of a code point.
+    generic [R: Region]
+    function appendRune(builder: &![StringBuilder, R], value: Index): Unit is
+        if value < #x80 then
+            writeByte(&~builder, indexByte(value));
+        else if value < #x800 then
+            writeByte(&~builder, indexByte((value / 64) + #xC0));
+            writeByte(&~builder, indexByte(rem(value, sixtyFour) + #x80));
+        else if value < #x10000 then
+            writeByte(&~builder, indexByte((value / 4096) + #xE0));
+            writeByte(&~builder, indexByte(rem(value / 64, sixtyFour) + #x80));
+            writeByte(&~builder, indexByte(rem(value, sixtyFour) + #x80));
+        else
+            writeByte(&~builder, indexByte((value / 262144) + #xF0));
+            writeByte(&~builder, indexByte(rem(value / 4096, sixtyFour) + #x80));
+            writeByte(&~builder, indexByte(rem(value / 64, sixtyFour) + #x80));
+            writeByte(&~builder, indexByte(rem(value, sixtyFour) + #x80));
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function appendDecimal(builder: &![StringBuilder, R], value: Index): Unit is
+        if value >= 10 then
+            appendDecimal(&~builder, value / 10);
+        end if;
+        writeByte(&~builder, indexByte(rem(value, ten) + 48));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function appendText(builder: &![StringBuilder, R], text: Span[Nat8, Static]): Unit is
+        let size: Index := spanLength(text);
+        if size > 0 then
+            for i from 0 to size - 1 do
+                writeByte(&~builder, text[i]);
+            end for;
+        end if;
+        return nil;
+    end;
+
+    ---
+    --- Messages
+    ---
+
+    function messageFor(code: Index, at: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        appendText(&!builder, "Standard.Regex: ");
+        appendText(&!builder, reasonFor(code));
+        appendText(&!builder, " at byte ");
+        appendDecimal(&!builder, at);
+        return finalize(builder);
+    end;
+
+    function reasonFor(code: Index): Span[Nat8, Static] is
+        if code = eMissingParen then
+            return "missing closing )";
+        end if;
+        if code = eUnexpectedParen then
+            return "unexpected )";
+        end if;
+        if code = eMissingRepeatArgument then
+            return "missing argument to repetition operator";
+        end if;
+        if code = eBadRepeat then
+            return "bad repetition operator";
+        end if;
+        if code = eBadRepeatCount then
+            return "invalid repeat count";
+        end if;
+        if code = eMissingBracket then
+            return "missing closing ]";
+        end if;
+        if code = eBadRange then
+            return "invalid character class range";
+        end if;
+        if code = eBadEscape then
+            return "invalid escape sequence";
+        end if;
+        if code = eTrailingBackslash then
+            return "trailing backslash at end of expression";
+        end if;
+        if code = eBadGroup then
+            return "invalid or unsupported group syntax";
+        end if;
+        if code = eBadFlag then
+            return "invalid or unsupported Perl syntax";
+        end if;
+        if code = eBadUtf8 then
+            return "invalid UTF-8";
+        end if;
+        if code = eTooLarge then
+            return "expression too large";
+        end if;
+        if code = eBadHex then
+            return "invalid escape sequence";
+        end if;
+        if code = eAnyByte then
+            return "\C is not supported by this engine";
+        end if;
+        if code = eBadPosix then
+            return "invalid character class range";
+        end if;
+        if code = eTooDeep then
+            return "expression nests too deeply";
+        end if;
+        if code = eBackreference then
+            return "backreferences are not supported -- they cannot be matched in linear time; Standard.Pcre has them";
+        end if;
+        if code = eLookaround then
+            return "lookaround is not supported -- it cannot be matched in linear time; Standard.Pcre has it";
+        end if;
+        if code = eAtomic then
+            return "atomic groups and possessive repetition are not supported; Standard.Pcre has them";
+        end if;
+        if code = ePcreOnly then
+            return "this is PCRE syntax, not RE2 syntax; Standard.Pcre has it";
+        end if;
+        return "invalid expression";
+    end;
+
+    generic [S: Region]
+    function fail(st: &![State, S], code: Index, at: Index): Index is
+        if not st->failed then
+            st->failed := true;
+            st->failCode := code;
+            st->failAt := at;
+        end if;
+        return none;
+    end;
+
+    -- fail at the current position.  The position is read before the
+    -- write borrow is taken, which a single call cannot do.
+    generic [S: Region]
+    function failHere(st: &![State, S], code: Index): Index is
+        let at: Index := st->pos;
+        return fail(&~st, code, at);
+    end;
+
+    ---
+    --- Building the tree
+    ---
+
+    generic [N: Region]
+    function addNode(nodes: &![Buffer[Node], N], kind: Index, a: Index, b: Index, c: Index, d: Index): Index is
+        insertBack(&~nodes, Node(kind => kind, a => a, b => b, c => c, d => d, next => none));
+        return lengthMut(&~nodes) - 1;
+    end;
+
+    generic [N: Region]
+    function setNext(nodes: &![Buffer[Node], N], id: Index, next: Index): Unit is
+        let n: Node := nthMut(&~nodes, id);
+        storeNth(&~nodes, id, Node(kind => n.kind, a => n.a, b => n.b, c => n.c, d => n.d, next => next));
+        return nil;
+    end;
+
+    generic [G: Region]
+    function addPair(ranges: &![Buffer[Index], G], low: Index, high: Index): Unit is
+        insertBack(&~ranges, low);
+        insertBack(&~ranges, high);
+        return nil;
+    end;
+
+    generic [G: Region]
+    function pairCount(ranges: &![Buffer[Index], G]): Index is
+        return lengthMut(&~ranges) / 2;
+    end;
+
+    -- A literal code point; when the i flag is on and other code points
+    -- fold together with it, a class of all of them.
+    generic [S: Region, N: Region, G: Region]
+    function literalNode(st: &![State, S], nodes: &![Buffer[Node], N], ranges: &![Buffer[Index], G], value: Index): Index is
+        if st->fold then
+            if nextInFoldOrbit(value) /= value then
+                let first: Index := pairCount(&~ranges);
+                addPair(&~ranges, value, value);
+                appendFoldPartners(value, value, &~ranges);
+                return addNode(&~nodes, kClass, first, pairCount(&~ranges) - first, 0, 0);
+            end if;
+        end if;
+        return addNode(&~nodes, kLiteral, value, 0, 0, 0);
+    end;
+
+    -- After a class's pairs were added from first, add every code point
+    -- that folds together with one they cover, when the i flag is on.  The
+    -- folding is Unicode's simple case folding, as in RE2.
+    generic [S: Region, G: Region]
+    function foldPairs(st: &![State, S], ranges: &![Buffer[Index], G], first: Index): Unit is
+        if not st->fold then
+            return nil;
+        end if;
+        let last: Index := pairCount(&~ranges);
+        var i: Index := first;
+        while i < last do
+            let low: Index := nthMut(&~ranges, i * 2);
+            let high: Index := nthMut(&~ranges, (i * 2) + 1);
+            appendFoldPartners(low, high, &~ranges);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- \p or \P at at: the pairs of the named property appended to ranges.
+    -- The name is one letter, or a name in braces, where a ^ first negates
+    -- it; \P negates as well.  Gives 1 when the class is negated, 0 when
+    -- not, and none after a failure recorded in st: a name the property
+    -- tables do not know, or braces that do not close.
+    generic [T: Region, S: Region, G: Region]
+    function propertyClass(text: Span[Nat8, T], st: &![State, S], ranges: &![Buffer[Index], G], at: Index): Index is
+        var negate: Bool := byteAt(text, at + 1) = 80;
+        var nameStart: Index := at + 2;
+        var nameEnd: Index := at + 3;
+        let size: Index := spanLength(text);
+        if nameStart >= size then
+            return fail(&~st, eBadPosix, at);
+        end if;
+        if byteIs(text, nameStart, '{') then
+            nameStart := nameStart + 1;
+            if byteIs(text, nameStart, '^') then
+                negate := not negate;
+                nameStart := nameStart + 1;
+            end if;
+            var k: Index := nameStart;
+            while (k < size) and (not byteIs(text, k, '}')) do
+                k := k + 1;
+            end while;
+            if k >= size then
+                return fail(&~st, eBadPosix, at);
+            end if;
+            nameEnd := k;
+            st->pos := k + 1;
+        else
+            st->pos := nameEnd;
+        end if;
+        if not appendProperty(spanPart(text, nameStart, nameEnd - nameStart), &~ranges) then
+            return fail(&~st, eBadPosix, at);
+        end if;
+        if negate then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    ---
+    --- The parser
+    ---
+
+    generic [T: Region, S: Region, N: Region, G: Region]
+    function parseAlternation(text: Span[Nat8, T], st: &![State, S], nodes: &![Buffer[Node], N],
+        ranges: &![Buffer[Index], G], depth: Index): Index is
+        if depth > depthLimit then
+            return failHere(&~st, eTooDeep);
+        end if;
+        let first: Index := parseConcat(text, &~st, &~nodes, &~ranges, depth);
+        if st->failed then
+            return none;
+        end if;
+        if not byteIs(text, st->pos, '|') then
+            return first;
+        end if;
+        let alt: Index := addNode(&~nodes, kAlternate, first, 0, 0, 0);
+        var last: Index := first;
+        while byteIs(text, st->pos, '|') do
+            st->pos := st->pos + 1;
+            let branch: Index := parseConcat(text, &~st, &~nodes, &~ranges, depth);
+            if st->failed then
+                return none;
+            end if;
+            setNext(&~nodes, last, branch);
+            last := branch;
+        end while;
+        return alt;
+    end;
+
+    generic [T: Region, S: Region, N: Region, G: Region]
+    function parseConcat(text: Span[Nat8, T], st: &![State, S], nodes: &![Buffer[Node], N],
+        ranges: &![Buffer[Index], G], depth: Index): Index is
+        var first: Index := none;
+        var last: Index := none;
+        var count: Index := 0;
+        var going: Bool := true;
+        while going do
+            if st->pos >= spanLength(text) then
+                going := false;
+            else if byteIs(text, st->pos, '|') then
+                going := false;
+            else if byteIs(text, st->pos, ')') then
+                going := false;
+            else
+                let piece: Index := parseRepeat(text, &~st, &~nodes, &~ranges, depth);
+                if st->failed then
+                    return none;
+                end if;
+                if piece /= none then
+                    if first = none then
+                        first := piece;
+                    else
+                        setNext(&~nodes, last, piece);
+                    end if;
+                    last := piece;
+                    count := count + 1;
+                end if;
+            end if;
+        end while;
+        if count = 0 then
+            return addNode(&~nodes, kEmpty, 0, 0, 0, 0);
+        end if;
+        if count = 1 then
+            return first;
+        end if;
+        return addNode(&~nodes, kConcat, first, 0, 0, 0);
+    end;
+
+    -- Is there a counted repetition {n}, {n,} or {n,m} at at?
+    generic [T: Region]
+    function isCountedRepeat(text: Span[Nat8, T], at: Index): Bool is
+        if not byteIs(text, at, '{') then
+            return false;
+        end if;
+        var i: Index := at + 1;
+        var digits: Index := 0;
+        while isAsciiDigit(byteAt(text, i)) do
+            i := i + 1;
+            digits := digits + 1;
+        end while;
+        if digits = 0 then
+            return false;
+        end if;
+        if byteIs(text, i, '}') then
+            return true;
+        end if;
+        if not byteIs(text, i, ',') then
+            return false;
+        end if;
+        i := i + 1;
+        while isAsciiDigit(byteAt(text, i)) do
+            i := i + 1;
+        end while;
+        return byteIs(text, i, '}');
+    end;
+
+    -- A decimal number at the parser's position, capped so that it cannot
+    -- overflow; the cap is above the repeat limit, so a capped number is
+    -- refused as a count anyway.
+    generic [T: Region, S: Region]
+    function readNumber(text: Span[Nat8, T], st: &![State, S]): Index is
+        var value: Index := 0;
+        while isAsciiDigit(byteAt(text, st->pos)) do
+            if value < 100000 then
+                value := (value * 10) + (byteAt(text, st->pos) - 48);
+            end if;
+            st->pos := st->pos + 1;
+        end while;
+        return value;
+    end;
+
+    function isRepeatByte(value: Index): Bool is
+        if value = 42 then
+            return true;
+        end if;
+        if value = 43 then
+            return true;
+        end if;
+        return value = 63;
+    end;
+
+    generic [T: Region, S: Region, N: Region, G: Region]
+    function parseRepeat(text: Span[Nat8, T], st: &![State, S], nodes: &![Buffer[Node], N],
+        ranges: &![Buffer[Index], G], depth: Index): Index is
+        let atom: Index := parseAtom(text, &~st, &~nodes, &~ranges, depth);
+        if st->failed then
+            return none;
+        end if;
+        let c: Index := byteAt(text, st->pos);
+        var minimum: Index := 0;
+        var maximum: Index := none;
+        if isRepeatByte(c) then
+            let opAt: Index := st->pos;
+            st->pos := st->pos + 1;
+            if c = 42 then
+                minimum := zero;
+                maximum := none;
+            else if c = 43 then
+                minimum := one;
+                maximum := none;
+            else
+                minimum := zero;
+                maximum := one;
+            end if;
+            return finishRepeat(text, &~st, &~nodes, atom, minimum, maximum, opAt);
+        end if;
+        if isCountedRepeat(text, st->pos) then
+            let opAt: Index := st->pos;
+            st->pos := st->pos + 1;
+            minimum := readNumber(text, &~st);
+            if byteIs(text, st->pos, ',') then
+                st->pos := st->pos + 1;
+                if byteIs(text, st->pos, '}') then
+                    maximum := none;
+                else
+                    maximum := readNumber(text, &~st);
+                end if;
+            else
+                maximum := minimum;
+            end if;
+            -- The closing brace, which isCountedRepeat has seen.
+            st->pos := st->pos + 1;
+            if minimum > repeatLimit then
+                return fail(&~st, eBadRepeatCount, opAt);
+            end if;
+            if maximum /= none then
+                if (maximum > repeatLimit) or (maximum < minimum) then
+                    return fail(&~st, eBadRepeatCount, opAt);
+                end if;
+            end if;
+            return finishRepeat(text, &~st, &~nodes, atom, minimum, maximum, opAt);
+        end if;
+        return atom;
+    end;
+
+    -- After the operator: a lazy ?, a possessive + (PCRE), and no second
+    -- operator.  First of all, something to repeat: a group of flags alone,
+    -- (?i), leaves no node, and (?i)* built a repetition of nothing that
+    -- the compiler then read past the end of the node buffer.
+    generic [T: Region, S: Region, N: Region]
+    function finishRepeat(text: Span[Nat8, T], st: &![State, S], nodes: &![Buffer[Node], N],
+        atom: Index, minimum: Index, maximum: Index, opAt: Index): Index is
+        if atom = none then
+            return fail(&~st, eMissingRepeatArgument, opAt);
+        end if;
+        var greedy: Bool := true;
+        if byteIs(text, st->pos, '?') then
+            greedy := false;
+            st->pos := st->pos + 1;
+        else if byteIs(text, st->pos, '+') then
+            return failHere(&~st, eAtomic);
+        end if;
+        if isRepeatByte(byteAt(text, st->pos)) or isCountedRepeat(text, st->pos) then
+            return failHere(&~st, eBadRepeat);
+        end if;
+        if st->ungreedy then
+            greedy := not greedy;
+        end if;
+        var greedyFlag: Index := 0;
+        if greedy then
+            greedyFlag := one;
+        end if;
+        return addNode(&~nodes, kRepeat, atom, minimum, maximum, greedyFlag);
+    end;
+
+    generic [T: Region, S: Region, N: Region, G: Region]
+    function parseAtom(text: Span[Nat8, T], st: &![State, S], nodes: &![Buffer[Node], N],
+        ranges: &![Buffer[Index], G], depth: Index): Index is
+        let at: Index := st->pos;
+        let c: Index := byteAt(text, at);
+        if c = 40 then
+            return parseGroup(text, &~st, &~nodes, &~ranges, depth);
+        end if;
+        if c = 91 then
+            return parseClass(text, &~st, &~nodes, &~ranges);
+        end if;
+        if c = 46 then
+            st->pos := at + 1;
+            var all: Index := 0;
+            if st->dotall then
+                all := one;
+            end if;
+            return addNode(&~nodes, kDot, all, 0, 0, 0);
+        end if;
+        if c = 94 then
+            st->pos := at + 1;
+            if st->multi then
+                return addNode(&~nodes, kAssert, aBeginLine, 0, 0, 0);
+            end if;
+            return addNode(&~nodes, kAssert, aBeginText, 0, 0, 0);
+        end if;
+        if c = 36 then
+            st->pos := at + 1;
+            if st->multi then
+                return addNode(&~nodes, kAssert, aEndLine, 0, 0, 0);
+            end if;
+            return addNode(&~nodes, kAssert, aEndText, 0, 0, 0);
+        end if;
+        if c = 92 then
+            return parseEscape(text, &~st, &~nodes, &~ranges);
+        end if;
+        if isRepeatByte(c) then
+            return fail(&~st, eMissingRepeatArgument, at);
+        end if;
+        if c = 123 then
+            if isCountedRepeat(text, at) then
+                return fail(&~st, eMissingRepeatArgument, at);
+            end if;
+        end if;
+        -- A literal code point, which must be valid UTF-8 in a pattern.
+        let rune: Rune := patternRune(text, at);
+        if rune.width = 0 then
+            return fail(&~st, eBadUtf8, at);
+        end if;
+        st->pos := at + rune.width;
+        return literalNode(&~st, &~nodes, &~ranges, rune.value);
+    end;
+
+    -- Like runeAt, but an invalid sequence is width 0: a pattern is judged.
+    generic [T: Region]
+    function patternRune(text: Span[Nat8, T], at: Index): Rune is
+        let rune: Rune := runeAt(text, at);
+        if (rune.value = #xFFFD) and (rune.width = 1) then
+            -- U+fffd written out is three bytes; one byte means a bad one.
+            return Rune(value => none, width => 0);
+        end if;
+        return rune;
+    end;
+
+    generic [T: Region, S: Region, N: Region, G: Region]
+    function parseGroup(text: Span[Nat8, T], st: &![State, S], nodes: &![Buffer[Node], N],
+        ranges: &![Buffer[Index], G], depth: Index): Index is
+        let open: Index := st->pos;
+        st->pos := open + 1;
+        -- The flags are the group's own: whatever is set inside ends at its
+        -- closing parenthesis.
+        let savedFold: Bool := st->fold;
+        let savedMulti: Bool := st->multi;
+        let savedDotall: Bool := st->dotall;
+        let savedUngreedy: Bool := st->ungreedy;
+        var capture: Bool := true;
+        if byteIs(text, st->pos, '*') then
+            -- PCRE's (*verb) forms.
+            return fail(&~st, ePcreOnly, open);
+        end if;
+        if byteIs(text, st->pos, '?') then
+            st->pos := st->pos + 1;
+            let c: Index := byteAt(text, st->pos);
+            if c = 58 then
+                st->pos := st->pos + 1;
+                capture := false;
+            else if (c = 61) or (c = 33) then
+                return fail(&~st, eLookaround, open);
+            else if c = 62 then
+                return fail(&~st, eAtomic, open);
+            else if isPcreGroupStart(c) then
+                return fail(&~st, ePcreOnly, open);
+            else if c = 80 then
+                -- (?P<name>...), and PCRE's (?P=name) and (?P>name).
+                st->pos := st->pos + 1;
+                if byteIs(text, st->pos, '=') then
+                    return fail(&~st, eBackreference, open);
+                end if;
+                if byteIs(text, st->pos, '>') then
+                    return fail(&~st, ePcreOnly, open);
+                end if;
+                if not byteIs(text, st->pos, '<') then
+                    return fail(&~st, eBadGroup, open);
+                end if;
+                if not skipGroupName(text, &~st) then
+                    return fail(&~st, eBadGroup, open);
+                end if;
+            else if c = 60 then
+                -- (?<name>...), or PCRE's lookbehind (?<= and (?<!.
+                if byteIs(text, st->pos + 1, '=') or byteIs(text, st->pos + 1, '!') then
+                    return fail(&~st, eLookaround, open);
+                end if;
+                if not skipGroupName(text, &~st) then
+                    return fail(&~st, eBadGroup, open);
+                end if;
+            else
+                -- Flags: (?flags) for the rest of the group, (?flags:re).
+                let result: Index := parseFlags(text, &~st);
+                if st->failed then
+                    return none;
+                end if;
+                if result = 1 then
+                    -- (?flags) alone: nothing to match here, and the flags
+                    -- stay set until the enclosing group ends.
+                    return none;
+                end if;
+                capture := false;
+            end if;
+        end if;
+        var group: Index := 0;
+        if capture then
+            st->groups := st->groups + 1;
+            group := st->groups;
+        end if;
+        let inner: Index := parseAlternation(text, &~st, &~nodes, &~ranges, depth + 1);
+        if st->failed then
+            return none;
+        end if;
+        if not byteIs(text, st->pos, ')') then
+            return fail(&~st, eMissingParen, open);
+        end if;
+        st->pos := st->pos + 1;
+        st->fold := savedFold;
+        st->multi := savedMulti;
+        st->dotall := savedDotall;
+        st->ungreedy := savedUngreedy;
+        if capture then
+            return addNode(&~nodes, kCapture, inner, group, 0, 0);
+        end if;
+        return inner;
+    end;
+
+    -- At < of <name>: skip the name and the >.  A name is letters,
+    -- digits and _, and not empty.
+    generic [T: Region, S: Region]
+    function skipGroupName(text: Span[Nat8, T], st: &![State, S]): Bool is
+        st->pos := st->pos + 1;
+        var count: Index := 0;
+        while isWordByte(byteAt(text, st->pos)) do
+            st->pos := st->pos + 1;
+            count := count + 1;
+        end while;
+        if count = 0 then
+            return false;
+        end if;
+        if not byteIs(text, st->pos, '>') then
+            return false;
+        end if;
+        st->pos := st->pos + 1;
+        return true;
+    end;
+
+    -- Flags after (?: [imsU]* optionally followed by - [imsU]*, then )
+    -- (answer 1) or : (answer 2).  The flags are set in the state.
+    generic [T: Region, S: Region]
+    function parseFlags(text: Span[Nat8, T], st: &![State, S]): Index is
+        let start: Index := st->pos;
+        var on: Bool := true;
+        var seen: Index := 0;
+        var sawMinus: Bool := false;
+        while true do
+            let c: Index := byteAt(text, st->pos);
+            if c = 105 then
+                st->fold := on;
+                seen := seen + 1;
+            else if c = 109 then
+                st->multi := on;
+                seen := seen + 1;
+            else if c = 115 then
+                st->dotall := on;
+                seen := seen + 1;
+            else if c = 85 then
+                st->ungreedy := on;
+                seen := seen + 1;
+            else if c = 45 then
+                if sawMinus then
+                    return fail(&~st, eBadFlag, start);
+                end if;
+                sawMinus := true;
+                on := false;
+            else if c = 41 then
+                if seen = 0 then
+                    return fail(&~st, eBadFlag, start);
+                end if;
+                st->pos := st->pos + 1;
+                return 1;
+            else if c = 58 then
+                st->pos := st->pos + 1;
+                return 2;
+            else
+                return fail(&~st, eBadFlag, start);
+            end if;
+            st->pos := st->pos + 1;
+        end while;
+        return none;
+    end;
+
+    ---
+    --- Escapes
+    ---
+
+    -- An escape outside a class: an assertion, a class, or a literal.
+    generic [T: Region, S: Region, N: Region, G: Region]
+    function parseEscape(text: Span[Nat8, T], st: &![State, S], nodes: &![Buffer[Node], N],
+        ranges: &![Buffer[Index], G]): Index is
+        let at: Index := st->pos;
+        let c: Index := byteAt(text, at + 1);
+        if c = none then
+            return fail(&~st, eTrailingBackslash, at);
+        end if;
+        if c = 98 then
+            st->pos := at + 2;
+            return addNode(&~nodes, kAssert, aWord, 0, 0, 0);
+        end if;
+        if c = 66 then
+            st->pos := at + 2;
+            return addNode(&~nodes, kAssert, aNotWord, 0, 0, 0);
+        end if;
+        if c = 65 then
+            st->pos := at + 2;
+            return addNode(&~nodes, kAssert, aBeginText, 0, 0, 0);
+        end if;
+        if c = 122 then
+            st->pos := at + 2;
+            return addNode(&~nodes, kAssert, aEndText, 0, 0, 0);
+        end if;
+        if c = 81 then
+            return parseQuoted(text, &~st, &~nodes, &~ranges);
+        end if;
+        let first: Index := pairCount(&~ranges);
+        let perl: Index := perlClass(c, &~ranges);
+        if perl /= none then
+            st->pos := at + 2;
+            foldPairs(&~st, &~ranges, first);
+            return addNode(&~nodes, kClass, first, pairCount(&~ranges) - first, perl, 0);
+        end if;
+        if (c = 112) or (c = 80) then
+            let negated: Index := propertyClass(text, &~st, &~ranges, at);
+            if st->failed then
+                return none;
+            end if;
+            foldPairs(&~st, &~ranges, first);
+            return addNode(&~nodes, kClass, first, pairCount(&~ranges) - first, negated, 0);
+        end if;
+        let value: Index := escapedValue(text, &~st);
+        if st->failed then
+            return none;
+        end if;
+        return literalNode(&~st, &~nodes, &~ranges, value);
+    end;
+
+    -- \d \s \w and their negations: the pairs are added and the answer is
+    -- 1 for a negated class, 0 for a plain one, none for anything else.
+    generic [G: Region]
+    function perlClass(c: Index, ranges: &![Buffer[Index], G]): Index is
+        if (c = 100) or (c = 68) then
+            addPair(&~ranges, 48, 57);
+            if c = 68 then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        if (c = 115) or (c = 83) then
+            -- RE2's \s: tab, newline, form feed, carriage return, space.
+            addPair(&~ranges, 9, 10);
+            addPair(&~ranges, 12, 13);
+            addPair(&~ranges, 32, 32);
+            if c = 83 then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        if (c = 119) or (c = 87) then
+            addPair(&~ranges, 48, 57);
+            addPair(&~ranges, 65, 90);
+            addPair(&~ranges, 95, 95);
+            addPair(&~ranges, 97, 122);
+            if c = 87 then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        return none;
+    end;
+
+    -- The code point an escape stands for, advancing past it: \a \f \t \n \r
+    -- \v, \xHH, \x{H...}, octal \0 to \377, and a backslash before
+    -- punctuation.  Everything else is refused, with PCRE's forms named.
+    generic [T: Region, S: Region]
+    function escapedValue(text: Span[Nat8, T], st: &![State, S]): Index is
+        let at: Index := st->pos;
+        let c: Index := byteAt(text, at + 1);
+        if c = none then
+            return fail(&~st, eTrailingBackslash, at);
+        end if;
+        st->pos := at + 2;
+        if c = 97 then
+            return 7;
+        end if;
+        if c = 102 then
+            return 12;
+        end if;
+        if c = 116 then
+            return 9;
+        end if;
+        if c = 110 then
+            return 10;
+        end if;
+        if c = 114 then
+            return 13;
+        end if;
+        if c = 118 then
+            return 11;
+        end if;
+        if c = 120 then
+            return hexEscape(text, &~st, at);
+        end if;
+        if (c >= 49) and (c <= 55) then
+            -- \1 to \7 followed by another octal digit is an octal code, as
+            -- RE2 reads \123; alone it is a backreference.  Found by the
+            -- differential test against Go.
+            if isOctal(byteAt(text, st->pos)) then
+                return octalEscape(text, &~st, c - 48);
+            end if;
+            return fail(&~st, eBackreference, at);
+        end if;
+        if (c = 56) or (c = 57) then
+            return fail(&~st, eBackreference, at);
+        end if;
+        if c = 48 then
+            return octalEscape(text, &~st, zero);
+        end if;
+        if (c = 107) or (c = 103) then
+            return fail(&~st, eBackreference, at);
+        end if;
+        if isPcreEscape(c) then
+            return fail(&~st, ePcreOnly, at);
+        end if;
+        if c = 67 then
+            return fail(&~st, eAnyByte, at);
+        end if;
+        if (c < 128) and (not isWordByte(c)) then
+            -- Punctuation stands for itself.
+            return c;
+        end if;
+        return fail(&~st, eBadEscape, at);
+    end;
+
+    -- What may follow (? in PCRE and not in RE2: a comment (#), a
+    -- conditional ((), recursion (R, a digit, +), a subroutine call (&), a
+    -- branch reset (|), and a group named in quotes (').
+    function isPcreGroupStart(c: Index): Bool is
+        if (c = 35) or (c = 40) then
+            return true;
+        end if;
+        if c = 39 then
+            return true;
+        end if;
+        if (c = 82) or (c = 38) then
+            return true;
+        end if;
+        if (c = 43) or (c = 124) then
+            return true;
+        end if;
+        return isAsciiDigit(c);
+    end;
+
+    -- Escapes PCRE has and RE2 does not: \Z \G \K \R \X \h \H \N.
+    function isPcreEscape(c: Index): Bool is
+        if (c = 90) or (c = 71) then
+            return true;
+        end if;
+        if (c = 75) or (c = 82) then
+            return true;
+        end if;
+        if (c = 88) or (c = 104) then
+            return true;
+        end if;
+        return (c = 72) or (c = 78);
+    end;
+
+    -- Octal: \0, \01, \012, \123 -- up to three digits in all, the first
+    -- already read and worth first.
+    generic [T: Region, S: Region]
+    function octalEscape(text: Span[Nat8, T], st: &![State, S], first: Index): Index is
+        var value: Index := first;
+        var digits: Index := 1;
+        while (digits < 3) and isOctal(byteAt(text, st->pos)) do
+            value := (value * 8) + (byteAt(text, st->pos) - 48);
+            st->pos := st->pos + 1;
+            digits := digits + 1;
+        end while;
+        return value;
+    end;
+
+    function isOctal(value: Index): Bool is
+        return (value >= 48) and (value <= 55);
+    end;
+
+    generic [T: Region, S: Region]
+    function hexEscape(text: Span[Nat8, T], st: &![State, S], at: Index): Index is
+        if byteIs(text, st->pos, '{') then
+            st->pos := st->pos + 1;
+            var value: Index := 0;
+            var digits: Index := 0;
+            while hexValue(byteAt(text, st->pos)) /= none do
+                if value <= #x10FFFF then
+                    value := (value * 16) + hexValue(byteAt(text, st->pos));
+                end if;
+                st->pos := st->pos + 1;
+                digits := digits + 1;
+            end while;
+            if (digits = 0) or (not byteIs(text, st->pos, '}')) then
+                return fail(&~st, eBadHex, at);
+            end if;
+            st->pos := st->pos + 1;
+            if value > #x10FFFF then
+                return fail(&~st, eBadHex, at);
+            end if;
+            return value;
+        end if;
+        let high: Index := hexValue(byteAt(text, st->pos));
+        let low: Index := hexValue(byteAt(text, st->pos + 1));
+        if (high = none) or (low = none) then
+            return fail(&~st, eBadHex, at);
+        end if;
+        st->pos := st->pos + 2;
+        return (high * 16) + low;
+    end;
+
+    -- \Q...\E: everything up to \E, or to the end, taken literally.
+    generic [T: Region, S: Region, N: Region, G: Region]
+    function parseQuoted(text: Span[Nat8, T], st: &![State, S], nodes: &![Buffer[Node], N],
+        ranges: &![Buffer[Index], G]): Index is
+        st->pos := st->pos + 2;
+        var first: Index := none;
+        var last: Index := none;
+        var count: Index := 0;
+        var going: Bool := true;
+        while going do
+            if st->pos >= spanLength(text) then
+                going := false;
+            else if byteIs(text, st->pos, '\\') and byteIs(text, st->pos + 1, 'E') then
+                st->pos := st->pos + 2;
+                going := false;
+            else
+                let rune: Rune := patternRune(text, st->pos);
+                if rune.width = 0 then
+                    return failHere(&~st, eBadUtf8);
+                end if;
+                st->pos := st->pos + rune.width;
+                let piece: Index := literalNode(&~st, &~nodes, &~ranges, rune.value);
+                if first = none then
+                    first := piece;
+                else
+                    setNext(&~nodes, last, piece);
+                end if;
+                last := piece;
+                count := count + 1;
+            end if;
+        end while;
+        if count = 0 then
+            return addNode(&~nodes, kEmpty, 0, 0, 0, 0);
+        end if;
+        if count = 1 then
+            return first;
+        end if;
+        return addNode(&~nodes, kConcat, first, 0, 0, 0);
+    end;
+
+    ---
+    --- Classes
+    ---
+
+    generic [T: Region, S: Region, N: Region, G: Region]
+    function parseClass(text: Span[Nat8, T], st: &![State, S], nodes: &![Buffer[Node], N],
+        ranges: &![Buffer[Index], G]): Index is
+        let open: Index := st->pos;
+        st->pos := open + 1;
+        var negate: Index := 0;
+        if byteIs(text, st->pos, '^') then
+            negate := one;
+            st->pos := st->pos + 1;
+        end if;
+        let first: Index := pairCount(&~ranges);
+        var items: Index := 0;
+        var going: Bool := true;
+        while going do
+            if st->pos >= spanLength(text) then
+                return fail(&~st, eMissingBracket, open);
+            end if;
+            if byteIs(text, st->pos, ']') and (items > 0) then
+                st->pos := st->pos + 1;
+                going := false;
+            else
+                classItem(text, &~st, &~ranges);
+                if st->failed then
+                    return none;
+                end if;
+                items := items + 1;
+            end if;
+        end while;
+        foldPairs(&~st, &~ranges, first);
+        return addNode(&~nodes, kClass, first, pairCount(&~ranges) - first, negate, 0);
+    end;
+
+    -- One item of a class: [:name:], a Perl class, or a code point or a
+    -- range of them.
+    generic [T: Region, S: Region, G: Region]
+    function classItem(text: Span[Nat8, T], st: &![State, S], ranges: &![Buffer[Index], G]): Unit is
+        if byteIs(text, st->pos, '[') and byteIs(text, st->pos + 1, ':') then
+            posixClass(text, &~st, &~ranges);
+            return nil;
+        end if;
+        if byteIs(text, st->pos, '\\') then
+            let c: Index := byteAt(text, st->pos + 1);
+            let before: Index := pairCount(&~ranges);
+            let perl: Index := perlClass(c, &~ranges);
+            if perl /= none then
+                st->pos := st->pos + 2;
+                if perl = 1 then
+                    complementFrom(&~ranges, before);
+                end if;
+                return nil;
+            end if;
+            if (c = 112) or (c = 80) then
+                let at: Index := st->pos;
+                let negated: Index := propertyClass(text, &~st, &~ranges, at);
+                if (not st->failed) and (negated = 1) then
+                    complementFrom(&~ranges, before);
+                end if;
+                return nil;
+            end if;
+        end if;
+        let low: Index := classValue(text, &~st);
+        if st->failed then
+            return nil;
+        end if;
+        var high: Index := low;
+        if byteIs(text, st->pos, '-') and (not byteIs(text, st->pos + 1, ']')) then
+            let dash: Index := st->pos;
+            if (st->pos + 1) >= spanLength(text) then
+                fail(&~st, eMissingBracket, dash);
+                return nil;
+            end if;
+            st->pos := st->pos + 1;
+            high := classValue(text, &~st);
+            if st->failed then
+                return nil;
+            end if;
+            if high < low then
+                fail(&~st, eBadRange, dash);
+                return nil;
+            end if;
+        end if;
+        addPair(&~ranges, low, high);
+        return nil;
+    end;
+
+    -- One code point inside a class: an escape or a literal.
+    generic [T: Region, S: Region]
+    function classValue(text: Span[Nat8, T], st: &![State, S]): Index is
+        if byteIs(text, st->pos, '\\') then
+            let c: Index := byteAt(text, st->pos + 1);
+            if c = 98 then
+                -- \b in a class is RE2's error, not a backspace.
+                return failHere(&~st, eBadEscape);
+            end if;
+            return escapedValue(text, &~st);
+        end if;
+        let rune: Rune := patternRune(text, st->pos);
+        if rune.width = 0 then
+            return failHere(&~st, eBadUtf8);
+        end if;
+        st->pos := st->pos + rune.width;
+        return rune.value;
+    end;
+
+    -- Replace the pairs added from origin by their complement over all code
+    -- points, for a negated Perl class or property inside a class.
+    generic [G: Region]
+    function complementFrom(ranges: &![Buffer[Index], G], origin: Index): Unit is
+        -- The pairs a Perl class or a property adds are sorted and do not
+        -- overlap.
+        let last: Index := pairCount(&~ranges);
+        var next: Index := 0;
+        var i: Index := origin;
+        var collected: Buffer[Index] := allocateEmpty();
+        while i < last do
+            let low: Index := nthMut(&~ranges, i * 2);
+            let high: Index := nthMut(&~ranges, (i * 2) + 1);
+            if low > next then
+                insertBack(&!collected, next);
+                insertBack(&!collected, low - 1);
+            end if;
+            next := high + 1;
+            i := i + 1;
+        end while;
+        if next <= #x10FFFF then
+            insertBack(&!collected, next);
+            insertBack(&!collected, maxRune);
+        end if;
+        -- Overwrite the Perl pairs with the complement.
+        var j: Index := 0;
+        let size: Index := bufferLength(&collected);
+        while j < size do
+            let at: Index := (origin * 2) + j;
+            if at < lengthMut(&~ranges) then
+                storeNth(&~ranges, at, nth(&collected, j));
+            else
+                insertBack(&~ranges, nth(&collected, j));
+            end if;
+            j := j + 1;
+        end while;
+        -- The complement of a Perl class has more pairs than the class, so
+        -- nothing is left over to remove.
+        destroyFree(collected);
+        return nil;
+    end;
+
+    generic [T: Region, S: Region, G: Region]
+    function posixClass(text: Span[Nat8, T], st: &![State, S], ranges: &![Buffer[Index], G]): Unit is
+        let open: Index := st->pos;
+        st->pos := st->pos + 2;
+        var negate: Bool := false;
+        if byteIs(text, st->pos, '^') then
+            negate := true;
+            st->pos := st->pos + 1;
+        end if;
+        let nameStart: Index := st->pos;
+        while (st->pos < spanLength(text)) and (not byteIs(text, st->pos, ':')) do
+            st->pos := st->pos + 1;
+        end while;
+        if not (byteIs(text, st->pos, ':') and byteIs(text, st->pos + 1, ']')) then
+            fail(&~st, eBadPosix, open);
+            return nil;
+        end if;
+        let nameStop: Index := st->pos;
+        st->pos := st->pos + 2;
+        let before: Index := pairCount(&~ranges);
+        if not posixPairs(text, nameStart, nameStop, &~ranges) then
+            fail(&~st, eBadPosix, open);
+            return nil;
+        end if;
+        if negate then
+            complementFrom(&~ranges, before);
+        end if;
+        return nil;
+    end;
+
+    generic [T: Region]
+    function nameIs(text: Span[Nat8, T], start: Index, stop: Index, name: Span[Nat8, Static]): Bool is
+        let size: Index := spanLength(name);
+        if (stop - start) /= size then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < size do
+            if text[start + i] /= name[i] then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    -- The fourteen POSIX classes RE2 knows, ASCII only, as RE2 has them.
+    generic [T: Region, G: Region]
+    function posixPairs(text: Span[Nat8, T], start: Index, stop: Index, ranges: &![Buffer[Index], G]): Bool is
+        if nameIs(text, start, stop, "alnum") then
+            addPair(&~ranges, 48, 57);
+            addPair(&~ranges, 65, 90);
+            addPair(&~ranges, 97, 122);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "alpha") then
+            addPair(&~ranges, 65, 90);
+            addPair(&~ranges, 97, 122);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "ascii") then
+            addPair(&~ranges, 0, 127);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "blank") then
+            addPair(&~ranges, 9, 9);
+            addPair(&~ranges, 32, 32);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "cntrl") then
+            addPair(&~ranges, 0, 31);
+            addPair(&~ranges, 127, 127);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "digit") then
+            addPair(&~ranges, 48, 57);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "graph") then
+            addPair(&~ranges, 33, 126);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "lower") then
+            addPair(&~ranges, 97, 122);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "print") then
+            addPair(&~ranges, 32, 126);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "punct") then
+            addPair(&~ranges, 33, 47);
+            addPair(&~ranges, 58, sixtyFour);
+            addPair(&~ranges, 91, 96);
+            addPair(&~ranges, 123, 126);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "space") then
+            addPair(&~ranges, 9, 13);
+            addPair(&~ranges, 32, 32);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "upper") then
+            addPair(&~ranges, 65, 90);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "word") then
+            addPair(&~ranges, 48, 57);
+            addPair(&~ranges, 65, 90);
+            addPair(&~ranges, 95, 95);
+            addPair(&~ranges, 97, 122);
+            return true;
+        end if;
+        if nameIs(text, start, stop, "xdigit") then
+            addPair(&~ranges, 48, 57);
+            addPair(&~ranges, 65, 70);
+            addPair(&~ranges, 97, 102);
+            return true;
+        end if;
+        return false;
+    end;
+
+    ---
+    --- The program
+    ---
+
+    generic [P: Region]
+    function emit(program: &![Buffer[Inst], P], op: Index, a: Index, b: Index, c: Index): Index is
+        insertBack(&~program, Inst(op => op, a => a, b => b, c => c));
+        return lengthMut(&~program) - 1;
+    end;
+
+    generic [P: Region]
+    function patchA(program: &![Buffer[Inst], P], at: Index, a: Index): Unit is
+        let i: Inst := nthMut(&~program, at);
+        storeNth(&~program, at, Inst(op => i.op, a => a, b => i.b, c => i.c));
+        return nil;
+    end;
+
+    generic [P: Region]
+    function patchB(program: &![Buffer[Inst], P], at: Index, b: Index): Unit is
+        let i: Inst := nthMut(&~program, at);
+        storeNth(&~program, at, Inst(op => i.op, a => i.a, b => b, c => i.c));
+        return nil;
+    end;
+
+    generic [P: Region]
+    function here(program: &![Buffer[Inst], P]): Index is
+        return lengthMut(&~program);
+    end;
+
+    -- Emit the program for one node.  false when the program would grow
+    -- past the limit.
+    generic [N: Region, G: Region, P: Region]
+    function emitNode(nodes: &[Buffer[Node], N], ranges: &![Buffer[Index], G],
+        program: &![Buffer[Inst], P], id: Index): Bool is
+        if here(&~program) > programLimit then
+            return false;
+        end if;
+        let n: Node := nth(nodes, id);
+        if n.kind = kLiteral then
+            let first: Index := pairCount(&~ranges);
+            addPair(&~ranges, n.a, n.a);
+            emit(&~program, opRanges, first, 1, 0);
+            return true;
+        end if;
+        if n.kind = kClass then
+            emit(&~program, opRanges, n.a, n.b, n.c);
+            return true;
+        end if;
+        if n.kind = kDot then
+            emit(&~program, opAny, n.a, 0, 0);
+            return true;
+        end if;
+        if n.kind = kAssert then
+            emit(&~program, opAssert, n.a, 0, 0);
+            return true;
+        end if;
+        if n.kind = kEmpty then
+            return true;
+        end if;
+        if n.kind = kCapture then
+            emit(&~program, opSave, n.b * 2, 0, 0);
+            if not emitNode(nodes, &~ranges, &~program, n.a) then
+                return false;
+            end if;
+            emit(&~program, opSave, (n.b * 2) + 1, 0, 0);
+            return true;
+        end if;
+        if n.kind = kConcat then
+            var child: Index := n.a;
+            while child /= none do
+                if not emitNode(nodes, &~ranges, &~program, child) then
+                    return false;
+                end if;
+                let current: Node := nth(nodes, child);
+                child := current.next;
+            end while;
+            return true;
+        end if;
+        if n.kind = kAlternate then
+            return emitAlternate(nodes, &~ranges, &~program, n.a);
+        end if;
+        if n.kind = kRepeat then
+            return emitRepeat(nodes, &~ranges, &~program, n);
+        end if;
+        return false;
+    end;
+
+    -- a|b|c: split to a or to the rest; each branch jumps to the end.
+    generic [N: Region, G: Region, P: Region]
+    function emitAlternate(nodes: &[Buffer[Node], N], ranges: &![Buffer[Index], G],
+        program: &![Buffer[Inst], P], first: Index): Bool is
+        var jumps: Buffer[Index] := allocateEmpty();
+        var child: Index := first;
+        var ok: Bool := true;
+        while (child /= none) and ok do
+            let childNode: Node := nth(nodes, child);
+            let next: Index := childNode.next;
+            if next = none then
+                ok := emitNode(nodes, &~ranges, &~program, child);
+                child := none;
+            else
+                let split: Index := emit(&~program, opSplit, 0, 0, 0);
+                patchA(&~program, split, split + 1);
+                ok := emitNode(nodes, &~ranges, &~program, child);
+                let jump: Index := emit(&~program, opJump, 0, 0, 0);
+                insertBack(&!jumps, jump);
+                let rest: Index := here(&~program);
+                patchB(&~program, split, rest);
+                child := next;
+            end if;
+        end while;
+        let end_: Index := here(&~program);
+        var j: Index := 0;
+        while j < bufferLength(&jumps) do
+            patchA(&~program, nth(&jumps, j), end_);
+            j := j + 1;
+        end while;
+        destroyFree(jumps);
+        return ok;
+    end;
+
+    -- x{min,max}: min copies, then either a loop (no maximum) or max-min
+    -- optional copies, each of which can jump to the end.
+    generic [N: Region, G: Region, P: Region]
+    function emitRepeat(nodes: &[Buffer[Node], N], ranges: &![Buffer[Index], G],
+        program: &![Buffer[Inst], P], n: Node): Bool is
+        let child: Index := n.a;
+        let greedy: Bool := n.d = 1;
+        var k: Index := 0;
+        while k < n.b do
+            if not emitNode(nodes, &~ranges, &~program, child) then
+                return false;
+            end if;
+            k := k + 1;
+        end while;
+        if n.c = none then
+            -- The unbounded tail is compiled as (x+)?: a split into the body
+            -- or past it, the body, and a split back into the body or on.
+            -- The older form, a split at the top of a loop the body jumps
+            -- back to, is the same language, but when the body matches the
+            -- empty string its thread returns to a split it has already
+            -- visited at this position and dies -- so (a*)* on "b" left
+            -- group 1 unset where RE2 and Perl set it to (0,0).  Found by
+            -- the differential test against Go.
+            let enter: Index := emit(&~program, opSplit, 0, 0, 0);
+            let inside: Index := here(&~program);
+            if not emitNode(nodes, &~ranges, &~program, child) then
+                return false;
+            end if;
+            let again: Index := emit(&~program, opSplit, 0, 0, 0);
+            let out: Index := here(&~program);
+            if greedy then
+                patchA(&~program, enter, inside);
+                patchB(&~program, enter, out);
+                patchA(&~program, again, inside);
+                patchB(&~program, again, out);
+            else
+                patchA(&~program, enter, out);
+                patchB(&~program, enter, inside);
+                patchA(&~program, again, out);
+                patchB(&~program, again, inside);
+            end if;
+            return true;
+        end if;
+        var splits: Buffer[Index] := allocateEmpty();
+        var ok: Bool := true;
+        var extra: Index := n.b;
+        while (extra < n.c) and ok do
+            let split: Index := emit(&~program, opSplit, 0, 0, 0);
+            insertBack(&!splits, split);
+            ok := emitNode(nodes, &~ranges, &~program, child);
+            extra := extra + 1;
+        end while;
+        let out: Index := here(&~program);
+        var j: Index := 0;
+        while j < bufferLength(&splits) do
+            let split: Index := nth(&splits, j);
+            if greedy then
+                patchA(&~program, split, split + 1);
+                patchB(&~program, split, out);
+            else
+                patchA(&~program, split, out);
+                patchB(&~program, split, split + 1);
+            end if;
+            j := j + 1;
+        end while;
+        destroyFree(splits);
+        return ok;
+    end;
+
+    ---
+    --- What a search can know before it starts
+    ---
+
+    -- A literal whose bytes every match of it carries.  U+fffd is not one:
+    -- a byte that is not UTF-8 reads as U+fffd (runeAt), so the literal
+    -- U+fffd matches text that does not contain its three bytes.
+    function plainLiteral(n: Node): Bool is
+        return (n.kind = kLiteral) and (n.a /= replacementRune);
+    end;
+
+    -- The bytes every match must begin with, when the pattern starts with
+    -- plain literals at its top level.
+    generic [N: Region]
+    function literalPrefix(nodes: &[Buffer[Node], N], root: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        let n: Node := nth(nodes, root);
+        if plainLiteral(n) then
+            appendRune(&!builder, n.a);
+        else if n.kind = kConcat then
+            var child: Index := n.a;
+            var going: Bool := true;
+            while going and (child /= none) do
+                let c: Node := nth(nodes, child);
+                if plainLiteral(c) then
+                    appendRune(&!builder, c.a);
+                    child := c.next;
+                else
+                    going := false;
+                end if;
+            end while;
+        end if;
+        return finalize(builder);
+    end;
+
+    -- The longest run of plain literals at the top level that is not at its
+    -- start (the run at the start is the prefix).  Every part of a
+    -- concatenation matches inside the match, in order, so every match
+    -- contains these bytes, and a text that does not contain them has no
+    -- match.  Empty when there is no such run.
+    generic [N: Region]
+    function requiredLiteral(nodes: &[Buffer[Node], N], root: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        let n: Node := nth(nodes, root);
+        if n.kind = kConcat then
+            var bestFirst: Index := none;
+            var bestCount: Index := 0;
+            var runFirst: Index := none;
+            var runCount: Index := 0;
+            var leading: Bool := true;
+            var child: Index := n.a;
+            while child /= none do
+                let c: Node := nth(nodes, child);
+                if plainLiteral(c) then
+                    if runCount = 0 then
+                        runFirst := child;
+                    end if;
+                    runCount := runCount + 1;
+                    if (not leading) and (runCount > bestCount) then
+                        bestFirst := runFirst;
+                        bestCount := runCount;
+                    end if;
+                else
+                    leading := false;
+                    runCount := zero;
+                end if;
+                child := c.next;
+            end while;
+            var k: Index := 0;
+            var at: Index := bestFirst;
+            while k < bestCount do
+                let c: Node := nth(nodes, at);
+                appendRune(&!builder, c.a);
+                at := c.next;
+                k := k + 1;
+            end while;
+        end if;
+        return finalize(builder);
+    end;
+
+    -- Must every match begin at offset 0?  true when every way from the
+    -- program's entry, through saves, jumps, splits and the other
+    -- assertions, meets \A before it meets anything that takes a code
+    -- point or matches.  A pc met twice is followed once: its ways are
+    -- already being walked.
+    generic [P: Region]
+    function isAnchored(program: &[Buffer[Inst], P]): Bool is
+        let size: Index := bufferLength(program);
+        var seen: Buffer[Bool] := initialize(size, false);
+        var stack: Buffer[Index] := allocateEmpty();
+        insertBack(&!stack, zero);
+        var anchored: Bool := true;
+        while anchored and (bufferLength(&stack) > 0) do
+            let pc: Index := removeLast(&!stack);
+            if not nth(&seen, pc) then
+                storeNth(&!seen, pc, true);
+                let inst: Inst := nth(program, pc);
+                if inst.op = opJump then
+                    insertBack(&!stack, inst.a);
+                else if inst.op = opSplit then
+                    insertBack(&!stack, inst.a);
+                    insertBack(&!stack, inst.b);
+                else if inst.op = opSave then
+                    insertBack(&!stack, pc + 1);
+                else if inst.op = opAssert then
+                    if inst.a /= aBeginText then
+                        insertBack(&!stack, pc + 1);
+                    end if;
+                else
+                    anchored := false;
+                end if;
+            end if;
+        end while;
+        destroyFree(seen);
+        destroyFree(stack);
+        return anchored;
+    end;
+
+    -- The bytes a match can begin with, as 256 bytes each 0 or 1: every
+    -- instruction that can take the first code point of a match, found by
+    -- the same walk as isAnchored, and the lead byte of every code point it
+    -- takes.  Empty -- any byte can begin a match -- when the walk meets a
+    -- match (the empty string matches), ., a negated class, or a class
+    -- holding U+fffd (a byte that is not UTF-8 reads as U+fffd).
+    --
+    -- Only a byte that can begin a code point is ever marked -- never
+    -- #x80 to #xC1, never above #xF4 -- and a search that steps one code
+    -- point at a time stands on every such byte of a text.  So a search
+    -- that skips to the next marked byte lands only where it would have
+    -- stood anyway.
+    generic [P: Region, G: Region]
+    function firstByteSet(program: &[Buffer[Inst], P], ranges: &[Buffer[Index], G]): String is
+        let size: Index := bufferLength(program);
+        var seen: Buffer[Bool] := initialize(size, false);
+        var stack: Buffer[Index] := allocateEmpty();
+        var set: String := makeString(256, 0);
+        insertBack(&!stack, zero);
+        var any: Bool := false;
+        while (not any) and (bufferLength(&stack) > 0) do
+            let pc: Index := removeLast(&!stack);
+            if not nth(&seen, pc) then
+                storeNth(&!seen, pc, true);
+                let inst: Inst := nth(program, pc);
+                if inst.op = opJump then
+                    insertBack(&!stack, inst.a);
+                else if inst.op = opSplit then
+                    insertBack(&!stack, inst.a);
+                    insertBack(&!stack, inst.b);
+                else if (inst.op = opSave) or (inst.op = opAssert) then
+                    insertBack(&!stack, pc + 1);
+                else if (inst.op = opRanges) and (inst.c = 0) then
+                    var k: Index := 0;
+                    while (not any) and (k < inst.b) do
+                        let low: Index := nth(ranges, (inst.a + k) * 2);
+                        let high: Index := nth(ranges, ((inst.a + k) * 2) + 1);
+                        if (low <= replacementRune) and (replacementRune <= high) then
+                            any := true;
+                        else
+                            markLeadBytes(&!set, low, high);
+                        end if;
+                        k := k + 1;
+                    end while;
+                else
+                    any := true;
+                end if;
+            end if;
+        end while;
+        destroyFree(seen);
+        destroyFree(stack);
+        if any then
+            destroyString(set);
+            return makeString(0, 0);
+        else
+            return set;
+        end if;
+    end;
+
+    -- The first byte of the UTF-8 form of a code point.  It grows with the
+    -- code point, so the lead bytes of a range lie between those of its ends.
+    function leadByte(value: Index): Index is
+        if value < #x80 then
+            return value;
+        end if;
+        if value < #x800 then
+            return (value / 64) + #xC0;
+        end if;
+        if value < #x10000 then
+            return (value / 4096) + #xE0;
+        end if;
+        return (value / 262144) + #xF0;
+    end;
+
+    -- Mark the lead byte of every code point from low to high: every
+    -- byte between the lead bytes of the two ends that can begin a code
+    -- point at all.  A superset for a range above #x7F, which is all a skip
+    -- needs.
+    generic [S: Region]
+    function markLeadBytes(set: &![String, S], low: Index, high: Index): Unit is
+        var b: Index := leadByte(low);
+        let last: Index := leadByte(high);
+        while b <= last do
+            if (b < #x80) or ((b >= #xC2) and (b <= #xF4)) then
+                storeByte(&~set, b, 1);
+            end if;
+            b := b + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The next byte at or after origin that a match can begin with, or
+    -- none.
+    generic [T: Region, S: Region]
+    function nextFirstByte(text: Span[Nat8, T], set: Span[Nat8, S], origin: Index): Index is
+        let size: Index := spanLength(text);
+        var at: Index := origin;
+        while at < size do
+            if set[byteValue(text[at])] /= 0 then
+                return at;
+            end if;
+            at := at + 1;
+        end while;
+        return none;
+    end;
+
+    ---
+    --- compile
+    ---
+
+    generic [R: Region]
+    function compile(pattern: Span[Nat8, R]): Either[String, Regex] is
+        let size: Index := spanLength(pattern);
+        var text: String := makeString(size, 0);
+        if size > 0 then
+            for i from 0 to size - 1 do
+                storeByte(&!text, i, pattern[i]);
+            end for;
+        end if;
+        var st: State := State(pos => 0, groups => 0, fold => false, multi => false,
+            dotall => false, ungreedy => false, failed => false,
+            failCode => 0, failAt => 0);
+        var nodes: Buffer[Node] := allocateEmpty();
+        var ranges: Buffer[Index] := allocateEmpty();
+        let root: Index := parseAlternation(asSpan(&text), &!st, &!nodes, &!ranges, 0);
+        let stopped: Bool := (not st.failed) and (st.pos < size);
+        if stopped then
+            -- The only thing that stops the top level early is a ) with
+            -- no ( before it.
+            failHere(&!st, eUnexpectedParen);
+        end if;
+        destroyString(text);
+        if st.failed then
+            destroyFree(nodes);
+            destroyFree(ranges);
+            let left: Either[String, Regex] := Left(left => messageFor(st.failCode, st.failAt));
+            return left;
+        else
+            return assemble(nodes, ranges, root, (st.groups + 1) * 2);
+        end if;
+    end;
+
+    -- The second half of compile: the tree is well formed, turn it into a
+    -- program.  Takes the tree and the range table over.
+    function assemble(nodes: Buffer[Node], ranges: Buffer[Index], root: Index,
+        slotCount: Index): Either[String, Regex] is
+        var table: Buffer[Index] := ranges;
+        var program: Buffer[Inst] := allocateEmpty();
+        emit(&!program, opSave, 0, 0, 0);
+        let fits: Bool := emitNode(&nodes, &!table, &!program, root);
+        emit(&!program, opSave, 1, 0, 0);
+        emit(&!program, opMatch, 0, 0, 0);
+        -- programLimit and the slot count, at most twice the pattern's
+        -- length, keep the product far inside an Index.
+        let captures: Index := (bufferLength(&program) * 2) * slotCount;
+        let tooLarge: Bool := ((not fits) or (bufferLength(&program) > programLimit)) or (captures > captureLimit);
+        if tooLarge then
+            destroyFree(nodes);
+            destroyFree(table);
+            destroyFree(program);
+            let left: Either[String, Regex] := Left(left => messageFor(eTooLarge, 0));
+            return left;
+        else
+            let prefix: String := literalPrefix(&nodes, root);
+            let required: String := requiredLiteral(&nodes, root);
+            destroyFree(nodes);
+            let anchored: Bool := isAnchored(&program);
+            let firstBytes: String := firstByteSet(&program, &table);
+            let regex: Regex := Regex(program => program, ranges => table,
+                slotCount => slotCount, prefix => prefix,
+                required => required, firstBytes => firstBytes,
+                anchored => anchored);
+            let right: Either[String, Regex] := Right(right => regex);
+            return right;
+        end if;
+    end;
+
+    function destroyRegex(regex: Regex): Unit is
+        let { program: Buffer[Inst], ranges: Buffer[Index], slotCount: Index, prefix: String,
+            required: String, firstBytes: String, anchored: Bool } := regex;
+        destroyFree(program);
+        destroyFree(ranges);
+        destroyString(prefix);
+        destroyString(required);
+        destroyString(firstBytes);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function groupCount(regex: &[Regex, R]): Index is
+        return (regex->slotCount / 2) - 1;
+    end;
+
+    ---
+    --- The Pike VM
+    ---
+
+    -- What the assertions need to know about one position.
+    record Place: Free is
+        pos: Index;
+        atStart: Bool;
+        atEnd: Bool;
+        afterNewline: Bool;
+        beforeNewline: Bool;
+        wordBefore: Bool;
+        wordAfter: Bool;
+    end;
+
+    generic [T: Region]
+    function placeAt(text: Span[Nat8, T], pos: Index): Place is
+        let size: Index := spanLength(text);
+        var afterNewline: Bool := false;
+        var wordBefore: Bool := false;
+        if pos > 0 then
+            let before: Index := byteAt(text, pos - 1);
+            afterNewline := before = 10;
+            wordBefore := isWordByte(before);
+        end if;
+        var beforeNewline: Bool := false;
+        var wordAfter: Bool := false;
+        if pos < size then
+            let after: Index := byteAt(text, pos);
+            beforeNewline := after = 10;
+            wordAfter := isWordByte(after);
+        end if;
+        return Place(pos => pos, atStart => pos = 0, atEnd => pos = size,
+            afterNewline => afterNewline, beforeNewline => beforeNewline,
+            wordBefore => wordBefore, wordAfter => wordAfter);
+    end;
+
+    function assertionHolds(kind: Index, place: Place): Bool is
+        if kind = aBeginText then
+            return place.atStart;
+        end if;
+        if kind = aEndText then
+            return place.atEnd;
+        end if;
+        if kind = aBeginLine then
+            return place.atStart or place.afterNewline;
+        end if;
+        if kind = aEndLine then
+            return place.atEnd or place.beforeNewline;
+        end if;
+        if kind = aWord then
+            return place.wordBefore /= place.wordAfter;
+        end if;
+        if kind = aNotWord then
+            return place.wordBefore = place.wordAfter;
+        end if;
+        return false;
+    end;
+
+    generic [G: Region]
+    function rangesHold(ranges: &[Buffer[Index], G], first: Index, count: Index, value: Index): Bool is
+        var i: Index := 0;
+        while i < count do
+            let low: Index := nth(ranges, (first + i) * 2);
+            let high: Index := nth(ranges, ((first + i) * 2) + 1);
+            if (value >= low) and (value <= high) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- Does this instruction take the code point value?
+    generic [R: Region]
+    function takes(regex: &[Regex, R], inst: Inst, value: Index): Bool is
+        if inst.op = opRanges then
+            let inside: Bool := rangesHold(&(regex->ranges), inst.a, inst.b, value);
+            if inst.c = 1 then
+                return not inside;
+            end if;
+            return inside;
+        end if;
+        if inst.op = opAny then
+            if inst.a = 1 then
+                return true;
+            end if;
+            return value /= 10;
+        end if;
+        return false;
+    end;
+
+    -- The sizes and generation marks of the two thread lists.  The lists
+    -- live side by side in one buffer each, and a list is emptied by
+    -- setting its size to 0 and moving its mark on -- so nothing is cleared
+    -- byte by byte between steps.
+    record Counts: Free is
+        size0: Index;
+        size1: Index;
+        mark0: Index;
+        mark1: Index;
+    end;
+
+    -- The explicit stack of addThread holds two values per entry: tag is
+    -- a pc to explore, or 2^31 + a slot to restore; value is the old value
+    -- of that slot.  A pc stays below programLimit and a slot below twice
+    -- captureLimit, so both stay below 2^31, and 2^31 + a slot fits an
+    -- Index of 32 bits.
+    constant restoreTag: Index := 2147483648;
+
+    -- Add a thread at start to list side, following jumps, splits, saves
+    -- and assertions at once, so that a list holds only threads that wait
+    -- for a code point or stand at a match.  The stack keeps the order of a
+    -- recursive walk -- a split's first target before its second -- and that
+    -- order is the preference among matches.
+    generic [R: Region, A: Region, B: Region, C: Region, D: Region, E: Region, F: Region, H: Region]
+    function addThread(regex: &[Regex, R], side: Index, counts: &![Counts, A],
+        pcs: &![Buffer[Index], B], caps: &![Buffer[Index], C],
+        marks: &![Buffer[Index], D], work: &![Buffer[Index], E],
+        tags: &![Buffer[Index], F], values: &![Buffer[Index], H],
+        start: Index, place: Place): Unit is
+        let progLen: Index := bufferLength(&(regex->program));
+        let slots: Index := regex->slotCount;
+        var mark: Index := counts->mark0;
+        if side = 1 then
+            mark := counts->mark1;
+        end if;
+        insertBack(&~tags, start);
+        insertBack(&~values, zero);
+        while lengthMut(&~tags) > 0 do
+            let tag: Index := removeLast(&~tags);
+            let old: Index := removeLast(&~values);
+            if tag >= restoreTag then
+                storeNth(&~work, tag - restoreTag, old);
+            else
+                let pc: Index := tag;
+                let markAt: Index := (side * progLen) + pc;
+                if nthMut(&~marks, markAt) /= mark then
+                    storeNth(&~marks, markAt, mark);
+                    let inst: Inst := nth(&(regex->program), pc);
+                    if inst.op = opJump then
+                        insertBack(&~tags, inst.a);
+                        insertBack(&~values, zero);
+                    else if inst.op = opSplit then
+                        -- Pushed second, popped first: the preferred target.
+                        insertBack(&~tags, inst.b);
+                        insertBack(&~values, zero);
+                        insertBack(&~tags, inst.a);
+                        insertBack(&~values, zero);
+                    else if inst.op = opSave then
+                        insertBack(&~tags, restoreTag + inst.a);
+                        insertBack(&~values, nthMut(&~work, inst.a));
+                        storeNth(&~work, inst.a, place.pos);
+                        insertBack(&~tags, pc + 1);
+                        insertBack(&~values, zero);
+                    else if inst.op = opAssert then
+                        if assertionHolds(inst.a, place) then
+                            insertBack(&~tags, pc + 1);
+                            insertBack(&~values, zero);
+                        end if;
+                    else
+                        var at: Index := counts->size0;
+                        if side = 1 then
+                            at := counts->size1;
+                        end if;
+                        storeNth(&~pcs, (side * progLen) + at, pc);
+                        let base: Index := ((side * progLen) + at) * slots;
+                        var s: Index := 0;
+                        while s < slots do
+                            storeNth(&~caps, base + s, nthMut(&~work, s));
+                            s := s + 1;
+                        end while;
+                        if side = 1 then
+                            counts->size1 := at + 1;
+                        else
+                            counts->size0 := at + 1;
+                        end if;
+                    end if;
+                end if;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    -- Where the prefix next occurs at or after from, or none.
+    generic [T: Region, P: Region]
+    function findPrefix(text: Span[Nat8, T], prefix: Span[Nat8, P], origin: Index): Index is
+        let size: Index := spanLength(text);
+        let plen: Index := spanLength(prefix);
+        if plen > size then
+            return none;
+        end if;
+        let first: Nat8 := prefix[0];
+        var at: Index := origin;
+        while (at + plen) <= size do
+            if text[at] = first then
+                var same: Bool := true;
+                var k: Index := 1;
+                while same and (k < plen) do
+                    if text[at + k] /= prefix[k] then
+                        same := false;
+                    end if;
+                    k := k + 1;
+                end while;
+                if same then
+                    return at;
+                end if;
+            end if;
+            at := at + 1;
+        end while;
+        return none;
+    end;
+
+    function sizeOf(counts: Counts, side: Index): Index is
+        if side = 1 then
+            return counts.size1;
+        end if;
+        return counts.size0;
+    end;
+
+    -- Search for the leftmost preferred match that starts at or after
+    -- from.  The capture slots of the match, or None.
+    generic [R: Region, T: Region]
+    function search(regex: &[Regex, R], text: Span[Nat8, T], origin: Index): Option[Buffer[Index]] is
+        -- Two answers that need no VM: an anchored pattern matches only at
+        -- offset 0, and a text without the required literal has no match.
+        -- The literal is not looked for when the pattern is anchored: the
+        -- VM ends such a search after the few bytes where its threads die,
+        -- and the look would read the whole rest of the text every time.
+        var hopeless: Bool := (regex->anchored) and (origin > 0);
+        if ((not hopeless) and (not (regex->anchored))) and (length(&(regex->required)) > 0) then
+            hopeless := (findPrefix(text, asSpan(&(regex->required)), origin) = none);
+        end if;
+        if hopeless then
+            let nothing: Option[Buffer[Index]] := None();
+            return nothing;
+        end if;
+        let progLen: Index := bufferLength(&(regex->program));
+        let slots: Index := regex->slotCount;
+        let size: Index := spanLength(text);
+        let prefixLength: Index := length(&(regex->prefix));
+        let firstLength: Index := length(&(regex->firstBytes));
+        let anchored: Bool := regex->anchored;
+        var pcs: Buffer[Index] := initialize(progLen * 2, zero);
+        var caps: Buffer[Index] := initialize((progLen * 2) * slots, none);
+        var marks: Buffer[Index] := initialize(progLen * 2, zero);
+        var work: Buffer[Index] := initialize(slots, none);
+        var best: Buffer[Index] := initialize(slots, none);
+        var tags: Buffer[Index] := allocateEmpty();
+        var values: Buffer[Index] := allocateEmpty();
+        var counts: Counts := Counts(size0 => 0, size1 => 0, mark0 => 1, mark1 => 1);
+        var matched: Bool := false;
+        var side: Index := 0;
+        var pos: Index := origin;
+        var going: Bool := origin <= size;
+        while going do
+            if (not matched) and (sizeOf(counts, side) = 0) then
+                -- No thread is alive, so the next match cannot start before
+                -- the next place one can begin: nowhere after offset 0 for
+                -- an anchored pattern, else where the prefix occurs, else
+                -- at a byte a match can begin with.
+                if anchored then
+                    if pos > origin then
+                        going := false;
+                    end if;
+                else if prefixLength > 0 then
+                    let next: Index := findPrefix(text, asSpan(&(regex->prefix)), pos);
+                    if next = none then
+                        going := false;
+                    else
+                        pos := next;
+                    end if;
+                else if firstLength > 0 then
+                    let next: Index := nextFirstByte(text, asSpan(&(regex->firstBytes)), pos);
+                    if next = none then
+                        going := false;
+                    else
+                        pos := next;
+                    end if;
+                end if;
+            end if;
+            if going then
+                let place: Place := placeAt(text, pos);
+                if (not matched) and ((not anchored) or (pos = origin)) then
+                    -- A new thread at every position, behind all the others:
+                    -- a match that starts earlier is always preferred.
+                    var s: Index := 0;
+                    while s < slots do
+                        storeNth(&!work, s, none);
+                        s := s + 1;
+                    end while;
+                    addThread(regex, side, &!counts, &!pcs, &!caps, &!marks, &!work,
+                        &!tags, &!values, 0, place);
+                end if;
+                let rune: Rune := runeAt(text, pos);
+                let other: Index := one - side;
+                if other = 1 then
+                    counts.size1 := zero;
+                    counts.mark1 := counts.mark1 + 1;
+                else
+                    counts.size0 := zero;
+                    counts.mark0 := counts.mark0 + 1;
+                end if;
+                let nextPlace: Place := placeAt(text, pos + rune.width);
+                let current: Index := sizeOf(counts, side);
+                var i: Index := 0;
+                var cut: Bool := false;
+                while (i < current) and (not cut) do
+                    let pc: Index := nth(&pcs, (side * progLen) + i);
+                    let inst: Inst := nth(&(regex->program), pc);
+                    let base: Index := ((side * progLen) + i) * slots;
+                    if inst.op = opMatch then
+                        matched := true;
+                        var s: Index := 0;
+                        while s < slots do
+                            storeNth(&!best, s, nth(&caps, base + s));
+                            s := s + 1;
+                        end while;
+                        -- Every thread after this one is less preferred.
+                        cut := true;
+                    else if rune.width > 0 then
+                        if takes(regex, inst, rune.value) then
+                            var s: Index := 0;
+                            while s < slots do
+                                storeNth(&!work, s, nth(&caps, base + s));
+                                s := s + 1;
+                            end while;
+                            addThread(regex, other, &!counts, &!pcs, &!caps, &!marks, &!work,
+                                &!tags, &!values, pc + 1, nextPlace);
+                        end if;
+                    end if;
+                    i := i + 1;
+                end while;
+                side := other;
+                if pos >= size then
+                    going := false;
+                else
+                    pos := pos + rune.width;
+                end if;
+                if matched and (sizeOf(counts, side) = 0) then
+                    going := false;
+                end if;
+            end if;
+        end while;
+        destroyFree(pcs);
+        destroyFree(caps);
+        destroyFree(marks);
+        destroyFree(work);
+        destroyFree(tags);
+        destroyFree(values);
+        if matched then
+            let some: Option[Buffer[Index]] := Some(value => best);
+            return some;
+        else
+            destroyFree(best);
+            let none_: Option[Buffer[Index]] := None();
+            return none_;
+        end if;
+    end;
+
+    ---
+    --- The interface
+    ---
+
+    generic [R: Region, S: Region]
+    function match(regex: &[Regex, R], text: Span[Nat8, S]): Bool is
+        case search(regex, text, 0) of
+            when Some(value as slots: Buffer[Index]) do
+                destroyFree(slots);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function find(regex: &[Regex, R], text: Span[Nat8, S]): Option[Found] is
+        case search(regex, text, 0) of
+            when Some(value as slots: Buffer[Index]) do
+                let some: Option[Found] := Some(value => Found(slots => slots));
+                return some;
+            when None do
+                let none_: Option[Found] := None();
+                return none_;
+        end case;
+    end;
+
+    generic [R: Region]
+    function foundStart(found: &[Found, R]): Index is
+        return nth(&(found->slots), 0);
+    end;
+
+    generic [R: Region]
+    function foundEnd(found: &[Found, R]): Index is
+        return nth(&(found->slots), 1);
+    end;
+
+    -- Whether the match has a group of this number.  Asked before the
+    -- number is doubled into a slot, so that no number can overflow there.
+    generic [R: Region]
+    function hasGroup(found: &[Found, R], group: Index): Bool is
+        return group < (bufferLength(&(found->slots)) / 2);
+    end;
+
+    generic [R: Region]
+    function groupStart(found: &[Found, R], group: Index): Option[Index] is
+        if not hasGroup(found, group) then
+            let absent: Option[Index] := None();
+            return absent;
+        end if;
+        return slotOf(found, group * 2);
+    end;
+
+    generic [R: Region]
+    function groupEnd(found: &[Found, R], group: Index): Option[Index] is
+        if not hasGroup(found, group) then
+            let absent: Option[Index] := None();
+            return absent;
+        end if;
+        return slotOf(found, (group * 2) + 1);
+    end;
+
+    generic [R: Region]
+    function slotOf(found: &[Found, R], slot: Index): Option[Index] is
+        if slot >= bufferLength(&(found->slots)) then
+            let absent: Option[Index] := None();
+            return absent;
+        end if;
+        let value: Index := nth(&(found->slots), slot);
+        if value = none then
+            let unset: Option[Index] := None();
+            return unset;
+        end if;
+        let some: Option[Index] := Some(value => value);
+        return some;
+    end;
+
+    function destroyFound(found: Found): Unit is
+        let { slots: Buffer[Index] } := found;
+        destroyFree(slots);
+        return nil;
+    end;
+
+    -- Where the next search starts after an empty match at at: one code
+    -- point further, or past the end.
+    generic [T: Region]
+    function stepPast(text: Span[Nat8, T], at: Index): Index is
+        let rune: Rune := runeAt(text, at);
+        if rune.width = 0 then
+            return at + 1;
+        end if;
+        return at + rune.width;
+    end;
+
+    generic [R: Region, S: Region]
+    function find_all(regex: &[Regex, R], text: Span[Nat8, S]): Buffer[Hit] is
+        let size: Index := spanLength(text);
+        var hits: Buffer[Hit] := allocateEmpty();
+        var pos: Index := 0;
+        var previousEnd: Index := none;
+        var going: Bool := true;
+        while going and (pos <= size) do
+            case search(regex, text, pos) of
+                when Some(value as slots: Buffer[Index]) do
+                    let start: Index := nth(&slots, 0);
+                    let stop: Index := nth(&slots, 1);
+                    destroyFree(slots);
+                    if (start = stop) and (start = previousEnd) then
+                        -- An empty match that abuts the previous one is not
+                        -- a match of its own.
+                        pos := stepPast(text, start);
+                    else
+                        insertBack(&!hits, Hit(start => start, stop => stop));
+                        previousEnd := stop;
+                        if stop > start then
+                            pos := stop;
+                        else
+                            pos := stepPast(text, start);
+                        end if;
+                    end if;
+                when None do
+                    going := false;
+            end case;
+        end while;
+        return hits;
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function replace(regex: &[Regex, R], text: Span[Nat8, S], rewrite: Span[Nat8, T]): String is
+        let size: Index := spanLength(text);
+        var out: StringBuilder := makeStringBuilder();
+        var pos: Index := 0;
+        var copied: Index := 0;
+        var previousEnd: Index := none;
+        var going: Bool := true;
+        while going and (pos <= size) do
+            case search(regex, text, pos) of
+                when Some(value as slots: Buffer[Index]) do
+                    let start: Index := nth(&slots, 0);
+                    let stop: Index := nth(&slots, 1);
+                    if (start = stop) and (start = previousEnd) then
+                        pos := stepPast(text, start);
+                    else
+                        copyBytes(&!out, text, copied, start);
+                        expand(&!out, text, rewrite, &slots);
+                        copied := stop;
+                        previousEnd := stop;
+                        if stop > start then
+                            pos := stop;
+                        else
+                            pos := stepPast(text, start);
+                        end if;
+                    end if;
+                    destroyFree(slots);
+                when None do
+                    going := false;
+            end case;
+        end while;
+        copyBytes(&!out, text, copied, size);
+        return finalize(out);
+    end;
+
+    generic [B: Region, S: Region]
+    function copyBytes(out: &![StringBuilder, B], text: Span[Nat8, S], origin: Index, limit: Index): Unit is
+        var i: Index := origin;
+        while i < limit do
+            writeByte(&~out, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The rewrite, with \0 to \9 replaced by what the match and its groups
+    -- matched, and \\ by one backslash.
+    generic [B: Region, S: Region, T: Region, U: Region]
+    function expand(out: &![StringBuilder, B], text: Span[Nat8, S], rewrite: Span[Nat8, T],
+        slots: &[Buffer[Index], U]): Unit is
+        let size: Index := spanLength(rewrite);
+        var i: Index := 0;
+        while i < size do
+            let c: Nat8 := rewrite[i];
+            if (c = '\\') and ((i + 1) < size) then
+                let d: Index := byteValue(rewrite[i + 1]);
+                if isAsciiDigit(d) then
+                    let group: Index := d - 48;
+                    let slot: Index := group * 2;
+                    if (slot + 1) < bufferLength(slots) then
+                        let origin: Index := nth(slots, slot);
+                        let limit: Index := nth(slots, slot + 1);
+                        if (origin /= none) and (limit /= none) then
+                            copyBytes(&~out, text, origin, limit);
+                        end if;
+                    end if;
+                    i := i + 2;
+                else if d = 92 then
+                    writeByte(&~out, '\\');
+                    i := i + 2;
+                else
+                    writeByte(&~out, c);
+                    i := i + 1;
+                end if;
+            else
+                writeByte(&~out, c);
+                i := i + 1;
+            end if;
+        end while;
+        return nil;
+    end;
+end module body.

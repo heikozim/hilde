@@ -1,0 +1,342 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length,
+    nth,
+    insertBack
+);
+import Standard.String (
+    String
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+
+module body Standard.I18n is
+    -- The arguments in one row of bytes: the value of the argument i is
+    -- the bytes from ends[i - 1] (0 for the first) to ends[i].
+    record Arguments: Linear is
+        names: Buffer[Span[Nat8, Static]];
+        ends: Buffer[Index];
+        bytes: Buffer[Nat8];
+        invariant length(&names) = length(&ends);
+    end;
+
+    function englishPlural(count: Int64): Category is
+        if count = 1 then
+            return One();
+        end if;
+        return Other();
+    end;
+
+    function germanPlural(count: Int64): Category is
+        return englishPlural(count);
+    end;
+
+    -- An ASCII letter as a small one; every other byte as it is.
+    function lower(byte: Nat8): Nat8 is
+        if (byte >= 'A') and (byte <= 'Z') then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameCode(a: Span[Nat8, R], b: Span[Nat8, S]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if lower(a[i]) /= lower(b[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [K: Free, R: Region]
+    function languageOf(catalog: Catalog[K], code: Span[Nat8, R]): Language[K] is
+        if sameCode(catalog.default.code, code) then
+            return catalog.default;
+        end if;
+        let others: Fn[Index, Option[Language[K]]] := catalog.others;
+        var i: Index := 0;
+        var looking: Bool := true;
+        var found: Language[K] := catalog.default;
+        while looking do
+            let next: Option[Language[K]] := others(i);
+            case next of
+                when Some(value as language: Language[K]) do
+                    if sameCode(language.code, code) then
+                        found := language;
+                        looking := false;
+                    end if;
+                    i := i + 1;
+                when None do
+                    looking := false;
+            end case;
+        end while;
+        return found;
+    end;
+
+    -- A form of Forms, other when it is empty.
+    function orOther(form: Span[Nat8, Static], other: Span[Nat8, Static]): Span[Nat8, Static] is
+        if spanLength(form) = 0 then
+            return other;
+        end if;
+        return form;
+    end;
+
+    function formOf(message: Message, plural: Fn[Int64, Category], count: Option[Int64]): Span[Nat8, Static] is
+        case message of
+            when Text(text as text: Span[Nat8, Static]) do
+                return text;
+            when Plural(one as one: Span[Nat8, Static], other as other: Span[Nat8, Static]) do
+                case count of
+                    when Some(value as n: Int64) do
+                        case plural(n) of
+                            when One do
+                                return one;
+                            when Zero do
+                                return other;
+                            when Two do
+                                return other;
+                            when Few do
+                                return other;
+                            when Many do
+                                return other;
+                            when Other do
+                                return other;
+                        end case;
+                    when None do
+                        return other;
+                end case;
+            when Forms(zero as zero: Span[Nat8, Static], one as one: Span[Nat8, Static], two as two: Span[Nat8, Static], few as few: Span[Nat8, Static], many as many: Span[Nat8, Static], other as other: Span[Nat8, Static]) do
+                case count of
+                    when Some(value as n: Int64) do
+                        case plural(n) of
+                            when Zero do
+                                return orOther(zero, other);
+                            when One do
+                                return orOther(one, other);
+                            when Two do
+                                return orOther(two, other);
+                            when Few do
+                                return orOther(few, other);
+                            when Many do
+                                return orOther(many, other);
+                            when Other do
+                                return other;
+                        end case;
+                    when None do
+                        return other;
+                end case;
+        end case;
+    end;
+
+    function noCount(): Option[Int64] is
+        return None();
+    end;
+
+    function makeArguments(): Arguments is
+        let names: Buffer[Span[Nat8, Static]] := allocateEmpty();
+        let ends: Buffer[Index] := allocateEmpty();
+        let bytes: Buffer[Nat8] := allocateEmpty();
+        return Arguments(names => names, ends => ends, bytes => bytes);
+    end;
+
+    generic [R: Region]
+    function countArguments(arguments: &[Arguments, R]): Index is
+        return length(&(arguments->names));
+    end;
+
+    -- The slots of the arguments to write through, each by a function of
+    -- its own, so that a loop can borrow them again on every round.
+    generic [R: Region]
+    function namesMut(arguments: &![Arguments, R]): &![Buffer[Span[Nat8, Static]], R] is
+        return &!(arguments->names);
+    end;
+
+    generic [R: Region]
+    function endsMut(arguments: &![Arguments, R]): &![Buffer[Index], R] is
+        return &!(arguments->ends);
+    end;
+
+    generic [R: Region]
+    function bytesMut(arguments: &![Arguments, R]): &![Buffer[Nat8], R] is
+        return &!(arguments->bytes);
+    end;
+
+    generic [R: Region]
+    function bytesLength(arguments: &![Arguments, R]): Index is
+        return length(&(arguments->bytes));
+    end;
+
+    generic [R: Region, S: Region]
+    function addText(arguments: &![Arguments, R], name: Span[Nat8, Static], value: Span[Nat8, S]): Unit is
+        var i: Index := 0;
+        while i < spanLength(value) do
+            insertBack(bytesMut(&~arguments), value[i]);
+            i := i + 1;
+        end while;
+        insertBack(namesMut(&~arguments), name);
+        let total: Index := bytesLength(&~arguments);
+        insertBack(endsMut(&~arguments), total);
+        return nil;
+    end;
+
+    -- The byte of a decimal digit from 0 to 9.
+    function digitByte(d: Int64): Nat8 is
+        let digits: Span[Nat8, Static] := "0123456789";
+        var i: Index := 0;
+        var at: Int64 := 0;
+        while at < d do
+            i := i + 1;
+            at := at + 1;
+        end while;
+        return digits[i];
+    end;
+
+    generic [R: Region]
+    function addNumber(arguments: &![Arguments, R], name: Span[Nat8, Static], value: Int64): Unit is
+        -- The digits from the last, then turned round.  A negative number
+        -- is counted down through the negative values, so that the
+        -- smallest Int64 has no positive to overflow into.
+        var digits: Buffer[Nat8] := allocateEmpty();
+        var n: Int64 := value;
+        if n > 0 then
+            n := 0 - n;
+        end if;
+        if n = 0 then
+            insertBack(&!digits, '0');
+        end if;
+        while n /= 0 do
+            let d: Int64 := ((n / 10) * 10) - n;
+            insertBack(&!digits, digitByte(d));
+            n := n / 10;
+        end while;
+        if value < 0 then
+            insertBack(bytesMut(&~arguments), '-');
+        end if;
+        var i: Index := length(&digits);
+        while i > 0 do
+            i := i - 1;
+            insertBack(bytesMut(&~arguments), nth(&digits, i));
+        end while;
+        destroyFree(digits);
+        insertBack(namesMut(&~arguments), name);
+        let total: Index := bytesLength(&~arguments);
+        insertBack(endsMut(&~arguments), total);
+        return nil;
+    end;
+
+    function destroyArguments(arguments: Arguments): Unit is
+        let { names: Buffer[Span[Nat8, Static]], ends: Buffer[Index], bytes: Buffer[Nat8] } := arguments;
+        destroyFree(names);
+        destroyFree(ends);
+        destroyFree(bytes);
+        return nil;
+    end;
+
+    function isNameByte(byte: Nat8): Bool is
+        return ((byte >= 'a') and (byte <= 'z')) or (((byte >= 'A') and (byte <= 'Z')) or (((byte >= '0') and (byte <= '9')) or (byte = '_')));
+    end;
+
+    -- Writes the value of the first argument called name and says whether
+    -- there was one.
+    generic [R: Region, S: Region, T: Region]
+    function writeArgument(out: &![StringBuilder, T], arguments: &[Arguments, R], name: Span[Nat8, S]): Bool is
+        let count: Index := length(&(arguments->names));
+        var i: Index := 0;
+        while i < count do
+            if sameBytes(nth(&(arguments->names), i), name) then
+                var start: Index := 0;
+                if i > 0 then
+                    start := nth(&(arguments->ends), i - 1);
+                end if;
+                let final: Index := nth(&(arguments->ends), i);
+                var at: Index := start;
+                while at < final do
+                    writeByte(&~out, nth(&(arguments->bytes), at));
+                    at := at + 1;
+                end while;
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(a: Span[Nat8, R], b: Span[Nat8, S]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function render(text: Span[Nat8, S], arguments: &[Arguments, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if (byte = '{') and (((i + 1) < size) and (text[i + 1] = '{')) then
+                writeByte(&!out, '{');
+                i := i + 2;
+            else if (byte = '}') and (((i + 1) < size) and (text[i + 1] = '}')) then
+                writeByte(&!out, '}');
+                i := i + 2;
+            else if byte = '{' then
+                -- A name of letters, digits and _ up to the closing brace.
+                var j: Index := i + 1;
+                while (j < size) and isNameByte(text[j]) do
+                    j := j + 1;
+                end while;
+                if ((j > (i + 1)) and (j < size)) and (text[j] = '}') then
+                    if not writeArgument(&!out, arguments, spanPart(text, i + 1, j - (i + 1))) then
+                        writeString(&!out, spanPart(text, i, (j + 1) - i));
+                    end if;
+                    i := j + 1;
+                else
+                    writeByte(&!out, byte);
+                    i := i + 1;
+                end if;
+            else
+                writeByte(&!out, byte);
+                i := i + 1;
+            end if;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [K: Free, R: Region, S: Region]
+    function translate(catalog: Catalog[K], code: Span[Nat8, R], key: K, count: Option[Int64], arguments: &[Arguments, S]): String is
+        let language: Language[K] := languageOf(catalog, code);
+        let texts: Fn[K, Message] := language.texts;
+        let text: Span[Nat8, Static] := formOf(texts(key), language.plural, count);
+        return render(text, arguments);
+    end;
+end module body.

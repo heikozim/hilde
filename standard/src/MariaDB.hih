@@ -1,0 +1,390 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A client for MariaDB through the system's libmariadb, in the form of Standard.Postgres.
+
+- The same types and functions as Standard.Postgres, so Standard.Database holds it as a backend.
+- Every connection runs over required TLS, the certificate verified against caFile, name included.
+- A statement is prepared; its values are bound to its question marks, apart from its text.
+- A timestamp is microseconds since 1970-01-01 UTC, sent as a UTC date and time of years 0 to 9999.
+- Columns are read as libmariadb converts them, and a conversion it refuses stops the programme.
+- An error carries the MariaDB error number, or one of the negative codes of this module.
+- A migration that fails half way is not undone.
+
+    case openWriter("db.local", 3306, "shop", "app", asSpan(&password), "ca.pem") of
+        when Right(right as db: Connection[Writing]) do
+            let values: Values := withText(withInt64(noValues(), 7), "apple");
+            let changed: Either[MariaError, Nat64] :=
+                execute(&!db, "insert into stock (id, name) values (?, ?)", values);
+            closeDatabase(db);
+        when Left(left as failed: MariaError) do
+            printLn(describe(failed));
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+
+module Standard.MariaDB is
+    """
+    The mode of a connection that may write.
+    """
+    record Writing: Free is
+    end;
+
+    """
+    The mode of a connection that only reads.
+    """
+    record Reading: Free is
+    end;
+
+    """
+    An open connection.  Linear: it must be closed.
+    """
+    type Connection[M: Free]: Linear;
+
+    """
+    What went wrong: MariaDB's error number, or one of the negative codes
+    below.
+    """
+    record MariaError: Free is
+        code: Int32;
+    end;
+
+    """
+    The connection could not be made: the server is not there, the
+    certificate does not verify, the password is wrong, or a parameter held
+    a zero byte.  lastMessage does not apply, because there is no
+    connection; the server's own reason is in its log.
+    """
+    constant connectionFailed: Int32;
+
+    """
+    migrate found more migrations in the database than this programme has.
+    """
+    constant newerDatabase: Int32;
+
+    """
+    A value of 2 GiB or more, which the protocol cannot carry; nothing was
+    sent.
+    """
+    constant tooLarge: Int32;
+
+    """
+    The server gave no answer: the connection broke.
+    """
+    constant connectionLost: Int32;
+
+    """
+    begin found a transaction open on the connection already.  Nothing was
+    sent, and the open transaction goes on.
+    """
+    constant alreadyInTransaction: Int32;
+
+    """
+    1062 or 1586, a duplicate entry for a unique key.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isUniqueViolation(error: MariaError): Bool;
+
+    """
+    Any constraint: unique, null (1048), foreign key (1451, 1452) or check
+    (4025).
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isConstraintViolation(error: MariaError): Bool;
+
+    """
+    A conflict that may go away when tried again: 1213, a deadlock, or
+    1205, a lock wait timeout.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isBusy(error: MariaError): Bool;
+
+    """
+    A short English description of the code; for an error number this
+    module does not name, a general one.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    function describe(error: MariaError): Span[Nat8, Static];
+
+    """
+    Open a connection that may write.  host is a name, which the
+    certificate must carry; caFile is the file of CA certificates the
+    server's certificate must chain to.
+    """
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openWriter(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F]): Either[MariaError, Connection[Writing]]
+        requires (spanLength(host) > 0) and (spanLength(database) > 0)
+        requires (spanLength(user) > 0) and (spanLength(caFile) > 0)
+        requires port > 0;
+
+    """
+    Open a connection whose transactions are all read only.
+    """
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openReader(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], caFile: Span[Nat8, F]): Either[MariaError, Connection[Reading]]
+        requires (spanLength(host) > 0) and (spanLength(database) > 0)
+        requires (spanLength(user) > 0) and (spanLength(caFile) > 0)
+        requires port > 0;
+
+    """
+    Close the connection.
+    No contract: it only frees or closes what it is given.
+    """
+    generic [M: Free]
+    function closeDatabase(db: Connection[M]): Unit;
+
+    """
+    The last message of libmariadb for this connection, for a log: the server's
+    words for the last failure.
+    No contract: a text whose length follows its input.
+    """
+    generic [M: Free, R: Region]
+    function lastMessage(db: &[Connection[M], R]): String;
+
+    """
+    True when the connection runs over TLS, which every connection of this
+    module does.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [M: Free, R: Region]
+    function usesTls(db: &[Connection[M], R]): Bool;
+
+    """
+    Apply the migrations embedded by @migrations that the database has not
+    seen.  Right carries how many were applied now.  Their numbers are kept
+    in the table hilde_migrations.  MariaDB commits a change of a table's
+    form at once, so a migration that fails half way is not undone; its
+    number is written only when it ran whole.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function migrate(db: &![Connection[Writing], R], migrations: Span[Nat8, Static]): Either[MariaError, Index];
+
+    """
+    A transaction that is open.  Linear: commit or rollback ends it.
+    """
+    type Transaction: Linear;
+
+    """
+    Begin a transaction.  Fails with alreadyInTransaction, before anything
+    is sent, when a transaction is open on the connection already: MariaDB
+    would commit the open one to start another.
+    No contract: the state is the server's, an I/O result.
+    """
+    generic [M: Free, R: Region]
+    function begin(db: &![Connection[M], R]): Either[MariaError, Transaction];
+
+    """
+    Commit.  When the commit fails the transaction is rolled back, so
+    either way it is over.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function commit(db: &![Connection[M], R], transaction: Transaction): Either[MariaError, Unit];
+
+    """
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [M: Free, R: Region]
+    function rollback(db: &![Connection[M], R], transaction: Transaction): Unit;
+
+    """
+    A copy of borrowed text, as a String of its own.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): String;
+
+    """
+    The values of a statement, in the order of its question marks.  Linear: a
+    text or bytes value is a copy the values own.
+    """
+    type Values: Linear;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function noValues(): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withInt64(values: Values, value: Int64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withFloat64(values: Values, value: Float64): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withBool(values: Values, value: Bool): Values;
+
+    """
+    A point in time as microseconds since 1970-01-01 UTC, sent as a
+    date and time, which holds the years 0 to 9999 only.
+    """
+    function withTimestamp(values: Values, value: Int64): Values
+        requires (value >= -62167219200000000) and (value <= 253402300799999999);
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values;
+    """
+    A null, whose type the server takes from the statement.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withNull(values: Values): Values;
+
+    """
+    Give back values that will not be sent.
+    No contract: it only frees or closes what it is given.
+    """
+    function dropValues(values: Values): Unit;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withInt64OrNull(values: Values, value: Option[Int64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withFloat64OrNull(values: Values, value: Option[Float64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withBoolOrNull(values: Values, value: Option[Bool]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function withTimestampOrNull(values: Values, value: Option[Int64]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withTextOrNull(values: Values, value: Option[Span[Nat8, R]]): Values;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function withBytesOrNull(values: Values, value: Option[Span[Nat8, R]]): Values;
+
+    """
+    How many values there are.
+    No contract: a number the system or the build gives.
+    """
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index;
+
+    """
+    A statement that was run, its rows being read.  Linear: finish ends it.
+    """
+    type Cursor: Linear;
+
+    """
+    Run a statement that reads.  A failure is kept in the cursor and
+    reported by finish.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [M: Free, R: Region, S: Region]
+    function start(db: &![Connection[M], R], sql: Span[Nat8, S], values: Values): Cursor;
+
+    """
+    Run a statement that writes and returns rows, an insert with returning.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region, S: Region]
+    function startWrite(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Cursor;
+
+    """
+    Run a statement that writes.  Right carries the number of rows it
+    changed.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function execute(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Either[MariaError, Nat64];
+
+    """
+    Go to the next row.  false at the end, and after a failure, which
+    finish then reports.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool;
+
+    """
+    The number of columns of the result; 0 after a failure.
+    """
+    generic [R: Region]
+    function columnCount(cursor: &[Cursor, R]): Int32
+        ensures result >= 0;
+
+    """
+    True when the column of the current row is null, whatever its type.
+    """
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool
+        requires index >= 0;
+
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64
+        requires index >= 0;
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64
+        requires index >= 0;
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool
+        requires index >= 0;
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64
+        requires index >= 0;
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R]
+        requires index >= 0;
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R]
+        requires index >= 0;
+    generic [R: Region]
+    function columnInt64OrNone(cursor: &[Cursor, R], index: Int32): Option[Int64]
+        requires index >= 0;
+    generic [R: Region]
+    function columnFloat64OrNone(cursor: &[Cursor, R], index: Int32): Option[Float64]
+        requires index >= 0;
+    generic [R: Region]
+    function columnBoolOrNone(cursor: &[Cursor, R], index: Int32): Option[Bool]
+        requires index >= 0;
+    generic [R: Region]
+    function columnTimestampOrNone(cursor: &[Cursor, R], index: Int32): Option[Int64]
+        requires index >= 0;
+    generic [R: Region]
+    function columnTextOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]]
+        requires index >= 0;
+    generic [R: Region]
+    function columnBytesOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]]
+        requires index >= 0;
+
+    """
+    End the cursor.  Some carries the failure of the statement.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [M: Free, R: Region]
+    function finish(db: &![Connection[M], R], cursor: Cursor): Option[MariaError];
+
+    """
+    The version of the MariaDB client library the programme runs with,
+    for version --full.
+    No contract: the library answers.
+    """
+    function libraryVersion(): Span[Nat8, Static];
+end module.

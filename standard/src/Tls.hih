@@ -1,0 +1,212 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A TLS client and server, through libtls on OpenBSD and libretls on Debian.
+
+- A client always verifies the server's certificate, against a file of certificates and the host.
+- Nothing turns that verification off.
+- The forms ending in Tls13 allow TLS 1.3 and nothing older.
+- A server of makeServer asks no certificate of its peer.
+- A server of makeVerifyingServer refuses every client without a certificate its CA verifies.
+- Every failure is a Left with the library's own words after the prefix Standard.Tls and a colon.
+- Those words differ between the two libraries.
+- The forms with a time limit keep it only on a connection made by connectOver or acceptOver.
+- One receive takes at most 16 MiB, whatever count it is asked for.
+
+    let made: Either[String, Client] := connect("example.org", "443", "/etc/ssl/cert.pem");
+    let sent: Either[String, Unit] := send(&!client, asSpan(&request));
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+import Standard.File (
+    FileDescriptor
+);
+
+module Standard.Tls is
+    """
+    A connection to a server.  It is linear: closeClient ends it.
+    """
+    type Client: Linear;
+
+    """
+    Connects to host at port, a number or a service name, and completes
+    the handshake, verifying the server's certificate against the
+    certificates in the file caFile and against host.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [H: Region, P: Region, C: Region]
+    function connect(host: Span[Nat8, H], port: Span[Nat8, P], caFile: Span[Nat8, C]): Either[String, Client];
+
+    """
+    Completes the handshake over socket, a TCP connection already made to
+    the server, within milliseconds, verifying the server's certificate
+    against the certificates in the file caFile and against host.  The
+    client takes the socket, makes it non-blocking, and closeClient closes
+    it; when the handshake fails or the time runs out the socket is closed
+    and the Left holds the reason.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [H: Region, C: Region]
+    function connectOver(socket: FileDescriptor, host: Span[Nat8, H], caFile: Span[Nat8, C], milliseconds: Nat32): Either[String, Client];
+
+    """
+    connect and connectOver for a server that asks for a client
+    certificate: the client presents the certificate chain in the PEM file
+    certificateFile and proves it holds the key in keyFile.  Left with the
+    library's words when a file cannot be read, the key does not belong to
+    the certificate, or the server refuses the certificate.
+    """
+    generic [H: Region, P: Region, C: Region, E: Region, K: Region]
+    function connectAs(host: Span[Nat8, H], port: Span[Nat8, P], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K]): Either[String, Client]
+        requires (spanLength(certificateFile) > 0) and (spanLength(keyFile) > 0);
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function connectOverAs(socket: FileDescriptor, host: Span[Nat8, H], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], milliseconds: Nat32): Either[String, Client]
+        requires (spanLength(certificateFile) > 0) and (spanLength(keyFile) > 0);
+
+    """
+    connectOverAs, limited to TLS 1.3: a server that offers an older
+    version is refused in the handshake.  The Left holds the library's words.
+    """
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function connectOverAsTls13(socket: FileDescriptor, host: Span[Nat8, H], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], milliseconds: Nat32): Either[String, Client]
+        requires (spanLength(certificateFile) > 0) and (spanLength(keyFile) > 0);
+
+    """
+    Whether the peer of the connection presented a certificate: a server
+    always does; a client does to a server of makeVerifyingServer, which
+    verified it in the handshake.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function peerCertificateProvided(client: &[Client, R]): Bool;
+
+    """
+    The subject of the peer's certificate as libtls writes it, each field
+    after a slash, and its hash, SHA256: and hexadecimal digits.  None when the peer
+    presented none.
+    No contract: None is the answer for no certificate.
+    """
+    generic [R: Region]
+    function peerSubject(client: &[Client, R]): Option[String];
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function peerHash(client: &[Client, R]): Option[String];
+
+    """
+    Sends all of data, waiting as long as it takes.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function send(client: &![Client, R], data: Span[Nat8, S]): Either[String, Unit];
+
+    """
+    Receives at most most bytes, at least one unless the server has closed
+    the connection; then the String is empty.  It waits as long as it
+    takes.  One call receives at most 16 MiB whatever most says, so a
+    count taken from the peer cannot make it ask for more memory than
+    that.  Fails when the library reports an error or no memory is left.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function receive(client: &![Client, R], most: Index): Either[String, String];
+
+    """
+    As send, for a client made by connectOver, in at most milliseconds in
+    all however the server paces its reading.  Fails when the time runs
+    out, and at once for a client made by connect, whose blocking socket
+    no limit can be kept on.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function sendWithin(client: &![Client, R], data: Span[Nat8, S], milliseconds: Nat32): Either[String, Unit];
+
+    """
+    As receive, for a client made by connectOver, in at most milliseconds
+    in all however the server paces its bytes.  Fails when the time runs
+    out, and at once for a client made by connect, whose blocking socket
+    no limit can be kept on.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function receiveWithin(client: &![Client, R], most: Index, milliseconds: Nat32): Either[String, String];
+
+    """
+    Sends the close notification of TLS, closes the socket and gives back
+    everything the connection held.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeClient(client: Client): Unit;
+
+    ---
+    --- The server side
+    ---
+
+    """
+    A certificate and its key, ready to accept connections.  It is
+    linear: closeServer ends it.  A connection it accepted stays usable
+    after it is closed.
+    """
+    type Server: Linear;
+
+    """
+    A server that presents the certificate chain in the PEM file
+    certificateFile and holds the private key in keyFile.  Left with the
+    library's words when a file cannot be read or the key does not belong
+    to the certificate.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [C: Region, K: Region]
+    function makeServer(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K]): Either[String, Server];
+
+    """
+    As makeServer, with the certificate chain and the key as PEM text in
+    memory.  The library copies both.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [C: Region, K: Region]
+    function makeServerFromMemory(certificate: Span[Nat8, C], key: Span[Nat8, K]): Either[String, Server];
+
+    """
+    Completes the server's handshake over socket, a connection a listener
+    accepted, within milliseconds.  The connection takes the socket and
+    makes it non-blocking; send, receive and their limited forms work on
+    it as on a client, and closeClient closes it.  When the handshake
+    fails or the time runs out the socket is closed and the Left holds the
+    reason.  No certificate is asked of the peer.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function acceptOver(server: &[Server, R], socket: FileDescriptor, milliseconds: Nat32): Either[String, Client];
+
+    """
+    makeServer and makeServerFromMemory for mutual TLS: the server asks
+    every client for a certificate and completes the handshake only with
+    one that the certificates in the PEM file clientCaFile, or the PEM
+    text clientCa, verify.  A client without one, or with one of another
+    CA, fails the handshake of acceptOver.
+    """
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServer(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K], clientCaFile: Span[Nat8, A]): Either[String, Server]
+        requires spanLength(clientCaFile) > 0;
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServerTls13(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K], clientCaFile: Span[Nat8, A]): Either[String, Server]
+        requires spanLength(clientCaFile) > 0;
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServerFromMemory(certificate: Span[Nat8, C], key: Span[Nat8, K], clientCa: Span[Nat8, A]): Either[String, Server]
+        requires spanLength(clientCa) > 0;
+
+    """
+    Gives back what the server held.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeServer(server: Server): Unit;
+end module.

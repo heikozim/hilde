@@ -1,0 +1,393 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test works in a directory of its own, made at its start and removed
+-- at its end, with the files of the vault in it.
+import Standard.Vault (
+    VaultError,
+    EnvUnreadable,
+    KeyMissing,
+    KeyInvalid,
+    PepperUnreadable,
+    CryptoFailed,
+    WriteFailed,
+    PepperExists,
+    KeyExists,
+    PepperInvalid,
+    NameInvalid,
+    NotFound,
+    Damaged,
+    Vault,
+    createPepper,
+    createKey,
+    openVault,
+    closeVault,
+    setSecret,
+    getSecret,
+    deleteSecret,
+    secretNames,
+    rotateKey,
+    rotatePepper
+);
+import Standard.String (
+    String,
+    destroyString,
+    destroyWiped,
+    asSpan,
+    length,
+    nthByte
+);
+import Standard.Buffer (
+    Buffer,
+    removeLast,
+    destroyEmpty,
+    length as bufferLength
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile,
+    createDirectory,
+    removeDirectory,
+    removeFileIfThere
+);
+import Standard.AtomicFile (
+    AtomicFailure,
+    writeAtomically
+);
+import Standard.Base64 (
+    decodeUrl
+);
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+
+module body Standard.Vault.Test is
+    -- Whether a result is a success.
+    function done(result: Either[VaultError, Unit]): Bool is
+        case result of
+            when Right(right as value: Unit) do
+                return true;
+            when Left(left as error: VaultError) do
+                return false;
+        end case;
+    end;
+
+    function doneBool(result: Either[VaultError, Bool]): Bool is
+        case result of
+            when Right(right as value: Bool) do
+                return value;
+            when Left(left as error: VaultError) do
+                return false;
+        end case;
+    end;
+
+    -- Whether an operation failed with the error named by isIt.
+    function isError(error: VaultError, which: Index): Bool is
+        case error of
+            when PepperExists do
+                return which = 1;
+            when KeyExists do
+                return which = 2;
+            when PepperInvalid do
+                return which = 3;
+            when NameInvalid do
+                return which = 4;
+            when NotFound do
+                return which = 5;
+            when Damaged do
+                return which = 6;
+            when EnvUnreadable do
+                return which = 7;
+            when KeyMissing do
+                return which = 8;
+            when KeyInvalid do
+                return which = 9;
+            when PepperUnreadable do
+                return which = 10;
+            when CryptoFailed do
+                return which = 11;
+            when WriteFailed do
+                return which = 12;
+        end case;
+    end;
+
+    function failedWith(result: Either[VaultError, Unit], which: Index): Bool is
+        case result of
+            when Right(right as value: Unit) do
+                return false;
+            when Left(left as error: VaultError) do
+                return isError(error, which);
+        end case;
+    end;
+
+    -- The value under name is text.
+    generic [R: Region]
+    function holds(vault: &[Vault, R], name: Span[Nat8, Static], text: Span[Nat8, Static]): Bool is
+        case getSecret(vault, name) of
+            when Right(right as value: String) do
+                let same: Bool := sameText(&value, text);
+                destroyWiped(value);
+                return same;
+            when Left(left as error: VaultError) do
+                return false;
+        end case;
+    end;
+
+    -- Reading name fails with the error named by which.
+    generic [R: Region]
+    function refuses(vault: &[Vault, R], name: Span[Nat8, Static], which: Index): Bool is
+        case getSecret(vault, name) of
+            when Right(right as value: String) do
+                destroyWiped(value);
+                return false;
+            when Left(left as error: VaultError) do
+                return isError(error, which);
+        end case;
+    end;
+
+    generic [R: Region]
+    function sameText(text: &[String, R], other: Span[Nat8, Static]): Bool is
+        if length(text) /= spanLength(other) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(text) do
+            if nthByte(text, i) /= other[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function readFile(path: Span[Nat8, Static]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case text of
+                    when Some(value as got: String) do
+                        return got;
+                    when None do
+                        return emptyText();
+                end case;
+            when None do
+                return emptyText();
+        end case;
+    end;
+
+    function emptyText(): String is
+        case decodeUrl("") of
+            when Some(value as nothing: String) do
+                return nothing;
+            when None do
+                abort("decodeUrl of the empty text gave nothing");
+        end case;
+    end;
+
+    function write(path: Span[Nat8, Static], text: Span[Nat8, Static]): Bool is
+        case writeAtomically(path, text, 384) of
+            when Right(right as ok: Unit) do
+                return true;
+            when Left(left as failure: AtomicFailure) do
+                return false;
+        end case;
+    end;
+
+    function remove(path: Span[Nat8, Static]): Unit is
+        let gone: Bool := removeFileIfThere(path);
+        return nil;
+    end;
+
+    function dropNames(names: Buffer[String]): Unit is
+        var all: Buffer[String] := names;
+        while bufferLength(&all) > 0 do
+            destroyString(removeLast(&!all));
+        end while;
+        destroyEmpty(all);
+        return nil;
+    end;
+
+    function open(env: Span[Nat8, Static], pepper: Span[Nat8, Static]): Vault is
+        case openVault(env, pepper, "VAULT_KEY") of
+            when Right(right as vault: Vault) do
+                return vault;
+            when Left(left as error: VaultError) do
+                abort("the vault did not open");
+        end case;
+    end;
+
+    -- Pepper, key, values, names, deletion and the refusals on the way.
+    function testLifecycle(): Unit is
+        let dir: Span[Nat8, Static] := "vault-test-1.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let env: Span[Nat8, Static] := "vault-test-1.dir/app.env";
+        let pepper: Span[Nat8, Static] := "vault-test-1.dir/app.pepper";
+        assertTrue(done(createPepper(pepper)), "a pepper is made");
+        assertTrue(failedWith(createPepper(pepper), 1), "a second pepper at the same place is refused");
+        assertTrue(done(createKey(env, pepper, "VAULT_KEY")), "a key is made");
+        assertTrue(failedWith(createKey(env, pepper, "VAULT_KEY"), 2), "a second key is refused");
+        var vault: Vault := open(env, pepper);
+        assertTrue(done(setSecret(&!vault, "DB_PASSWORD", "s3cret")), "a value is stored");
+        assertTrue(done(setSecret(&!vault, "API_TOKEN", "t0ken")), "another value is stored");
+        assertTrue(done(setSecret(&!vault, "DB_PASSWORD", "n3w")), "a value is replaced");
+        assertTrue(holds(&vault, "DB_PASSWORD", "n3w"), "the replaced value is read");
+        assertTrue(holds(&vault, "API_TOKEN", "t0ken"), "the other value is read");
+        case secretNames(&vault) of
+            when Right(right as names: Buffer[String]) do
+                assertTrue(bufferLength(&names) = 2, "two names, without the key");
+                dropNames(names);
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the names were read");
+        end case;
+        assertTrue(failedWith(setSecret(&!vault, "VAULT_KEY", "x"), 4), "the key's name takes no value");
+        assertTrue(failedWith(setSecret(&!vault, "lower", "x"), 4), "a small letter is refused");
+        assertTrue(failedWith(setSecret(&!vault, "9LIVES", "x"), 4), "a leading digit is refused");
+        assertTrue(failedWith(setSecret(&!vault, "", "x"), 4), "the empty name is refused");
+        assertTrue(refuses(&vault, "VAULT_KEY", 4), "the key is not read as a value");
+        assertTrue(doneBool(deleteSecret(&!vault, "API_TOKEN")), "a value is deleted");
+        assertTrue(refuses(&vault, "API_TOKEN", 5), "a deleted value is not found");
+        case deleteSecret(&!vault, "API_TOKEN") of
+            when Right(right as was: Bool) do
+                assertFalse(was, "a second delete finds nothing");
+            when Left(left as error: VaultError) do
+                assertTrue(false, "a second delete fails");
+        end case;
+        closeVault(vault);
+        let text: String := readFile(env);
+        assertFalse(sameText(&text, ""), "the .env was written");
+        destroyString(text);
+        remove(env);
+        remove(pepper);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    -- A value read under another pepper, or changed in the file, is Damaged;
+    -- a pepper of 31 bytes does not open.
+    function testWrongPepperAndDamage(): Unit is
+        let dir: Span[Nat8, Static] := "vault-test-2.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let env: Span[Nat8, Static] := "vault-test-2.dir/app.env";
+        let pepper: Span[Nat8, Static] := "vault-test-2.dir/a.pepper";
+        let other: Span[Nat8, Static] := "vault-test-2.dir/b.pepper";
+        let short: Span[Nat8, Static] := "vault-test-2.dir/c.pepper";
+        assertTrue(done(createPepper(pepper)), "a pepper is made");
+        assertTrue(done(createPepper(other)), "another pepper is made");
+        assertTrue(write(short, "0123456789012345678901234567890"), "a pepper of 31 bytes is written");
+        assertTrue(done(createKey(env, pepper, "VAULT_KEY")), "a key is made");
+        var vault: Vault := open(env, pepper);
+        assertTrue(done(setSecret(&!vault, "SECRET", "value")), "a value is stored");
+        closeVault(vault);
+        let wrong: Vault := open(env, other);
+        assertTrue(refuses(&wrong, "SECRET", 6), "another pepper reads nothing");
+        closeVault(wrong);
+        case openVault(env, short, "VAULT_KEY") of
+            when Right(right as unexpected: Vault) do
+                closeVault(unexpected);
+                assertTrue(false, "a pepper of 31 bytes opened");
+            when Left(left as error: VaultError) do
+                assertTrue(isError(error, 3), "a pepper of 31 bytes is refused");
+        end case;
+        assertTrue(write(env, "VAULT_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nSECRET=zA==\n"), "a broken value is written");
+        let broken: Vault := open(env, pepper);
+        assertTrue(refuses(&broken, "SECRET", 6), "a value too short for the format is Damaged");
+        closeVault(broken);
+        remove(env);
+        remove(pepper);
+        remove(other);
+        remove(short);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    -- Comments, blank lines, export and quotes of other lines survive a
+    -- write; a quoted value is read without its quotes.
+    function testOtherLinesKept(): Unit is
+        let dir: Span[Nat8, Static] := "vault-test-3.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let env: Span[Nat8, Static] := "vault-test-3.dir/app.env";
+        let pepper: Span[Nat8, Static] := "vault-test-3.dir/app.pepper";
+        assertTrue(write(env, "# managed by the vault\n\nexport PLAIN=\"quoted value\"\n"), "a .env with a comment is written");
+        assertTrue(done(createPepper(pepper)), "a pepper is made");
+        assertTrue(done(createKey(env, pepper, "VAULT_KEY")), "a key is added to the .env");
+        var vault: Vault := open(env, pepper);
+        assertTrue(done(setSecret(&!vault, "SECRET", "value")), "a value is stored");
+        closeVault(vault);
+        let text: String := readFile(env);
+        assertTrue(length(&text) > 60, "the .env holds the lines");
+        assertTrue(nthByte(&text, 0) = '#', "the comment is still the first line");
+        assertTrue(nthByte(&text, 23) = '\n', "the blank line is still there");
+        destroyString(text);
+        remove(env);
+        remove(pepper);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    -- A new key reseals every value, on disk too; a new pepper at its own
+    -- place and at a new one does the same.
+    function testRotation(): Unit is
+        let dir: Span[Nat8, Static] := "vault-test-4.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let env: Span[Nat8, Static] := "vault-test-4.dir/app.env";
+        let pepper: Span[Nat8, Static] := "vault-test-4.dir/app.pepper";
+        let moved: Span[Nat8, Static] := "vault-test-4.dir/moved.pepper";
+        assertTrue(done(createPepper(pepper)), "a pepper is made");
+        assertTrue(done(createKey(env, pepper, "VAULT_KEY")), "a key is made");
+        var vault: Vault := open(env, pepper);
+        assertTrue(done(setSecret(&!vault, "ONE", "1")), "a value is stored");
+        assertTrue(done(setSecret(&!vault, "TWO", "2")), "another value is stored");
+        let before: String := readFile(env);
+        case rotateKey(&!vault) of
+            when Right(right as count: Index) do
+                assertTrue(count = 2, "two values were resealed");
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the key was rotated");
+        end case;
+        let after: String := readFile(env);
+        assertFalse(sameText(&after, ""), "the .env was written");
+        assertTrue(length(&before) = length(&after), "the .env has the same lines, sealed anew");
+        destroyString(before);
+        destroyString(after);
+        assertTrue(holds(&vault, "ONE", "1"), "the open vault reads under the new key");
+        closeVault(vault);
+        let again: Vault := open(env, pepper);
+        assertTrue(holds(&again, "TWO", "2"), "the vault opened again reads under the new key");
+        closeVault(again);
+        var third: Vault := open(env, pepper);
+        case rotatePepper(&!third, pepper) of
+            when Right(right as count: Index) do
+                assertTrue(count = 2, "a new pepper at its own place reseals both");
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the pepper was rotated in place");
+        end case;
+        assertTrue(holds(&third, "ONE", "1"), "the value reads under the new pepper");
+        assertTrue(done(createPepper("vault-test-4.dir/app.pepper.new")), "the staged pepper was moved into place");
+        remove("vault-test-4.dir/app.pepper.new");
+        case rotatePepper(&!third, moved) of
+            when Right(right as count: Index) do
+                assertTrue(count = 2, "a pepper at a new place reseals both");
+            when Left(left as error: VaultError) do
+                assertTrue(false, "the pepper was moved");
+        end case;
+        closeVault(third);
+        let fourth: Vault := open(env, moved);
+        assertTrue(holds(&fourth, "TWO", "2"), "the moved pepper reads the values");
+        closeVault(fourth);
+        remove(env);
+        remove(pepper);
+        remove(moved);
+        remove("vault-test-4.dir/app.pepper.new");
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+end module body.

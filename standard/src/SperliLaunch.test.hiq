@@ -1,0 +1,269 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.SperliLaunch: host lists with the hosts that are refused, the
+-- words of hilde run with the options that are only taken, and the keys,
+-- ports and descriptions of a launch.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    insertBack,
+    removeLast,
+    destroyEmpty
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length as textLength,
+    getSpan,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Standard.SperliError (
+    refusedHost,
+    badLaunch,
+    startFailed
+);
+import Standard.SperliLaunch (
+    sshPort,
+    basePort,
+    HostList,
+    Launch,
+    RunOptions,
+    parseHostList,
+    hostCount,
+    destroyHostList,
+    newLaunch,
+    launchId,
+    launchRanks,
+    launchPort,
+    launchHost,
+    launchPublicKey,
+    launchExpiry,
+    describeRank,
+    tokenWith,
+    destroyLaunch,
+    parseRunArguments,
+    destroyRunOptions
+);
+
+module body Standard.SperliLaunch.Test is
+    -- The code parseHostList gives for text and deny, or 0 for a list.
+    function codeOf(text: Span[Nat8, Static], deny: Span[Nat8, Static]): Int32 is
+        case parseHostList(text, deny) of
+            when Left(left as code: Int32) do
+                return code;
+            when Right(right as hosts: HostList) do
+                destroyHostList(hosts);
+                return 0;
+        end case;
+    end;
+
+    function testHostList(): Unit is
+        case parseHostList("# a comment\nnode1\n\nnode2 47001\n  node3\t47002  \n", "") of
+            when Right(right as hosts: HostList) do
+                assertTrue(hostCount(&hosts) = 3, "three hosts, the comment and the blank line left out");
+                case newLaunch(&hosts, 3, 1, 600) of
+                    when Right(right as launch: Launch) do
+                        assertTrue(launchPort(&launch, 1) = 47001, "a port a line names");
+                        assertTrue(launchPort(&launch, 2) = 47002, "a port after a tab");
+                        assertTrue(launchPort(&launch, 0) = 47000, "basePort and the rank for a remote host");
+                        let host: String := launchHost(&launch, 2);
+                        assertTrue(equal(asSpan(&host), "node3"), "the host of rank 2");
+                        destroyString(host);
+                        destroyLaunch(launch);
+                    when Left(left as code: Int32) do
+                        assertTrue(false, "a launch of the three hosts");
+                end case;
+                destroyHostList(hosts);
+            when Left(left as code: Int32) do
+                assertTrue(false, "a host list");
+        end case;
+        assertTrue(sshPort() = 62222, "ssh at port 62222");
+        assertTrue(basePort() = 47000, "ports from 47000");
+        return nil;
+    end;
+
+    function testRefusedHosts(): Unit is
+        assertTrue(codeOf("host-a.invalid\n", "") = refusedHost(), "host-a.invalid is refused with H1603");
+        assertTrue(codeOf("node1\nHOST-A.INVALID\n", "") = refusedHost(), "HOST-A.INVALID is refused");
+        assertTrue(codeOf("host-b.invalid 47001\n", "") = refusedHost(), "host-b.invalid is refused with a port");
+        assertTrue(codeOf("node1\nbox.host-b.invalid\n", "") = refusedHost(), "a name below host-b.invalid is refused");
+        assertTrue(codeOf("host-a.invalid.example.org\n", "") = refusedHost(), "a name that starts with host-a.invalid is refused");
+        assertTrue(codeOf("host-a.invalidity\n", "") = 0, "host-a.invalidity is another host");
+        assertTrue(codeOf("node1\nnode9\n", "node9\n") = refusedHost(), "a host of the deny file is refused");
+        assertTrue(codeOf("node1\nhost.node9\n", "node9\n") = refusedHost(), "a name below a denied name is refused");
+        assertTrue(codeOf("host-a.invalid\n", "node9\n") = refusedHost(), "the deny file does not lift the built-in rule");
+        assertTrue(codeOf("host-a.invalid\n", "") /= 0, "host-a.invalid is refused with an empty deny file");
+        return nil;
+    end;
+
+    function testBadHostLists(): Unit is
+        assertTrue(codeOf("", "") = badLaunch(), "no host at all");
+        assertTrue(codeOf("# nothing\n\n", "") = badLaunch(), "only comments");
+        assertTrue(codeOf("node1 port\n", "") = badLaunch(), "a port that is no number");
+        assertTrue(codeOf("node1 70000\n", "") = badLaunch(), "a port above 65535");
+        assertTrue(codeOf("node1 0\n", "") = badLaunch(), "port 0");
+        assertTrue(codeOf("-bad-\n", "") = badLaunch(), "a name that is no host name");
+        return nil;
+    end;
+
+    function words(list: Span[Nat8, Static]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        var start: Index := 0;
+        var at: Index := 0;
+        while at <= spanLength(list) do
+            if (at = spanLength(list)) or (list[at] = 32) then
+                if at > start then
+                    insertBack(&!out, fromLiteral(spanPart(list, start, at - start)));
+                end if;
+                start := at + 1;
+            end if;
+            at := at + 1;
+        end while;
+        return out;
+    end;
+
+    function destroyWords(list: Buffer[String]): Unit is
+        var rest: Buffer[String] := list;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function parsed(line: Span[Nat8, Static]): Bool is
+        let list: Buffer[String] := words(line);
+        case parseRunArguments(&list) of
+            when Right(right as options: RunOptions) do
+                destroyWords(list);
+                destroyRunOptions(options);
+                return true;
+            when Left(left as code: Int32) do
+                destroyWords(list);
+                return false;
+        end case;
+    end;
+
+    -- The checkpoint options are deferred: they are read and kept, nothing acts on them until the array type exists.
+    function testRunArguments(): Unit is
+        let list: Buffer[String] := words("-n 4 --hosts h.txt --checkpoint-dir ck --checkpoint-every 30 --restart-max 2 --resume abc ./app one two");
+        case parseRunArguments(&list) of
+            when Right(right as options: RunOptions) do
+                let { ranks: Nat32, hostsFile: String, denyFile: String, checkpointDir: String, checkpointEvery: Nat32,
+                    restartMax: Nat32, resume: String, program: String, arguments: Buffer[String] } := options;
+                assertTrue(ranks = 4, "four ranks");
+                assertTrue(equal(asSpan(&hostsFile), "h.txt"), "the host file");
+                assertTrue(equal(asSpan(&checkpointDir), "ck"), "the checkpoint directory is taken");
+                assertTrue(checkpointEvery = 30, "the checkpoint interval is taken");
+                assertTrue(restartMax = 2, "the restart limit is taken");
+                assertTrue(equal(asSpan(&resume), "abc"), "the job to resume is taken");
+                assertTrue(equal(asSpan(&program), "./app"), "the programme");
+                assertTrue(length(&arguments) = 2, "two arguments of the programme");
+                destroyString(hostsFile);
+                destroyString(denyFile);
+                destroyString(checkpointDir);
+                destroyString(resume);
+                destroyString(program);
+                destroyWords(arguments);
+            when Left(left as code: Int32) do
+                assertTrue(false, "the words were taken");
+        end case;
+        destroyWords(list);
+        assertTrue(parsed("-n 1 --hosts h ./app"), "the shortest line");
+        assertTrue(parsed("-n 2 --hosts h ./app -n 7 --hosts"), "the words after the programme are its own");
+        assertFalse(parsed("--hosts h ./app"), "no -n");
+        assertFalse(parsed("-n 3 ./app"), "no --hosts");
+        assertFalse(parsed("-n 3 --hosts h"), "no programme");
+        assertFalse(parsed("-n 0 --hosts h ./app"), "zero ranks");
+        assertFalse(parsed("-n 4097 --hosts h ./app"), "more than 4096 ranks");
+        assertFalse(parsed("-n x --hosts h ./app"), "a rank count that is no number");
+        assertFalse(parsed("-n 3 --hosts h --restart-max many ./app"), "a restart limit that is no number");
+        assertFalse(parsed("-n 3 --hosts h --frobnicate ./app"), "an unknown option");
+        assertFalse(parsed("-n 3 --hosts"), "an option with no value");
+        return nil;
+    end;
+
+    function testLaunch(): Unit is
+        case parseHostList("localhost\nlocalhost\nnode2\n", "") of
+            when Right(right as hosts: HostList) do
+                assertTrue(newLaunchCode(&hosts, 4) = badLaunch(), "more ranks than hosts");
+                case newLaunch(&hosts, 3, 2, 600) of
+                    when Right(right as launch: Launch) do
+                        assertTrue(launchRanks(&launch) = 3, "three ranks");
+                        let id: String := launchId(&launch);
+                        assertTrue(textLength(&id) = 16, "a job id of 16 bytes");
+                        let key: String := launchPublicKey(&launch);
+                        assertTrue(textLength(&key) = 1344, "a public key of 1344 bytes");
+                        assertTrue(launchPort(&launch, 0) /= launchPort(&launch, 1), "free ports are different");
+                        assertTrue(launchPort(&launch, 2) = 47002, "a remote host gets basePort and its rank");
+                        assertTrue(launchExpiry(&launch) > 1700000000, "an expiry in the future of 2023");
+                        case describeRank(&launch, 1) of
+                            when Some(value as description: String) do
+                                assertTrue(textLength(&description) > 3000, "a description holds a token and PEM texts");
+                                assertTrue(equalPrefix(&description), "a description starts with its magic");
+                                destroyString(description);
+                            when None do
+                                assertTrue(false, "a description was made");
+                        end case;
+                        assertTrue(describeCode(&launch, 3) = 0, "no description for a rank outside the job");
+                        case tokenWith(&launch, asSpan(&id), 0, 5, "localhost") of
+                            when Some(value as token: String) do
+                                assertTrue(textLength(&token) = (46 + 9 + 2 + 2484), "a token of any expiry");
+                                destroyString(token);
+                            when None do
+                                assertTrue(false, "a token was made");
+                        end case;
+                        destroyString(key);
+                        destroyString(id);
+                        destroyLaunch(launch);
+                    when Left(left as code: Int32) do
+                        assertTrue(false, "a launch of three ranks");
+                end case;
+                destroyHostList(hosts);
+            when Left(left as code: Int32) do
+                assertTrue(false, "a host list");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function newLaunchCode(hosts: &[HostList, R], ranks: Nat32): Int32 is
+        case newLaunch(hosts, ranks, 1, 600) of
+            when Left(left as code: Int32) do
+                return code;
+            when Right(right as launch: Launch) do
+                destroyLaunch(launch);
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region]
+    function describeCode(launch: &[Launch, R], rank: Nat32): Nat32 is
+        case describeRank(launch, rank) of
+            when Some(value as description: String) do
+                destroyString(description);
+                return 1;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region]
+    function equalPrefix(description: &[String, R]): Bool is
+        return equal(getSpan(description, 0, 3), "SPJD");
+    end;
+end module body.

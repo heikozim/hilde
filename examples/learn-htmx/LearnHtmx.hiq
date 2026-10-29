@@ -1,0 +1,185 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    length as count
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Template (
+    Render
+);
+import Standard.Text (
+    replace
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    requestParam,
+    destroyRequest
+);
+import Standard.Htmx (
+    requestVariable,
+    isHtmxRequest,
+    triggerHeader,
+    htmlResponse
+);
+
+module body Example.LearnHtmx is
+    record Todo: Linear is
+        text: String;
+    end;
+
+    record Page: Linear is
+        title: String;
+        todos: Buffer[Todo];
+    end;
+
+    -- The whole page, page.jinja, which includes the list, todos.jinja.
+    generic [R: Region]
+    function renderPage(page: &[Page, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    -- The list alone, the fragment htmx swaps into the page.
+    generic [R: Region]
+    function renderTodos(page: &[Page, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("todos.jinja", page, out);
+        return finalize(out);
+    end;
+
+    -- Whether the request came from htmx, by its HX-Request header.
+    function fromHtmx(request: Request): Bool is
+        var htmx: Bool := false;
+        case requestParam(&request, requestVariable()) of
+            when Some(value as header: String) do
+                htmx := isHtmxRequest(asSpan(&header));
+                destroyString(header);
+            when None do
+                skip;
+        end case;
+        destroyRequest(request);
+        return htmx;
+    end;
+
+    -- GET /todos: the page for a browser, the list for htmx.
+    generic [R: Region]
+    function list(request: Request, page: &[Page, R]): String is
+        var text: String := fromLiteral("");
+        if fromHtmx(request) then
+            destroyString(text);
+            text := renderTodos(page);
+        else
+            destroyString(text);
+            text := renderPage(page);
+        end if;
+        let answer: String := htmlResponse(200, "", asSpan(&text));
+        destroyString(text);
+        return answer;
+    end;
+
+    -- The page with one more entry.
+    function withTodo(page: Page, text: Span[Nat8, Static]): Page is
+        let { title: String, todos: Buffer[Todo] } := page;
+        var more: Buffer[Todo] := todos;
+        insertBack(&!more, Todo(text => fromLiteral(text)));
+        return Page(title => title, todos => more);
+    end;
+
+    -- The answer to POST /todos: no content, and HX-Trigger todo-added, on
+    -- which the list in the page loads itself again.
+    function added(): String is
+        let trigger: String := triggerHeader("todo-added");
+        let answer: String := htmlResponse(201, asSpan(&trigger), "");
+        destroyString(trigger);
+        return answer;
+    end;
+
+    -- A request as a web server sends it, with HX-Request when hx is not
+    -- empty.
+    function webRequest(hx: Span[Nat8, Static]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        case makePair("REQUEST_METHOD", "GET") of
+            when Some(value as pair: String) do
+                writeString(&!params, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                skip;
+        end case;
+        if spanLength(hx) > 0 then
+            case makePair(requestVariable(), hx) of
+                when Some(value as pair: String) do
+                    writeString(&!params, asSpan(&pair));
+                    destroyString(pair);
+                when None do
+                    skip;
+            end case;
+        end if;
+        return makeRequest(finalize(params), fromLiteral(""));
+    end;
+
+    -- The answer as it would go out, its CR LF printed as LF.
+    generic [R: Region]
+    function show(label: Span[Nat8, Static], answer: &[String, R]): Unit is
+        printLn(label);
+        let plain: String := replace(asSpan(answer), "\r", "");
+        if length(&plain) > 0 then
+            printLn(getSpan(&plain, 0, length(&plain) - 1));
+        end if;
+        destroyString(plain);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        var todos: Buffer[Todo] := allocateEmpty();
+        insertBack(&!todos, Todo(text => fromLiteral("buy tea")));
+        let first: Page := Page(title => fromLiteral("Todo"), todos => todos);
+        let whole: String := list(webRequest(""), &first);
+        show("-- GET /todos from a browser:", &whole);
+        destroyString(whole);
+        let page: Page := withTodo(first, "call <Ann>");
+        let answer: String := added();
+        show("-- POST /todos from htmx:", &answer);
+        destroyString(answer);
+        let fragment: String := list(webRequest("true"), &page);
+        show("-- GET /todos from htmx, after todo-added:", &fragment);
+        destroyString(fragment);
+        let { title: String, todos as rest: Buffer[Todo] } := page;
+        destroyString(title);
+        var left: Buffer[Todo] := rest;
+        while count(&left) > 0 do
+            let todo: Todo := removeLast(&!left);
+            let { text: String } := todo;
+            destroyString(text);
+        end while;
+        destroyEmpty(left);
+        return ExitSuccess();
+    end;
+end module body.

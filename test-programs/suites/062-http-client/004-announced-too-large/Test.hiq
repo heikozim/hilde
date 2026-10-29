@@ -1,0 +1,258 @@
+-- Standard.HttpClient: a length above the limit, refused from the header.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readExactly,
+    readAll,
+    closeFile
+);
+import Standard.Http (
+    headerCount
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.HttpClient (
+    Method,
+    Get,
+    Post,
+    Limits,
+    FailureKind,
+    BadUrl,
+    BadRequest,
+    NotResolved,
+    NotPublic,
+    ConnectFailed,
+    TimedOut,
+    TlsFailed,
+    TooLarge,
+    BadResponse,
+    Failure,
+    Response,
+    request
+);
+
+module body Test is
+    -- A file of the tree, from HILDE_TREE.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    function kindName(kind: FailureKind): Span[Nat8, Static] is
+        case kind of
+            when BadUrl do
+                return "BadUrl";
+            when BadRequest do
+                return "BadRequest";
+            when NotResolved do
+                return "NotResolved";
+            when NotPublic do
+                return "NotPublic";
+            when ConnectFailed do
+                return "ConnectFailed";
+            when TimedOut do
+                return "TimedOut";
+            when TlsFailed do
+                return "TlsFailed";
+            when TooLarge do
+                return "TooLarge";
+            when BadResponse do
+                return "BadResponse";
+        end case;
+    end;
+
+    -- The words of a TLS failure are the library's, and differ between
+    -- OpenSSL and LibreSSL, so they are not printed.
+    function isTls(kind: FailureKind): Bool is
+        case kind of
+            when TlsFailed do
+                return true;
+            when BadUrl do
+                return false;
+            when BadRequest do
+                return false;
+            when NotResolved do
+                return false;
+            when NotPublic do
+                return false;
+            when ConnectFailed do
+                return false;
+            when TimedOut do
+                return false;
+            when TooLarge do
+                return false;
+            when BadResponse do
+                return false;
+        end case;
+    end;
+
+    function report(result: Either[Failure, Response]): Unit is
+        case result of
+            when Right(right as answer: Response) do
+                let { status: Nat16, headers: String, content: String } := answer;
+                print("status: ");
+                printLn(status);
+                print("header lines: ");
+                printLn(headerCount(asSpan(&headers)));
+                print("body: ");
+                printText(&content);
+                printLn("");
+                destroyString(headers);
+                destroyString(content);
+            when Left(left as failed: Failure) do
+                let { kind: FailureKind, detail: String } := failed;
+                print("failure: ");
+                printLn(kindName(kind));
+                if not isTls(kind) then
+                    print("detail: ");
+                    printText(&detail);
+                    printLn("");
+                end if;
+                destroyString(detail);
+        end case;
+        return nil;
+    end;
+
+    -- Whether the time from started to now is below three seconds; false
+    -- when there is no monotonic clock to say it.
+    function within(started: Option[Nat64]): Bool is
+        let limit: Nat64 := 3000000000;
+        case started of
+            when Some(value as first: Nat64) do
+                case monotonicNanos() of
+                    when Some(value as now: Nat64) do
+                        return (now - first) < limit;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function serverCommand(): Command is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/http/server.py");
+        let mode: String := fromLiteral("announced");
+        let command: Command := addArgument(addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script)), asSpan(&mode));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        destroyString(mode);
+        return command;
+    end;
+
+    -- The URL https://localhost, the port the server printed, and path.
+    generic [R: Region]
+    function urlFor(port: &[String, R], path: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "https://localhost:");
+        writeString(&!out, getSpan(port, 0, 4));
+        writeString(&!out, path);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function talk(port: &[String, R]): Unit is
+        let url: String := urlFor(port, "/");
+        let connect: Nat32 := 5000;
+        let total: Nat32 := 5000;
+        let most: Index := 256;
+        let limits: Limits := Limits(connectMillis => connect, totalMillis => total, maximumBytes => most, publicOnly => false);
+        let started: Option[Nat64] := monotonicNanos();
+        let result: Either[Failure, Response] := request(Get(), asSpan(&url), "", "", "server-cert.pem", limits);
+        let quick: Bool := within(started);
+        destroyString(url);
+        report(result);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case spawnProcess(serverCommand()) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                var out: FileDescriptor := output;
+                var err: FileDescriptor := errors;
+                case readExactly(&!out, 6) of
+                    when Some(value as port: String) do
+                        talk(&port);
+                        destroyString(port);
+                    when None do
+                        printLn("the server printed no port");
+                end case;
+                let closedInput: Bool := closeFile(input);
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        printText(&text);
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's output failed)");
+                end case;
+                case readAll(&!err) of
+                    when Some(value as text: String) do
+                        if length(&text) > 0 then
+                            printLn("-- the server's error stream:");
+                            printText(&text);
+                        end if;
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's errors failed)");
+                end case;
+                let closedOut: Bool := closeFile(out);
+                let closedErr: Bool := closeFile(err);
+                let status: ProcessStatus := waitProcess(process);
+                print("server exited normally: ");
+                print(exitedNormally(status));
+                print(", code ");
+                printLn(exitCode(status));
+            when None do
+                printLn("the server could not be started");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

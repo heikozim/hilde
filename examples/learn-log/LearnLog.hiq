@@ -1,0 +1,177 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- What a service does around its work.  Standard.Log writes entries with
+-- a level and named fields, as text or as JSON, to standard error, a file
+-- or syslog; Standard.Signal catches a signal the process sends itself;
+-- Standard.Resource reads the limits and the usage of the process.  Only
+-- what is the same on every run is printed: an entry formatted for a
+-- fixed instant, and whether each call answered.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Calendar (
+    Instant
+);
+import Standard.Log (
+    Log,
+    Level,
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Format,
+    TextLines,
+    JsonLines,
+    Entry,
+    logToFile,
+    logsLevel,
+    closeLog,
+    makeEntry,
+    addText,
+    addInteger,
+    addBool,
+    writeEntry,
+    formatEntry,
+    discardEntry,
+    logLine
+);
+import Standard.File (
+    removeFileIfThere
+);
+import Standard.Signal (
+    Signals,
+    Wanted,
+    SignalKind,
+    User1,
+    watchSignals,
+    takeSignal,
+    sendSignal,
+    processNumber,
+    stopWatching
+);
+import Standard.Resource (
+    Resource,
+    OpenFiles,
+    Limit,
+    Usage,
+    readLimit,
+    readUsage,
+    systemUptimeNanos
+);
+
+import Standard.Sandbox (
+    Report,
+    makePolicy,
+    allowPromises,
+    allowPath,
+    applyPolicy,
+    reportRefused
+);
+
+module body Example.LearnLog is
+    -- Before anything else the programme gives up what it does not need:
+    -- of the file system only its own directory, and of the system calls
+    -- only those of the promises.  On OpenBSD that is pledge and unveil, on
+    -- Linux Landlock and seccomp, elsewhere nothing.  fattr is for the mode
+    -- logToFile gives the log file; without it pledge stops the programme
+    -- at that fchmod.  A policy that is not valid is a mistake in this
+    -- programme, and it stops.
+    function confine(): Unit is
+        let applied: Report := applyPolicy(allowPath(allowPromises(makePolicy(), "stdio rpath wpath cpath fattr proc"), ".", "rwc"));
+        if reportRefused(applied) then
+            abort("the sandbox policy is not valid");
+        end if;
+        return nil;
+    end;
+
+    function request(): Entry is
+        let status: Int64 := 200;
+        let e0: Entry := makeEntry(Info(), "request served");
+        let e1: Entry := addText(e0, "path", "/index.html");
+        let e2: Entry := addInteger(e1, "status", status);
+        return addBool(e2, "cached", false);
+    end;
+
+    function main(): ExitCode is
+        confine();
+        -- One entry, formatted for a fixed instant as text and as JSON.
+        let noNanos: Nat32 := 0;
+        let moment: Int64 := 1790557200;
+        let at: Instant := Instant(seconds => moment, nanos => noNanos);
+        let entry: Entry := request();
+        let text: String := formatEntry(&entry, at, TextLines());
+        print("as text: ");
+        printLn(asSpan(&text));
+        destroyString(text);
+        let json: String := formatEntry(&entry, at, JsonLines());
+        print("as JSON: ");
+        printLn(asSpan(&json));
+        destroyString(json);
+        discardEntry(entry);
+        -- A log that takes warnings and above, to a file, then removed.
+        case logToFile("service.log", Warning(), TextLines()) of
+            when Some(value as l: Log) do
+                var log: Log := l;
+                print("the log takes debug: ");
+                printLn(logsLevel(&log, Debug()));
+                print("the log takes errors: ");
+                printLn(logsLevel(&log, Error()));
+                print("an error written: ");
+                printLn(logLine(&!log, Error(), "the disk is full"));
+                print("the entry of a request written: ");
+                printLn(writeEntry(&!log, request()));
+                print("closed: ");
+                printLn(closeLog(log));
+            when None do
+                printLn("no log file");
+        end case;
+        print("the log file removed: ");
+        printLn(removeFileIfThere("service.log"));
+        -- A signal the process sends itself.
+        let wanted: Wanted := Wanted(hangup => false, interrupt => false, terminate => false, user1 => true, user2 => false);
+        case watchSignals(wanted) of
+            when Some(value as s: Signals) do
+                var signals: Signals := s;
+                print("sent USR1 to itself: ");
+                printLn(sendSignal(processNumber(), User1()));
+                print("USR1 taken: ");
+                printLn(takeSignal(&!signals, User1()));
+                print("taken again: ");
+                printLn(takeSignal(&!signals, User1()));
+                print("watch stopped: ");
+                printLn(stopWatching(signals));
+            when None do
+                printLn("no watch over signals");
+        end case;
+        -- The limits and the usage of the process.
+        case readLimit(OpenFiles()) of
+            when Some(value as limit: Limit) do
+                print("open files, the soft limit within the hard: ");
+                printLn(limit.soft <= limit.hard);
+            when None do
+                printLn("no limit of open files");
+        end case;
+        case readUsage() of
+            when Some(value as usage: Usage) do
+                printLn("the usage of the process was read");
+            when None do
+                printLn("no usage");
+        end case;
+        case systemUptimeNanos() of
+            when Some(value as up: Nat64) do
+                let zero: Nat64 := 0;
+                print("the system is up: ");
+                printLn(up > zero);
+            when None do
+                printLn("no uptime");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

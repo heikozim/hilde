@@ -1,0 +1,678 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- An interface is read by its lines, as the form of the files has them: a
+-- declaration starts at a line indented by four blanks and runs to the
+-- line that ends with a semicolon, or for a record, a union and a type
+-- class to the line end and a semicolon at that indent.  A pragma line is
+-- kept with the declaration after it.  A docstring is the text between two
+-- lines of three double quotes; it belongs to the declaration that follows.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nth,
+    nthRef,
+    insertBack,
+    removeFirst,
+    removeLast,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    endsWith,
+    trim,
+    substring,
+    lines,
+    formatNat
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem
+);
+import Pkg.Tree (
+    treeFiles
+);
+import Pkg.Files (
+    readText,
+    joinPath
+);
+
+module body Pkg.Api is
+    function levelName(level: Nat8): Span[Nat8, Static] is
+        if level = 0 then
+            return "patch";
+        else if level = 1 then
+            return "minor";
+        end if;
+        return "major";
+    end;
+
+    function destroyDeclaration(d: Declaration): Unit is
+        let { key: String, name: String, signature: String, needs: Buffer[String], gives: Buffer[String], docstring: String } := d;
+        destroyString(key);
+        destroyString(name);
+        destroyString(signature);
+        destroyArguments(needs);
+        destroyArguments(gives);
+        destroyString(docstring);
+        return nil;
+    end;
+
+    function destroyDeclarations(declarations: Buffer[Declaration]): Unit is
+        var rest: Buffer[Declaration] := declarations;
+        while bufferLength(&rest) > 0 do
+            destroyDeclaration(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyDiff(diff: ApiDiff): Unit is
+        let { level: Nat8, changes: Buffer[String], sites: Buffer[String] } := diff;
+        destroyArguments(changes);
+        destroyArguments(sites);
+        return nil;
+    end;
+
+    function isBlank(byte: Nat8): Bool is
+        return (((byte = ' ') or (byte = '\t')) or (byte = '\r')) or (byte = '\n');
+    end;
+
+    function isWordByte(byte: Nat8): Bool is
+        return ((((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'))) or ((byte >= '0') and (byte <= '9'))) or (byte = '_');
+    end;
+
+    -- Writes text with every run of blanks made one blank and none at the
+    -- ends; a blank is written before when out is not empty and want is
+    -- true.
+    generic [B: Region, T: Region]
+    function writeSquashed(out: &![StringBuilder, B], text: Span[Nat8, T], blankFirst: Bool): Unit is
+        var pending: Bool := blankFirst;
+        var any: Bool := false;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if isBlank(byte) then
+                pending := true;
+            else
+                if pending and (any or blankFirst) then
+                    writeByte(&~out, ' ');
+                end if;
+                pending := false;
+                any := true;
+                writeByte(&~out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The text without a semicolon at its end.
+    generic [T: Region]
+    function withoutSemicolon(text: Span[Nat8, T]): Span[Nat8, T] is
+        let t: Span[Nat8, T] := trim(text);
+        if endsWith(t, ";") then
+            return substring(t, 0, spanLength(t) - 1);
+        end if;
+        return t;
+    end;
+
+    -- The word after the first blank after the keyword, up to a byte that
+    -- is not of a name.
+    generic [T: Region]
+    function nameAfter(text: Span[Nat8, T], keyword: Span[Nat8, Static]): Span[Nat8, T] is
+        let n: Index := spanLength(text);
+        let k: Index := spanLength(keyword);
+        var i: Index := 0;
+        while (i + k) < n do
+            if equal(substring(text, i, i + k), keyword) and ((i = 0) or (not isWordByte(text[i - 1]))) and isBlank(text[i + k]) then
+                var j: Index := i + k;
+                while (j < n) and isBlank(text[j]) do
+                    j := j + 1;
+                end while;
+                var e: Index := j;
+                while (e < n) and isWordByte(text[e]) do
+                    e := e + 1;
+                end while;
+                return substring(text, j, e);
+            end if;
+            i := i + 1;
+        end while;
+        return substring(text, 0, 0);
+    end;
+
+    -- The kind of a declaration from its signature: the first keyword of
+    -- function, record, union, type, constant, typeclass, instance.
+    generic [T: Region]
+    function kindOf(signature: Span[Nat8, T]): Span[Nat8, Static] is
+        if spanLength(nameAfter(signature, "function")) > 0 then
+            return "function";
+        else if spanLength(nameAfter(signature, "typeclass")) > 0 then
+            return "typeclass";
+        else if spanLength(nameAfter(signature, "record")) > 0 then
+            return "record";
+        else if spanLength(nameAfter(signature, "union")) > 0 then
+            return "union";
+        else if spanLength(nameAfter(signature, "constant")) > 0 then
+            return "constant";
+        else if spanLength(nameAfter(signature, "type")) > 0 then
+            return "type";
+        else if spanLength(nameAfter(signature, "instance")) > 0 then
+            return "instance";
+        end if;
+        return "other";
+    end;
+
+    -- The parts of one declaration, its lines given from first to last.
+    generic [L: Region, M: Region, D: Region]
+    function declarationOf(all: &[Buffer[Span[Nat8, L]], D], first: Index, last: Index, owner: Span[Nat8, M], docstring: String): Declaration is
+        var sig: StringBuilder := makeStringBuilder();
+        var needs: Buffer[String] := allocateEmpty();
+        var gives: Buffer[String] := allocateEmpty();
+        -- 0 the signature, 1 a requires, 2 an ensures.
+        var part: Nat8 := 0;
+        var clause: StringBuilder := makeStringBuilder();
+        var i: Index := first;
+        while i <= last do
+            let line: Span[Nat8, L] := trim(nth(all, i));
+            if startsWith(line, "--") then
+                -- A comment is no part of the interface.
+                skip;
+            else if startsWith(line, "requires ") or startsWith(line, "ensures ") then
+                let previous: String := finalize(clause);
+                keepClause(part, previous, &!needs, &!gives);
+                clause := makeStringBuilder();
+                if startsWith(line, "requires ") then
+                    part := 1;
+                    writeSquashed(&!clause, withoutSemicolon(substring(line, 9, spanLength(line))), false);
+                else
+                    part := 2;
+                    writeSquashed(&!clause, withoutSemicolon(substring(line, 8, spanLength(line))), false);
+                end if;
+            else if part = 0 then
+                writeSquashed(&!sig, withoutSemicolon(line), i > first);
+            else
+                writeSquashed(&!clause, withoutSemicolon(line), true);
+            end if;
+            i := i + 1;
+        end while;
+        let previous: String := finalize(clause);
+        keepClause(part, previous, &!needs, &!gives);
+        let signature: String := finalize(sig);
+        let kind: Span[Nat8, Static] := kindOf(asSpan(&signature));
+        var name: String := makeEmpty();
+        if equal(kind, "instance") or equal(kind, "other") then
+            destroyString(name);
+            name := fromSpan(asSpan(&signature));
+        else
+            destroyString(name);
+            name := fromSpan(nameAfter(asSpan(&signature), kind));
+        end if;
+        var key: StringBuilder := makeStringBuilder();
+        writeString(&!key, owner);
+        writeByte(&!key, ' ');
+        writeString(&!key, kind);
+        writeByte(&!key, ' ');
+        writeString(&!key, asSpan(&name));
+        return Declaration(key => finalize(key), name => name, signature => signature, needs => needs, gives => gives, docstring => docstring);
+    end;
+
+    generic [N: Region, G: Region]
+    function keepClause(part: Nat8, clause: String, needs: &![Buffer[String], N], gives: &![Buffer[String], G]): Unit is
+        if part = 1 then
+            insertBack(&~needs, clause);
+        else if part = 2 then
+            insertBack(&~gives, clause);
+        else
+            destroyString(clause);
+        end if;
+        return nil;
+    end;
+
+    -- Whether the line is a top level of the module body: four blanks and
+    -- then a byte that is no blank.
+    generic [L: Region]
+    function startsDeclaration(line: Span[Nat8, L]): Bool is
+        return ((spanLength(line) > 4) and equal(substring(line, 0, 4), "    ")) and (not isBlank(line[4]));
+    end;
+
+    generic [L: Region]
+    function isBlock(line: Span[Nat8, L]): Bool is
+        let t: Span[Nat8, L] := trim(line);
+        return ((startsWith(t, "record ") or startsWith(t, "union ")) or startsWith(t, "typeclass ")) and endsWith(t, " is");
+    end;
+
+    -- The docstring from the line after first to before the closing line,
+    -- each line trimmed and joined by new lines; and where it ends.
+    generic [L: Region, D: Region]
+    function docstringAt(all: &[Buffer[Span[Nat8, L]], D], first: Index): String is
+        -- The indent of the opening line is taken off every line, so that
+        -- an example keeps the four blanks it is set off by.
+        let opening: Span[Nat8, L] := nth(all, first);
+        var indent: Index := 0;
+        while (indent < spanLength(opening)) and (opening[indent] = ' ') do
+            indent := indent + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := first + 1;
+        var any: Bool := false;
+        while (i < bufferLength(all)) and (not equal(trim(nth(all, i)), "\"\"\"")) do
+            if any then
+                writeByte(&!out, '\n');
+            end if;
+            let line: Span[Nat8, L] := nth(all, i);
+            var start: Index := 0;
+            while ((start < indent) and (start < spanLength(line))) and (line[start] = ' ') do
+                start := start + 1;
+            end while;
+            var stop: Index := spanLength(line);
+            while (stop > start) and isBlank(line[stop - 1]) do
+                stop := stop - 1;
+            end while;
+            writeString(&!out, substring(line, start, stop));
+            any := true;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [L: Region, D: Region]
+    function docstringEnd(all: &[Buffer[Span[Nat8, L]], D], first: Index): Index is
+        var i: Index := first + 1;
+        while (i < bufferLength(all)) and (not equal(trim(nth(all, i)), "\"\"\"")) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    generic [R: Region]
+    function declarationsOf(text: Span[Nat8, R]): Buffer[Declaration] is
+        let all: Buffer[Span[Nat8, R]] := lines(text);
+        var out: Buffer[Declaration] := allocateEmpty();
+        var owner: String := makeEmpty();
+        var inModule: Bool := false;
+        var doc: String := makeEmpty();
+        var prefix: StringBuilder := makeStringBuilder();
+        let n: Index := bufferLength(&all);
+        var i: Index := 0;
+        while i < n do
+            let line: Span[Nat8, R] := nth(&all, i);
+            let t: Span[Nat8, R] := trim(line);
+            if equal(t, "\"\"\"") then
+                destroyString(doc);
+                doc := docstringAt(&all, i);
+                i := docstringEnd(&all, i) + 1;
+            else if (not inModule) and (startsWith(t, "module ") and endsWith(t, " is")) then
+                destroyString(owner);
+                owner := fromSpan(substring(t, 7, spanLength(t) - 3));
+                inModule := true;
+                insertBack(&!out, Declaration(key => fromSpan(asSpan(&owner)), name => fromSpan(asSpan(&owner)), signature => fromLiteral("module"), needs => allocateEmpty(), gives => allocateEmpty(), docstring => doc));
+                doc := makeEmpty();
+                i := i + 1;
+            else if inModule and equal(t, "end module.") then
+                i := n;
+            else if inModule and startsWith(t, "--") then
+                i := i + 1;
+            else if inModule and startsDeclaration(line) then
+                if startsWith(t, "pragma ") then
+                    writeString(&!prefix, t);
+                    writeByte(&!prefix, ' ');
+                    i := i + 1;
+                else
+                    var last: Index := i;
+                    if isBlock(line) then
+                        while (last < n) and (not equal(nth(&all, last), "    end;")) do
+                            last := last + 1;
+                        end while;
+                    else
+                        while (last < n) and (not endsWith(trim(nth(&all, last)), ";")) do
+                            last := last + 1;
+                        end while;
+                    end if;
+                    if last >= n then
+                        last := n - 1;
+                    end if;
+                    let pragmas: String := finalize(prefix);
+                    prefix := makeStringBuilder();
+                    let d: Declaration := declarationOf(&all, i, last, asSpan(&owner), doc);
+                    doc := makeEmpty();
+                    insertBack(&!out, withPragmas(d, asSpan(&pragmas)));
+                    destroyString(pragmas);
+                    i := last + 1;
+                end if;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        let rest: String := finalize(prefix);
+        destroyString(rest);
+        destroyString(doc);
+        destroyString(owner);
+        destroyFree(all);
+        return out;
+    end;
+
+    -- The declaration with its pragmas before its signature.
+    generic [P: Region]
+    function withPragmas(d: Declaration, pragmas: Span[Nat8, P]): Declaration is
+        if spanLength(pragmas) = 0 then
+            return d;
+        end if;
+        let { key: String, name: String, signature: String, needs: Buffer[String], gives: Buffer[String], docstring: String } := d;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, pragmas);
+        writeString(&!out, asSpan(&signature));
+        destroyString(signature);
+        return Declaration(key => key, name => name, signature => finalize(out), needs => needs, gives => gives, docstring => docstring);
+    end;
+
+    generic [D: Region]
+    function declarationsIn(directory: Span[Nat8, D]): Either[Problem, Buffer[Declaration]] is
+        case treeFiles(directory) of
+            when Right(right as files: Buffer[String]) do
+                var out: Buffer[Declaration] := allocateEmpty();
+                addFrom(directory, &files, &!out);
+                destroyArguments(files);
+                return Right(right => out);
+            when Left(left as p: Problem) do
+                return Left(left => p);
+        end case;
+    end;
+
+    generic [D: Region, F: Region, B: Region]
+    function addFrom(directory: Span[Nat8, D], files: &[Buffer[String], F], out: &![Buffer[Declaration], B]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            if endsWith(file, ".hih") then
+                let path: String := joinPath(directory, file);
+                case readText(asSpan(&path)) of
+                    when Some(value as text: String) do
+                        var found: Buffer[Declaration] := declarationsOf(asSpan(&text));
+                        while bufferLength(&found) > 0 do
+                            insertBack(&~out, removeFirst(&!found));
+                        end while;
+                        destroyEmpty(found);
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                destroyString(path);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [D: Region, K: Region]
+    function find(declarations: &[Buffer[Declaration], D], key: Span[Nat8, K]): Index is
+        var i: Index := 0;
+        while i < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, i);
+            if equal(asSpan(&(d->key)), key) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return bufferLength(declarations);
+    end;
+
+    generic [A: Region, K: Region]
+    function hasText(texts: &[Buffer[String], A], text: Span[Nat8, K]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(texts) do
+            if equal(asSpan(nthRef(texts, i)), text) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [K: Region, C: Region]
+    function line3(level: Span[Nat8, Static], what: Span[Nat8, Static], key: Span[Nat8, K], clause: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, level);
+        writeString(&!out, ": ");
+        writeString(&!out, what);
+        writeByte(&!out, ' ');
+        writeString(&!out, key);
+        if spanLength(clause) > 0 then
+            writeString(&!out, ": ");
+            writeString(&!out, clause);
+        end if;
+        return finalize(out);
+    end;
+
+    -- The clauses of source that are not in target, each as a change of the level.
+    generic [F: Region, T: Region, K: Region, B: Region]
+    function clauseChanges(source: &[Buffer[String], F], target: &[Buffer[String], T], level: Span[Nat8, Static], what: Span[Nat8, Static], key: Span[Nat8, K], out: &![Buffer[String], B]): Bool is
+        var any: Bool := false;
+        var i: Index := 0;
+        while i < bufferLength(source) do
+            let c: Span[Nat8, F] := asSpan(nthRef(source, i));
+            if not hasText(target, c) then
+                insertBack(&~out, line3(level, what, key, c));
+                any := true;
+            end if;
+            i := i + 1;
+        end while;
+        return any;
+    end;
+
+    -- The changes of one declaration that is in both, and the level they
+    -- call for.
+    generic [O: Region, N: Region, B: Region, X: Region]
+    function compareOne(old: &[Declaration, O], new: &[Declaration, N], out: &![Buffer[String], B], broken: &![Buffer[String], X]): Nat8 is
+        let key: Span[Nat8, O] := asSpan(&(old->key));
+        if not equal(asSpan(&(old->signature)), asSpan(&(new->signature))) then
+            insertBack(&~out, line3("major", "changed", key, asSpan(&(new->signature))));
+            insertBack(&~broken, fromSpan(asSpan(&(old->name))));
+            return 2;
+        end if;
+        var level: Nat8 := 0;
+        -- A requires the new one adds or changes is stricter for a caller.
+        if clauseChanges(&(new->needs), &(old->needs), "major", "requires added or changed in", key, &~out) then
+            level := 2;
+        end if;
+        -- An ensures the new one drops or changes promises less.
+        if clauseChanges(&(old->gives), &(new->gives), "major", "ensures removed or changed in", key, &~out) then
+            level := 2;
+        end if;
+        if level = 2 then
+            insertBack(&~broken, fromSpan(asSpan(&(old->name))));
+        end if;
+        if clauseChanges(&(old->needs), &(new->needs), "minor", "requires removed from", key, &~out) and (level < 1) then
+            level := 1;
+        end if;
+        if clauseChanges(&(new->gives), &(old->gives), "minor", "ensures added to", key, &~out) and (level < 1) then
+            level := 1;
+        end if;
+        return level;
+    end;
+
+    generic [O: Region, N: Region, B: Region, X: Region]
+    function compareAll(old: &[Buffer[Declaration], O], new: &[Buffer[Declaration], N], out: &![Buffer[String], B], broken: &![Buffer[String], X]): Nat8 is
+        var level: Nat8 := 0;
+        var i: Index := 0;
+        while i < bufferLength(old) do
+            let d: &[Declaration, O] := nthRef(old, i);
+            let at: Index := find(new, asSpan(&(d->key)));
+            if at = bufferLength(new) then
+                insertBack(&~out, line3("major", "removed", asSpan(&(d->key)), ""));
+                insertBack(&~broken, fromSpan(asSpan(&(d->name))));
+                level := 2;
+            else
+                let one: Nat8 := compareOne(d, nthRef(new, at), &~out, &~broken);
+                if one > level then
+                    level := one;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        var j: Index := 0;
+        while j < bufferLength(new) do
+            let d: &[Declaration, N] := nthRef(new, j);
+            if find(old, asSpan(&(d->key))) = bufferLength(old) then
+                insertBack(&~out, line3("minor", "added", asSpan(&(d->key)), ""));
+                if level < 1 then
+                    level := 1;
+                end if;
+            end if;
+            j := j + 1;
+        end while;
+        return level;
+    end;
+
+    -- Whether the line calls name: the name, a parenthesis after it, and no
+    -- byte of a name right before it.
+    generic [L: Region, M: Region]
+    function calls(line: Span[Nat8, L], name: Span[Nat8, M]): Bool is
+        let n: Index := spanLength(line);
+        let k: Index := spanLength(name);
+        if k = 0 then
+            return false;
+        end if;
+        var i: Index := 0;
+        while (i + k) < n do
+            if equal(substring(line, i, i + k), name) and (line[i + k] = '(') and ((i = 0) or (not isWordByte(line[i - 1]))) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    function lineNumber(n: Index): String is
+        case toNat64(n) of
+            when Some(value as wide: Nat64) do
+                return formatNat(wide);
+            when None do
+                abort("Pkg.Api: a line number did not fit a Nat64");
+        end case;
+    end;
+
+    -- The places below dir that call one of the names, as path:line: name.
+    generic [D: Region, X: Region, B: Region]
+    function callSites(dir: Span[Nat8, D], broken: &[Buffer[String], X], out: &![Buffer[String], B]): Unit is
+        if bufferLength(broken) = 0 then
+            return nil;
+        end if;
+        case treeFiles(dir) of
+            when Right(right as files: Buffer[String]) do
+                sitesIn(dir, &files, broken, &~out);
+                destroyArguments(files);
+            when Left(left as p: Problem) do
+                destroyProblemHere(p);
+        end case;
+        return nil;
+    end;
+
+    function destroyProblemHere(p: Problem): Unit is
+        let { code: Int64, message: String, suggestion: String } := p;
+        destroyString(message);
+        destroyString(suggestion);
+        return nil;
+    end;
+
+    generic [D: Region, F: Region, X: Region, B: Region]
+    function sitesIn(dir: Span[Nat8, D], files: &[Buffer[String], F], broken: &[Buffer[String], X], out: &![Buffer[String], B]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            if endsWith(file, ".hiq") or endsWith(file, ".hih") then
+                let path: String := joinPath(dir, file);
+                case readText(asSpan(&path)) of
+                    when Some(value as text: String) do
+                        sitesInText(asSpan(&path), asSpan(&text), broken, &~out);
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                destroyString(path);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [P: Region, T: Region, X: Region, B: Region]
+    function sitesInText(path: Span[Nat8, P], text: Span[Nat8, T], broken: &[Buffer[String], X], out: &![Buffer[String], B]): Unit is
+        let all: Buffer[Span[Nat8, T]] := lines(text);
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let line: Span[Nat8, T] := nth(&all, i);
+            var j: Index := 0;
+            while j < bufferLength(broken) do
+                let name: Span[Nat8, X] := asSpan(nthRef(broken, j));
+                if calls(line, name) then
+                    var site: StringBuilder := makeStringBuilder();
+                    writeString(&!site, path);
+                    writeByte(&!site, ':');
+                    let at: String := lineNumber(i + 1);
+                    writeString(&!site, asSpan(&at));
+                    destroyString(at);
+                    writeString(&!site, ": ");
+                    writeString(&!site, name);
+                    insertBack(&~out, finalize(site));
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return nil;
+    end;
+
+    generic [O: Region, N: Region, S: Region]
+    function diffTrees(old: Span[Nat8, O], new: Span[Nat8, N], sites: Span[Nat8, S]): Either[Problem, ApiDiff] is
+        case declarationsIn(old) of
+            when Right(right as before: Buffer[Declaration]) do
+                case declarationsIn(new) of
+                    when Right(right as after: Buffer[Declaration]) do
+                        var changes: Buffer[String] := allocateEmpty();
+                        var broken: Buffer[String] := allocateEmpty();
+                        let level: Nat8 := compareAll(&before, &after, &!changes, &!broken);
+                        var found: Buffer[String] := allocateEmpty();
+                        if spanLength(sites) > 0 then
+                            callSites(sites, &broken, &!found);
+                        end if;
+                        destroyArguments(broken);
+                        destroyDeclarations(before);
+                        destroyDeclarations(after);
+                        return Right(right => ApiDiff(level => level, changes => changes, sites => found));
+                    when Left(left as p: Problem) do
+                        destroyDeclarations(before);
+                        return Left(left => p);
+                end case;
+            when Left(left as p: Problem) do
+                return Left(left => p);
+        end case;
+    end;
+end module body.

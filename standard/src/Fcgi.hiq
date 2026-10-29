@@ -1,0 +1,655 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring,
+    isDigit,
+    indexOfByte
+);
+
+module body Standard.Fcgi is
+    ---
+    --- The numbers of the protocol
+    ---
+
+    constant typeBeginRequest: Nat8 := 1;
+    constant typeAbortRequest: Nat8 := 2;
+    constant typeEndRequest: Nat8 := 3;
+    constant typeParams: Nat8 := 4;
+    constant typeStdin: Nat8 := 5;
+    constant typeStdout: Nat8 := 6;
+    constant typeStderr: Nat8 := 7;
+    constant typeData: Nat8 := 8;
+    constant typeGetValues: Nat8 := 9;
+    constant typeGetValuesResult: Nat8 := 10;
+    constant typeUnknown: Nat8 := 11;
+
+    constant roleResponder: Nat64 := 1;
+    constant roleAuthorizer: Nat64 := 2;
+    constant roleFilter: Nat64 := 3;
+
+    constant statusRequestComplete: Nat8 := 0;
+    constant statusCantMultiplex: Nat8 := 1;
+    constant statusOverloaded: Nat8 := 2;
+    constant statusUnknownRole: Nat8 := 3;
+
+    constant protocolVersion: Nat8 := 1;
+    constant zeroByte: Nat8 := 0;
+    constant highBitByte: Nat8 := 128;
+
+    -- An integer literal is an Int32 unless a declaration says otherwise,
+    -- and a literal on the left of an operator does not take the other
+    -- side's type.  Everything this module computes with is named.
+    constant zeroIndex: Index := 0;
+    constant oneIndex: Index := 1;
+    constant twoIndex: Index := 2;
+    constant threeIndex: Index := 3;
+    constant fourIndex: Index := 4;
+    constant sixIndex: Index := 6;
+    constant eightIndex: Index := 8;
+    constant headerLength: Index := 8;
+    constant bodyLength: Index := 8;
+    constant shortLengthLimit: Index := 128;
+    -- The content length field is two bytes, so a record carries at most
+    -- 65535 bytes of content.
+    constant maxContentLength: Index := 65535;
+    -- A name-value length field is 31 bits when it is four bytes wide.
+    constant maxFieldLength: Index := 2147483647;
+
+    constant zeroNat: Nat64 := 0;
+    constant oneNat: Nat64 := 1;
+    constant twoNat: Nat64 := 2;
+
+    -- The bytes the header-variable functions below read and write.
+    constant byteHyphen: Nat8 := 45;
+    constant byteColon: Nat8 := 58;
+    constant byteUpperA: Nat8 := 65;
+    constant byteUpperH: Nat8 := 72;
+    constant byteUpperP: Nat8 := 80;
+    constant byteUpperT: Nat8 := 84;
+    constant byteUpperZ: Nat8 := 90;
+    constant byteUnderscore: Nat8 := 95;
+    constant byteLowerA: Nat8 := 97;
+    constant byteLowerZ: Nat8 := 122;
+    constant caseGap: Nat8 := 32;
+    constant byteModulus: Nat64 := 256;
+    constant highBitValue: Nat64 := 2147483648;
+
+    record RecordHeader: Free is
+        version: Nat8;
+        kind: Nat8;
+        requestId: Nat64;
+        contentLength: Index;
+        paddingLength: Index;
+    end;
+
+    -- A length field of a name-value pair, and how many bytes it took.
+    record Field: Free is
+        size: Index;
+        width: Index;
+        ok: Bool;
+    end;
+
+    -- Where the two halves of one name-value pair are, and where the next
+    -- pair starts.
+    record Pair: Free is
+        nameAt: Index;
+        nameSize: Index;
+        valueAt: Index;
+        valueSize: Index;
+        next: Index;
+        ok: Bool;
+    end;
+
+    ---
+    --- Widening, which cannot fail and still has to say so
+    ---
+
+    function natOfByte(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value: Nat64) do
+                return value;
+            when None do
+                abort("Standard.Fcgi: a Nat8 did not fit in a Nat64.");
+        end case;
+    end;
+
+    function natOfIndex(index: Index): Nat64 is
+        case toNat64(index) of
+            when Some(value: Nat64) do
+                return value;
+            when None do
+                abort("Standard.Fcgi: an Index did not fit in a Nat64.");
+        end case;
+    end;
+
+    function indexOfNat(wide: Nat64): Index is
+        case toIndex(wide) of
+            when Some(value: Index) do
+                return value;
+            when None do
+                abort("Standard.Fcgi: a length did not fit in an Index.");
+        end case;
+    end;
+
+    function byteOfNat(wide: Nat64): Nat8 is
+        case toNat8(wide) of
+            when Some(value: Nat8) do
+                return value;
+            when None do
+                abort("Standard.Fcgi: a byte value did not fit in a Nat8.");
+        end case;
+    end;
+
+    ---
+    --- Reading numbers off the wire, most significant byte first
+    ---
+
+    generic [R: Region]
+    function bigEndian(bytes: Span[Nat8, R], at: Index, width: Index): Nat64 is
+        var total: Nat64 := zeroNat;
+        var i: Index := zeroIndex;
+        while i < width do
+            total := (total * byteModulus) + natOfByte(bytes[at + i]);
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    ---
+    --- The record header
+    ---
+
+    generic [R: Region]
+    function bytesAfterHeader(bytes: Span[Nat8, R]): Option[Index] is
+        let none: Option[Index] := None();
+        if spanLength(bytes) < headerLength then
+            return none;
+        end if;
+        if bytes[0] /= protocolVersion then
+            return none;
+        end if;
+        let contentLength: Index := indexOfNat(bigEndian(bytes, fourIndex, twoIndex));
+        let paddingLength: Index := indexOfNat(natOfByte(bytes[sixIndex]));
+        let some: Option[Index] := Some(value => contentLength + paddingLength);
+        return some;
+    end;
+
+    generic [R: Region]
+    function readHeader(bytes: Span[Nat8, R], at: Index): Option[RecordHeader] is
+        let size: Index := spanLength(bytes);
+        let none: Option[RecordHeader] := None();
+        if at >= size then
+            return none;
+        end if;
+        let left: Index := size - at;
+        if left < headerLength then
+            return none;
+        end if;
+        let version: Nat8 := bytes[at];
+        if version /= protocolVersion then
+            return none;
+        end if;
+        let contentLength: Index := indexOfNat(bigEndian(bytes, at + fourIndex, twoIndex));
+        let paddingLength: Index := indexOfNat(natOfByte(bytes[at + sixIndex]));
+        -- The lengths come from the other end.  Written as a subtraction so
+        -- that the sum cannot wrap past the test that is meant to catch it.
+        if contentLength > (left - headerLength) then
+            return none;
+        end if;
+        if paddingLength > ((left - headerLength) - contentLength) then
+            return none;
+        end if;
+        let header: RecordHeader := RecordHeader(
+            version => version,
+            kind => bytes[at + oneIndex],
+            requestId => bigEndian(bytes, at + twoIndex, twoIndex),
+            contentLength => contentLength,
+            paddingLength => paddingLength);
+        let some: Option[RecordHeader] := Some(value => header);
+        return some;
+    end;
+
+    function headerVersion(header: RecordHeader): Nat8 is
+        return header.version;
+    end;
+
+    function headerKind(header: RecordHeader): Nat8 is
+        return header.kind;
+    end;
+
+    function headerRequestId(header: RecordHeader): Nat64 is
+        return header.requestId;
+    end;
+
+    function headerContentLength(header: RecordHeader): Index is
+        return header.contentLength;
+    end;
+
+    function headerPaddingLength(header: RecordHeader): Index is
+        return header.paddingLength;
+    end;
+
+    function recordLength(header: RecordHeader): Index is
+        return (headerLength + header.contentLength) + header.paddingLength;
+    end;
+
+    generic [R: Region]
+    function readContent(bytes: Span[Nat8, R], at: Index,
+        header: RecordHeader): Option[String] is
+        -- The header may come from other bytes than these: each length
+        -- is held to what is there, as a subtraction that cannot wrap.
+        let size: Index := spanLength(bytes);
+        var fits: Bool := false;
+        if at <= size then
+            let left: Index := size - at;
+            if left >= headerLength then
+                fits := header.contentLength <= (left - headerLength);
+            end if;
+        end if;
+        if fits then
+            let startAt: Index := at + headerLength;
+            let some: Option[String] := Some(value => fromSpan(substring(bytes, startAt, startAt + header.contentLength)));
+            return some;
+        else
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    ---
+    --- The body of a begin-request record
+    ---
+
+    generic [R: Region]
+    function beginRequestRole(bodyBytes: Span[Nat8, R]): Option[Nat64] is
+        let none: Option[Nat64] := None();
+        if spanLength(bodyBytes) /= bodyLength then
+            return none;
+        end if;
+        let some: Option[Nat64] := Some(value => bigEndian(bodyBytes, zeroIndex, twoIndex));
+        return some;
+    end;
+
+    generic [R: Region]
+    function beginRequestKeepConnection(bodyBytes: Span[Nat8, R]): Option[Bool] is
+        let none: Option[Bool] := None();
+        if spanLength(bodyBytes) /= bodyLength then
+            return none;
+        end if;
+        let flags: Nat64 := natOfByte(bodyBytes[twoIndex]);
+        let some: Option[Bool] := Some(value => rem(flags, twoNat) = oneNat);
+        return some;
+    end;
+
+    ---
+    --- Name-value pairs
+    ---
+
+    generic [R: Region]
+    function readLength(block: Span[Nat8, R], at: Index): Field is
+        let size: Index := spanLength(block);
+        let bad: Field := Field(size => zeroIndex, width => zeroIndex, ok => false);
+        if at >= size then
+            return bad;
+        end if;
+        let first: Nat8 := block[at];
+        if first < highBitByte then
+            return Field(size => indexOfNat(natOfByte(first)),
+                width => oneIndex, ok => true);
+        end if;
+        if (size - at) < fourIndex then
+            return bad;
+        end if;
+        -- Four bytes, with the top bit of the first one a marker and not
+        -- part of the number.
+        let wide: Nat64 := bigEndian(block, at, fourIndex) - highBitValue;
+        return Field(size => indexOfNat(wide), width => fourIndex, ok => true);
+    end;
+
+    generic [R: Region]
+    function readPair(block: Span[Nat8, R], at: Index): Pair is
+        let size: Index := spanLength(block);
+        let bad: Pair := Pair(nameAt => zeroIndex, nameSize => zeroIndex,
+            valueAt => zeroIndex, valueSize => zeroIndex,
+            next => zeroIndex, ok => false);
+        let nameField: Field := readLength(block, at);
+        if not nameField.ok then
+            return bad;
+        end if;
+        let valueField: Field := readLength(block, at + nameField.width);
+        if not valueField.ok then
+            return bad;
+        end if;
+        let nameAt: Index := (at + nameField.width) + valueField.width;
+        if nameAt > size then
+            return bad;
+        end if;
+        -- Every test is a subtraction against what is left, so that a length
+        -- from the wire cannot be added into a wrap and past its own check.
+        if nameField.size > (size - nameAt) then
+            return bad;
+        end if;
+        let valueAt: Index := nameAt + nameField.size;
+        if valueField.size > (size - valueAt) then
+            return bad;
+        end if;
+        return Pair(nameAt => nameAt, nameSize => nameField.size,
+            valueAt => valueAt, valueSize => valueField.size,
+            next => valueAt + valueField.size, ok => true);
+    end;
+
+    generic [R: Region]
+    function pairCount(block: Span[Nat8, R]): Index is
+        let size: Index := spanLength(block);
+        var at: Index := zeroIndex;
+        var count: Index := zeroIndex;
+        var going: Bool := true;
+        while going do
+            if at >= size then
+                going := false;
+            else
+                let pair: Pair := readPair(block, at);
+                if not pair.ok then
+                    going := false;
+                else
+                    count := count + oneIndex;
+                    at := pair.next;
+                end if;
+            end if;
+        end while;
+        return count;
+    end;
+
+    generic [R: Region]
+    function nthPair(block: Span[Nat8, R], n: Index): Pair is
+        let size: Index := spanLength(block);
+        let bad: Pair := Pair(nameAt => zeroIndex, nameSize => zeroIndex,
+            valueAt => zeroIndex, valueSize => zeroIndex,
+            next => zeroIndex, ok => false);
+        var at: Index := zeroIndex;
+        var seen: Index := zeroIndex;
+        var going: Bool := true;
+        while going do
+            if at >= size then
+                going := false;
+            else
+                let pair: Pair := readPair(block, at);
+                if not pair.ok then
+                    going := false;
+                else
+                    if seen = n then
+                        return pair;
+                    end if;
+                    seen := seen + oneIndex;
+                    at := pair.next;
+                end if;
+            end if;
+        end while;
+        return bad;
+    end;
+
+    generic [R: Region]
+    function nthPairName(block: Span[Nat8, R], n: Index): Option[String] is
+        let pair: Pair := nthPair(block, n);
+        if not pair.ok then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let some: Option[String] :=
+            Some(value => fromSpan(substring(block, pair.nameAt, pair.nameAt + pair.nameSize)));
+        return some;
+    end;
+
+    generic [R: Region]
+    function nthPairValue(block: Span[Nat8, R], n: Index): Option[String] is
+        let pair: Pair := nthPair(block, n);
+        if not pair.ok then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let some: Option[String] :=
+            Some(value => fromSpan(substring(block, pair.valueAt, pair.valueAt + pair.valueSize)));
+        return some;
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    -- Every writer takes the builder and gives it back: a write reference is
+    -- linear and could be used exactly once, while an owned builder can be
+    -- borrowed afresh for every byte.
+    function putByte(builder: StringBuilder, byte: Nat8): StringBuilder is
+        var b: StringBuilder := builder;
+        writeByte(&!b, byte);
+        return b;
+    end;
+
+    function putBigEndian(builder: StringBuilder, wide: Nat64,
+        width: Index): StringBuilder is
+        var b: StringBuilder := builder;
+        var k: Index := width;
+        while k > zeroIndex do
+            k := k - oneIndex;
+            let step: Nat64 := powerOfByte(k);
+            writeByte(&!b, byteOfNat(rem(wide / step, byteModulus)));
+        end while;
+        return b;
+    end;
+
+    function powerOfByte(exponent: Index): Nat64 is
+        var result: Nat64 := oneNat;
+        var i: Index := zeroIndex;
+        while i < exponent do
+            result := result * byteModulus;
+            i := i + 1;
+        end while;
+        return result;
+    end;
+
+    function putZeros(builder: StringBuilder, count: Index): StringBuilder is
+        var b: StringBuilder := builder;
+        var i: Index := zeroIndex;
+        while i < count do
+            writeByte(&!b, zeroByte);
+            i := i + oneIndex;
+        end while;
+        return b;
+    end;
+
+    generic [R: Region]
+    function putString(builder: StringBuilder, text: Span[Nat8, R]): StringBuilder is
+        var b: StringBuilder := builder;
+        writeString(&!b, text);
+        return b;
+    end;
+
+    function paddingFor(size: Index): Index is
+        let over: Index := rem(size, eightIndex);
+        if over = zeroIndex then
+            return zeroIndex;
+        end if;
+        return eightIndex - over;
+    end;
+
+    generic [R: Region]
+    function makeRecord(kind: Nat8, requestId: Nat64,
+        content: Span[Nat8, R]): Option[String] is
+        let size: Index := spanLength(content);
+        if size > maxContentLength then
+            -- Splitting a long body across records is the caller's decision:
+            -- only the caller knows whether the parts have to stay together.
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let padding: Index := paddingFor(size);
+        var b: StringBuilder := makeStringBuilder();
+        b := putByte(b, protocolVersion);
+        b := putByte(b, kind);
+        b := putBigEndian(b, requestId, twoIndex);
+        b := putBigEndian(b, natOfIndex(size), twoIndex);
+        b := putByte(b, byteOfNat(natOfIndex(padding)));
+        b := putByte(b, zeroByte);
+        b := putString(b, content);
+        b := putZeros(b, padding);
+        let some: Option[String] := Some(value => finalize(b));
+        return some;
+    end;
+
+    function wrapFixedBody(kind: Nat8, requestId: Nat64, bodyBytes: String): String is
+        var owned: String := bodyBytes;
+        let made: Option[String] := makeRecord(kind, requestId, asSpan(&owned));
+        destroyString(owned);
+        case made of
+            when Some(value: String) do
+                return value;
+            when None do
+                -- Only reached by a body longer than 65535 bytes, and the
+                -- one caller passes eight.
+                abort("Standard.Fcgi: a record body of fixed size did not fit.");
+        end case;
+    end;
+
+    function makeEndRequest(requestId: Nat64, appStatus: Nat64,
+        protocolStatus: Nat8): String is
+        var b: StringBuilder := makeStringBuilder();
+        b := putBigEndian(b, appStatus, fourIndex);
+        b := putByte(b, protocolStatus);
+        b := putZeros(b, threeIndex);
+        return wrapFixedBody(typeEndRequest, requestId, finalize(b));
+    end;
+
+    function putLength(builder: StringBuilder, size: Index): StringBuilder is
+        -- An explicit else: the builder is linear, and an if that
+        -- consumes it in one path and falls through in the other is refused.
+        if size < shortLengthLimit then
+            return putByte(builder, byteOfNat(natOfIndex(size)));
+        else
+            return putBigEndian(builder, natOfIndex(size) + highBitValue,
+                fourIndex);
+        end if;
+    end;
+
+    generic [R: Region, S: Region]
+    function makePair(name: Span[Nat8, R], content: Span[Nat8, S]): Option[String] is
+        let nameSize: Index := spanLength(name);
+        let valueSize: Index := spanLength(content);
+        if nameSize > maxFieldLength then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if valueSize > maxFieldLength then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var b: StringBuilder := makeStringBuilder();
+        b := putLength(b, nameSize);
+        b := putLength(b, valueSize);
+        b := putString(b, name);
+        b := putString(b, content);
+        let some: Option[String] := Some(value => finalize(b));
+        return some;
+    end;
+
+    ---
+    --- Header names as CGI variables
+    ---
+
+    function isHeaderNameByte(byte: Nat8): Bool is
+        if (byte >= byteUpperA) and (byte <= byteUpperZ) then
+            return true;
+        end if;
+        if (byte >= byteLowerA) and (byte <= byteLowerZ) then
+            return true;
+        end if;
+        if isDigit(byte) then
+            return true;
+        end if;
+        return byte = byteHyphen;
+    end;
+
+    generic [R: Region]
+    function headerNameIsValid(string: Span[Nat8, R], upto: Index): Bool is
+        var i: Index := 0;
+        var good: Bool := true;
+        while (i < upto) and good do
+            let byte: Nat8 := string[i];
+            good := isHeaderNameByte(byte);
+            i := i + 1;
+        end while;
+        return good;
+    end;
+
+    generic [R: Region]
+    function buildVariable(string: Span[Nat8, R], upto: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, byteUpperH);
+        writeByte(&!builder, byteUpperT);
+        writeByte(&!builder, byteUpperT);
+        writeByte(&!builder, byteUpperP);
+        writeByte(&!builder, byteUnderscore);
+        var i: Index := 0;
+        while i < upto do
+            let byte: Nat8 := string[i];
+            if (byte >= byteLowerA) and (byte <= byteLowerZ) then
+                writeByte(&!builder, byte - caseGap);
+            else
+                if byte = byteHyphen then
+                    writeByte(&!builder, byteUnderscore);
+                else
+                    writeByte(&!builder, byte);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    generic [R: Region]
+    function variableFrom(string: Span[Nat8, R], upto: Index): Option[String] is
+        -- Option[String] is linear, so a single none cannot be consumed in
+        -- one branch and left alone in another: each refusal makes its own.
+        if upto = 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if not headerNameIsValid(string, upto) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let made: String := buildVariable(string, upto);
+        let some: Option[String] := Some(value => made);
+        return some;
+    end;
+
+    generic [R: Region]
+    function headerToVariable(string: Span[Nat8, R]): Option[String] is
+        case indexOfByte(string, byteColon) of
+            when Some(value: Index) do
+                return variableFrom(string, value);
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+end module body.

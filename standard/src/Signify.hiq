@@ -1,0 +1,331 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The layouts are signify's: a public key is Ed, the key
+-- number (8) and the key (32); a secret key is EdBK (the algorithm and
+-- bcrypt pbkdf), the rounds (4, big endian), a salt (16), a checksum (8),
+-- the key number (8) and the secret
+-- (64, the seed and then the public key); a signature is Ed, the key
+-- number (8) and the signature (64).  With 0 rounds the secret is stored as
+-- it is, and the checksum is the first 8 bytes of its SHA-512.
+import Standard.String (
+    String,
+    destroyString,
+    destroyWiped,
+    asSpan,
+    length,
+    nthByte,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    constantTimeEqual,
+    startsWith,
+    indexOfByte,
+    trim,
+    substring
+);
+import Standard.Base64 (
+    encode,
+    decode
+);
+import Standard.Libcrypto (
+    ed25519PublicKey,
+    ed25519Sign,
+    ed25519Verify,
+    randomBytes,
+    sha512
+);
+
+module body Standard.Signify is
+    constant publicSize: Index := 42;
+    constant secretSize: Index := 104;
+    constant signatureSize: Index := 74;
+    constant zeroByte: Nat8 := 0;
+
+    generic [B: Region]
+    function writeZeros(out: &![StringBuilder, B], count: Index): Unit is
+        var i: Index := 0;
+        while i < count do
+            writeByte(&~out, zeroByte);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    function publicKeyLineLength(): Index is
+        return 56;
+    end;
+
+    function destroyKeyPair(keys: KeyPair): Unit is
+        let { publicKey: String, secretKey: String } := keys;
+        destroyString(publicKey);
+        destroyWiped(secretKey);
+        return nil;
+    end;
+
+    generic [C: Region]
+    function hasNewLine(text: Span[Nat8, C]): Bool is
+        case indexOfByte(text, '\n') of
+            when Some(value as at: Index) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The base64 line of a file: the line after a comment line when the
+    -- text starts with one, else the whole text; blanks around it dropped.
+    generic [R: Region]
+    function lineOf(text: Span[Nat8, R]): Span[Nat8, R] is
+        if startsWith(text, "untrusted comment: ") then
+            case indexOfByte(text, '\n') of
+                when Some(value as at: Index) do
+                    return trim(substring(text, at + 1, spanLength(text)));
+                when None do
+                    return substring(text, 0, 0);
+            end case;
+        end if;
+        return trim(text);
+    end;
+
+    -- The decoded bytes of the file's line when they have the size and start
+    -- with Ed, the algorithm signify knows.
+    generic [R: Region]
+    function payloadOf(text: Span[Nat8, R], size: Index): Option[String] is
+        case decode(lineOf(text)) of
+            when Some(value as bytes: String) do
+                if (length(&bytes) = size) and equal(substring(asSpan(&bytes), 0, 2), "Ed") then
+                    return Some(value => bytes);
+                end if;
+                destroyWiped(bytes);
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The text of a file: the comment line and the base64 of the bytes.
+    generic [C: Region, B: Region]
+    function fileText(comment: Span[Nat8, C], bytes: Span[Nat8, B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "untrusted comment: ");
+        writeString(&!out, comment);
+        writeByte(&!out, '\n');
+        let line: String := encode(bytes);
+        writeString(&!out, asSpan(&line));
+        destroyString(line);
+        writeByte(&!out, '\n');
+        return finalize(out);
+    end;
+
+    -- The checksum of a secret: the first 8 bytes of its SHA-512.
+    generic [S: Region]
+    function checksumOf(secret: Span[Nat8, S]): Option[String] is
+        case sha512(secret) of
+            when Some(value as digest: String) do
+                let sum: String := fromSpan(substring(asSpan(&digest), 0, 8));
+                destroyString(digest);
+                return Some(value => sum);
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The comment with a word after it, such as "demo secret key".
+    generic [C: Region]
+    function commentWith(comment: Span[Nat8, C], word: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, comment);
+        writeString(&!out, word);
+        return finalize(out);
+    end;
+
+    generic [S: Region, P: Region, N: Region, T: Region, U: Region]
+    function keysOf(seed: Span[Nat8, S], public: Span[Nat8, P], number: Span[Nat8, N], salt: Span[Nat8, T], comment: Span[Nat8, U]): Option[KeyPair] is
+        var secret: StringBuilder := makeStringBuilder();
+        writeString(&!secret, seed);
+        writeString(&!secret, public);
+        let whole: String := finalize(secret);
+        case checksumOf(asSpan(&whole)) of
+            when Some(value as sum: String) do
+                var sk: StringBuilder := makeStringBuilder();
+                writeString(&!sk, "EdBK");
+                writeZeros(&!sk, 4);
+                writeString(&!sk, salt);
+                writeString(&!sk, asSpan(&sum));
+                writeString(&!sk, number);
+                writeString(&!sk, asSpan(&whole));
+                let skBytes: String := finalize(sk);
+                var pk: StringBuilder := makeStringBuilder();
+                writeString(&!pk, "Ed");
+                writeString(&!pk, number);
+                writeString(&!pk, public);
+                let pkBytes: String := finalize(pk);
+                let skComment: String := commentWith(comment, " secret key");
+                let pkComment: String := commentWith(comment, " public key");
+                let keys: KeyPair := KeyPair(
+                    publicKey => fileText(asSpan(&pkComment), asSpan(&pkBytes)),
+                    secretKey => fileText(asSpan(&skComment), asSpan(&skBytes))
+                );
+                destroyString(skComment);
+                destroyString(pkComment);
+                destroyString(pkBytes);
+                destroyWiped(skBytes);
+                destroyString(sum);
+                destroyWiped(whole);
+                return Some(value => keys);
+            when None do
+                destroyWiped(whole);
+                return None();
+        end case;
+    end;
+
+    generic [C: Region]
+    function generateKeys(comment: Span[Nat8, C]): Option[KeyPair] is
+        if hasNewLine(comment) then
+            return None();
+        end if;
+        case randomBytes(56) of
+            when Some(value as random: String) do
+                case ed25519PublicKey(substring(asSpan(&random), 0, 32)) of
+                    when Some(value as public: String) do
+                        let keys: Option[KeyPair] := keysOf(substring(asSpan(&random), 0, 32), asSpan(&public), substring(asSpan(&random), 32, 40), substring(asSpan(&random), 40, 56), comment);
+                        destroyString(public);
+                        destroyWiped(random);
+                        return keys;
+                    when None do
+                        destroyWiped(random);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Whether a secret key of 104 bytes is one this module reads: EdBK, 0
+    -- rounds, and a checksum that holds.
+    generic [K: Region]
+    function secretHolds(key: &[String, K]): Bool is
+        if not equal(substring(asSpan(key), 0, 4), "EdBK") then
+            return false;
+        end if;
+        var i: Index := 4;
+        while i < 8 do
+            if nthByte(key, i) /= zeroByte then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        case checksumOf(substring(asSpan(key), 40, 104)) of
+            when Some(value as sum: String) do
+                let holds: Bool := constantTimeEqual(asSpan(&sum), substring(asSpan(key), 24, 32));
+                destroyString(sum);
+                return holds;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [K: Region, M: Region, C: Region]
+    function signMessage(secretKey: Span[Nat8, K], message: Span[Nat8, M], comment: Span[Nat8, C]): Option[String] is
+        if hasNewLine(comment) then
+            return None();
+        end if;
+        case payloadOf(secretKey, secretSize) of
+            when Some(value as key: String) do
+                if not secretHolds(&key) then
+                    destroyWiped(key);
+                    return None();
+                end if;
+                case ed25519Sign(substring(asSpan(&key), 40, 72), message) of
+                    when Some(value as signature: String) do
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, "Ed");
+                        writeString(&!out, substring(asSpan(&key), 32, 40));
+                        writeString(&!out, asSpan(&signature));
+                        let bytes: String := finalize(out);
+                        let text: String := fileText(comment, asSpan(&bytes));
+                        destroyString(bytes);
+                        destroyString(signature);
+                        destroyWiped(key);
+                        return Some(value => text);
+                    when None do
+                        destroyWiped(key);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [P: Region, M: Region, G: Region]
+    function verifyMessage(publicKey: Span[Nat8, P], message: Span[Nat8, M], signature: Span[Nat8, G]): Bool is
+        case payloadOf(publicKey, publicSize) of
+            when Some(value as key: String) do
+                case payloadOf(signature, signatureSize) of
+                    when Some(value as sig: String) do
+                        var good: Bool := false;
+                        if equal(substring(asSpan(&key), 2, 10), substring(asSpan(&sig), 2, 10)) then
+                            good := ed25519Verify(substring(asSpan(&key), 10, 42), message, substring(asSpan(&sig), 10, 74));
+                        end if;
+                        destroyString(sig);
+                        destroyString(key);
+                        return good;
+                    when None do
+                        destroyString(key);
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [P: Region]
+    function publicKeyLine(publicKey: Span[Nat8, P]): Option[String] is
+        case payloadOf(publicKey, publicSize) of
+            when Some(value as key: String) do
+                destroyString(key);
+                return Some(value => fromSpan(lineOf(publicKey)));
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [K: Region, C: Region]
+    function publicKeyOf(secretKey: Span[Nat8, K], comment: Span[Nat8, C]): Option[String] is
+        if hasNewLine(comment) then
+            return None();
+        end if;
+        case payloadOf(secretKey, secretSize) of
+            when Some(value as key: String) do
+                if not secretHolds(&key) then
+                    destroyWiped(key);
+                    return None();
+                end if;
+                var pk: StringBuilder := makeStringBuilder();
+                writeString(&!pk, "Ed");
+                writeString(&!pk, substring(asSpan(&key), 32, 40));
+                writeString(&!pk, substring(asSpan(&key), 72, 104));
+                let bytes: String := finalize(pk);
+                let text: String := fileText(comment, asSpan(&bytes));
+                destroyString(bytes);
+                destroyWiped(key);
+                return Some(value => text);
+            when None do
+                return None();
+        end case;
+    end;
+end module body.

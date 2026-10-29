@@ -1,0 +1,653 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module over Standard.File.  Every name is looked at with lstat
+-- before it is used, so that a symbolic link is seen as one; a file is
+-- read and written through descriptors in pieces of 64 KiB.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Path (
+    joinPath
+);
+import Standard.Failure (
+    Failure,
+    FailureKind,
+    Unclassified,
+    NotFound,
+    Invalid,
+    makeFailure
+);
+import Standard.File (
+    FileDescriptor,
+    FileKind,
+    kindRegular,
+    kindDirectory,
+    kindSymlink,
+    sameKind,
+    FileStatus,
+    FileLookup,
+    FileFound,
+    FileMissing,
+    FileUnreadable,
+    statusOf,
+    statusOfOpen,
+    openRead,
+    openOverwrite,
+    createNewFile,
+    readExactly,
+    writeAll,
+    syncFile,
+    setFileMode,
+    closeFile,
+    removeFile,
+    createDirectory,
+    Directory,
+    openDirectory,
+    nextEntry,
+    directoryFailed,
+    closeDirectory,
+    linkTarget,
+    createSymlink
+);
+
+module body Standard.FileHelpers is
+    -- How much is read and written at once.
+    constant piece: Nat64 := 65536;
+
+    -- How deep a tree may be before it is refused.
+    constant deepest: Nat32 := 64;
+
+    ---
+    --- Failures
+    ---
+
+    -- A failure of op of kind, whose message is what and the path.
+    generic [R: Region]
+    function failure(op: Span[Nat8, Static], kind: FailureKind, what: Span[Nat8, Static], path: Span[Nat8, R]): Failure is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, what);
+        writeString(&!out, ": ");
+        writeString(&!out, path);
+        let message: String := finalize(out);
+        let made: Failure := makeFailure(op, kind, asSpan(&message));
+        destroyString(message);
+        return made;
+    end;
+
+    generic [R: Region]
+    function unitFailure(op: Span[Nat8, Static], kind: FailureKind, what: Span[Nat8, Static], path: Span[Nat8, R]): Either[Failure, Unit] is
+        let left: Either[Failure, Unit] := Left(left => failure(op, kind, what, path));
+        return left;
+    end;
+
+    function done(): Either[Failure, Unit] is
+        let right: Either[Failure, Unit] := Right(right => nil);
+        return right;
+    end;
+
+    ---
+    --- What is at a name
+    ---
+
+    -- 0 nothing, 1 an ordinary file, 2 a directory, 3 a symbolic link, 4
+    -- something else, 5 the name could not be looked at.
+    generic [R: Region]
+    function kindAt(path: Span[Nat8, R]): Nat8 is
+        case statusOf(path) of
+            when FileFound(status: FileStatus) do
+                if sameKind(status.kind, kindRegular) then
+                    return 1;
+                end if;
+                if sameKind(status.kind, kindDirectory) then
+                    return 2;
+                end if;
+                if sameKind(status.kind, kindSymlink) then
+                    return 3;
+                end if;
+                return 4;
+            when FileMissing do
+                return 0;
+            when FileUnreadable do
+                return 5;
+        end case;
+    end;
+
+    ---
+    --- Copying a file
+    ---
+
+    -- Copies size bytes from source to target in pieces.  True when every
+    -- byte was read and written.
+    generic [R: Region, S: Region]
+    function copyBytes(source: &![FileDescriptor, R], target: &![FileDescriptor, S], size: Nat64): Bool is
+        var left: Nat64 := size;
+        var fine: Bool := true;
+        while fine and (left > 0) do
+            var take: Nat64 := piece;
+            if left < piece then
+                take := left;
+            end if;
+            case toIndex(take) of
+                when Some(value as count: Index) do
+                    case readExactly(&~source, count) of
+                        when Some(value as bytes: String) do
+                            fine := writeAll(&~target, asSpan(&bytes));
+                            destroyString(bytes);
+                        when None do
+                            fine := false;
+                    end case;
+                when None do
+                    fine := false;
+            end case;
+            left := left - take;
+        end while;
+        return fine;
+    end;
+
+    generic [R: Region, S: Region]
+    function copyFile(source: Span[Nat8, R], target: Span[Nat8, S]): Either[Failure, Unit] is
+        let op: Span[Nat8, Static] := "copyFile";
+        let kind: Nat8 := kindAt(source);
+        if kind = 0 then
+            return unitFailure(op, NotFound(), "no such file", source);
+        end if;
+        if kind /= 1 then
+            return unitFailure(op, Invalid(), "not an ordinary file", source);
+        end if;
+        if kindAt(target) /= 0 then
+            return unitFailure(op, Invalid(), "the target exists", target);
+        end if;
+        case openRead(source) of
+            when Some(value as opened: FileDescriptor) do
+                var input: FileDescriptor := opened;
+                case statusOfOpen(&input) of
+                    when Some(value as status: FileStatus) do
+                        case createNewFile(target, status.mode) of
+                            when Some(value as made: FileDescriptor) do
+                                var output: FileDescriptor := made;
+                                let copied: Bool := copyBytes(&!input, &!output, status.size);
+                                let closedOut: Bool := closeFile(output);
+                                let closedIn: Bool := closeFile(input);
+                                if copied and closedOut then
+                                    return done();
+                                end if;
+                                let removed: Bool := removeFile(target);
+                                return unitFailure(op, Unclassified(), "could not copy the bytes", source);
+                            when None do
+                                let closed: Bool := closeFile(input);
+                                return unitFailure(op, Unclassified(), "could not make the target", target);
+                        end case;
+                    when None do
+                        let closed: Bool := closeFile(input);
+                        return unitFailure(op, Unclassified(), "could not look at the open file", source);
+                end case;
+            when None do
+                return unitFailure(op, Unclassified(), "could not open", source);
+        end case;
+    end;
+
+    ---
+    --- Copying a tree
+    ---
+
+    -- Sets the mode of the directory at path through a descriptor opened
+    -- for reading, as fchmod(2) takes one.
+    generic [R: Region]
+    function setDirectoryMode(path: Span[Nat8, R], mode: Nat32): Bool is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var directory: FileDescriptor := opened;
+                let set: Bool := setFileMode(&!directory, mode);
+                let closed: Bool := closeFile(directory);
+                return set and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Copies what is at source to target: an ordinary file, a directory
+    -- and what is in it, or a symbolic link as a link.
+    generic [R: Region, S: Region]
+    function copyEntry(source: Span[Nat8, R], target: Span[Nat8, S], depth: Nat32): Either[Failure, Unit] is
+        let kind: Nat8 := kindAt(source);
+        if kind = 1 then
+            return copyFile(source, target);
+        end if;
+        if kind = 2 then
+            return copyTree(source, target, depth + 1);
+        end if;
+        if kind = 3 then
+            case linkTarget(source) of
+                when Some(value as pointsTo: String) do
+                    let made: Bool := createSymlink(asSpan(&pointsTo), target);
+                    destroyString(pointsTo);
+                    if made then
+                        return done();
+                    end if;
+                    return unitFailure("copyDirectory", Unclassified(), "could not make the link", target);
+                when None do
+                    return unitFailure("copyDirectory", Unclassified(), "could not read the link", source);
+            end case;
+        end if;
+        return unitFailure("copyDirectory", Invalid(), "neither file, directory nor link", source);
+    end;
+
+    -- Copies every entry of the directory being read at source into
+    -- target, and stops at the first that fails.
+    generic [D: Region, R: Region, S: Region]
+    function copyEntries(directory: &![Directory, D], source: Span[Nat8, R], target: Span[Nat8, S], depth: Nat32): Either[Failure, Unit] is
+        var going: Bool := true;
+        while going do
+            case nextEntry(&~directory) of
+                when Some(value as name: String) do
+                    let inner: String := joinPath(source, asSpan(&name));
+                    let outer: String := joinPath(target, asSpan(&name));
+                    destroyString(name);
+                    let copied: Either[Failure, Unit] := copyEntry(asSpan(&inner), asSpan(&outer), depth);
+                    destroyString(inner);
+                    destroyString(outer);
+                    case copied of
+                        when Right(right: Unit) do
+                            skip;
+                        when Left(left as why: Failure) do
+                            let failed: Either[Failure, Unit] := Left(left => why);
+                            return failed;
+                    end case;
+                when None do
+                    going := false;
+            end case;
+        end while;
+        if directoryFailed(&directory) then
+            return unitFailure("copyDirectory", Unclassified(), "could not read the directory", source);
+        end if;
+        return done();
+    end;
+
+    generic [R: Region, S: Region]
+    function copyTree(source: Span[Nat8, R], target: Span[Nat8, S], depth: Nat32): Either[Failure, Unit] is
+        if depth > deepest then
+            return unitFailure("copyDirectory", Invalid(), "deeper than 64 directories", source);
+        end if;
+        var mode: Nat32 := 448;
+        case statusOf(source) of
+            when FileFound(status: FileStatus) do
+                mode := status.mode;
+            when FileMissing do
+                skip;
+            when FileUnreadable do
+                skip;
+        end case;
+        if not createDirectory(target) then
+            return unitFailure("copyDirectory", Unclassified(), "could not make the directory", target);
+        end if;
+        case openDirectory(source) of
+            when Some(value as stream: Directory) do
+                var directory: Directory := stream;
+                let copied: Either[Failure, Unit] := copyEntries(&!directory, source, target, depth);
+                let closed: Bool := closeDirectory(directory);
+                case copied of
+                    when Right(right: Unit) do
+                        if not setDirectoryMode(target, mode) then
+                            return unitFailure("copyDirectory", Unclassified(), "could not set the mode", target);
+                        end if;
+                        return done();
+                    when Left(left as why: Failure) do
+                        let failed: Either[Failure, Unit] := Left(left => why);
+                        return failed;
+                end case;
+            when None do
+                return unitFailure("copyDirectory", Unclassified(), "could not open the directory", source);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function copyDirectory(source: Span[Nat8, R], target: Span[Nat8, S]): Either[Failure, Unit] is
+        let op: Span[Nat8, Static] := "copyDirectory";
+        let kind: Nat8 := kindAt(source);
+        if kind = 0 then
+            return unitFailure(op, NotFound(), "no such directory", source);
+        end if;
+        if kind /= 2 then
+            return unitFailure(op, Invalid(), "not a directory", source);
+        end if;
+        if kindAt(target) /= 0 then
+            return unitFailure(op, Invalid(), "the target exists", target);
+        end if;
+        let top: Nat32 := 1;
+        return copyTree(source, target, top);
+    end;
+
+    ---
+    --- The size of a tree
+    ---
+
+    function sizeFailure(why: Failure): Either[Failure, Nat64] is
+        let left: Either[Failure, Nat64] := Left(left => why);
+        return left;
+    end;
+
+    function sizeRight(size: Nat64): Either[Failure, Nat64] is
+        let right: Either[Failure, Nat64] := Right(right => size);
+        return right;
+    end;
+
+    -- The bytes at path: an ordinary file's size, a directory's tree, and
+    -- nothing for a link, something else, or a name gone meanwhile.
+    generic [R: Region]
+    function entrySize(path: Span[Nat8, R], depth: Nat32): Either[Failure, Nat64] is
+        case statusOf(path) of
+            when FileFound(status: FileStatus) do
+                if sameKind(status.kind, kindRegular) then
+                    return sizeRight(status.size);
+                end if;
+                if sameKind(status.kind, kindDirectory) then
+                    return sizeOf(path, depth + 1);
+                end if;
+                return sizeRight(0);
+            when FileMissing do
+                return sizeRight(0);
+            when FileUnreadable do
+                return sizeFailure(failure("directorySize", Unclassified(), "could not look at", path));
+        end case;
+    end;
+
+    -- The sum of the entries of the directory being read at path, stopping
+    -- at the first that fails.
+    generic [D: Region, R: Region]
+    function sumEntries(directory: &![Directory, D], path: Span[Nat8, R], depth: Nat32): Either[Failure, Nat64] is
+        var total: Nat64 := 0;
+        var going: Bool := true;
+        while going do
+            case nextEntry(&~directory) of
+                when Some(value as name: String) do
+                    let inside: String := joinPath(path, asSpan(&name));
+                    destroyString(name);
+                    let sized: Either[Failure, Nat64] := entrySize(asSpan(&inside), depth);
+                    destroyString(inside);
+                    case sized of
+                        when Right(right as bytes: Nat64) do
+                            -- File sizes are the file system's word: sparse
+                            -- files can claim more than a Nat64 holds in
+                            -- sum, so the sum is checked before it is made.
+                            if bytes > (maximum_nat64 - total) then
+                                return sizeFailure(failure("directorySize", Invalid(), "the sizes add up to more than a Nat64 holds", path));
+                            end if;
+                            total := total + bytes;
+                        when Left(left as why: Failure) do
+                            return sizeFailure(why);
+                    end case;
+                when None do
+                    going := false;
+            end case;
+        end while;
+        if directoryFailed(&directory) then
+            return sizeFailure(failure("directorySize", Unclassified(), "could not read the directory", path));
+        end if;
+        return sizeRight(total);
+    end;
+
+    generic [R: Region]
+    function sizeOf(path: Span[Nat8, R], depth: Nat32): Either[Failure, Nat64] is
+        if depth > deepest then
+            return sizeFailure(failure("directorySize", Invalid(), "deeper than 64 directories", path));
+        end if;
+        case openDirectory(path) of
+            when Some(value as stream: Directory) do
+                var directory: Directory := stream;
+                let summed: Either[Failure, Nat64] := sumEntries(&!directory, path, depth);
+                let closed: Bool := closeDirectory(directory);
+                return summed;
+            when None do
+                return sizeFailure(failure("directorySize", Unclassified(), "could not open the directory", path));
+        end case;
+    end;
+
+    generic [R: Region]
+    function directorySize(path: Span[Nat8, R]): Either[Failure, Nat64] is
+        let kind: Nat8 := kindAt(path);
+        if kind = 0 then
+            return sizeFailure(failure("directorySize", NotFound(), "no such directory", path));
+        end if;
+        if kind /= 2 then
+            return sizeFailure(failure("directorySize", Invalid(), "not a directory", path));
+        end if;
+        let top: Nat32 := 1;
+        return sizeOf(path, top);
+    end;
+
+    ---
+    --- A free name
+    ---
+
+    -- The decimal digits of value.
+    function digits(value: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeDigits(&!out, value);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function writeDigits(out: &![StringBuilder, R], value: Nat64): Unit is
+        let ten: Nat64 := 10;
+        if value >= ten then
+            writeDigits(&~out, value / ten);
+        end if;
+        let last: Nat64 := value - ((value / ten) * ten);
+        case toNat8(last) of
+            when Some(value as digit: Nat8) do
+                writeByte(out, ('0' : Nat8) + digit);
+            when None do
+                writeByte(out, '?');
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function unusedName(directory: Span[Nat8, R], name: Span[Nat8, S], isDirectory: Bool): Option[String] is
+        let size: Index := spanLength(name);
+        var slash: Bool := size = 0;
+        var dot: Index := 0;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if name[i] = '/' then
+                    slash := true;
+                end if;
+                if name[i] = '.' then
+                    dot := i;
+                end if;
+            end for;
+        end if;
+        if slash then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        -- The part before -N: all of it for a directory, or when the last
+        -- dot is the first or the last byte; else what is before the dot.
+        var cut: Index := size;
+        if (not isDirectory) and ((dot > 0) and (dot < (size - 1))) then
+            cut := dot;
+        end if;
+        var n: Nat64 := 1;
+        let most: Nat64 := 9999;
+        while n <= most do
+            var out: StringBuilder := makeStringBuilder();
+            if cut > 0 then
+                for i from 0 to cut - 1 do
+                    writeByte(&!out, name[i]);
+                end for;
+            end if;
+            writeByte(&!out, '-');
+            writeDigits(&!out, n);
+            if cut < size then
+                for i from cut to size - 1 do
+                    writeByte(&!out, name[i]);
+                end for;
+            end if;
+            let candidate: String := finalize(out);
+            let full: String := joinPath(directory, asSpan(&candidate));
+            let kind: Nat8 := kindAt(asSpan(&full));
+            destroyString(full);
+            if kind = 0 then
+                let some: Option[String] := Some(value => candidate);
+                return some;
+            else
+                destroyString(candidate);
+                if kind = 5 then
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+            end if;
+            n := n + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    ---
+    --- Overwriting before removing
+    ---
+
+    -- Writes size random bytes from random into file, in pieces.
+    generic [R: Region, S: Region]
+    function overwrite(file: &![FileDescriptor, R], random: &![FileDescriptor, S], size: Nat64): Bool is
+        var left: Nat64 := size;
+        var fine: Bool := true;
+        while fine and (left > 0) do
+            var take: Nat64 := piece;
+            if left < piece then
+                take := left;
+            end if;
+            case toIndex(take) of
+                when Some(value as count: Index) do
+                    case readExactly(&~random, count) of
+                        when Some(value as bytes: String) do
+                            fine := writeAll(&~file, asSpan(&bytes));
+                            destroyString(bytes);
+                        when None do
+                            fine := false;
+                    end case;
+                when None do
+                    fine := false;
+            end case;
+            left := left - take;
+        end while;
+        return fine;
+    end;
+
+    function boolFailure(why: Failure): Either[Failure, Bool] is
+        let left: Either[Failure, Bool] := Left(left => why);
+        return left;
+    end;
+
+    generic [R: Region]
+    function secureDelete(path: Span[Nat8, R]): Either[Failure, Bool] is
+        let op: Span[Nat8, Static] := "secureDelete";
+        let kind: Nat8 := kindAt(path);
+        if kind = 0 then
+            let none: Either[Failure, Bool] := Right(right => false);
+            return none;
+        end if;
+        if kind /= 1 then
+            return boolFailure(failure(op, Invalid(), "not an ordinary file", path));
+        end if;
+        case openRead("/dev/urandom") of
+            when Some(value as opened: FileDescriptor) do
+                var random: FileDescriptor := opened;
+                case openOverwrite(path) of
+                    when Some(value as target: FileDescriptor) do
+                        var file: FileDescriptor := target;
+                        var written: Bool := false;
+                        case statusOfOpen(&file) of
+                            when Some(value as status: FileStatus) do
+                                written := overwrite(&!file, &!random, status.size);
+                                if written then
+                                    written := syncFile(&!file);
+                                end if;
+                            when None do
+                                written := false;
+                        end case;
+                        let closedFile: Bool := closeFile(file);
+                        let closedRandom: Bool := closeFile(random);
+                        if not (written and closedFile) then
+                            return boolFailure(failure(op, Unclassified(), "could not overwrite", path));
+                        end if;
+                        if not removeFile(path) then
+                            return boolFailure(failure(op, Unclassified(), "overwritten, but could not remove", path));
+                        end if;
+                        let removed: Either[Failure, Bool] := Right(right => true);
+                        return removed;
+                    when None do
+                        let closed: Bool := closeFile(random);
+                        return boolFailure(failure(op, Unclassified(), "could not open for writing", path));
+                end case;
+            when None do
+                return boolFailure(failure(op, Unclassified(), "could not open /dev/urandom for", path));
+        end case;
+    end;
+
+    ---
+    --- A size for people
+    ---
+
+    function formatSize(size: Nat64): String is
+        let kilo: Nat64 := 1024;
+        let mega: Nat64 := 1048576;
+        let giga: Nat64 := 1073741824;
+        if size < kilo then
+            return digits(size);
+        end if;
+        var unit: Nat64 := kilo;
+        var letter: Nat8 := 'K';
+        if size >= giga then
+            unit := giga;
+            letter := ('G' : Nat8);
+        else
+            if size >= mega then
+                unit := mega;
+                letter := ('M' : Nat8);
+            end if;
+        end if;
+        let ten: Nat64 := 10;
+        var whole: Nat64 := size / unit;
+        let rest: Nat64 := size - (whole * unit);
+        var tenth: Nat64 := (rest * ten) / unit;
+        let over: Nat64 := (rest * ten) - (tenth * unit);
+        let two: Nat64 := 2;
+        -- Nearer tenth; a tie goes to the even one.
+        if (over * two) > unit then
+            tenth := tenth + 1;
+        else
+            if ((over * two) = unit) and ((tenth - ((tenth / two) * two)) = 1) then
+                tenth := tenth + 1;
+            end if;
+        end if;
+        if tenth = ten then
+            whole := whole + 1;
+            tenth := (0 : Nat64);
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeDigits(&!out, whole);
+        writeByte(&!out, '.');
+        writeDigits(&!out, tenth);
+        writeByte(&!out, letter);
+        return finalize(out);
+    end;
+end module body.

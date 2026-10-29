@@ -1,0 +1,223 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The network modules, as far as they work without a network, so that the
+-- output is the same on every machine.  Standard.Ip reads, masks and
+-- anonymises addresses; Standard.Resolve checks host names and looks up
+-- localhost; Standard.HttpClient reads the https URLs it will fetch and
+-- refuses others; Standard.Tls is refused by a port where nothing
+-- listens; Standard.Smtp composes a message; Standard.Sftp says what its
+-- error codes mean.  None of them stops the programme on bad input.
+import Standard.Buffer (
+    Buffer,
+    destroyFree,
+    length as bufferLength,
+    nth
+);
+import Standard.String (
+    String,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Calendar (
+    Instant
+);
+import Standard.Ip (
+    IpAddress,
+    parseIp,
+    isIpv6,
+    isPrivateOrReserved,
+    ipToString,
+    inSubnet,
+    anonymise,
+    sameIp
+);
+import Standard.Resolve (
+    Family,
+    OnlyIpv4,
+    ResolveFailure,
+    validHostname,
+    resolveHost
+);
+import Standard.HttpClient (
+    Target,
+    parseUrl,
+    validHeaderLines
+);
+import Standard.Tls (
+    Client,
+    connect,
+    closeClient
+);
+import Standard.Smtp (
+    validAddress,
+    composeMessage
+);
+import Standard.Sftp (
+    SftpError,
+    describe
+);
+
+module body Example.LearnNetwork is
+    function showAddress(text: Span[Nat8, Static]): Unit is
+        print(text);
+        case parseIp(text) of
+            when Some(value as a: IpAddress) do
+                print(": IPv6 ");
+                print(isIpv6(a));
+                print(", private or reserved ");
+                printLn(isPrivateOrReserved(a));
+            when None do
+                printLn(": no address");
+        end case;
+        return nil;
+    end;
+
+    function showUrl(url: Span[Nat8, Static]): Unit is
+        print(url);
+        case parseUrl(url) of
+            when Some(value as t: Target) do
+                let { host: String, port: Nat16, path: String } := t;
+                print(": host ");
+                print(asSpan(&host));
+                print(", port ");
+                print(port);
+                print(", path ");
+                printLn(asSpan(&path));
+                destroyString(host);
+                destroyString(path);
+            when None do
+                printLn(": refused");
+        end case;
+        return nil;
+    end;
+
+    -- The first line of a message, up to its carriage return.
+    generic [R: Region]
+    function firstLine(message: &[String, R]): Unit is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        var going: Bool := i < stringLength(message);
+        while going do
+            let b: Nat8 := nthByte(message, i);
+            if (b = '\r') or (b = '\n') then
+                going := false;
+            else
+                writeByte(&!out, b);
+                i := i + 1;
+                going := i < stringLength(message);
+            end if;
+        end while;
+        let line: String := finalize(out);
+        print(asSpan(&line));
+        destroyString(line);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        -- Addresses.
+        showAddress("198.51.100.20");
+        showAddress("8.8.8.8");
+        showAddress("2001:db8::1");
+        showAddress("300.1.1.1");
+        case parseIp("198.51.100.20") of
+            when Some(value as a: IpAddress) do
+                let hidden: String := ipToString(anonymise(a));
+                print("anonymised: ");
+                printLn(asSpan(&hidden));
+                destroyString(hidden);
+                case parseIp("198.51.100.0") of
+                    when Some(value as net: IpAddress) do
+                        let bits: Index := 24;
+                        print("in 198.51.100.0/24: ");
+                        printLn(inSubnet(a, net, bits));
+                    when None do
+                        printLn("no subnet");
+                end case;
+            when None do
+                printLn("no address");
+        end case;
+        -- Host names, and localhost looked up.
+        print("example.org is a host name: ");
+        printLn(validHostname("example.org"));
+        print("bad_name is a host name: ");
+        printLn(validHostname("bad_name"));
+        case resolveHost("localhost", OnlyIpv4()) of
+            when Right(right as addresses: Buffer[IpAddress]) do
+                var loopback: Bool := false;
+                case parseIp("127.0.0.1") of
+                    when Some(value as want: IpAddress) do
+                        var k: Index := 0;
+                        while k < bufferLength(&addresses) do
+                            if sameIp(nth(&addresses, k), want) then
+                                loopback := true;
+                            end if;
+                            k := k + 1;
+                        end while;
+                    when None do
+                        skip;
+                end case;
+                print("localhost is 127.0.0.1: ");
+                printLn(loopback);
+                destroyFree(addresses);
+            when Left(left as f: ResolveFailure) do
+                printLn("localhost has no answer");
+        end case;
+        -- URLs the client would fetch.
+        showUrl("https://example.org:8443/news?page=2#top");
+        showUrl("https://[2001:db8::1]/");
+        showUrl("http://example.org/");
+        print("header lines are well formed: ");
+        printLn(validHeaderLines("Accept: text/html\r\nUser-Agent: hilde\r\n"));
+        print("a header line with a line feed in its value: ");
+        printLn(validHeaderLines("Accept: a\nb\r\n"));
+        -- TLS to a port where nothing listens.
+        case connect("127.0.0.1", "9", "") of
+            when Right(right as c: Client) do
+                printLn("TLS: connected, which nothing should");
+                closeClient(c);
+            when Left(left as reason: String) do
+                printLn("TLS to 127.0.0.1 port 9: refused");
+                destroyString(reason);
+        end case;
+        -- A message composed for a fixed time.
+        print("ann@example.org is an address: ");
+        printLn(validAddress("ann@example.org"));
+        let noNanos: Nat32 := 0;
+        let moment: Int64 := 1790557200;
+        case composeMessage("ann@example.org", "bo@example.org", "Hello", "Hello, Bo.\n", Instant(seconds => moment, nanos => noNanos)) of
+            when Some(value as message: String) do
+                print("the message's first line: ");
+                firstLine(&message);
+                printLn("");
+                print("its bytes: ");
+                printLn(stringLength(&message));
+                destroyString(message);
+            when None do
+                printLn("no message");
+        end case;
+        -- What the codes of an SFTP server mean.
+        let noSuchFile: Int32 := 2;
+        let permission: Int32 := 3;
+        let gone: Int32 := -1;
+        print("SFTP 2: ");
+        printLn(describe(SftpError(code => noSuchFile)));
+        print("SFTP 3: ");
+        printLn(describe(SftpError(code => permission)));
+        print("SFTP -1: ");
+        printLn(describe(SftpError(code => gone)));
+        return ExitSuccess();
+    end;
+end module body.

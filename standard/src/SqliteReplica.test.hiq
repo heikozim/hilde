@@ -1,0 +1,689 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.SqliteReplica: which writes are refused before they enter the
+-- log, and a simulated cluster of three nodes, each with its own database
+-- file, through partitions, a snapshot and both kinds of reads.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    length,
+    nth,
+    nthRef,
+    insertBack,
+    insert,
+    remove,
+    removeFirst,
+    removeLast,
+    storeNth
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    writeByte,
+    finalize
+);
+import Standard.File (
+    removeFile
+);
+import Standard.Raft (
+    Config,
+    Message,
+    Node,
+    majority,
+    destroyMessage,
+    newNode,
+    destroyNode,
+    tick,
+    step,
+    takeMessages,
+    applyCommitted,
+    compactWith,
+    isLeader,
+    currentTerm,
+    snapshotIndexOf
+);
+import Standard.SqliteReplica (
+    Value,
+    Store,
+    WriteResult,
+    Barrier,
+    textValue,
+    integerValue,
+    nullValue,
+    destroyValues,
+    destroyRows,
+    textRefusal,
+    refusedNot,
+    refusedEmpty,
+    refusedLiteral,
+    refusedNondeterministic,
+    refusedStatementKind,
+    refusedNotLeader,
+    refusedDoesNotPrepare,
+    refusedReadOnly,
+    refusedParameterCount,
+    openStore,
+    closeStore,
+    resultOf,
+    proposeWrite,
+    readBarrier,
+    linearizableReady,
+    queryLocal,
+    queryLinearizable
+);
+
+module body Standard.SqliteReplica.Test is
+    function noValues(): Buffer[Value] is
+        return allocateEmpty();
+    end;
+
+    function oneText(text: Span[Nat8, Static]): Buffer[Value] is
+        var values: Buffer[Value] := noValues();
+        insertBack(&!values, textValue(text));
+        return values;
+    end;
+
+    function refusalOf(sql: Span[Nat8, Static], values: Buffer[Value]): Nat8 is
+        let refusal: Nat8 := textRefusal(sql, &values);
+        destroyValues(values);
+        return refusal;
+    end;
+
+    function testRefusals(): Unit is
+        assertTrue(refusalOf("INSERT INTO kv (k, v) VALUES (?, ?)", noValues()) = refusedNot(), "bound values pass");
+        assertTrue(refusalOf("UPDATE kv SET v = v + 1 WHERE k = ?", noValues()) = refusedNot(), "a number in the text passes");
+        assertTrue(refusalOf("   ", noValues()) = refusedEmpty(), "no statement");
+        assertTrue(refusalOf("-- only a comment", noValues()) = refusedEmpty(), "a comment alone");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES ('x')", noValues()) = refusedLiteral(), "a quoted literal");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES (X'00')", noValues()) = refusedLiteral(), "a blob literal");
+        assertTrue(refusalOf("INSERT INTO \"odd 'name\" (k) VALUES (?)", noValues()) = refusedNot(), "a quote inside a quoted name");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES (random())", noValues()) = refusedNondeterministic(), "random");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES (RandomBlob(4))", noValues()) = refusedNondeterministic(), "randomblob in capitals");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES (CURRENT_TIMESTAMP)", noValues()) = refusedNondeterministic(), "the current time");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES (datetime(?))", oneText("now")) = refusedNondeterministic(), "datetime of now");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES (datetime(?))", oneText("NOW")) = refusedNondeterministic(), "datetime of NOW");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES (datetime(?))", oneText("2026-10-15 12:00:00")) = refusedNot(), "datetime of a given time");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES (?)", oneText("now")) = refusedNot(), "the word now as plain data");
+        assertTrue(refusalOf("INSERT INTO kv (k) VALUES (?) -- random()", noValues()) = refusedNot(), "random in a comment");
+        assertTrue(refusalOf("PRAGMA journal_mode = WAL", noValues()) = refusedStatementKind(), "a pragma");
+        assertTrue(refusalOf("attach ? as other", noValues()) = refusedStatementKind(), "attach");
+        assertTrue(refusalOf("BEGIN", noValues()) = refusedStatementKind(), "begin");
+        assertTrue(refusalOf("VACUUM", noValues()) = refusedStatementKind(), "vacuum");
+        assertTrue(refusalOf("DELETE FROM kv WHERE k = ?", noValues()) = refusedNot(), "a delete");
+        return nil;
+    end;
+
+    ---
+    --- The cluster
+    ---
+
+    constant multiplier: Nat64 := 6364136223846793005;
+    constant increment: Nat64 := 1442695040888963407;
+    constant highBits: Nat64 := 4294967296;
+    constant drawRange: Nat64 := 1048576;
+    constant sideA: Nat8 := 0;
+    constant sideB: Nat8 := 1;
+    constant secondId: Nat64 := 2;
+
+    record Cluster: Linear is
+        nodes: Buffer[Node];
+        stores: Buffer[Store];
+        network: Buffer[Message];
+        group: Buffer[Nat8];
+        random: Nat64;
+        name: Nat8;
+    end;
+
+    function noNodes(): Buffer[Node] is
+        return allocateEmpty();
+    end;
+
+    function noStores(): Buffer[Store] is
+        return allocateEmpty();
+    end;
+
+    function noMessages(): Buffer[Message] is
+        return allocateEmpty();
+    end;
+
+    function noGroups(): Buffer[Nat8] is
+        return allocateEmpty();
+    end;
+
+    function idsUpTo(count: Nat64): Buffer[Nat64] is
+        var ids: Buffer[Nat64] := allocateEmpty();
+        var id: Nat64 := 1;
+        while id <= count do
+            insertBack(&!ids, id);
+            id := id + 1;
+        end while;
+        return ids;
+    end;
+
+    -- The database file of node id in the cluster called name, a letter.
+    function fileOf(name: Nat8, id: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "replica-test-");
+        writeByte(&!out, name);
+        writeByte(&!out, '-');
+        case toNat8(id) of
+            when Some(value as small: Nat8) do
+                writeByte(&!out, small + 48);
+            when None do
+                writeByte(&!out, 120);
+        end case;
+        writeString(&!out, ".db");
+        return finalize(out);
+    end;
+
+    function makeCluster(name: Nat8, seed: Nat64): Cluster is
+        var nodes: Buffer[Node] := noNodes();
+        var stores: Buffer[Store] := noStores();
+        var group: Buffer[Nat8] := noGroups();
+        var id: Nat64 := 1;
+        while id <= 3 do
+            let config: Config := Config(id => id, electionTicks => 10, heartbeatTicks => 3, seed => seed, quorum => majority);
+            insertBack(&!nodes, newNode(config, idsUpTo(3)));
+            let file: String := fileOf(name, id);
+            let gone: Bool := removeFile(asSpan(&file));
+            case openStore(asSpan(&file), ".") of
+                when Right(right as store: Store) do
+                    insertBack(&!stores, store);
+                when Left(left as message: String) do
+                    destroyString(message);
+                    abort("Standard.SqliteReplica.Test: a store did not open");
+            end case;
+            destroyString(file);
+            insertBack(&!group, sideA);
+            id := id + 1;
+        end while;
+        return Cluster(nodes => nodes, stores => stores, network => noMessages(), group => group, random => seed, name => name);
+    end;
+
+    function destroyCluster(cluster: Cluster): Unit is
+        let { nodes: Buffer[Node], stores: Buffer[Store], network: Buffer[Message], group: Buffer[Nat8],
+            random: Nat64, name: Nat8 } := cluster;
+        var n: Buffer[Node] := nodes;
+        while length(&n) > 0 do
+            destroyNode(removeLast(&!n));
+        end while;
+        destroyEmpty(n);
+        var s: Buffer[Store] := stores;
+        while length(&s) > 0 do
+            closeStore(removeLast(&!s));
+        end while;
+        destroyEmpty(s);
+        var w: Buffer[Message] := network;
+        while length(&w) > 0 do
+            destroyMessage(removeLast(&!w));
+        end while;
+        destroyEmpty(w);
+        var g: Buffer[Nat8] := group;
+        while length(&g) > 0 do
+            let side: Nat8 := removeLast(&!g);
+        end while;
+        destroyEmpty(g);
+        var id: Nat64 := 1;
+        while id <= 3 do
+            let file: String := fileOf(name, id);
+            let removed: Bool := removeFile(asSpan(&file));
+            destroyString(file);
+            id := id + 1;
+        end while;
+        return nil;
+    end;
+
+    function slot(id: Nat64): Index is
+        case toIndex(id - 1) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.SqliteReplica.Test: an id did not fit an Index");
+        end case;
+    end;
+
+    function wide(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SqliteReplica.Test: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    generic [R: Region]
+    function takeNode(cluster: &![Cluster, R], at: Index): Node is
+        return remove(&!(cluster->nodes), at);
+    end;
+
+    generic [R: Region]
+    function putNode(cluster: &![Cluster, R], at: Index, node: Node): Unit is
+        insert(&!(cluster->nodes), at, node);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function takeStore(cluster: &![Cluster, R], at: Index): Store is
+        return remove(&!(cluster->stores), at);
+    end;
+
+    generic [R: Region]
+    function putStore(cluster: &![Cluster, R], at: Index, store: Store): Unit is
+        insert(&!(cluster->stores), at, store);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function takeMessage(cluster: &![Cluster, R], at: Index): Message is
+        return remove(&!(cluster->network), at);
+    end;
+
+    generic [R: Region]
+    function send(cluster: &![Cluster, R], message: Message): Unit is
+        insertBack(&!(cluster->network), message);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function networkSize(cluster: &[Cluster, R]): Index is
+        return length(&(cluster->network));
+    end;
+
+    generic [R: Region]
+    function groupOf(cluster: &[Cluster, R], id: Nat64): Nat8 is
+        return nth(&(cluster->group), slot(id));
+    end;
+
+    generic [R: Region]
+    function setGroup(cluster: &![Cluster, R], id: Nat64, group: Nat8): Unit is
+        storeNth(&!(cluster->group), slot(id), group);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function draw(cluster: &![Cluster, R], below: Nat64): Nat64 is
+        cluster->random := modularAdd(modularMultiply(cluster->random, multiplier), increment);
+        let state: Nat64 := (cluster->random);
+        return rem(rem(state / highBits, drawRange), below);
+    end;
+
+    -- What a node did: its messages to the network, its committed entries
+    -- to its store.
+    generic [R: Region]
+    function observe(cluster: &![Cluster, R], at: Index): Unit is
+        var node: Node := takeNode(&~cluster, at);
+        var store: Store := takeStore(&~cluster, at);
+        let applied: Index := applyCommitted(&!node, &!store);
+        var out: Buffer[Message] := takeMessages(&!node);
+        while length(&out) > 0 do
+            send(&~cluster, removeFirst(&!out));
+        end while;
+        destroyEmpty(out);
+        putStore(&~cluster, at, store);
+        putNode(&~cluster, at, node);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function deliverOne(cluster: &![Cluster, R]): Unit is
+        let count: Nat64 := wide(networkSize(&cluster));
+        if count = 0 then
+            return nil;
+        end if;
+        let pick: Index := slot(draw(&~cluster, count) + 1);
+        let message: Message := takeMessage(&~cluster, pick);
+        let receiver: Nat64 := message.receiver;
+        let sender: Nat64 := message.sender;
+        var through: Bool := (receiver <= 3) and (sender <= 3);
+        if through then
+            through := groupOf(&cluster, receiver) = groupOf(&cluster, sender);
+        end if;
+        if through then
+            var node: Node := takeNode(&~cluster, slot(receiver));
+            step(&!node, message);
+            putNode(&~cluster, slot(receiver), node);
+            observe(&~cluster, slot(receiver));
+        else
+            destroyMessage(message);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function tickOne(cluster: &![Cluster, R], at: Index): Unit is
+        var node: Node := takeNode(&~cluster, at);
+        tick(&!node);
+        putNode(&~cluster, at, node);
+        observe(&~cluster, at);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function run(cluster: &![Cluster, R], rounds: Nat64): Unit is
+        var round: Nat64 := 0;
+        while round < rounds do
+            var i: Index := 0;
+            while i < 3 do
+                tickOne(&~cluster, i);
+                i := i + 1;
+            end while;
+            var budget: Index := networkSize(&cluster);
+            while (budget > 0) and (networkSize(&cluster) > 0) do
+                deliverOne(&~cluster);
+                budget := budget - 1;
+            end while;
+            round := round + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The leader of the highest term among the nodes of group, 0 when none.
+    generic [R: Region]
+    function leaderOn(cluster: &[Cluster, R], group: Nat8): Nat64 is
+        var id: Nat64 := 0;
+        var term: Nat64 := 0;
+        var i: Index := 0;
+        while i < 3 do
+            let node: &[Node, R] := nthRef(&(cluster->nodes), i);
+            if (isLeader(node) and (nth(&(cluster->group), i) = group)) and (currentTerm(node) >= term) then
+                id := wide(i) + 1;
+                term := currentTerm(node);
+            end if;
+            i := i + 1;
+        end while;
+        return id;
+    end;
+
+    -- A write proposed through node id with its own store; the index, or
+    -- 0 with the refusal in the result's place.
+    generic [R: Region]
+    function write(cluster: &![Cluster, R], id: Nat64, sql: Span[Nat8, Static], values: Buffer[Value]): Either[Nat8, Nat64] is
+        var node: Node := takeNode(&~cluster, slot(id));
+        let store: Store := takeStore(&~cluster, slot(id));
+        let made: Either[Nat8, Nat64] := proposeWrite(&!node, &store, sql, &values);
+        destroyValues(values);
+        putStore(&~cluster, slot(id), store);
+        putNode(&~cluster, slot(id), node);
+        observe(&~cluster, slot(id));
+        return made;
+    end;
+
+    function indexOf(made: Either[Nat8, Nat64]): Nat64 is
+        case made of
+            when Right(right as index: Nat64) do
+                return index;
+            when Left(left as refusal: Nat8) do
+                return 0;
+        end case;
+    end;
+
+    function refusalIn(made: Either[Nat8, Nat64]): Nat8 is
+        case made of
+            when Right(right as index: Nat64) do
+                return refusedNot();
+            when Left(left as refusal: Nat8) do
+                return refusal;
+        end case;
+    end;
+
+    function pair(key: Span[Nat8, Static], value: Int64): Buffer[Value] is
+        var values: Buffer[Value] := noValues();
+        insertBack(&!values, textValue(key));
+        insertBack(&!values, integerValue(value));
+        return values;
+    end;
+
+    constant listing: Span[Nat8, Static] := "SELECT coalesce(group_concat(k || '=' || v, ','), '') FROM (SELECT k, v FROM kv ORDER BY k)";
+
+    -- The first column of the first row as text, or a word for a failure.
+    function firstText(rows: Either[String, Buffer[Buffer[Value]]]): String is
+        case rows of
+            when Right(right as found: Buffer[Buffer[Value]]) do
+                var text: String := fromLiteral("(no rows)");
+                if length(&found) > 0 then
+                    destroyString(text);
+                    text := copyFirst(&found);
+                end if;
+                destroyRows(found);
+                return text;
+            when Left(left as message: String) do
+                destroyString(message);
+                return fromLiteral("(failed)");
+        end case;
+    end;
+
+    generic [R: Region]
+    function copyFirst(rows: &[Buffer[Buffer[Value]], R]): String is
+        let row: &[Buffer[Value], R] := nthRef(rows, 0);
+        let value: &[Value, R] := nthRef(row, 0);
+        return fromSpan(asSpan(&(value->bytes)));
+    end;
+
+    -- What node id holds in kv, read on its own store.
+    generic [R: Region]
+    function localListing(cluster: &[Cluster, R], id: Nat64): String is
+        let store: &[Store, R] := nthRef(&(cluster->stores), slot(id));
+        let values: Buffer[Value] := noValues();
+        let text: String := firstText(queryLocal(store, listing, &values));
+        destroyValues(values);
+        return text;
+    end;
+
+    generic [R: Region, S: Region]
+    function listingIs(cluster: &[Cluster, R], id: Nat64, expected: Span[Nat8, S]): Bool is
+        let text: String := localListing(cluster, id);
+        let same: Bool := equal(asSpan(&text), expected);
+        destroyString(text);
+        return same;
+    end;
+
+    generic [R: Region]
+    function resultAt(cluster: &[Cluster, R], id: Nat64, index: Nat64): Option[WriteResult] is
+        return resultOf(nthRef(&(cluster->stores), slot(id)), index);
+    end;
+
+    generic [R: Region]
+    function readyOn(cluster: &[Cluster, R], id: Nat64, barrier: Barrier): Bool is
+        return linearizableReady(nthRef(&(cluster->nodes), slot(id)), barrier);
+    end;
+
+    generic [R: Region]
+    function snapshotOn(cluster: &[Cluster, R], id: Nat64): Nat64 is
+        return snapshotIndexOf(nthRef(&(cluster->nodes), slot(id)));
+    end;
+
+    -- What node id holds in kv, read linearizably for barrier.
+    generic [R: Region]
+    function linearListing(cluster: &[Cluster, R], id: Nat64, barrier: Barrier): String is
+        let values: Buffer[Value] := noValues();
+        let text: String := firstText(queryLinearizable(nthRef(&(cluster->stores), slot(id)), nthRef(&(cluster->nodes), slot(id)), barrier, listing, &values));
+        destroyValues(values);
+        return text;
+    end;
+
+    ---
+    --- The cluster's tests
+    ---
+
+    function testReplicatedWrites(): Unit is
+        var cluster: Cluster := makeCluster('a', 21);
+        run(&!cluster, 60);
+        let leader: Nat64 := leaderOn(&cluster, sideA);
+        assertTrue(leader > 0, "a leader");
+        let table: Nat64 := indexOf(write(&!cluster, leader, "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER) STRICT", noValues()));
+        assertTrue(table > 0, "the table is proposed");
+        let one: Nat64 := indexOf(write(&!cluster, leader, "INSERT INTO kv (k, v) VALUES (?, ?)", pair("apple", 1)));
+        let two: Nat64 := indexOf(write(&!cluster, leader, "INSERT INTO kv (k, v) VALUES (?, ?)", pair("pear", 2)));
+        run(&!cluster, 10);
+        let again: Nat64 := indexOf(write(&!cluster, leader, "INSERT INTO kv (k, v) VALUES (?, ?)", pair("apple", 3)));
+        assertTrue(((one > 0) and (two > 0)) and (again > 0), "the inserts are proposed");
+        run(&!cluster, 10);
+        var id: Nat64 := 1;
+        while id <= 3 do
+            assertTrue(listingIs(&cluster, id, "apple=1,pear=2"), "every node holds apple and pear");
+            case resultAt(&cluster, id, one) of
+                when Some(value as result: WriteResult) do
+                    assertTrue(result.applied and (result.changes = 1), "the first insert changed one row");
+                when None do
+                    assertTrue(false, "the result of the first insert is kept");
+            end case;
+            case resultAt(&cluster, id, again) of
+                when Some(value as result: WriteResult) do
+                    assertFalse(result.applied, "a second apple is refused by the primary key");
+                    assertTrue(result.code = 1555, "with SQLITE_CONSTRAINT_PRIMARYKEY on every node");
+                when None do
+                    assertTrue(false, "the result of the second apple is kept");
+            end case;
+            id := id + 1;
+        end while;
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    -- The leader is cut off.  What it takes alone is never applied; its
+    -- barrier never makes a linearizable read; the other side elects a
+    -- leader whose reads are linearizable and see its writes; after the
+    -- healing every node holds what the majority committed.
+    function testPartitionAndReads(): Unit is
+        var cluster: Cluster := makeCluster('b', 22);
+        run(&!cluster, 60);
+        let former: Nat64 := leaderOn(&cluster, sideA);
+        let table: Nat64 := indexOf(write(&!cluster, former, "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER) STRICT", noValues()));
+        let first: Nat64 := indexOf(write(&!cluster, former, "INSERT INTO kv (k, v) VALUES (?, ?)", pair("a", 1)));
+        run(&!cluster, 10);
+        assertTrue(listingIs(&cluster, former, "a=1"), "a is applied before the partition");
+        setGroup(&!cluster, former, sideB);
+        let lost: Nat64 := indexOf(write(&!cluster, former, "INSERT INTO kv (k, v) VALUES (?, ?)", pair("b", 2)));
+        assertTrue(lost > 0, "the cut-off leader takes b");
+        var cut: Node := takeNode(&!cluster, slot(former));
+        let barrier: Option[Barrier] := readBarrier(&!cut);
+        putNode(&!cluster, slot(former), cut);
+        run(&!cluster, 80);
+        case barrier of
+            when Some(value as stale: Barrier) do
+                assertFalse(readyOn(&cluster, former, stale), "the cut-off leader never reads linearizably");
+            when None do
+                assertTrue(false, "a barrier on the cut-off leader");
+        end case;
+        assertTrue(listingIs(&cluster, former, "a=1"), "a local read on the cut-off node sees a only");
+        let next: Nat64 := leaderOn(&cluster, sideA);
+        assertTrue((next > 0) and (next /= former), "the other side elects a leader");
+        let third: Nat64 := indexOf(write(&!cluster, next, "INSERT INTO kv (k, v) VALUES (?, ?)", pair("c", 3)));
+        run(&!cluster, 10);
+        var leading: Node := takeNode(&!cluster, slot(next));
+        let fresh: Option[Barrier] := readBarrier(&!leading);
+        putNode(&!cluster, slot(next), leading);
+        run(&!cluster, 10);
+        case fresh of
+            when Some(value as ready: Barrier) do
+                assertTrue(readyOn(&cluster, next, ready), "the new leader's barrier is applied");
+                let text: String := linearListing(&cluster, next, ready);
+                assertTrue(equal(asSpan(&text), "a=1,c=3"), "the linearizable read sees a and c");
+                destroyString(text);
+            when None do
+                assertTrue(false, "a barrier on the new leader");
+        end case;
+        setGroup(&!cluster, former, sideA);
+        run(&!cluster, 60);
+        var id: Nat64 := 1;
+        while id <= 3 do
+            assertTrue(listingIs(&cluster, id, "a=1,c=3"), "after the healing every node holds a and c, not b");
+            id := id + 1;
+        end while;
+        case resultAt(&cluster, former, lost) of
+            when Some(value as result: WriteResult) do
+                assertTrue(false, "the write of the cut-off leader has no result");
+            when None do
+                skip;
+        end case;
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    -- Node 3 is away while ten rows are written and the others replace
+    -- their logs by snapshots of the online backup; it comes back with the
+    -- snapshot and holds the same rows.
+    function testSnapshot(): Unit is
+        var cluster: Cluster := makeCluster('c', 23);
+        run(&!cluster, 60);
+        var leader: Nat64 := leaderOn(&cluster, sideA);
+        if leader = 3 then
+            setGroup(&!cluster, 3, sideB);
+            run(&!cluster, 80);
+            setGroup(&!cluster, 3, sideA);
+            run(&!cluster, 40);
+            leader := leaderOn(&cluster, sideA);
+        end if;
+        let table: Nat64 := indexOf(write(&!cluster, leader, "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER) STRICT", noValues()));
+        run(&!cluster, 10);
+        setGroup(&!cluster, 3, sideB);
+        var n: Int64 := 0;
+        while n < 10 do
+            var values: Buffer[Value] := noValues();
+            insertBack(&!values, integerValue(n));
+            insertBack(&!values, integerValue(n));
+            let head: Nat64 := leaderOn(&cluster, sideA);
+            let made: Nat64 := indexOf(write(&!cluster, head, "INSERT INTO kv (k, v) VALUES (CAST(? AS TEXT), ?)", values));
+            run(&!cluster, 2);
+            n := n + 1;
+        end while;
+        run(&!cluster, 10);
+        var id: Nat64 := 1;
+        while id <= 2 do
+            var node: Node := takeNode(&!cluster, slot(id));
+            let store: Store := takeStore(&!cluster, slot(id));
+            assertTrue(compactWith(&!node, &store), "the log is compacted");
+            putStore(&!cluster, slot(id), store);
+            putNode(&!cluster, slot(id), node);
+            id := id + 1;
+        end while;
+        setGroup(&!cluster, 3, sideA);
+        run(&!cluster, 60);
+        assertTrue(snapshotOn(&cluster, 3) > 0, "node 3 installed a snapshot");
+        assertTrue(listingIs(&cluster, 3, "0=0,1=1,2=2,3=3,4=4,5=5,6=6,7=7,8=8,9=9"), "node 3 holds the ten rows");
+        assertTrue(listingIs(&cluster, 1, "0=0,1=1,2=2,3=3,4=4,5=5,6=6,7=7,8=8,9=9"), "node 1 holds them as well");
+        destroyCluster(cluster);
+        return nil;
+    end;
+
+    -- The refusals that need the database and the node.
+    function testRefusalsOfTheNode(): Unit is
+        var cluster: Cluster := makeCluster('d', 24);
+        run(&!cluster, 60);
+        let leader: Nat64 := leaderOn(&cluster, sideA);
+        var other: Nat64 := 1;
+        if leader = 1 then
+            other := secondId;
+        end if;
+        let table: Nat64 := indexOf(write(&!cluster, leader, "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER) STRICT", noValues()));
+        run(&!cluster, 10);
+        assertTrue(refusalIn(write(&!cluster, other, "INSERT INTO kv (k, v) VALUES (?, ?)", pair("x", 1))) = refusedNotLeader(), "a follower takes no write");
+        assertTrue(refusalIn(write(&!cluster, leader, "SELECT k FROM kv", noValues())) = refusedReadOnly(), "a read is no write");
+        assertTrue(refusalIn(write(&!cluster, leader, "INSERT INTO kv (k, v) VALUES (?, ?)", oneText("x"))) = refusedParameterCount(), "one value for two parameters");
+        assertTrue(refusalIn(write(&!cluster, leader, "INSERT INTO nowhere (k) VALUES (?)", oneText("x"))) = refusedDoesNotPrepare(), "a table that is not there");
+        assertTrue(refusalIn(write(&!cluster, leader, "INSERT INTO kv (k, v) VALUES (?, 1); DELETE FROM kv", oneText("x"))) = refusedDoesNotPrepare(), "two statements");
+        destroyCluster(cluster);
+        return nil;
+    end;
+end module body.

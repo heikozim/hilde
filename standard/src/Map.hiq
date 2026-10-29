@@ -1,0 +1,209 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The map keeps two buffers: the keys, sorted, and the values beside them,
+-- position for position.  A lookup is a binary search over the keys; put
+-- and remove move the entries behind the position, which is why they cost
+-- time linear in the size.
+
+import Standard.Tuples (
+    Pair
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty as destroyEmptyBuffer,
+    destroyFree as destroyFreeBuffer,
+    length as bufferLength,
+    nth,
+    nthRef,
+    swapNth,
+    insert,
+    remove as removeFrom
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Sort (
+    Search,
+    binarySearch
+);
+
+module body Standard.Map is
+    record Map[K: Type, V: Type]: Linear is
+        keys: Buffer[K];
+        values: Buffer[V];
+        invariant bufferLength(&keys) = bufferLength(&values);
+    end;
+
+    -- The two buffers, each through the kind of reference the map is held
+    -- by.  A caller with a write reference that only reads passes &map, a
+    -- read borrow of the write reference; one that writes passes &~map.
+    -- Either way the map stays borrowed while the result lives.
+
+    generic [K: Type, V: Type, R: Region]
+    function keysRead(map: &[Map[K, V], R]): &[Buffer[K], R] is
+        return &(map->keys);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function keysMut(map: &![Map[K, V], R]): &![Buffer[K], R] is
+        return &!(map->keys);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function valuesMut(map: &![Map[K, V], R]): &![Buffer[V], R] is
+        return &!(map->values);
+    end;
+
+    ---
+    --- Lifecycle
+    ---
+
+    generic [K: Type, V: Type]
+    function makeMap(): Map[K, V] is
+        let keys: Buffer[K] := allocateEmpty();
+        let values: Buffer[V] := allocateEmpty();
+        return Map(keys => keys, values => values);
+    end;
+
+    generic [K: Type, V: Type]
+    function destroyEmpty(map: Map[K, V]): Unit is
+        let { keys: Buffer[K], values: Buffer[V] } := map;
+        destroyEmptyBuffer(keys);
+        destroyEmptyBuffer(values);
+        return nil;
+    end;
+
+    generic [K: Free, V: Free]
+    function destroyFree(map: Map[K, V]): Unit is
+        let { keys: Buffer[K], values: Buffer[V] } := map;
+        destroyFreeBuffer(keys);
+        destroyFreeBuffer(values);
+        return nil;
+    end;
+
+    ---
+    --- Asking
+    ---
+
+    generic [K: Type, V: Type, R: Region]
+    function size(map: &[Map[K, V], R]): Index is
+        return bufferLength(&(map->keys));
+    end;
+
+    generic [K: Type(TotalOrder), V: Type, R: Region, S: Region]
+    function contains(map: &[Map[K, V], R], key: &[K, S]): Bool is
+        case binarySearch(&(map->keys), key) of
+            when Found(position as p: Index) do
+                return true;
+            when Missing(insertAt as q: Index) do
+                return false;
+        end case;
+    end;
+
+    generic [K: Type(TotalOrder), V: Free, R: Region, S: Region]
+    function get(map: &[Map[K, V], R], key: &[K, S]): Option[V] is
+        case binarySearch(&(map->keys), key) of
+            when Found(position as p: Index) do
+                return Some(value => nth(&(map->values), p));
+            when Missing(insertAt as q: Index) do
+                return None();
+        end case;
+    end;
+
+    generic [K: Type(TotalOrder), V: Type, R: Region, S: Region]
+    function getRef(map: &[Map[K, V], R], key: &[K, S]): Option[&[V, R]] is
+        case binarySearch(&(map->keys), key) of
+            when Found(position as p: Index) do
+                return Some(value => nthRef(&(map->values), p));
+            when Missing(insertAt as q: Index) do
+                return None();
+        end case;
+    end;
+
+    ---
+    --- Asking through a write reference
+    ---
+
+    generic [K: Type, V: Type, R: Region]
+    function sizeMut(map: &![Map[K, V], R]): Index is
+        return size(&map);
+    end;
+
+    generic [K: Type(TotalOrder), V: Type, R: Region, S: Region]
+    function containsMut(map: &![Map[K, V], R], key: &[K, S]): Bool is
+        return contains(&map, key);
+    end;
+
+    generic [K: Type(TotalOrder), V: Free, R: Region, S: Region]
+    function getMut(map: &![Map[K, V], R], key: &[K, S]): Option[V] is
+        return get(&map, key);
+    end;
+
+    ---
+    --- Changing
+    ---
+
+    generic [K: Type(TotalOrder), V: Type, R: Region]
+    function put(map: &![Map[K, V], R], key: K, value: V): Option[Pair[K, V]] is
+        let found: Search := binarySearch(keysRead(&map), &key);
+        case found of
+            when Found(position as p: Index) do
+                let oldKey: K := swapNth(keysMut(&~map), p, key);
+                let oldValue: V := swapNth(valuesMut(&~map), p, value);
+                return Some(value => Pair(first => oldKey, second => oldValue));
+            when Missing(insertAt as p: Index) do
+                insert(keysMut(&~map), p, key);
+                insert(valuesMut(&~map), p, value);
+                return None();
+        end case;
+    end;
+
+    generic [K: Type(TotalOrder), V: Type, R: Region, S: Region]
+    function replaceValue(map: &![Map[K, V], R], key: &[K, S], value: V): Either[V, V] is
+        let found: Search := binarySearch(keysRead(&map), key);
+        case found of
+            when Found(position as p: Index) do
+                return Right(right => swapNth(valuesMut(&~map), p, value));
+            when Missing(insertAt as q: Index) do
+                return Left(left => value);
+        end case;
+    end;
+
+    generic [K: Type(TotalOrder), V: Type, R: Region, S: Region]
+    function remove(map: &![Map[K, V], R], key: &[K, S]): Option[Pair[K, V]] is
+        let found: Search := binarySearch(keysRead(&map), key);
+        case found of
+            when Found(position as p: Index) do
+                return Some(value => removeAt(&~map, p));
+            when Missing(insertAt as q: Index) do
+                return None();
+        end case;
+    end;
+
+    ---
+    --- In the order of the keys
+    ---
+
+    generic [K: Type, V: Type, R: Region]
+    function keyAt(map: &[Map[K, V], R], pos: Index): &[K, R] is
+        return nthRef(&(map->keys), pos);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function valueAt(map: &[Map[K, V], R], pos: Index): &[V, R] is
+        return nthRef(&(map->values), pos);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function removeAt(map: &![Map[K, V], R], pos: Index): Pair[K, V] is
+        let key: K := removeFrom(keysMut(&~map), pos);
+        let value: V := removeFrom(valuesMut(&~map), pos);
+        return Pair(first => key, second => value);
+    end;
+end module body.

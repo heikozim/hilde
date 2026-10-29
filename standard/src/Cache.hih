@@ -1,0 +1,176 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A cache of values under keys, with a lifetime per entry and limits on count and total size.
+
+- Time comes from the caller in monotonic nanoseconds; a lifetime of 0 never expires.
+- When full, the entry used longest ago goes first, chosen the same way on every run.
+- A put into a full cache costs time linear in the number of entries.
+- Every entry that leaves the cache comes back to the caller as a key and value pair.
+- Keys are Free, and the readers copy, so they take Free values only.
+- A fill that began before a clear or a flush stores nothing.
+
+    var cache: Cache[Nat64, Nat64] := makeCache(1000, 1048576, 60000000000);
+    let price: Option[Nat64] := getWith(&!cache, item, nowNanos(), lookUpPrice);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.Buffer (
+    Buffer
+);
+import Standard.HashMap (
+    HashMap
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Hash (
+    Hashable
+);
+
+module Standard.Cache is
+    """
+    The cache.  Linear: drainCache ends it and gives back what it held.
+    """
+    type Cache[K: Type, V: Type]: Linear;
+
+    """
+    A value made by a fill, with its size in whatever unit the cache counts.
+    """
+    record Filled[V: Type]: Type is
+        value: V;
+        size: Nat64;
+    end;
+
+    """
+    The serial number of a cache when a fill began; finishFill stores the
+    value only when the cache was not cleared or flushed since.
+    """
+    record Ticket: Free is
+        serial: Nat64;
+    end;
+
+    """
+    An empty cache for at most limit entries of a total size of at most
+    sizeLimit, each kept for lifetime nanoseconds, 0 for no end.
+    """
+    generic [K: Free(TotalOrder, Hashable), V: Type]
+    function makeCache(limit: Index, sizeLimit: Nat64, lifetime: Nat64): Cache[K, V]
+        requires (limit > 0) and (sizeLimit > 0)
+        ensures count(&result) = 0;
+
+    """
+    The cache's entries, in no order, and the end of the cache.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [K: Type, V: Type]
+    function drainCache(cache: Cache[K, V]): Buffer[Pair[K, V]];
+
+    """
+    The number of entries, expired ones included until something removes
+    them.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [K: Type, V: Type, R: Region]
+    function count(cache: &[Cache[K, V], R]): Index;
+
+    """
+    The sum of the sizes of the entries.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [K: Type, V: Type, R: Region]
+    function totalSize(cache: &[Cache[K, V], R]): Nat64;
+
+    """
+    The limits the cache was made with.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [K: Type, V: Type, R: Region]
+    function limitOf(cache: &[Cache[K, V], R]): Index;
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [K: Type, V: Type, R: Region]
+    function sizeLimitOf(cache: &[Cache[K, V], R]): Nat64;
+
+    """
+    The monotonic clock in nanoseconds; it stops the programme on a system
+    without one, which the platforms Hilde builds for all have.
+    No contract: a number the system or the build gives.
+    """
+    function nowNanos(): Nat64;
+
+    """
+    Store value under key with its size.  What it gives back: the value
+    that was under key before, the entries that had expired, and the
+    entries pushed out to make room, least recently used first.  A value
+    larger than the size limit is not stored and comes back itself.
+    """
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function put(cache: &![Cache[K, V], R], key: K, value: V, weight: Nat64, now: Nat64): Buffer[Pair[K, V]]
+        ensures count(&cache) <= limitOf(&cache)
+        ensures totalSize(&cache) <= sizeLimitOf(&cache);
+
+    """
+    A copy of the value under key when it is there and not expired, and the
+    entry counts as used now.  None otherwise.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [K: Free(TotalOrder, Hashable), V: Free, R: Region, S: Region]
+    function get(cache: &![Cache[K, V], R], key: &[K, S], now: Nat64): Option[V];
+
+    """
+    get, and on a miss the value fill makes for key, stored and returned;
+    None when fill makes none.  The keys are Free, so that the key can be
+    given to fill and kept as well.
+    """
+    generic [K: Free(TotalOrder, Hashable), V: Free, R: Region]
+    function getWith(cache: &![Cache[K, V], R], key: K, now: Nat64, fill: Fn[K, Option[Filled[V]]]): Option[V]
+        ensures count(&cache) <= limitOf(&cache);
+
+    """
+    The ticket for a fill that runs apart from the cache.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [K: Type, V: Type, R: Region]
+    function startFill(cache: &[Cache[K, V], R]): Ticket;
+
+    """
+    Store the value of a fill begun with ticket.  Left gives key and value
+    back when the cache was cleared or flushed since the ticket was taken;
+    Right carries what put gave back.
+    """
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function finishFill(cache: &![Cache[K, V], R], ticket: Ticket, key: K, value: V, weight: Nat64, now: Nat64): Either[Pair[K, V], Buffer[Pair[K, V]]]
+        ensures count(&cache) <= limitOf(&cache);
+
+    """
+    Remove the entry under key and give it back.  Every fill begun before
+    is stale after it.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region, S: Region]
+    function clear(cache: &![Cache[K, V], R], key: &[K, S]): Option[Pair[K, V]];
+
+    """
+    Remove every entry and give them back.  Every fill begun before is
+    stale after it.
+    """
+    generic [K: Type, V: Type, R: Region]
+    function flush(cache: &![Cache[K, V], R]): Buffer[Pair[K, V]]
+        ensures count(&cache) = 0;
+
+    """
+    Remove the entries that have expired by now and give them back.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [K: Type, V: Type, R: Region]
+    function expire(cache: &![Cache[K, V], R], now: Nat64): Buffer[Pair[K, V]];
+end module.

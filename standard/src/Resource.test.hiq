@@ -1,0 +1,193 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The limits are read, lowered and raised again within the hard limit, so
+-- that the test needs no privilege; switching core dumps off lowers a hard
+-- limit, which holds for this test's process only.  That a lowered limit
+-- refuses a descriptor is the end-to-end suite's.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    length,
+    nthByte
+);
+import Standard.Resource (
+    Resource,
+    DataSize,
+    OpenFiles,
+    CoreSize,
+    Limit,
+    unlimited,
+    readLimit,
+    setLimit,
+    disableCoreDumps,
+    Usage,
+    readUsage,
+    systemUptimeNanos
+);
+
+module body Standard.Resource.Test is
+    function limitOf(resource: Resource): Limit is
+        case readLimit(resource) of
+            when Some(value as limit: Limit) do
+                return limit;
+            when None do
+                let zero: Nat64 := 0;
+                return Limit(soft => zero, hard => zero);
+        end case;
+    end;
+
+    function readable(resource: Resource): Bool is
+        case readLimit(resource) of
+            when Some(value as limit: Limit) do
+                return limit.soft <= limit.hard;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function usageNow(): Usage is
+        case readUsage() of
+            when Some(value as usage: Usage) do
+                return usage;
+            when None do
+                let zero: Nat64 := 0;
+                return Usage(userMicros => zero, systemMicros => zero, peakResidentBytes => zero);
+        end case;
+    end;
+
+    function uptime(): Nat64 is
+        case systemUptimeNanos() of
+            when Some(value as nanos: Nat64) do
+                return nanos;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Work for the CPU: a sum over many numbers, returned so that it is
+    -- not left out.  For 50000000 rounds it stays below 2 to the 41.
+    function busy(rounds: Nat64): Nat64 is
+        var sum: Nat64 := 0;
+        var i: Nat64 := 0;
+        while i < rounds do
+            sum := sum + (i / 1000);
+            i := i + 1;
+        end while;
+        return sum;
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    -- No limit is 2 to the 63 minus 1, the number OpenBSD writes for none,
+    -- which this module reads as unlimited.
+    function notRaw(resource: Resource): Bool is
+        let raw: Nat64 := 9223372036854775807;
+        let limit: Limit := limitOf(resource);
+        return (limit.soft /= raw) and (limit.hard /= raw);
+    end;
+
+    function testLimitsRead(): Unit is
+        assertTrue(readable(DataSize()), "the data size limit reads, soft at most hard");
+        assertTrue(readable(OpenFiles()), "the open files limit reads, soft at most hard");
+        assertTrue(readable(CoreSize()), "the core size limit reads, soft at most hard");
+        assertTrue((notRaw(DataSize()) and notRaw(OpenFiles())) and notRaw(CoreSize()), "no limit reads as the platform's own number for none");
+        return nil;
+    end;
+
+    function testSoftLowered(): Unit is
+        let before: Limit := limitOf(OpenFiles());
+        let sixteen: Nat64 := 16;
+        assertTrue(before.soft > sixteen, "the open files limit is above 16 to start with");
+        assertTrue(setLimit(OpenFiles(), Limit(soft => sixteen, hard => before.hard)), "the soft limit is lowered");
+        let lowered: Limit := limitOf(OpenFiles());
+        assertTrue(lowered.soft = sixteen, "the lowered soft limit reads back");
+        assertTrue(lowered.hard = before.hard, "the hard limit did not move");
+        assertTrue(setLimit(OpenFiles(), before), "the soft limit is raised again");
+        let after: Limit := limitOf(OpenFiles());
+        assertTrue((after.soft = before.soft) and (after.hard = before.hard), "the limits are as before");
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        let before: Limit := limitOf(OpenFiles());
+        let one: Nat64 := 1;
+        let two: Nat64 := 2;
+        assertTrue(not setLimit(OpenFiles(), Limit(soft => two, hard => one)), "a soft limit above the hard one is refused");
+        let huge: Nat64 := 9223372036854775808;
+        assertTrue(not setLimit(OpenFiles(), Limit(soft => huge, hard => huge)), "a limit of 2 to the 63 open files is refused");
+        let after: Limit := limitOf(OpenFiles());
+        assertTrue((after.soft = before.soft) and (after.hard = before.hard), "a refused limit changed nothing");
+        return nil;
+    end;
+
+    function testCoreDumps(): Unit is
+        assertTrue(disableCoreDumps(), "core dumps are switched off");
+        let core: Limit := limitOf(CoreSize());
+        let zero: Nat64 := 0;
+        assertTrue((core.soft = zero) and (core.hard = zero), "the core size limit is 0 and 0");
+        assertTrue(disableCoreDumps(), "switching them off again is allowed");
+        return nil;
+    end;
+
+    function testUsage(): Unit is
+        let first: Usage := usageNow();
+        let sum: Nat64 := busy(50000000);
+        let second: Usage := usageNow();
+        -- Asked after the work: FreeBSD's kernel sets the largest resident set
+        -- at a clock tick, and a process that asks first thing reads 0 there.
+        assertTrue(second.peakResidentBytes > 0, "the process has a resident set");
+        assertTrue(sum > 0, "the work was done");
+        assertTrue((second.userMicros + second.systemMicros) > (first.userMicros + first.systemMicros), "CPU time grew with the work");
+        return nil;
+    end;
+
+    -- The block is 64 MiB larger than the peak before it, and every byte of
+    -- it is written, so all of it is resident at once and the new peak lies
+    -- at least 60 MiB above the old one.  A block of a fixed size would not
+    -- do: a process can have had a peak above its present resident set
+    -- before the test began, and the block then only fills that gap.
+    function testPeakGrows(): Unit is
+        let first: Usage := usageNow();
+        let extra: Index := 67108864;
+        let size: Index := asIndex(first.peakResidentBytes) + extra;
+        let block: String := makeString(size, 1);
+        let second: Usage := usageNow();
+        let wanted: Nat64 := first.peakResidentBytes + 62914560;
+        assertTrue(length(&block) = size, "the block was allocated");
+        assertTrue(nthByte(&block, size - 1) = 1, "the last byte was written");
+        assertTrue(second.peakResidentBytes >= wanted, "the peak resident set grew by at least 60 MiB past its old value");
+        destroyString(block);
+        return nil;
+    end;
+
+    function asIndex(n: Nat64): Index is
+        case toIndex(n) of
+            when Some(value as index: Index) do
+                return index;
+            when None do
+                let zero: Index := 0;
+                return zero;
+        end case;
+    end;
+
+    function testUptime(): Unit is
+        let first: Nat64 := uptime();
+        let second: Nat64 := uptime();
+        let oneSecond: Nat64 := 1000000000;
+        assertTrue(first >= oneSecond, "the system has been up for at least a second");
+        assertTrue(second >= first, "the uptime does not go back");
+        assertTrue(unlimited = 18446744073709551615, "unlimited is the largest Nat64");
+        return nil;
+    end;
+end module body.

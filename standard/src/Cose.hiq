@@ -1,0 +1,236 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  A COSE key is read with Standard.Cbor, written again as
+-- the JSON Web Key with the same members, and that key goes through
+-- Standard.Jws, which writes the DER and holds every length; so the DER of
+-- both kinds of key comes from one place.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Base64 (
+    encodeUrl
+);
+import Standard.Json (
+    JsonWriter,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    writeName,
+    writeString as writeJsonString,
+    finishJson
+);
+import Standard.Jws (
+    publicKeyFromJwk
+);
+import Standard.Cbor (
+    Cbor,
+    CborError,
+    CborItem,
+    readCbor,
+    destroyCbor,
+    rootOf,
+    integerOf,
+    bytesOf,
+    integerKey
+);
+
+module body Standard.Cose is
+    -- The labels of a COSE key: kty, alg and the parameters of each kind.
+    constant labelKty: Int64 := 1;
+    constant labelAlg: Int64 := 3;
+    constant labelFirst: Int64 := -1;
+    constant labelSecond: Int64 := -2;
+    constant labelThird: Int64 := -3;
+
+    function noString(): Option[String] is
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    -- The integer under label in the map top.
+    generic [R: Region]
+    function integerAt(document: &[Cbor, R], top: CborItem, label: Int64): Option[Int64] is
+        let item: CborItem := integerKey(document, top, label)?;
+        return integerOf(document, item);
+    end;
+
+    -- The bytes under label in the map top, written in base64url without
+    -- padding, as a JSON Web Key holds them.
+    generic [R: Region]
+    function bytesAt(document: &[Cbor, R], top: CborItem, label: Int64): Option[String] is
+        let item: CborItem := integerKey(document, top, label)?;
+        let bytes: String := bytesOf(document, item)?;
+        let padded: String := encodeUrl(asSpan(&bytes));
+        destroyString(bytes);
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < length(&padded) do
+            let byte: Nat8 := nthByte(&padded, i);
+            if byte /= '=' then
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(padded);
+        let some: Option[String] := Some(value => finalize(out));
+        return some;
+    end;
+
+    -- Whether the key names no alg, or the one wanted.
+    generic [R: Region]
+    function algIs(document: &[Cbor, R], top: CborItem, wanted: Int64): Bool is
+        case integerKey(document, top, labelAlg) of
+            when Some(value as item: CborItem) do
+                case integerOf(document, item) of
+                    when Some(value as alg: Int64) do
+                        return alg = wanted;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- A member name and a value of base64url text, the value given up.
+    generic [R: Region]
+    function member(writer: &![JsonWriter, R], name: Span[Nat8, Static], value: String): Unit is
+        writeName(&~writer, name);
+        writeJsonString(&~writer, asSpan(&value));
+        destroyString(value);
+        return nil;
+    end;
+
+    -- The JSON Web Key of a key of kty 2.  The curve decides the alg.
+    generic [R: Region]
+    function ecJwk(document: &[Cbor, R], top: CborItem): Option[String] is
+        let crv: Int64 := integerAt(document, top, labelFirst)?;
+        var name: Span[Nat8, Static] := "";
+        var alg: Int64 := 0;
+        if crv = 1 then
+            name := "P-256";
+            alg := -7;
+        else if crv = 2 then
+            name := "P-384";
+            alg := -35;
+        else if crv = 3 then
+            name := "P-521";
+            alg := -36;
+        else
+            return noString();
+        end if;
+        if not algIs(document, top, alg) then
+            return noString();
+        end if;
+        let x: String := bytesAt(document, top, labelSecond)?;
+        case bytesAt(document, top, labelThird) of
+            when Some(value as y: String) do
+                var writer: JsonWriter := makeJsonWriter();
+                beginObject(&!writer);
+                writeName(&!writer, "kty");
+                writeJsonString(&!writer, "EC");
+                writeName(&!writer, "crv");
+                writeJsonString(&!writer, name);
+                member(&!writer, "x", x);
+                member(&!writer, "y", y);
+                endObject(&!writer);
+                return finishJson(writer);
+            when None do
+                destroyString(x);
+                return noString();
+        end case;
+    end;
+
+    -- The JSON Web Key of a key of kty 1, which must be crv 6, Ed25519.
+    generic [R: Region]
+    function okpJwk(document: &[Cbor, R], top: CborItem): Option[String] is
+        let crv: Int64 := integerAt(document, top, labelFirst)?;
+        if (crv /= 6) or (not algIs(document, top, -8)) then
+            return noString();
+        end if;
+        let x: String := bytesAt(document, top, labelSecond)?;
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "kty");
+        writeJsonString(&!writer, "OKP");
+        writeName(&!writer, "crv");
+        writeJsonString(&!writer, "Ed25519");
+        member(&!writer, "x", x);
+        endObject(&!writer);
+        return finishJson(writer);
+    end;
+
+    -- The JSON Web Key of a key of kty 3: n under -1 and e under -2.
+    generic [R: Region]
+    function rsaJwk(document: &[Cbor, R], top: CborItem): Option[String] is
+        if not algIs(document, top, -257) then
+            return noString();
+        end if;
+        let n: String := bytesAt(document, top, labelFirst)?;
+        case bytesAt(document, top, labelSecond) of
+            when Some(value as e: String) do
+                var writer: JsonWriter := makeJsonWriter();
+                beginObject(&!writer);
+                writeName(&!writer, "kty");
+                writeJsonString(&!writer, "RSA");
+                member(&!writer, "n", n);
+                member(&!writer, "e", e);
+                endObject(&!writer);
+                return finishJson(writer);
+            when None do
+                destroyString(n);
+                return noString();
+        end case;
+    end;
+
+    generic [R: Region]
+    function jwkOf(document: &[Cbor, R]): Option[String] is
+        let top: CborItem := rootOf(document);
+        let kty: Int64 := integerAt(document, top, labelKty)?;
+        if kty = 2 then
+            return ecJwk(document, top);
+        end if;
+        if kty = 1 then
+            return okpJwk(document, top);
+        end if;
+        if kty = 3 then
+            return rsaJwk(document, top);
+        end if;
+        return noString();
+    end;
+
+    generic [K: Region]
+    function publicKeyFromCose(key: Span[Nat8, K]): Option[String] is
+        case readCbor(key) of
+            when Right(right as document: Cbor) do
+                let jwk: Option[String] := jwkOf(&document);
+                destroyCbor(document);
+                case jwk of
+                    when Some(value as text: String) do
+                        let der: Option[String] := publicKeyFromJwk(asSpan(&text));
+                        destroyString(text);
+                        return der;
+                    when None do
+                        return noString();
+                end case;
+            when Left(left as refused: CborError) do
+                return noString();
+        end case;
+    end;
+end module body.

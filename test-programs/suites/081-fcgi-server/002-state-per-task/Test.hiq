@@ -1,0 +1,211 @@
+-- Standard.FcgiServer.serveUnixWith against scripts/socket/fcgi-client.py:
+-- three clients connect at once, two states are given, each a counter
+-- of the requests its tasks served.  After the loop both states are back
+-- and together they counted the three requests.  Which state served
+-- which client is not fixed, so only the sum is printed.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    insertBack,
+    removeFirst,
+    length
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Listener,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    listenUnix,
+    closeListener,
+    removeFile,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readAll,
+    closeFile
+);
+import Standard.Signal (
+    Signals,
+    Wanted,
+    watchSignals,
+    stopWatching
+);
+import Standard.FcgiServer (
+    Limits,
+    Request,
+    Turn,
+    Served,
+    defaultLimits,
+    destroyRequest,
+    cgiResponse,
+    serveUnixWith
+);
+
+module body Test is
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    -- Counts the request in the state of its task and answers it.
+    function count(turn: Turn[Int64]): Served[Int64] is
+        let { state as counted: Int64, request: Request } := turn;
+        destroyRequest(request);
+        return Served(state => counted + 1, answer => cgiResponse(200, "text/plain", "counted"));
+    end;
+
+    generic [P: Region]
+    function startClient(path: &[String, P]): Option[Running] is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/socket/fcgi-client.py");
+        let command: Command :=
+            addArgument(addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script)), asSpan(path));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        return spawnProcess(command);
+    end;
+
+    -- Waits for a client after reading what it wrote; only its exit is
+    -- printed.
+    function finish(running: Running): Unit is
+        let { process: Process, input: FileDescriptor, output: FileDescriptor,
+            errors: FileDescriptor } := running;
+        let closedInput: Bool := closeFile(input);
+        var out: FileDescriptor := output;
+        var err: FileDescriptor := errors;
+        case readAll(&!out) of
+            when Some(value as text: String) do
+                destroyString(text);
+            when None do
+                printLn("(reading its output failed)");
+        end case;
+        case readAll(&!err) of
+            when Some(value as text: String) do
+                destroyString(text);
+            when None do
+                printLn("(reading its errors failed)");
+        end case;
+        let closedOut: Bool := closeFile(out);
+        let closedErr: Bool := closeFile(err);
+        let status: ProcessStatus := waitProcess(process);
+        print("client exited normally: ");
+        print(exitedNormally(status));
+        print(", code ");
+        printLn(exitCode(status));
+        return nil;
+    end;
+
+    generic [R: Region, B: Region]
+    function serveAll(listener: &[Listener, R], states: &![Buffer[Int64], B]): Unit is
+        let base: Limits := defaultLimits();
+        let limits: Limits := Limits(
+            workers => 8,
+            connections => 3,
+            paramsBytes => base.paramsBytes,
+            bodyBytes => base.bodyBytes,
+            requestMilliseconds => 10000,
+            writeMilliseconds => 10000
+        );
+        let wanted: Wanted := Wanted(hangup => false, interrupt => true, terminate => true, user1 => false, user2 => false);
+        case watchSignals(wanted) of
+            when Some(value as watching: Signals) do
+                var signals: Signals := watching;
+                case serveUnixWith(listener, &~states, count, limits, &!signals) of
+                    when Some(value as accepted: Index) do
+                        print("connections accepted: ");
+                        printLn(accepted);
+                    when None do
+                        printLn("the loop could not start");
+                end case;
+                let stopped: Bool := stopWatching(signals);
+            when None do
+                printLn("no signals");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, P: Region]
+    function withClients(listener: &[Listener, R], path: &[String, P]): Unit is
+        var states: Buffer[Int64] := allocateEmpty();
+        insertBack(&!states, 0);
+        insertBack(&!states, 0);
+        case startClient(path) of
+            when Some(value as first: Running) do
+                case startClient(path) of
+                    when Some(value as second: Running) do
+                        case startClient(path) of
+                            when Some(value as third: Running) do
+                                serveAll(listener, &!states);
+                                finish(first);
+                                finish(second);
+                                finish(third);
+                            when None do
+                                printLn("the third client could not be started");
+                                finish(first);
+                                finish(second);
+                        end case;
+                    when None do
+                        printLn("the second client could not be started");
+                        finish(first);
+                end case;
+            when None do
+                printLn("the first client could not be started");
+        end case;
+        print("states given back: ");
+        printLn(length(&states));
+        var sum: Int64 := 0;
+        while length(&states) > 0 do
+            sum := sum + removeFirst(&!states);
+        end while;
+        destroyEmpty(states);
+        print("requests counted: ");
+        printLn(sum);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        let path: String := fromLiteral("hilde-081-002.sock");
+        let removed: Bool := removeFile(asSpan(&path));
+        case listenUnix(asSpan(&path), #o600) of
+            when Some(value as listener: Listener) do
+                withClients(&listener, &path);
+                print("listener closed: ");
+                printLn(closeListener(listener));
+            when None do
+                printLn("listen: failed");
+        end case;
+        destroyString(path);
+        return ExitSuccess();
+    end;
+end module body.

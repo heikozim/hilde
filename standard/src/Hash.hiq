@@ -1,0 +1,302 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Hash.  SipHash after the paper of Aumasson and Bernstein, the
+-- number of rounds a parameter.  Hilde has no shift operators, so a shift
+-- left is a multiplication modulo 2^64 and a shift right a division; a
+-- rotation is both, joined with an or.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length as bufferLength,
+    insertBack,
+    getSpan as bufferSpan
+);
+import Standard.String (
+    String,
+    asSpan
+);
+
+module body Standard.Hash is
+    constant twoTo8: Nat64 := 256;
+    constant twoTo13: Nat64 := 8192;
+    constant twoTo16: Nat64 := 65536;
+    constant twoTo17: Nat64 := 131072;
+    constant twoTo21: Nat64 := 2097152;
+    constant twoTo32: Nat64 := 4294967296;
+    constant twoTo43: Nat64 := 8796093022208;
+    constant twoTo47: Nat64 := 140737488355328;
+    constant twoTo48: Nat64 := 281474976710656;
+    constant twoTo51: Nat64 := 2251799813685248;
+    constant twoTo56: Nat64 := 72057594037927936;
+
+    -- The initial words of the paper: "somepseudorandomlygeneratedbytes".
+    constant init0: Nat64 := 8317987319222330741;
+    constant init1: Nat64 := 7237128888997146477;
+    constant init2: Nat64 := 7816392313619706465;
+    constant init3: Nat64 := 8387220255154660723;
+
+    constant finalByte: Nat64 := 255;
+
+    record State: Free is
+        v0: Nat64;
+        v1: Nat64;
+        v2: Nat64;
+        v3: Nat64;
+    end;
+
+    -- x rotated left by as many bits as up = 2^b says; down = 2^(64 - b).
+    function rotate(x: Nat64, up: Nat64, down: Nat64): Nat64 is
+        return bitwiseOr(modularMultiply(x, up), x / down);
+    end;
+
+    function round(s: State): State is
+        var v0: Nat64 := modularAdd(s.v0, s.v1);
+        var v1: Nat64 := bitwiseXor(rotate(s.v1, twoTo13, twoTo51), v0);
+        v0 := rotate(v0, twoTo32, twoTo32);
+        var v2: Nat64 := modularAdd(s.v2, s.v3);
+        var v3: Nat64 := bitwiseXor(rotate(s.v3, twoTo16, twoTo48), v2);
+        v0 := modularAdd(v0, v3);
+        v3 := bitwiseXor(rotate(v3, twoTo21, twoTo43), v0);
+        v2 := modularAdd(v2, v1);
+        v1 := bitwiseXor(rotate(v1, twoTo17, twoTo47), v2);
+        v2 := rotate(v2, twoTo32, twoTo32);
+        return State(v0 => v0, v1 => v1, v2 => v2, v3 => v3);
+    end;
+
+    function rounds(s: State, count: Index): State is
+        var t: State := s;
+        var i: Index := 0;
+        while i < count do
+            t := round(t);
+            i := i + 1;
+        end while;
+        return t;
+    end;
+
+    -- One word into the state: v3 takes it before the rounds, v0 after.
+    function absorb(s: State, word: Nat64, count: Index): State is
+        let before: State := State(v0 => s.v0, v1 => s.v1, v2 => s.v2, v3 => bitwiseXor(s.v3, word));
+        let after: State := rounds(before, count);
+        return State(v0 => bitwiseXor(after.v0, word), v1 => after.v1, v2 => after.v2, v3 => after.v3);
+    end;
+
+    function wideOf(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Bytes at up to at + count, count at most 8, as a little-endian word.
+    generic [R: Region]
+    function wordAt(bytes: Span[Nat8, R], at: Index, count: Index): Nat64 is
+        var word: Nat64 := 0;
+        var j: Index := count;
+        while j > 0 do
+            j := j - 1;
+            word := modularAdd(modularMultiply(word, twoTo8), wideOf(bytes[at + j]));
+        end while;
+        return word;
+    end;
+
+    generic [R: Region]
+    function sipHash(key0: Nat64, key1: Nat64, bytes: Span[Nat8, R], compression: Index, finalisation: Index): Nat64 is
+        var s: State := State(v0 => bitwiseXor(key0, init0), v1 => bitwiseXor(key1, init1),
+            v2 => bitwiseXor(key0, init2), v3 => bitwiseXor(key1, init3));
+        let n: Index := spanLength(bytes);
+        let eight: Index := 8;
+        let whole: Index := n - rem(n, eight);
+        var at: Index := 0;
+        while at < whole do
+            s := absorb(s, wordAt(bytes, at, eight), compression);
+            at := at + eight;
+        end while;
+        let byteRange: Index := 256;
+        let lengthByte: Index := rem(n, byteRange);
+        var lengthWord: Nat64 := 0;
+        case toNat64(lengthByte) of
+            when Some(value as w: Nat64) do
+                lengthWord := w;
+            when None do
+                skip;
+        end case;
+        let last: Nat64 := bitwiseOr(modularMultiply(lengthWord, twoTo56), wordAt(bytes, whole, n - whole));
+        s := absorb(s, last, compression);
+        let closing: State := State(v0 => s.v0, v1 => s.v1, v2 => bitwiseXor(s.v2, finalByte), v3 => s.v3);
+        let t: State := rounds(closing, finalisation);
+        return bitwiseXor(bitwiseXor(t.v0, t.v1), bitwiseXor(t.v2, t.v3));
+    end;
+
+    generic [R: Region]
+    function sipHash13(key0: Nat64, key1: Nat64, bytes: Span[Nat8, R]): Nat64 is
+        return sipHash(key0, key1, bytes, 1, 3);
+    end;
+
+    generic [R: Region]
+    function sipHash24(key0: Nat64, key1: Nat64, bytes: Span[Nat8, R]): Nat64 is
+        return sipHash(key0, key1, bytes, 2, 4);
+    end;
+
+    -- SipHash-1-3 of the size little-endian bytes of word, size at most 8.
+    function hashWord(word: Nat64, size: Index, key0: Nat64, key1: Nat64): Nat64 is
+        var bytes: Buffer[Nat8] := allocateEmpty();
+        var rest: Nat64 := word;
+        var i: Index := 0;
+        while i < size do
+            case toNat8(rem(rest, twoTo8)) of
+                when Some(value as b: Nat8) do
+                    insertBack(&!bytes, b);
+                when None do
+                    skip;
+            end case;
+            rest := rest / twoTo8;
+            i := i + 1;
+        end while;
+        let h: Nat64 := hashBytes(&bytes, key0, key1);
+        destroyFree(bytes);
+        return h;
+    end;
+
+    generic [R: Region]
+    function hashBytes(bytes: &[Buffer[Nat8], R], key0: Nat64, key1: Nat64): Nat64 is
+        if bufferLength(bytes) = 0 then
+            let none: Span[Nat8, Static] := "";
+            return sipHash13(key0, key1, none);
+        else
+            return sipHash13(key0, key1, bufferSpan(bytes, 0, bufferLength(bytes) - 1));
+        end if;
+    end;
+
+    -- A signed value as the Nat64 of its two's complement.
+    function unsignedOf(value: Int64): Nat64 is
+        let zero: Int64 := 0;
+        if value >= zero then
+            case toNat64(value) of
+                when Some(value as w: Nat64) do
+                    return w;
+                when None do
+                    return 0;
+            end case;
+        end if;
+        -- value + 2^63 fits an Int64 and a Nat64; adding 2^63 again gives
+        -- the two's complement modulo 2^64.
+        let half: Int64 := 9223372036854775807;
+        let one: Int64 := 1;
+        let shifted: Int64 := (value + half) + one;
+        let top: Nat64 := 9223372036854775808;
+        case toNat64(shifted) of
+            when Some(value as w: Nat64) do
+                return modularAdd(w, top);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    instance Hashable(Nat8) is
+        generic [R: Region]
+        method hashOf(value: &[Nat8, R], key0: Nat64, key1: Nat64): Nat64 is
+            return hashWord(wideOf(!value), 1, key0, key1);
+        end;
+    end;
+
+    instance Hashable(Nat16) is
+        generic [R: Region]
+        method hashOf(value: &[Nat16, R], key0: Nat64, key1: Nat64): Nat64 is
+            case toNat64(!value) of
+                when Some(value as w: Nat64) do
+                    return hashWord(w, 2, key0, key1);
+                when None do
+                    return 0;
+            end case;
+        end;
+    end;
+
+    instance Hashable(Nat32) is
+        generic [R: Region]
+        method hashOf(value: &[Nat32, R], key0: Nat64, key1: Nat64): Nat64 is
+            case toNat64(!value) of
+                when Some(value as w: Nat64) do
+                    return hashWord(w, 4, key0, key1);
+                when None do
+                    return 0;
+            end case;
+        end;
+    end;
+
+    instance Hashable(Nat64) is
+        generic [R: Region]
+        method hashOf(value: &[Nat64, R], key0: Nat64, key1: Nat64): Nat64 is
+            return hashWord(!value, 8, key0, key1);
+        end;
+    end;
+
+    instance Hashable(Int8) is
+        generic [R: Region]
+        method hashOf(value: &[Int8, R], key0: Nat64, key1: Nat64): Nat64 is
+            case toInt64(!value) of
+                when Some(value as w: Int64) do
+                    return hashWord(unsignedOf(w), 1, key0, key1);
+                when None do
+                    return 0;
+            end case;
+        end;
+    end;
+
+    instance Hashable(Int16) is
+        generic [R: Region]
+        method hashOf(value: &[Int16, R], key0: Nat64, key1: Nat64): Nat64 is
+            case toInt64(!value) of
+                when Some(value as w: Int64) do
+                    return hashWord(unsignedOf(w), 2, key0, key1);
+                when None do
+                    return 0;
+            end case;
+        end;
+    end;
+
+    instance Hashable(Int32) is
+        generic [R: Region]
+        method hashOf(value: &[Int32, R], key0: Nat64, key1: Nat64): Nat64 is
+            case toInt64(!value) of
+                when Some(value as w: Int64) do
+                    return hashWord(unsignedOf(w), 4, key0, key1);
+                when None do
+                    return 0;
+            end case;
+        end;
+    end;
+
+    instance Hashable(Int64) is
+        generic [R: Region]
+        method hashOf(value: &[Int64, R], key0: Nat64, key1: Nat64): Nat64 is
+            return hashWord(unsignedOf(!value), 8, key0, key1);
+        end;
+    end;
+
+    instance Hashable(Index) is
+        generic [R: Region]
+        method hashOf(value: &[Index, R], key0: Nat64, key1: Nat64): Nat64 is
+            case toNat64(!value) of
+                when Some(value as w: Nat64) do
+                    return hashWord(w, 8, key0, key1);
+                when None do
+                    return 0;
+            end case;
+        end;
+    end;
+
+    instance Hashable(String) is
+        generic [R: Region]
+        method hashOf(value: &[String, R], key0: Nat64, key1: Nat64): Nat64 is
+            return sipHash13(key0, key1, asSpan(value));
+        end;
+    end;
+end module body.

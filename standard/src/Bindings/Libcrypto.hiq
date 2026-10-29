@@ -1,0 +1,696 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Binds libcrypto through the declarations of Bindings.C.Libcrypto.  It
+-- hands addresses to C, so it is an unsafe module; Standard.Libcrypto is
+-- the safe module built on it.  What goes in is a span the caller holds,
+-- what comes out is a String of its own; nothing of the library's memory
+-- is handed out.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullPointer,
+    nullCheck,
+    allocateBuffer,
+    load,
+    store,
+    deallocate
+);
+import Standard.String (
+    String,
+    makeString,
+    storeNth
+);
+import Bindings.C.Libcrypto (
+    OPENSSL_VERSION,
+    OpenSSL_version,
+    EVP_CTRL_AEAD_SET_IVLEN,
+    EVP_CTRL_AEAD_GET_TAG,
+    EVP_CTRL_AEAD_SET_TAG,
+    EVP_PKEY_X25519,
+    EVP_PKEY_ED25519,
+    EVP_CIPHER_CTX_new,
+    EVP_CIPHER_CTX_free,
+    EVP_CIPHER_CTX_ctrl,
+    EVP_aes_256_gcm,
+    EVP_chacha20_poly1305,
+    EVP_EncryptInit_ex,
+    EVP_EncryptUpdate,
+    EVP_EncryptFinal_ex,
+    EVP_DecryptInit_ex,
+    EVP_DecryptUpdate,
+    EVP_DecryptFinal_ex,
+    EVP_PKEY_new_raw_private_key,
+    EVP_PKEY_new_raw_public_key,
+    EVP_PKEY_get_raw_public_key,
+    EVP_PKEY_free,
+    EVP_PKEY_CTX_new,
+    EVP_PKEY_CTX_free,
+    EVP_PKEY_derive_init,
+    EVP_PKEY_derive_set_peer,
+    EVP_PKEY_derive,
+    EVP_MD_CTX_new,
+    EVP_MD_CTX_free,
+    EVP_DigestSignInit,
+    EVP_DigestSign,
+    EVP_DigestVerifyInit,
+    EVP_DigestVerify,
+    RAND_bytes,
+    EVP_sha256,
+    EVP_sha384,
+    EVP_sha512,
+    EVP_sha1,
+    EVP_sha3_256,
+    EVP_sha3_512,
+    EVP_Digest,
+    HMAC
+);
+
+module body Bindings.Libcrypto is
+    constant tagSize: Index := 16;
+
+    ---
+    --- Addresses
+    ---
+
+    -- The first byte of a span, never null (an empty span points at an
+    -- empty string).
+    generic [R: Region]
+    function bytesOf(value: Span[Nat8, R]): Address[Nat8] is
+        if spanLength(value) = 0 then
+            return @embed(Address[Nat8], "(hilde_nat8_t*)\"\"");
+        end if;
+        return @embed(Address[Nat8], "(hilde_nat8_t*)($1).data", value);
+    end;
+
+    function isNull(address: Address[Unit]): Bool is
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[Unit]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function int32Of(size: Index): Int32 is
+        case toInt32(size) of
+            when Some(value as v: Int32) do
+                return v;
+            when None do
+                return -1;
+        end case;
+    end;
+
+    function indexOf(value: Int32): Index is
+        case toIndex(value) of
+            when Some(value as v: Index) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The size bytes at address, as a String.
+    function copied(address: Address[Nat8], size: Index): String is
+        var out: String := makeString(size, 0);
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!out, i, @embed(Nat8, "($1)[$2]", address, i));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The address that lies by bytes after the given one.
+    function offset(address: Address[Nat8], by: Index): Address[Nat8] is
+        return @embed(Address[Nat8], "($1 + $2)", address, by);
+    end;
+
+    -- A buffer of count elements.  With no memory the programme aborts: the
+    -- library would write through a null output, or take it as a question
+    -- for the length and answer success.
+    generic [T: Type]
+    function allocated(count: Index): Address[T] is
+        let address: Address[T] := allocateBuffer(count);
+        if @embed(Bool, "(($1) == NULL)", address) then
+            abort("Standard.Libcrypto: out of memory");
+        end if;
+        return address;
+    end;
+
+    -- A buffer of at least one byte, given back with release.
+    function scratch(size: Index): Address[Nat8] is
+        return allocated(size + 1);
+    end;
+
+    function release(address: Address[Nat8]): Unit is
+        @embed(Unit, "hilde_free($1)", address);
+        return nil;
+    end;
+
+    -- A slot for an int the library writes.
+    function intSlot(): Address[Int32] is
+        return allocated(1);
+    end;
+
+    function intIn(slot: Address[Int32]): Int32 is
+        case nullCheck(slot) of
+            when Some(value as pointer: Pointer[Int32]) do
+                return load(pointer);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function sizeSlot(size: Index): Address[Index] is
+        let slot: Address[Index] := allocateBuffer(1);
+        case nullCheck(slot) of
+            when Some(value as pointer: Pointer[Index]) do
+                store(pointer, size);
+            when None do
+                abort("Standard.Libcrypto: out of memory");
+        end case;
+        return slot;
+    end;
+
+    function sizeIn(slot: Address[Index]): Index is
+        case nullCheck(slot) of
+            when Some(value as pointer: Pointer[Index]) do
+                return load(pointer);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function freeSlot(slot: Address[Int32]): Unit is
+        @embed(Unit, "hilde_free($1)", slot);
+        return nil;
+    end;
+
+    function freeSizeSlot(slot: Address[Index]): Unit is
+        @embed(Unit, "hilde_free($1)", slot);
+        return nil;
+    end;
+
+    -- A slot for an unsigned int the library writes, with the value it
+    -- starts with.
+    function natSlot(): Address[Nat32] is
+        return allocated(1);
+    end;
+
+    function natIn(slot: Address[Nat32]): Nat32 is
+        case nullCheck(slot) of
+            when Some(value as pointer: Pointer[Nat32]) do
+                return load(pointer);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function freeNatSlot(slot: Address[Nat32]): Unit is
+        @embed(Unit, "hilde_free($1)", slot);
+        return nil;
+    end;
+
+    -- The first byte of a span as the untyped address a void parameter of
+    -- C takes.
+    generic [R: Region]
+    function voidOf(value: Span[Nat8, R]): Address[Unit] is
+        return @embed(Address[Unit], "(void*)($1)", bytesOf(value));
+    end;
+
+    ---
+    --- Authenticated encryption
+    ---
+
+    -- Seals with cipher, AES-256-GCM or ChaCha20-Poly1305: the ciphertext,
+    -- then the tag.
+    generic [K: Region, N: Region, P: Region, A: Region]
+    function seal(cipher: Address[Unit], key: Span[Nat8, K], nonce: Span[Nat8, N],
+        plaintext: Span[Nat8, P], aad: Span[Nat8, A]): Option[String] is
+        if (spanLength(key) /= 32) or (spanLength(nonce) /= 12) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let context: Address[Unit] := EVP_CIPHER_CTX_new();
+        if isNull(context) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let noEngine: Address[Unit] := nullPointer();
+        let noBytes: Address[Nat8] := nullPointer();
+        let noCipher: Address[Unit] := nullPointer();
+        let noPointer: Address[Unit] := nullPointer();
+        let size: Index := spanLength(plaintext);
+        let out: Address[Nat8] := scratch(size + tagSize);
+        let written: Address[Int32] := intSlot();
+        var ok: Bool := EVP_EncryptInit_ex(context, cipher, noEngine, noBytes, noBytes) = 1;
+        if ok then
+            ok := EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_SET_IVLEN, 12, noPointer) = 1;
+        end if;
+        if ok then
+            ok := EVP_EncryptInit_ex(context, noCipher, noEngine, bytesOf(key), bytesOf(nonce)) = 1;
+        end if;
+        if ok and (spanLength(aad) > 0) then
+            ok := EVP_EncryptUpdate(context, noBytes, written, bytesOf(aad), int32Of(spanLength(aad))) = 1;
+        end if;
+        var total: Index := 0;
+        if ok then
+            ok := EVP_EncryptUpdate(context, out, written, bytesOf(plaintext), int32Of(size)) = 1;
+            total := indexOf(intIn(written));
+        end if;
+        if ok then
+            ok := EVP_EncryptFinal_ex(context, offset(out, total), written) = 1;
+            total := total + indexOf(intIn(written));
+        end if;
+        if ok then
+            let tagAt: Address[Unit] := @embed(Address[Unit], "(void*)$1", offset(out, total));
+            ok := EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_GET_TAG, 16, tagAt) = 1;
+        end if;
+        EVP_CIPHER_CTX_free(context);
+        freeSlot(written);
+        if ok then
+            let sealed: String := copied(out, total + tagSize);
+            release(out);
+            let some: Option[String] := Some(value => sealed);
+            return some;
+        else
+            release(out);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    -- Opens what seal made.  The final call checks the tag, and a failure
+    -- there gives None and nothing of the plaintext.
+    generic [K: Region, N: Region, S: Region, A: Region]
+    function open(cipher: Address[Unit], key: Span[Nat8, K], nonce: Span[Nat8, N],
+        sealed: Span[Nat8, S], aad: Span[Nat8, A]): Option[String] is
+        if ((spanLength(key) /= 32) or (spanLength(nonce) /= 12)) or (spanLength(sealed) < tagSize) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let context: Address[Unit] := EVP_CIPHER_CTX_new();
+        if isNull(context) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let noEngine: Address[Unit] := nullPointer();
+        let noBytes: Address[Nat8] := nullPointer();
+        let noCipher: Address[Unit] := nullPointer();
+        let noPointer: Address[Unit] := nullPointer();
+        let size: Index := spanLength(sealed) - tagSize;
+        let ciphertextAt: Address[Nat8] := bytesOf(sealed);
+        let out: Address[Nat8] := scratch(size);
+        let written: Address[Int32] := intSlot();
+        var ok: Bool := EVP_DecryptInit_ex(context, cipher, noEngine, noBytes, noBytes) = 1;
+        if ok then
+            ok := EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_SET_IVLEN, 12, noPointer) = 1;
+        end if;
+        if ok then
+            ok := EVP_DecryptInit_ex(context, noCipher, noEngine, bytesOf(key), bytesOf(nonce)) = 1;
+        end if;
+        if ok and (spanLength(aad) > 0) then
+            ok := EVP_DecryptUpdate(context, noBytes, written, bytesOf(aad), int32Of(spanLength(aad))) = 1;
+        end if;
+        var total: Index := 0;
+        if ok then
+            ok := EVP_DecryptUpdate(context, out, written, ciphertextAt, int32Of(size)) = 1;
+            total := indexOf(intIn(written));
+        end if;
+        if ok then
+            let tagAt: Address[Unit] := @embed(Address[Unit], "(void*)$1", offset(ciphertextAt, size));
+            ok := EVP_CIPHER_CTX_ctrl(context, EVP_CTRL_AEAD_SET_TAG, 16, tagAt) = 1;
+        end if;
+        if ok then
+            ok := EVP_DecryptFinal_ex(context, offset(out, total), written) = 1;
+            total := total + indexOf(intIn(written));
+        end if;
+        EVP_CIPHER_CTX_free(context);
+        freeSlot(written);
+        if ok then
+            let plain: String := copied(out, total);
+            release(out);
+            let some: Option[String] := Some(value => plain);
+            return some;
+        else
+            release(out);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    generic [K: Region, N: Region, P: Region, A: Region]
+    function sealAes256Gcm(key: Span[Nat8, K], nonce: Span[Nat8, N], plaintext: Span[Nat8, P], aad: Span[Nat8, A]): Option[String] is
+        return seal(EVP_aes_256_gcm(), key, nonce, plaintext, aad);
+    end;
+
+    generic [K: Region, N: Region, S: Region, A: Region]
+    function openAes256Gcm(key: Span[Nat8, K], nonce: Span[Nat8, N], sealed: Span[Nat8, S], aad: Span[Nat8, A]): Option[String] is
+        return open(EVP_aes_256_gcm(), key, nonce, sealed, aad);
+    end;
+
+    generic [K: Region, N: Region, P: Region, A: Region]
+    function sealChaCha20Poly1305(key: Span[Nat8, K], nonce: Span[Nat8, N], plaintext: Span[Nat8, P], aad: Span[Nat8, A]): Option[String] is
+        return seal(EVP_chacha20_poly1305(), key, nonce, plaintext, aad);
+    end;
+
+    generic [K: Region, N: Region, S: Region, A: Region]
+    function openChaCha20Poly1305(key: Span[Nat8, K], nonce: Span[Nat8, N], sealed: Span[Nat8, S], aad: Span[Nat8, A]): Option[String] is
+        return open(EVP_chacha20_poly1305(), key, nonce, sealed, aad);
+    end;
+
+    ---
+    --- Keys
+    ---
+
+    -- The raw public key of a key object, or None.
+    function publicOf(key: Address[Unit]): Option[String] is
+        let out: Address[Nat8] := scratch(32);
+        let size: Address[Index] := sizeSlot(32);
+        let ok: Bool := EVP_PKEY_get_raw_public_key(key, out, size) = 1;
+        let got: Index := sizeIn(size);
+        freeSizeSlot(size);
+        if ok and (got = 32) then
+            let public: String := copied(out, 32);
+            release(out);
+            let some: Option[String] := Some(value => public);
+            return some;
+        else
+            release(out);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    generic [K: Region]
+    function privateKeyOf(kind: Int32, bytes: Span[Nat8, K]): Address[Unit] is
+        let noEngine: Address[Unit] := nullPointer();
+        if spanLength(bytes) /= 32 then
+            let none: Address[Unit] := nullPointer();
+            return none;
+        end if;
+        return EVP_PKEY_new_raw_private_key(kind, noEngine, bytesOf(bytes), 32);
+    end;
+
+    generic [K: Region]
+    function x25519PublicKey(privateKey: Span[Nat8, K]): Option[String] is
+        let key: Address[Unit] := privateKeyOf(EVP_PKEY_X25519, privateKey);
+        if isNull(key) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let public: Option[String] := publicOf(key);
+        EVP_PKEY_free(key);
+        return public;
+    end;
+
+    generic [K: Region, P: Region]
+    function x25519SharedSecret(privateKey: Span[Nat8, K], peerPublicKey: Span[Nat8, P]): Option[String] is
+        let noEngine: Address[Unit] := nullPointer();
+        let mine: Address[Unit] := privateKeyOf(EVP_PKEY_X25519, privateKey);
+        var peer: Address[Unit] := nullPointer();
+        if spanLength(peerPublicKey) = 32 then
+            peer := EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, noEngine, bytesOf(peerPublicKey), 32);
+        end if;
+        var ok: Bool := (not isNull(mine)) and (not isNull(peer));
+        var context: Address[Unit] := nullPointer();
+        if ok then
+            context := EVP_PKEY_CTX_new(mine, noEngine);
+            ok := not isNull(context);
+        end if;
+        if ok then
+            ok := EVP_PKEY_derive_init(context) = 1;
+        end if;
+        if ok then
+            ok := EVP_PKEY_derive_set_peer(context, peer) = 1;
+        end if;
+        let out: Address[Nat8] := scratch(32);
+        let size: Address[Index] := sizeSlot(32);
+        if ok then
+            ok := EVP_PKEY_derive(context, out, size) = 1;
+        end if;
+        let got: Index := sizeIn(size);
+        freeSizeSlot(size);
+        if not isNull(context) then
+            EVP_PKEY_CTX_free(context);
+        end if;
+        if not isNull(peer) then
+            EVP_PKEY_free(peer);
+        end if;
+        if not isNull(mine) then
+            EVP_PKEY_free(mine);
+        end if;
+        if ok and (got = 32) then
+            let secret: String := copied(out, 32);
+            @embed(Unit, "hilde_wipe($1, 32)", out);
+            release(out);
+            let some: Option[String] := Some(value => secret);
+            return some;
+        else
+            release(out);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    generic [S: Region]
+    function ed25519PublicKey(seed: Span[Nat8, S]): Option[String] is
+        let key: Address[Unit] := privateKeyOf(EVP_PKEY_ED25519, seed);
+        if isNull(key) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let public: Option[String] := publicOf(key);
+        EVP_PKEY_free(key);
+        return public;
+    end;
+
+    generic [S: Region, M: Region]
+    function ed25519Sign(seed: Span[Nat8, S], message: Span[Nat8, M]): Option[String] is
+        let key: Address[Unit] := privateKeyOf(EVP_PKEY_ED25519, seed);
+        let context: Address[Unit] := EVP_MD_CTX_new();
+        let noEngine: Address[Unit] := nullPointer();
+        let noDigest: Address[Unit] := nullPointer();
+        let noContext: Address[Address[Unit]] := nullPointer();
+        var ok: Bool := (not isNull(key)) and (not isNull(context));
+        if ok then
+            ok := EVP_DigestSignInit(context, noContext, noDigest, noEngine, key) = 1;
+        end if;
+        let out: Address[Nat8] := scratch(64);
+        let size: Address[Index] := sizeSlot(64);
+        if ok then
+            ok := EVP_DigestSign(context, out, size, bytesOf(message), spanLength(message)) = 1;
+        end if;
+        let got: Index := sizeIn(size);
+        freeSizeSlot(size);
+        if not isNull(context) then
+            EVP_MD_CTX_free(context);
+        end if;
+        if not isNull(key) then
+            EVP_PKEY_free(key);
+        end if;
+        if ok and (got = 64) then
+            let signature: String := copied(out, 64);
+            release(out);
+            let some: Option[String] := Some(value => signature);
+            return some;
+        else
+            release(out);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    generic [P: Region, M: Region, G: Region]
+    function ed25519Verify(publicKey: Span[Nat8, P], message: Span[Nat8, M], signature: Span[Nat8, G]): Bool is
+        if (spanLength(publicKey) /= 32) or (spanLength(signature) /= 64) then
+            return false;
+        end if;
+        let noEngine: Address[Unit] := nullPointer();
+        let noDigest: Address[Unit] := nullPointer();
+        let noContext: Address[Address[Unit]] := nullPointer();
+        let key: Address[Unit] := EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, noEngine, bytesOf(publicKey), 32);
+        let context: Address[Unit] := EVP_MD_CTX_new();
+        var ok: Bool := (not isNull(key)) and (not isNull(context));
+        if ok then
+            ok := EVP_DigestVerifyInit(context, noContext, noDigest, noEngine, key) = 1;
+        end if;
+        if ok then
+            ok := EVP_DigestVerify(context, bytesOf(signature), 64, bytesOf(message), spanLength(message)) = 1;
+        end if;
+        if not isNull(context) then
+            EVP_MD_CTX_free(context);
+        end if;
+        if not isNull(key) then
+            EVP_PKEY_free(key);
+        end if;
+        return ok;
+    end;
+
+    ---
+    --- Random bytes
+    ---
+
+    -- The bytes come from RAND_bytes into a scratch buffer, which is wiped
+    -- once they are copied out: they may be a key.  A count RAND_bytes
+    -- cannot take, one above the largest int, gives None, as does a
+    -- failure of the library.
+    function randomBytes(count: Index): Option[String] is
+        let size: Int32 := int32Of(count);
+        if size < 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let out: Address[Nat8] := scratch(count);
+        let ok: Bool := RAND_bytes(out, size) = 1;
+        if ok then
+            let bytes: String := copied(out, count);
+            @embed(Unit, "hilde_wipe($1, $2)", out, count);
+            release(out);
+            let some: Option[String] := Some(value => bytes);
+            return some;
+        else
+            @embed(Unit, "hilde_wipe($1, $2)", out, count);
+            release(out);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    ---
+    --- Hashes
+    ---
+
+    -- The 32 bytes the library wrote at out, when ok and it said it wrote
+    -- 32; the buffer is wiped and given back either way.
+    function digestOf(ok: Bool, out: Address[Nat8], size: Address[Nat32]): Option[String] is
+        return digestSized(ok, out, size, 32);
+    end;
+
+    -- The want bytes the library wrote at out, when ok and it said it wrote
+    -- want; the buffer is wiped and given back either way.
+    function digestSized(ok: Bool, out: Address[Nat8], size: Address[Nat32], want: Index): Option[String] is
+        let written: Nat32 := natIn(size);
+        freeNatSlot(size);
+        var same: Bool := false;
+        case toNat32(want) of
+            when Some(value as w: Nat32) do
+                same := written = w;
+            when None do
+                skip;
+        end case;
+        if ok and same then
+            let digest: String := copied(out, want);
+            @embed(Unit, "hilde_wipe($1, $2)", out, want);
+            release(out);
+            let some: Option[String] := Some(value => digest);
+            return some;
+        else
+            @embed(Unit, "hilde_wipe($1, $2)", out, want);
+            release(out);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    -- The digest of message under md, a digest of want bytes.
+    generic [M: Region]
+    function digestWith(md: Address[Unit], want: Index, message: Span[Nat8, M]): Option[String] is
+        let out: Address[Nat8] := scratch(want);
+        let size: Address[Nat32] := natSlot();
+        let noEngine: Address[Unit] := nullPointer();
+        let ok: Bool := EVP_Digest(voidOf(message), spanLength(message), out, size, md, noEngine) = 1;
+        return digestSized(ok, out, size, want);
+    end;
+
+    -- The HMAC of message under key with md, a digest of want bytes.
+    generic [K: Region, M: Region]
+    function hmacWith(md: Address[Unit], want: Index, key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        let keySize: Int32 := int32Of(spanLength(key));
+        if keySize < 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let out: Address[Nat8] := scratch(want);
+        let size: Address[Nat32] := natSlot();
+        let result: Address[Nat8] := HMAC(md, voidOf(key), keySize, bytesOf(message), spanLength(message), out, size);
+        let ok: Bool := not isNull(@embed(Address[Unit], "(void*)($1)", result));
+        return digestSized(ok, out, size, want);
+    end;
+
+    generic [M: Region]
+    function sha384(message: Span[Nat8, M]): Option[String] is
+        return digestWith(EVP_sha384(), 48, message);
+    end;
+
+    generic [M: Region]
+    function sha512(message: Span[Nat8, M]): Option[String] is
+        return digestWith(EVP_sha512(), 64, message);
+    end;
+
+    generic [M: Region]
+    function sha3_256(message: Span[Nat8, M]): Option[String] is
+        return digestWith(EVP_sha3_256(), 32, message);
+    end;
+
+    generic [M: Region]
+    function sha3_512(message: Span[Nat8, M]): Option[String] is
+        return digestWith(EVP_sha3_512(), 64, message);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha384(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        return hmacWith(EVP_sha384(), 48, key, message);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha512(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        return hmacWith(EVP_sha512(), 64, key, message);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha3_512(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        return hmacWith(EVP_sha3_512(), 64, key, message);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha1(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        return hmacWith(EVP_sha1(), 20, key, message);
+    end;
+
+    generic [M: Region]
+    function sha256(message: Span[Nat8, M]): Option[String] is
+        let out: Address[Nat8] := scratch(32);
+        let size: Address[Nat32] := natSlot();
+        let noEngine: Address[Unit] := nullPointer();
+        let ok: Bool := EVP_Digest(voidOf(message), spanLength(message), out, size, EVP_sha256(), noEngine) = 1;
+        return digestOf(ok, out, size);
+    end;
+
+    generic [K: Region, M: Region]
+    function hmacSha256(key: Span[Nat8, K], message: Span[Nat8, M]): Option[String] is
+        let keySize: Int32 := int32Of(spanLength(key));
+        if keySize < 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let out: Address[Nat8] := scratch(32);
+        let size: Address[Nat32] := natSlot();
+        let result: Address[Nat8] := HMAC(EVP_sha256(), voidOf(key), keySize, bytesOf(message), spanLength(message), out, size);
+        let ok: Bool := not isNull(@embed(Address[Unit], "(void*)($1)", result));
+        return digestOf(ok, out, size);
+    end;
+
+    function libraryVersion(): Span[Nat8, Static] is
+        let text: Address[Nat8] := OpenSSL_version(OPENSSL_VERSION);
+        return @embed(Span[Nat8, Static], "(($1) == NULL) ? hilde_make_span((void*)\"\", 0) : hilde_make_span((void*)$1, strlen((const char*)$1))", text);
+    end;
+end module body.

@@ -1,0 +1,155 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Tests for Standard.Sandbox that confine nothing: the checks of a policy
+-- and the folding of its paths.  applyPolicy is not called here, since on
+-- OpenBSD and Linux it would confine the rest of the tests; the suite of
+-- test programmes calls it in child processes.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.Sandbox (
+    Policy,
+    makePolicy,
+    allowPromises,
+    allowExecPromises,
+    allowPath,
+    policyValid,
+    policyPathCount,
+    describePaths,
+    foldPolicy,
+    discardPolicy
+);
+
+module body Standard.Sandbox.Test is
+    -- Whether text holds exactly the bytes of expected.
+    generic [R: Region]
+    function sameText(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let want: String := fromLiteral(expected);
+        let size: Index := length(&want);
+        var same: Bool := length(text) = size;
+        if same and (size > 0) then
+            for i from 0 to size - 1 do
+                if nthByte(text, i) /= nthByte(&want, i) then
+                    same := false;
+                end if;
+            end for;
+        end if;
+        destroyString(want);
+        return same;
+    end;
+
+    -- A policy with the path and permissions added.
+    function plus(policy: Policy, path: Span[Nat8, Static], permissions: Span[Nat8, Static]): Policy is
+        let p: String := fromLiteral(path);
+        let q: String := fromLiteral(permissions);
+        let added: Policy := allowPath(policy, asSpan(&p), asSpan(&q));
+        destroyString(p);
+        destroyString(q);
+        return added;
+    end;
+
+    -- Folds the policy down to target and says whether its paths are then
+    -- expected, one per line with their permissions.
+    function foldsTo(policy: Policy, target: Index, expected: Span[Nat8, Static]): Bool is
+        let folded: Policy := foldPolicy(policy, target);
+        let paths: String := describePaths(&folded);
+        let same: Bool := sameText(&paths, expected);
+        destroyString(paths);
+        discardPolicy(folded);
+        return same;
+    end;
+
+    -- execpromises are checked as promises are.
+    function testExecPromisesChecked(): Unit is
+        let good: String := fromLiteral("stdio rpath");
+        let bad: String := fromLiteral("stdio nosuchword");
+        let fine: Policy := allowExecPromises(allowPromises(makePolicy(), asSpan(&good)), asSpan(&good));
+        assertTrue(policyValid(&fine), "known words as execpromises keep the policy valid");
+        discardPolicy(fine);
+        let wrong: Policy := allowExecPromises(makePolicy(), asSpan(&bad));
+        assertTrue(not policyValid(&wrong), "an unknown word in execpromises makes the policy invalid");
+        discardPolicy(wrong);
+        destroyString(good);
+        destroyString(bad);
+        return nil;
+    end;
+
+    -- Paths come back as they were added, and describePaths names them.
+    function testPathsListed(): Unit is
+        let policy: Policy := plus(plus(makePolicy(), "/srv/a", "r"), "/var/log", "rwc");
+        assertTrue(policyPathCount(&policy) = 2, "two paths are counted");
+        let paths: String := describePaths(&policy);
+        assertTrue(sameText(&paths, "/srv/a r\n/var/log rwc\n"), "each path is listed with its permissions");
+        destroyString(paths);
+        discardPolicy(policy);
+        return nil;
+    end;
+
+    -- Siblings with the same permissions become their parent; a sibling
+    -- with other permissions keeps its own entry.
+    function testSiblingsFold(): Unit is
+        let policy: Policy := plus(plus(plus(makePolicy(), "/srv/a", "r"), "/srv/b", "r"), "/srv/c", "rw");
+        assertTrue(foldsTo(policy, 1, "/srv/c rw\n/srv r\n"), "the two read siblings fold, the writable one stays");
+        return nil;
+    end;
+
+    -- A parent the policy already names takes the group into its entry.
+    function testParentEntryAbsorbs(): Unit is
+        let policy: Policy := plus(plus(plus(makePolicy(), "/data", "r"), "/data/x", "r"), "/data/y", "r");
+        assertTrue(foldsTo(policy, 1, "/data r\n"), "the children fold into the parent entry");
+        return nil;
+    end;
+
+    -- A parent that grants more than the group is not folded onto: the
+    -- children would get its wider grant.
+    function testParentGrantingMoreRefused(): Unit is
+        let policy: Policy := plus(plus(plus(makePolicy(), "/data", "rwc"), "/data/x", "r"), "/data/y", "r");
+        assertTrue(foldsTo(policy, 1, "/data rwc\n/data/x r\n/data/y r\n"), "read children stay beside a writable parent");
+        return nil;
+    end;
+
+    -- Nothing is folded onto the root, however it is spelt, and nothing
+    -- relative is folded.
+    function testRootAndRelativeRefused(): Unit is
+        let top: Policy := plus(plus(makePolicy(), "/x", "r"), "/y", "r");
+        assertTrue(foldsTo(top, 1, "/x r\n/y r\n"), "paths under the root stay");
+        let slashes: Policy := plus(plus(makePolicy(), "//x", "r"), "//y", "r");
+        assertTrue(foldsTo(slashes, 1, "//x r\n//y r\n"), "paths under a root of two slashes stay");
+        let relative: Policy := plus(plus(makePolicy(), "a/x", "r"), "a/y", "r");
+        assertTrue(foldsTo(relative, 1, "a/x r\na/y r\n"), "relative paths stay");
+        return nil;
+    end;
+
+    -- Folding goes up level by level, and only as far as needed.
+    function testFoldsOnlyAsFarAsNeeded(): Unit is
+        let deep: Policy := plus(plus(plus(makePolicy(), "/a/b/x", "r"), "/a/b/y", "r"), "/a/c", "r");
+        assertTrue(foldsTo(deep, 1, "/a r\n"), "two folds reach one path");
+        let near: Policy := plus(plus(plus(makePolicy(), "/a/b/x", "r"), "/a/b/y", "r"), "/a/c", "r");
+        assertTrue(foldsTo(near, 2, "/a/c r\n/a/b r\n"), "one fold is enough for two paths");
+        let fits: Policy := plus(plus(plus(makePolicy(), "/a/b/x", "r"), "/a/b/y", "r"), "/a/c", "r");
+        assertTrue(foldsTo(fits, 3, "/a/b/x r\n/a/b/y r\n/a/c r\n"), "a list that fits is left alone");
+        return nil;
+    end;
+
+    -- The largest group folds first.
+    function testLargestGroupFirst(): Unit is
+        let policy: Policy := plus(plus(plus(plus(plus(makePolicy(),
+            "/m/one", "r"), "/n/one", "r"), "/n/two", "r"), "/n/three", "r"), "/m/two", "r");
+        assertTrue(foldsTo(policy, 4, "/m/one r\n/m/two r\n/n r\n"), "the group of three folds before the group of two");
+        return nil;
+    end;
+end module body.

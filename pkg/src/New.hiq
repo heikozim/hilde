@@ -1,0 +1,473 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The templates hold six words between at signs: the module prefix, its
+-- last part, the name in small letters with hyphens as a system package
+-- is named, the author, the year, and the date of a Debian changelog.
+-- fill replaces them.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    replace,
+    startsWith,
+    substring,
+    formatInt
+);
+import Standard.Calendar (
+    Instant,
+    Civil,
+    civilAt,
+    weekday
+);
+import Standard.Semver (
+    makeVersion
+);
+import Pkg.Report (
+    Problem,
+    problemOf
+);
+import Pkg.Manifest (
+    Manifest,
+    isPrefix,
+    makeManifest,
+    readManifest,
+    formatManifest,
+    nameOf,
+    destroyManifest
+);
+import Pkg.Files (
+    readText,
+    writeText,
+    writeScript,
+    isThere,
+    joinPath,
+    makeDirectories
+);
+
+module body Pkg.New is
+    function destroyPlan(plan: NewPlan): Unit is
+        let { name: String, binary: Bool, packaging: Bool, author: String, seconds: Int64 } := plan;
+        destroyString(name);
+        destroyString(author);
+        return nil;
+    end;
+
+    constant licenseText: Span[Nat8, Static] := "Copyright (c) @YEAR@ @AUTHOR@\n\nPermission to use, copy, modify, and distribute this software for any\npurpose with or without fee is hereby granted, provided that the above\ncopyright notice and this permission notice appear in all copies.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES\nWITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF\nMERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR\nANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES\nWHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN\nACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF\nOR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.\n";
+
+    constant changelogText: Span[Nat8, Static] := "@LOWER@ (0.1.0) unstable; urgency=medium\n\n  * First version.\n\n -- @AUTHOR@  @DATE@\n";
+
+    constant readmeText: Span[Nat8, Static] := "# @NAME@\n\nWhat the package is for, in one sentence.\n\n## Use\n\nIn the package that needs it:\n\n    hilde get @NAME@@v0.1.0 --git=<url of this repository>\n\n## Build and test\n\n    hilde test src\n    hilde verify\n    hilde guard src/@LAST@.hih,src/@LAST@.hiq\n";
+
+    constant readmeBinaryText: Span[Nat8, Static] := "# @NAME@\n\nWhat the programme is for, in one sentence.\n\n## Build and test\n\n    hilde compile src/@LAST@.hih,src/@LAST@.hiq --entrypoint=@NAME@:main --output=@LOWER@\n    hilde test src\n    hilde verify\n";
+
+    constant headerText: Span[Nat8, Static] := "--\n-- SPDX-FileCopyrightText: @YEAR@ @AUTHOR@\n-- SPDX-License-Identifier: ISC\n--\n";
+
+    constant interfaceText: Span[Nat8, Static] := "\"\"\"\nWhat @NAME@ is for, in one sentence.\n\n- One guarantee or limit on each line.\n\n    let n: Int64 := double(21);\n\"\"\"\nmodule @NAME@ is\n    \"\"\"\n    Twice the number.\n\n        let n: Int64 := double(21);\n    \"\"\"\n    function double(n: Int64): Int64\n        requires (n > -1000000000) and (n < 1000000000)\n        ensures result = (n * 2);\nend module.\n";
+
+    constant binaryInterfaceText: Span[Nat8, Static] := "\"\"\"\nWhat @NAME@ is for, in one sentence.\n\n- One guarantee or limit on each line.\n\n    let n: Int64 := double(21);\n\"\"\"\nmodule @NAME@ is\n    \"\"\"\n    Twice the number.\n\n        let n: Int64 := double(21);\n    \"\"\"\n    function double(n: Int64): Int64\n        requires (n > -1000000000) and (n < 1000000000)\n        ensures result = (n * 2);\n\n    \"\"\"\n    The programme: it prints twice 21.\n    No contract: the exit code is the work of the programme.\n    \"\"\"\n    function main(): ExitCode;\nend module.\n";
+
+    constant bodyText: Span[Nat8, Static] := "module body @NAME@ is\n    function double(n: Int64): Int64 is\n        return n * 2;\n    end;\nend module body.\n";
+
+    constant binaryBodyText: Span[Nat8, Static] := "module body @NAME@ is\n    function double(n: Int64): Int64 is\n        return n * 2;\n    end;\n\n    function main(): ExitCode is\n        printLn(double(21));\n        return ExitSuccess();\n    end;\nend module body.\n";
+
+    constant testText: Span[Nat8, Static] := "import Standard.Testing (\n    assertTrue\n);\nimport @NAME@ (\n    double\n);\n\nmodule body @NAME@.Test is\n    function testDouble(): Unit is\n        assertTrue(double(21) = 42, \"twice 21 is 42\");\n        return nil;\n    end;\nend module body.\n";
+
+    constant moduleInterfaceText: Span[Nat8, Static] := "\"\"\"\nWhat @NAME@ is for, in one sentence.\n\n- One guarantee or limit on each line.\n\n    let n: Int64 := triple(14);\n\"\"\"\nmodule @NAME@ is\n    \"\"\"\n    Three times the number.\n    \"\"\"\n    function triple(n: Int64): Int64\n        requires (n > -1000000000) and (n < 1000000000)\n        ensures result = (n * 3);\nend module.\n";
+
+    constant moduleBodyText: Span[Nat8, Static] := "module body @NAME@ is\n    function triple(n: Int64): Int64 is\n        return n * 3;\n    end;\nend module body.\n";
+
+    constant moduleTestText: Span[Nat8, Static] := "import Standard.Testing (\n    assertTrue\n);\nimport @NAME@ (\n    triple\n);\n\nmodule body @NAME@.Test is\n    function testTriple(): Unit is\n        assertTrue(triple(14) = 42, \"three times 14 is 42\");\n        return nil;\n    end;\nend module body.\n";
+
+    constant sourcePackageText: Span[Nat8, Static] := "#!/bin/sh\n#\n# Makes @LOWER@-VERSION.tar.gz of the files git tracks at HEAD.\n#\n#     packaging/make_source_package\nset -e\nversion=$(sed -n 's/^version = \"v\\(.*\\)\"$/\\1/p' hilde.toml | head -n 1)\n[ -n \"$version\" ] || { echo \"ABORT: no version in hilde.toml\" >&2; exit 9; }\ngit archive --format=tar.gz --prefix=\"@LOWER@-$version/\" -o \"@LOWER@-$version.tar.gz\" HEAD\necho \"@LOWER@-$version.tar.gz\"\n";
+
+    constant debianPackageText: Span[Nat8, Static] := "#!/bin/sh\n#\n# Makes a Debian package of what hilde install puts into a staging tree;\n# dpkg-deb wraps it, nothing is built as root.\n#\n#     packaging/make_debian_package\nset -e\nversion=$(sed -n 's/^version = \"v\\(.*\\)\"$/\\1/p' hilde.toml | head -n 1)\n[ -n \"$version\" ] || { echo \"ABORT: no version in hilde.toml\" >&2; exit 9; }\narch=$(dpkg --print-architecture)\nstage=build_debian_package/@LOWER@_${version}_$arch\nrm -rf build_debian_package\nhilde install --prefix=/usr --destdir=\"$stage\"\nmkdir -p \"$stage/DEBIAN\"\nprintf 'Package: @LOWER@\\nVersion: %s\\nArchitecture: %s\\nMaintainer: @AUTHOR@\\nDescription: @NAME@\\n' \"$version\" \"$arch\" > \"$stage/DEBIAN/control\"\ndpkg-deb --root-owner-group --build \"$stage\"\n";
+
+    constant openbsdPackageText: Span[Nat8, Static] := "#!/bin/sh\n#\n# Makes an OpenBSD package of what hilde install puts into a staging tree;\n# pkg_create(1) of the base system wraps it, nothing is built as root.\n#\n#     packaging/make_openbsd_package\nset -e\nversion=$(sed -n 's/^version = \"v\\(.*\\)\"$/\\1/p' hilde.toml | head -n 1)\n[ -n \"$version\" ] || { echo \"ABORT: no version in hilde.toml\" >&2; exit 9; }\nwork=build_openbsd_package\nrm -rf \"$work\"\nhilde install --prefix=/usr/local --destdir=\"$work/fake\"\nprintf '@name @LOWER@-%s\\n@cwd /usr/local\\n' \"$version\" > \"$work/PLIST\"\n( cd \"$work/fake/usr/local\" && find . -type f | sed 's|^\\./||' | sort ) >> \"$work/PLIST\"\necho '@NAME@' > \"$work/DESCR\"\npkg_create -A \"$(uname -m)\" -B \"$work/fake\" -d \"$work/DESCR\" -D COMMENT='@NAME@' -D FULLPKGPATH=local/@LOWER@ -f \"$work/PLIST\" -p /usr/local \"$work/@LOWER@-$version.tgz\"\necho \"$work/@LOWER@-$version.tgz\"\n";
+
+    constant freebsdPackageText: Span[Nat8, Static] := "#!/bin/sh\n#\n# Makes a FreeBSD package of what hilde install puts into a staging tree;\n# pkg create wraps it, nothing is built as root.\n#\n#     packaging/make_freebsd_package\nset -e\nversion=$(sed -n 's/^version = \"v\\(.*\\)\"$/\\1/p' hilde.toml | head -n 1)\n[ -n \"$version\" ] || { echo \"ABORT: no version in hilde.toml\" >&2; exit 9; }\nwork=build_freebsd_package\nrm -rf \"$work\"\nhilde install --prefix=/usr/local --destdir=\"$work/stage\"\nprintf 'name: @LOWER@\\nversion: \"%s\"\\norigin: local/@LOWER@\\ncomment: \"@NAME@\"\\ndesc: \"@NAME@\"\\nmaintainer: \"@AUTHOR@\"\\nwww: \"\"\\nprefix: /usr/local\\n' \"$version\" > \"$work/+MANIFEST\"\n( cd \"$work/stage\" && find . -type f | sed 's|^\\.||' | sort ) > \"$work/plist\"\npkg create -M \"$work/+MANIFEST\" -p \"$work/plist\" -r \"$work/stage\" -o \"$work\"\nls \"$work\"/*.pkg\n";
+
+    -- The name in small letters with hyphens for dots, as a system package
+    -- is named.
+    generic [N: Region]
+    function lowerOf(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(name) do
+            let byte: Nat8 := name[i];
+            if byte = '.' then
+                writeByte(&!out, '-');
+            else if (byte >= 'A') and (byte <= 'Z') then
+                writeByte(&!out, byte + 32);
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The part after the last dot.
+    generic [N: Region]
+    function lastOf(name: Span[Nat8, N]): Span[Nat8, N] is
+        var at: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(name) do
+            if name[i] = '.' then
+                at := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return substring(name, at, spanLength(name));
+    end;
+
+    generic [B: Region]
+    function twoDigits(out: &![StringBuilder, B], n: Int64): Unit is
+        if n < 10 then
+            writeByte(&~out, '0');
+        end if;
+        let text: String := formatInt(n);
+        writeString(&~out, asSpan(&text));
+        destroyString(text);
+        return nil;
+    end;
+
+    function natNumber(n: Nat8): Int64 is
+        case toInt64(n) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Pkg.New: a Nat8 did not fit an Int64");
+        end case;
+    end;
+
+    function intNumber(n: Int32): Int64 is
+        case toInt64(n) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Pkg.New: an Int32 did not fit an Int64");
+        end case;
+    end;
+
+    -- The date of a Debian changelog, as RFC 5322 writes it in UTC:
+    -- Sun, 25 Oct 2026 02:30:00 +0000.
+    function debianDate(civil: Civil): String is
+        let days: Span[Nat8, Static] := "MonTueWedThuFriSatSun";
+        let months: Span[Nat8, Static] := "JanFebMarAprMayJunJulAugSepOctNovDec";
+        var out: StringBuilder := makeStringBuilder();
+        case toIndex(weekday(civil)) of
+            when Some(value as wd: Index) do
+                if (wd >= 1) and (wd <= 7) then
+                    writeString(&!out, substring(days, (wd - 1) * 3, wd * 3));
+                end if;
+            when None do
+                skip;
+        end case;
+        writeString(&!out, ", ");
+        twoDigits(&!out, natNumber(civil.day));
+        writeByte(&!out, ' ');
+        case toIndex(civil.month) of
+            when Some(value as m: Index) do
+                if (m >= 1) and (m <= 12) then
+                    writeString(&!out, substring(months, (m - 1) * 3, m * 3));
+                end if;
+            when None do
+                skip;
+        end case;
+        writeByte(&!out, ' ');
+        let year: String := formatInt(intNumber(civil.year));
+        writeString(&!out, asSpan(&year));
+        destroyString(year);
+        writeByte(&!out, ' ');
+        twoDigits(&!out, natNumber(civil.hour));
+        writeByte(&!out, ':');
+        twoDigits(&!out, natNumber(civil.minute));
+        writeByte(&!out, ':');
+        twoDigits(&!out, natNumber(civil.second));
+        writeString(&!out, " +0000");
+        return finalize(out);
+    end;
+
+    function civilOf(seconds: Int64): Civil is
+        case civilAt(Instant(seconds => seconds, nanos => 0), 0) of
+            when Some(value as civil: Civil) do
+                return civil;
+            when None do
+                case civilAt(Instant(seconds => 0, nanos => 0), 0) of
+                    when Some(value as epoch: Civil) do
+                        return epoch;
+                    when None do
+                        abort("Pkg.New: the epoch has no date");
+                end case;
+        end case;
+    end;
+
+    -- The template with every word of the module's comment replaced.
+    generic [P: Region, T: Region]
+    function fill(plan: &[NewPlan, P], template: Span[Nat8, T]): String is
+        let name: Span[Nat8, P] := asSpan(&(plan->name));
+        let civil: Civil := civilOf(plan->seconds);
+        let lower: String := lowerOf(name);
+        let year: String := formatInt(intNumber(civil.year));
+        let date: String := debianDate(civil);
+        let a: String := replace(template, "@NAME@", name);
+        let b: String := replace(asSpan(&a), "@LAST@", lastOf(name));
+        destroyString(a);
+        let c: String := replace(asSpan(&b), "@LOWER@", asSpan(&lower));
+        destroyString(b);
+        let d: String := replace(asSpan(&c), "@AUTHOR@", asSpan(&(plan->author)));
+        destroyString(c);
+        let e: String := replace(asSpan(&d), "@YEAR@", asSpan(&year));
+        destroyString(d);
+        let f: String := replace(asSpan(&e), "@DATE@", asSpan(&date));
+        destroyString(e);
+        destroyString(lower);
+        destroyString(year);
+        destroyString(date);
+        return f;
+    end;
+
+    -- A source: the SPDX header and the template.
+    generic [P: Region, T: Region]
+    function source(plan: &[NewPlan, P], template: Span[Nat8, T]): String is
+        let head: String := fill(plan, headerText);
+        let rest: String := fill(plan, template);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&head));
+        writeString(&!out, asSpan(&rest));
+        destroyString(head);
+        destroyString(rest);
+        return finalize(out);
+    end;
+
+    generic [D: Region]
+    function writeProblem(path: Span[Nat8, D]): Problem is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "a file cannot be written: ");
+        writeString(&!out, path);
+        return problemOf(1519, finalize(out), fromLiteral("check that the directory may be written"));
+    end;
+
+    -- Writes the text to directory/file; false when it could not.
+    generic [D: Region]
+    function put(directory: Span[Nat8, D], file: Span[Nat8, Static], text: String, script: Bool): Bool is
+        let path: String := joinPath(directory, file);
+        var good: Bool := false;
+        if script then
+            good := writeScript(asSpan(&path), asSpan(&text));
+        else
+            good := writeText(asSpan(&path), asSpan(&text));
+        end if;
+        destroyString(path);
+        destroyString(text);
+        return good;
+    end;
+
+    generic [P: Region, D: Region]
+    function newPackage(plan: &[NewPlan, P], parent: Span[Nat8, D]): Either[Problem, Index] is
+        let name: Span[Nat8, P] := asSpan(&(plan->name));
+        if not isPrefix(name) then
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, name);
+            writeString(&!out, " is not a module prefix");
+            return Left(left => problemOf(1505, finalize(out), fromLiteral("a package is named by its module prefix, such as Acme.Json")));
+        end if;
+        let dir: String := joinPath(parent, name);
+        if isThere(asSpan(&dir)) then
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, "the directory is there already: ");
+            writeString(&!out, asSpan(&dir));
+            destroyString(dir);
+            return Left(left => problemOf(1521, finalize(out), fromLiteral("choose another name, or remove the directory")));
+        end if;
+        let src: String := joinPath(asSpan(&dir), "src");
+        if not makeDirectories(asSpan(&src)) then
+            let p: Problem := writeProblem(asSpan(&src));
+            destroyString(src);
+            destroyString(dir);
+            return Left(left => p);
+        end if;
+        let manifest: Manifest := makeManifest(name, makeVersion(0, 1, 0));
+        let toml: String := formatManifest(&manifest);
+        destroyManifest(manifest);
+        var written: Index := 0;
+        var good: Bool := put(asSpan(&dir), "hilde.toml", toml, false);
+        good := good and put(asSpan(&dir), "hilde.sum", fromLiteral(""), false);
+        good := good and put(asSpan(&dir), "CHANGELOG", fill(plan, changelogText), false);
+        good := good and put(asSpan(&dir), "LICENSE", fill(plan, licenseText), false);
+        good := good and put(asSpan(&dir), ".gitignore", fromLiteral(".hilde-cache/\ndist/\n"), false);
+        if plan->binary then
+            good := good and put(asSpan(&dir), "README.md", fill(plan, readmeBinaryText), false);
+        else
+            good := good and put(asSpan(&dir), "README.md", fill(plan, readmeText), false);
+        end if;
+        written := 6;
+        let last: Span[Nat8, P] := lastOf(name);
+        good := good and putSource(plan, asSpan(&src), last, ".hih", interfaceText, binaryInterfaceText);
+        good := good and putSource(plan, asSpan(&src), last, ".hiq", bodyText, binaryBodyText);
+        good := good and putSource(plan, asSpan(&src), last, ".test.hiq", testText, testText);
+        written := written + 3;
+        if plan->packaging then
+            let pack: String := joinPath(asSpan(&dir), "packaging");
+            good := good and makeDirectories(asSpan(&pack));
+            good := good and put(asSpan(&pack), "make_source_package", fill(plan, sourcePackageText), true);
+            good := good and put(asSpan(&pack), "make_debian_package", fill(plan, debianPackageText), true);
+            good := good and put(asSpan(&pack), "make_openbsd_package", fill(plan, openbsdPackageText), true);
+            good := good and put(asSpan(&pack), "make_freebsd_package", fill(plan, freebsdPackageText), true);
+            destroyString(pack);
+            written := written + 4;
+        end if;
+        destroyString(src);
+        if not good then
+            let p: Problem := writeProblem(asSpan(&dir));
+            destroyString(dir);
+            return Left(left => p);
+        end if;
+        destroyString(dir);
+        return Right(right => written);
+    end;
+
+    -- One source of the package: src/Last and the suffix.
+    generic [P: Region, S: Region, L: Region]
+    function putSource(plan: &[NewPlan, P], src: Span[Nat8, S], last: Span[Nat8, L], suffix: Span[Nat8, Static], library: Span[Nat8, Static], binary: Span[Nat8, Static]): Bool is
+        var file: StringBuilder := makeStringBuilder();
+        writeString(&!file, last);
+        writeString(&!file, suffix);
+        let fileName: String := finalize(file);
+        let path: String := joinPath(src, asSpan(&fileName));
+        destroyString(fileName);
+        var text: String := source(plan, library);
+        if plan->binary then
+            destroyString(text);
+            text := source(plan, binary);
+        end if;
+        let good: Bool := writeText(asSpan(&path), asSpan(&text));
+        destroyString(text);
+        destroyString(path);
+        return good;
+    end;
+
+    generic [P: Region, R: Region]
+    function newModule(plan: &[NewPlan, P], root: Span[Nat8, R]): Either[Problem, Index] is
+        let name: Span[Nat8, P] := asSpan(&(plan->name));
+        let tomlPath: String := joinPath(root, "hilde.toml");
+        let text: Option[String] := readText(asSpan(&tomlPath));
+        destroyString(tomlPath);
+        case text of
+            when Some(value as toml: String) do
+                let read: Either[Problem, Manifest] := readManifest(asSpan(&toml));
+                destroyString(toml);
+                case read of
+                    when Right(right as manifest: Manifest) do
+                        let result: Either[Problem, Index] := moduleIn(plan, root, &manifest);
+                        destroyManifest(manifest);
+                        return result;
+                    when Left(left as p: Problem) do
+                        return Left(left => p);
+                end case;
+            when None do
+                return Left(left => problemOf(1501, fromLiteral("no hilde.toml here, so no package to add a module to"), fromLiteral("run hilde new module in the directory of the package")));
+        end case;
+    end;
+
+    generic [P: Region, R: Region, M: Region]
+    function moduleIn(plan: &[NewPlan, P], root: Span[Nat8, R], manifest: &[Manifest, M]): Either[Problem, Index] is
+        let name: Span[Nat8, P] := asSpan(&(plan->name));
+        let package: Span[Nat8, M] := nameOf(manifest);
+        let size: Index := spanLength(package);
+        if ((not isPrefix(name)) or (spanLength(name) <= (size + 1))) or ((not startsWith(name, package)) or (name[size] /= '.')) then
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, name);
+            writeString(&!out, " is not a module of the package ");
+            writeString(&!out, package);
+            return Left(left => problemOf(1505, finalize(out), fromLiteral("name the module by the prefix of the package, a dot and the rest, such as Acme.Json.Parse")));
+        end if;
+        -- The parts after the package prefix, as directories and a file.
+        var path: StringBuilder := makeStringBuilder();
+        writeString(&!path, root);
+        writeString(&!path, "/src/");
+        var i: Index := size + 1;
+        while i < spanLength(name) do
+            if name[i] = '.' then
+                writeByte(&!path, '/');
+            else
+                writeByte(&!path, name[i]);
+            end if;
+            i := i + 1;
+        end while;
+        let base: String := finalize(path);
+        let hih: String := joinNoSlash(asSpan(&base), ".hih");
+        if isThere(asSpan(&hih)) then
+            var out: StringBuilder := makeStringBuilder();
+            writeString(&!out, "the module file is there already: ");
+            writeString(&!out, asSpan(&hih));
+            destroyString(hih);
+            destroyString(base);
+            return Left(left => problemOf(1521, finalize(out), fromLiteral("choose another name")));
+        end if;
+        destroyString(hih);
+        let dirEnd: Index := lastSlash(asSpan(&base));
+        let dir: String := fromSpan(substring(asSpan(&base), 0, dirEnd));
+        var good: Bool := makeDirectories(asSpan(&dir));
+        destroyString(dir);
+        good := good and putModuleFile(plan, asSpan(&base), ".hih", moduleInterfaceText);
+        good := good and putModuleFile(plan, asSpan(&base), ".hiq", moduleBodyText);
+        good := good and putModuleFile(plan, asSpan(&base), ".test.hiq", moduleTestText);
+        if not good then
+            let p: Problem := writeProblem(asSpan(&base));
+            destroyString(base);
+            return Left(left => p);
+        end if;
+        destroyString(base);
+        return Right(right => 3);
+    end;
+
+    generic [B: Region]
+    function lastSlash(path: Span[Nat8, B]): Index is
+        var at: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(path) do
+            if path[i] = '/' then
+                at := i;
+            end if;
+            i := i + 1;
+        end while;
+        return at;
+    end;
+
+    generic [B: Region]
+    function joinNoSlash(base: Span[Nat8, B], suffix: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, base);
+        writeString(&!out, suffix);
+        return finalize(out);
+    end;
+
+    generic [P: Region, B: Region]
+    function putModuleFile(plan: &[NewPlan, P], base: Span[Nat8, B], suffix: Span[Nat8, Static], template: Span[Nat8, Static]): Bool is
+        let path: String := joinNoSlash(base, suffix);
+        let text: String := source(plan, template);
+        let good: Bool := writeText(asSpan(&path), asSpan(&text));
+        destroyString(text);
+        destroyString(path);
+        return good;
+    end;
+end module body.

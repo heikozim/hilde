@@ -1,0 +1,105 @@
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    Sender,
+    Receiver,
+    Channel,
+    openChannel,
+    send,
+    closeSender,
+    closeReceiver,
+    Polled,
+    tryReceive
+);
+
+module body Test is
+    function now(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as t: Nat64) do
+                return t;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Sends 42 and closes.
+    function answer(sender: Sender[Int32]): Unit is
+        var out: Sender[Int32] := sender;
+        let value: Int32 := 42;
+        case send(&!out, value) of
+            when Some(value as back: Int32) do
+                printLn(back);
+            when None do
+                skip;
+        end case;
+        closeSender(out);
+        return nil;
+    end;
+
+    -- main asks the channel in a loop that never waits: on one worker the
+    -- task gets to run only when main is made to let it.  The loop gives
+    -- up after five seconds, so that a runtime without preemption fails
+    -- instead of hanging.
+    generic [R: Region]
+    function spin(scope: &![Scope, R]): Unit is
+        let one: Index := 1;
+        let made: Option[Channel[Int32]] := openChannel(one);
+        case made of
+            when Some(value as ends: Channel[Int32]) do
+                let { sender: Sender[Int32], receiver: Receiver[Int32] } := ends;
+                var input: Receiver[Int32] := receiver;
+                let work: Fn[Sender[Int32], Unit] := answer;
+                case spawn(&~scope, work, sender) of
+                    when Right(right as t: Task[Unit]) do
+                        let limit: Nat64 := 5000000000;
+                        let start: Nat64 := now();
+                        var done: Bool := false;
+                        var asked: Nat64 := 0;
+                        while (not done) and ((now() - start) < limit) do
+                            asked := asked + 1;
+                            case tryReceive(&!input) of
+                                when Ready(value as v: Int32) do
+                                    print("ready ");
+                                    printLn(v);
+                                    done := true;
+                                when Empty do
+                                    skip;
+                                when Closed do
+                                    printLn("closed");
+                                    done := true;
+                            end case;
+                        end while;
+                        if not done then
+                            printLn("the task never ran");
+                        end if;
+                        join(t);
+                    when Left(left as unused: Sender[Int32]) do
+                        closeSender(unused);
+                        printLn(-2);
+                end case;
+                closeReceiver(input);
+            when None do
+                printLn(-1);
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                spin(&!scope);
+                closeScope(scope);
+            when None do
+                printLn(-2);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

@@ -1,0 +1,175 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFile
+);
+import Standard.FcgiServer (
+    isHeaderBlock
+);
+import Standard.Htmx (
+    requestVariable,
+    isHtmxRequest,
+    isEventName,
+    redirectHeader,
+    triggerHeader,
+    varyHeader,
+    htmlResponse,
+    scriptLimit,
+    scriptResponse
+);
+
+module body Standard.Htmx.Test is
+    function testRequestVariable(): Unit is
+        assertTrue(equal(requestVariable(), "HTTP_HX_REQUEST"), "the CGI name of HX-Request");
+        return nil;
+    end;
+
+    -- htmx sends the four bytes true; every other value is no htmx request.
+    function testIsHtmxRequest(): Unit is
+        assertTrue(isHtmxRequest("true"), "true");
+        assertFalse(isHtmxRequest(""), "no header");
+        assertFalse(isHtmxRequest("True"), "True");
+        assertFalse(isHtmxRequest("TRUE"), "TRUE");
+        assertFalse(isHtmxRequest("1"), "1");
+        assertFalse(isHtmxRequest("true "), "true with a space");
+        assertFalse(isHtmxRequest(" true"), "a space before true");
+        assertFalse(isHtmxRequest("tru"), "three bytes");
+        assertFalse(isHtmxRequest("false"), "false");
+        return nil;
+    end;
+
+    function testIsEventName(): Unit is
+        assertTrue(isEventName("item-saved"), "letters and a dash");
+        assertTrue(isEventName("cart:updated.v2_x"), "colon, dot, underscore, digit");
+        assertTrue(isEventName("A"), "one byte");
+        assertFalse(isEventName(""), "empty");
+        assertFalse(isEventName("a b"), "a space");
+        assertFalse(isEventName("a,b"), "a list");
+        assertFalse(isEventName("{\"a\":1}"), "JSON");
+        assertFalse(isEventName("a\r\nSet-Cookie: x=1"), "a line end");
+        -- 128 bytes are allowed, 129 are not.
+        let longest: Span[Nat8, Static] := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assertTrue(spanLength(longest) = 128, "the probe has 128 bytes");
+        assertTrue(isEventName(longest), "128 bytes");
+        let over: Span[Nat8, Static] := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assertTrue(spanLength(over) = 129, "the probe has 129 bytes");
+        assertFalse(isEventName(over), "129 bytes");
+        return nil;
+    end;
+
+    function testHeaders(): Unit is
+        let redirect: String := redirectHeader("/orders/7");
+        assertTrue(equal(asSpan(&redirect), "HX-Redirect: /orders/7\r\n"), "HX-Redirect");
+        assertTrue(isHeaderBlock(asSpan(&redirect)), "HX-Redirect is a header block");
+        destroyString(redirect);
+        let trigger: String := triggerHeader("item-saved");
+        assertTrue(equal(asSpan(&trigger), "HX-Trigger: item-saved\r\n"), "HX-Trigger");
+        assertTrue(isHeaderBlock(asSpan(&trigger)), "HX-Trigger is a header block");
+        destroyString(trigger);
+        assertTrue(equal(varyHeader(), "Vary: HX-Request\r\n"), "Vary");
+        return nil;
+    end;
+
+    function testHtmlResponse(): Unit is
+        let bare: String := htmlResponse(200, "", "<p>hi</p>");
+        assertTrue(equal(asSpan(&bare), "Status: 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nVary: HX-Request\r\n\r\n<p>hi</p>"), "no further headers");
+        destroyString(bare);
+        let trigger: String := triggerHeader("item-saved");
+        let withTrigger: String := htmlResponse(201, asSpan(&trigger), "<li>tea</li>");
+        assertTrue(equal(asSpan(&withTrigger), "Status: 201 Created\r\nContent-Type: text/html; charset=utf-8\r\nVary: HX-Request\r\nHX-Trigger: item-saved\r\n\r\n<li>tea</li>"), "with HX-Trigger");
+        destroyString(withTrigger);
+        destroyString(trigger);
+        return nil;
+    end;
+
+    function putFile(path: Span[Nat8, Static], text: Span[Nat8, Static]): Bool is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- A file of 1024 times piece, which has 1024 bytes, and then extra.
+    function putMebibyte(path: Span[Nat8, Static], extra: Span[Nat8, Static]): Bool is
+        let piece: Span[Nat8, Static] := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        if spanLength(piece) /= 1024 then
+            return false;
+        end if;
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var good: Bool := true;
+                var i: Index := 0;
+                while i < 1024 do
+                    if not writeAll(&!file, piece) then
+                        good := false;
+                    end if;
+                    i := i + 1;
+                end while;
+                if not writeAll(&!file, extra) then
+                    good := false;
+                end if;
+                let closed: Bool := closeFile(file);
+                return good and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- scriptLimit bytes are served, one more is refused with 500.
+    function testScriptLimit(): Unit is
+        let path: Span[Nat8, Static] := "htmx-test-limit.js";
+        assertTrue(putMebibyte(path, ""), "a file of 1048576 bytes was written");
+        let largest: String := scriptResponse(path);
+        assertTrue(length(&largest) > scriptLimit(), "the largest script is served");
+        destroyString(largest);
+        assertTrue(removeFile(path), "the file was removed");
+        assertTrue(putMebibyte(path, "x"), "a file of 1048577 bytes was written");
+        let over: String := scriptResponse(path);
+        assertTrue(equal(asSpan(&over), "Status: 500 Internal Server Error\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"), "one byte over the limit");
+        destroyString(over);
+        assertTrue(removeFile(path), "the file was removed again");
+        return nil;
+    end;
+
+    function testScriptResponse(): Unit is
+        assertTrue(scriptLimit() = 1048576, "the limit");
+        let path: Span[Nat8, Static] := "htmx-test-script.js";
+        assertTrue(putFile(path, "console.log(1);\n"), "the script was written");
+        let served: String := scriptResponse(path);
+        assertTrue(equal(asSpan(&served), "Status: 200 OK\r\nContent-Type: text/javascript; charset=utf-8\r\nCache-Control: public, max-age=86400\r\n\r\nconsole.log(1);\n"), "the script served");
+        destroyString(served);
+        assertTrue(removeFile(path), "the script was removed");
+        let missing: String := scriptResponse("htmx-test-no-such-file.js");
+        assertTrue(equal(asSpan(&missing), "Status: 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"), "a missing file");
+        destroyString(missing);
+        return nil;
+    end;
+end module body.

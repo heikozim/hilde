@@ -1,0 +1,269 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack
+);
+import Standard.Sqlite (
+    Connection,
+    Writing,
+    SqlError,
+    Cursor,
+    noValues,
+    withInt64,
+    withText,
+    withBlob,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish
+);
+import Standard.Users (
+    UserError,
+    StorageFailed,
+    StoredUser,
+    UserStore,
+    destroyUserNames
+);
+
+module body Standard.SqliteUsers is
+    record SqliteUsers: Linear is
+        db: Connection[Writing];
+    end;
+
+    -- One statement that changes nothing the caller reads back: Right of
+    -- nil, or StorageFailed.
+    generic [R: Region]
+    function run(db: &![Connection[Writing], R], sql: Span[Nat8, Static]): Option[SqlError] is
+        case execute(&~db, sql, noValues()) of
+            when Right(right as changed: Nat64) do
+                let none: Option[SqlError] := None();
+                return none;
+            when Left(left as error: SqlError) do
+                let some: Option[SqlError] := Some(value => error);
+                return some;
+        end case;
+    end;
+
+    function openSqliteUsers(db: Connection[Writing]): Either[SqliteUsersFailed, SqliteUsers] is
+        var conn: Connection[Writing] := db;
+        let users: Option[SqlError] := run(&!conn, "CREATE TABLE IF NOT EXISTS hilde_users (name TEXT PRIMARY KEY NOT NULL, hash TEXT NOT NULL, locked INTEGER NOT NULL) STRICT");
+        case users of
+            when Some(value as error: SqlError) do
+                let failed: Either[SqliteUsersFailed, SqliteUsers] := Left(left => SqliteUsersFailed(db => conn, error => StorageFailed()));
+                return failed;
+            when None do
+                skip;
+        end case;
+        let failures: Option[SqlError] := run(&!conn, "CREATE TABLE IF NOT EXISTS hilde_user_failures (client BLOB NOT NULL, at INTEGER NOT NULL) STRICT");
+        case failures of
+            when Some(value as error: SqlError) do
+                let failed: Either[SqliteUsersFailed, SqliteUsers] := Left(left => SqliteUsersFailed(db => conn, error => StorageFailed()));
+                return failed;
+            when None do
+                skip;
+        end case;
+        let index: Option[SqlError] := run(&!conn, "CREATE INDEX IF NOT EXISTS hilde_user_failures_client ON hilde_user_failures (client, at)");
+        case index of
+            when Some(value as error: SqlError) do
+                let failed: Either[SqliteUsersFailed, SqliteUsers] := Left(left => SqliteUsersFailed(db => conn, error => StorageFailed()));
+                return failed;
+            when None do
+                skip;
+        end case;
+        let opened: Either[SqliteUsersFailed, SqliteUsers] := Right(right => SqliteUsers(db => conn));
+        return opened;
+    end;
+
+    function closeSqliteUsers(users: SqliteUsers): Connection[Writing] is
+        let { db: Connection[Writing] } := users;
+        return db;
+    end;
+
+    -- The rows a statement changed, as Right of whether there was one.
+    function changedOne(result: Either[SqlError, Nat64]): Either[UserError, Bool] is
+        case result of
+            when Right(right as changed: Nat64) do
+                let done: Either[UserError, Bool] := Right(right => changed > 0);
+                return done;
+            when Left(left as error: SqlError) do
+                let failed: Either[UserError, Bool] := Left(left => StorageFailed());
+                return failed;
+        end case;
+    end;
+
+    function changedAny(result: Either[SqlError, Nat64]): Either[UserError, Unit] is
+        case result of
+            when Right(right as changed: Nat64) do
+                let done: Either[UserError, Unit] := Right(right => nil);
+                return done;
+            when Left(left as error: SqlError) do
+                let failed: Either[UserError, Unit] := Left(left => StorageFailed());
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, N: Region]
+    function sqlReadUser(db: &![Connection[Writing], R], name: Span[Nat8, N]): Either[UserError, Option[StoredUser]] is
+        var cursor: Cursor := start(&~db, "SELECT hash, locked FROM hilde_users WHERE name = ?", withText(noValues(), name));
+        if advance(&!cursor) then
+            let hash: String := fromSpan(columnText(&cursor, 0));
+            let locked: Bool := columnInt64(&cursor, 1) /= 0;
+            case finish(&~db, cursor) of
+                when Some(value as error: SqlError) do
+                    destroyString(hash);
+                    let failed: Either[UserError, Option[StoredUser]] := Left(left => StorageFailed());
+                    return failed;
+                when None do
+                    let some: Option[StoredUser] := Some(value => StoredUser(hash => hash, locked => locked));
+                    let found: Either[UserError, Option[StoredUser]] := Right(right => some);
+                    return found;
+            end case;
+        else
+            case finish(&~db, cursor) of
+                when Some(value as error: SqlError) do
+                    let failed: Either[UserError, Option[StoredUser]] := Left(left => StorageFailed());
+                    return failed;
+                when None do
+                    let none: Option[StoredUser] := None();
+                    let absent: Either[UserError, Option[StoredUser]] := Right(right => none);
+                    return absent;
+            end case;
+        end if;
+    end;
+
+    generic [R: Region, N: Region, H: Region]
+    function sqlInsertUser(db: &![Connection[Writing], R], name: Span[Nat8, N], hash: Span[Nat8, H]): Either[UserError, Bool] is
+        return changedOne(execute(&~db, "INSERT INTO hilde_users (name, hash, locked) VALUES (?, ?, 0) ON CONFLICT (name) DO NOTHING", withText(withText(noValues(), name), hash)));
+    end;
+
+    generic [R: Region, N: Region, H: Region]
+    function sqlReplaceHash(db: &![Connection[Writing], R], name: Span[Nat8, N], hash: Span[Nat8, H]): Either[UserError, Bool] is
+        return changedOne(execute(&~db, "UPDATE hilde_users SET hash = ? WHERE name = ?", withText(withText(noValues(), hash), name)));
+    end;
+
+    generic [R: Region, N: Region]
+    function sqlSetLocked(db: &![Connection[Writing], R], name: Span[Nat8, N], locked: Bool): Either[UserError, Bool] is
+        var flag: Int64 := 0;
+        if locked then
+            flag := 1;
+        end if;
+        return changedOne(execute(&~db, "UPDATE hilde_users SET locked = ? WHERE name = ?", withText(withInt64(noValues(), flag), name)));
+    end;
+
+    generic [R: Region, N: Region]
+    function sqlRemoveUser(db: &![Connection[Writing], R], name: Span[Nat8, N]): Either[UserError, Bool] is
+        return changedOne(execute(&~db, "DELETE FROM hilde_users WHERE name = ?", withText(noValues(), name)));
+    end;
+
+    generic [R: Region]
+    function sqlUserNames(db: &![Connection[Writing], R]): Either[UserError, Buffer[String]] is
+        var names: Buffer[String] := allocateEmpty();
+        var cursor: Cursor := start(&~db, "SELECT name FROM hilde_users ORDER BY name", noValues());
+        while advance(&!cursor) do
+            insertBack(&!names, fromSpan(columnText(&cursor, 0)));
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: SqlError) do
+                destroyUserNames(names);
+                let failed: Either[UserError, Buffer[String]] := Left(left => StorageFailed());
+                return failed;
+            when None do
+                let listed: Either[UserError, Buffer[String]] := Right(right => names);
+                return listed;
+        end case;
+    end;
+
+    generic [R: Region, C: Region]
+    function sqlFailuresSince(db: &![Connection[Writing], R], client: Span[Nat8, C], since: Int64): Either[UserError, Int64] is
+        var cursor: Cursor := start(&~db, "SELECT count(*) FROM hilde_user_failures WHERE client = ? AND at > ?", withInt64(withBlob(noValues(), client), since));
+        var count: Int64 := 0;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: SqlError) do
+                let failed: Either[UserError, Int64] := Left(left => StorageFailed());
+                return failed;
+            when None do
+                let counted: Either[UserError, Int64] := Right(right => count);
+                return counted;
+        end case;
+    end;
+
+    generic [R: Region, C: Region]
+    function sqlNoteFailure(db: &![Connection[Writing], R], client: Span[Nat8, C], now: Int64, keepSince: Int64): Either[UserError, Unit] is
+        case changedAny(execute(&~db, "DELETE FROM hilde_user_failures WHERE client = ? AND at <= ?", withInt64(withBlob(noValues(), client), keepSince))) of
+            when Right(right as done: Unit) do
+                return changedAny(execute(&~db, "INSERT INTO hilde_user_failures (client, at) VALUES (?, ?)", withInt64(withBlob(noValues(), client), now)));
+            when Left(left as error: UserError) do
+                let failed: Either[UserError, Unit] := Left(left => error);
+                return failed;
+        end case;
+    end;
+
+    generic [R: Region, C: Region]
+    function sqlForgetFailures(db: &![Connection[Writing], R], client: Span[Nat8, C]): Either[UserError, Unit] is
+        return changedAny(execute(&~db, "DELETE FROM hilde_user_failures WHERE client = ?", withBlob(noValues(), client)));
+    end;
+
+    instance UserStore(SqliteUsers) is
+        generic [R: Region, N: Region]
+        method readUser(store: &![SqliteUsers, R], name: Span[Nat8, N]): Either[UserError, Option[StoredUser]] is
+            return sqlReadUser(&!(store->db), name);
+        end;
+
+        generic [R: Region, N: Region, H: Region]
+        method insertUser(store: &![SqliteUsers, R], name: Span[Nat8, N], hash: Span[Nat8, H]): Either[UserError, Bool] is
+            return sqlInsertUser(&!(store->db), name, hash);
+        end;
+
+        generic [R: Region, N: Region, H: Region]
+        method replaceHash(store: &![SqliteUsers, R], name: Span[Nat8, N], hash: Span[Nat8, H]): Either[UserError, Bool] is
+            return sqlReplaceHash(&!(store->db), name, hash);
+        end;
+
+        generic [R: Region, N: Region]
+        method setLocked(store: &![SqliteUsers, R], name: Span[Nat8, N], locked: Bool): Either[UserError, Bool] is
+            return sqlSetLocked(&!(store->db), name, locked);
+        end;
+
+        generic [R: Region, N: Region]
+        method removeUser(store: &![SqliteUsers, R], name: Span[Nat8, N]): Either[UserError, Bool] is
+            return sqlRemoveUser(&!(store->db), name);
+        end;
+
+        generic [R: Region]
+        method userNames(store: &![SqliteUsers, R]): Either[UserError, Buffer[String]] is
+            return sqlUserNames(&!(store->db));
+        end;
+
+        generic [R: Region, C: Region]
+        method failuresSince(store: &![SqliteUsers, R], client: Span[Nat8, C], since: Int64): Either[UserError, Int64] is
+            return sqlFailuresSince(&!(store->db), client, since);
+        end;
+
+        generic [R: Region, C: Region]
+        method noteFailure(store: &![SqliteUsers, R], client: Span[Nat8, C], now: Int64, keepSince: Int64): Either[UserError, Unit] is
+            return sqlNoteFailure(&!(store->db), client, now, keepSince);
+        end;
+
+        generic [R: Region, C: Region]
+        method forgetFailures(store: &![SqliteUsers, R], client: Span[Nat8, C]): Either[UserError, Unit] is
+            return sqlForgetFailures(&!(store->db), client);
+        end;
+    end;
+end module body.

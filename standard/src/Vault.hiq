@@ -1,0 +1,1083 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromLiteral,
+    fromSpan,
+    makeString,
+    destroyString,
+    destroyWiped,
+    asSpan,
+    length,
+    nthByte,
+    storeNth
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    nthRef,
+    swapNth,
+    removeLast,
+    destroyEmpty,
+    length as bufferLength
+);
+import Standard.File (
+    FileDescriptor,
+    FileLookup,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    FileStatus,
+    openRead,
+    readAll,
+    closeFile,
+    statusOf,
+    renameFile,
+    removeFileIfThere
+);
+import Standard.AtomicFile (
+    AtomicFailure,
+    writeAtomically
+);
+import Standard.Libcrypto (
+    randomBytes,
+    hmacSha256,
+    hmacSha3_512,
+    sealXChaCha20Poly1305,
+    openXChaCha20Poly1305
+);
+import Standard.Base64 (
+    encodeUrl,
+    decodeUrl
+);
+import Standard.Text (
+    constantTimeEqual
+);
+import Standard.Time (
+    wallNanos
+);
+
+module body Standard.Vault is
+    -- The first byte of every value: the format of XChaCha20-Poly1305 with
+    -- an HMAC-SHA3-512 over it.
+    constant formatMark: Nat8 := 204;
+
+    -- Mode 0600 of the .env and of the pepper.
+    constant ownerOnly: Nat32 := 384;
+
+    -- The bytes of a value before the ciphertext: mark, time, nonce.
+    constant headerSize: Index := 33;
+
+    -- The size of the HMAC-SHA3-512 at the end of a value.
+    constant codeSize: Index := 64;
+
+    -- The cipher keys stand in keys, 16 bytes that sign and 32 that
+    -- encrypt; a rotation writes new bytes over them in place.  The path of
+    -- the pepper is the one element of pepper, so that a rotation to a new
+    -- path can swap it.
+    record Vault: Linear is
+        envPath: String;
+        pepper: Buffer[String];
+        keyName: String;
+        keys: String;
+        invariant length(&keys) = 48;
+        invariant bufferLength(&pepper) = 1;
+    end;
+
+    -- Where a line of the .env holds a name and its value: the bytes from
+    -- nameStart before nameEnd, and from valueStart before valueEnd.
+    record Entry: Free is
+        nameStart: Index;
+        nameEnd: Index;
+        valueStart: Index;
+        valueEnd: Index;
+    end;
+
+    function describeVaultError(error: VaultError): String is
+        case error of
+            when EnvUnreadable do
+                return fromLiteral("the .env file could not be read");
+            when KeyMissing do
+                return fromLiteral("the .env has no key line");
+            when KeyExists do
+                return fromLiteral("the .env has a key line already");
+            when KeyInvalid do
+                return fromLiteral("the key is not 32 bytes of URL Base64");
+            when PepperUnreadable do
+                return fromLiteral("the pepper file could not be read");
+            when PepperInvalid do
+                return fromLiteral("the pepper file is not 32 bytes");
+            when PepperExists do
+                return fromLiteral("a file is where the new pepper would go");
+            when NameInvalid do
+                return fromLiteral("a name is not of A to Z, 0 to 9 and _");
+            when NotFound do
+                return fromLiteral("no secret of that name");
+            when Damaged do
+                return fromLiteral("a value does not open under this key and pepper");
+            when CryptoFailed do
+                return fromLiteral("no random bytes, or the cipher failed");
+            when WriteFailed do
+                return fromLiteral("a file could not be written, and nothing was replaced");
+        end case;
+    end;
+
+    ---
+    --- Bytes
+    ---
+
+    -- The lowest byte of a number.
+    function lowByte(n: Nat64): Nat8 is
+        case toNat8(bitwiseAnd(n, 255)) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A copy of count bytes of span from at, into a string of that size.
+    generic [R: Region]
+    function copyOf(span: Span[Nat8, R], at: Index, count: Index): String is
+        var out: String := makeString(count, 0);
+        var i: Index := 0;
+        while i < count do
+            storeNth(&!out, i, span[at + i]);
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- a and b one after the other, in a string of their size.
+    generic [R: Region, S: Region]
+    function joined(a: Span[Nat8, R], b: Span[Nat8, S]): String is
+        var out: String := makeString(spanLength(a) + spanLength(b), 0);
+        var i: Index := 0;
+        while i < spanLength(a) do
+            storeNth(&!out, i, a[i]);
+            i := i + 1;
+        end while;
+        var j: Index := 0;
+        while j < spanLength(b) do
+            storeNth(&!out, i + j, b[j]);
+            j := j + 1;
+        end while;
+        return out;
+    end;
+
+    -- Whether a name is A to Z, 0 to 9 and _, not starting with a digit,
+    -- from 1 to 128 bytes.
+    generic [R: Region]
+    function validName(name: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(name);
+        if (size = 0) or (size > 128) then
+            return false;
+        end if;
+        if (name[0] >= '0') and (name[0] <= '9') then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let b: Nat8 := name[i];
+            let upper: Bool := (b >= 'A') and (b <= 'Z');
+            let digit: Bool := (b >= '0') and (b <= '9');
+            if not ((upper or digit) or (b = '_')) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    ---
+    --- Files
+    ---
+
+    -- The whole of a file, or None when it cannot be read.
+    generic [R: Region]
+    function readText(path: Span[Nat8, R]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- Whether nothing is at path.
+    generic [R: Region]
+    function missing(path: Span[Nat8, R]): Bool is
+        case statusOf(path) of
+            when FileMissing do
+                return true;
+            when FileUnreadable do
+                return false;
+            when FileFound(status as unused: FileStatus) do
+                return false;
+        end case;
+    end;
+
+    -- The .env as text: empty when there is none yet, None when it is
+    -- there and cannot be read.
+    generic [R: Region]
+    function readEnv(path: Span[Nat8, R]): Option[String] is
+        if missing(path) then
+            let empty: Option[String] := Some(value => fromLiteral(""));
+            return empty;
+        end if;
+        return readText(path);
+    end;
+
+    -- The pepper, read and held to its size.
+    generic [R: Region]
+    function readPepper(path: Span[Nat8, R]): Either[VaultError, String] is
+        case readText(path) of
+            when Some(value as pepper: String) do
+                if length(&pepper) /= 32 then
+                    destroyWiped(pepper);
+                    return Left(left => PepperInvalid());
+                end if;
+                return Right(right => pepper);
+            when None do
+                return Left(left => PepperUnreadable());
+        end case;
+    end;
+
+    -- Writes text as the .env, atomically, mode 0600.
+    generic [R: Region, S: Region]
+    function writeEnv(path: Span[Nat8, R], text: Span[Nat8, S]): Either[VaultError, Unit] is
+        case writeAtomically(path, text, ownerOnly) of
+            when Right(right as done: Unit) do
+                return Right(right => nil);
+            when Left(left as failure: AtomicFailure) do
+                return Left(left => WriteFailed());
+        end case;
+    end;
+
+    ---
+    --- Lines of the .env
+    ---
+
+    function isBlank(b: Nat8): Bool is
+        return (b = ' ') or (b = '\t');
+    end;
+
+    -- The end of the line that starts at start: its newline, or the end.
+    generic [R: Region]
+    function lineEnd(text: Span[Nat8, R], start: Index): Index is
+        var i: Index := start;
+        while (i < spanLength(text)) and (text[i] /= '\n') do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- Whether the seven bytes from at are export and a space.
+    generic [R: Region]
+    function startsExport(text: Span[Nat8, R], at: Index): Bool is
+        let word: Span[Nat8, Static] := "export ";
+        var i: Index := 0;
+        while i < 7 do
+            if text[at + i] /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The name and the value of the line from start before final, read as
+    -- the .env files of this format are: blank and comment lines hold
+    -- none, an export before the name and quotes around the value are
+    -- dropped, white space around each is not part of it.
+    generic [R: Region]
+    function entryOf(text: Span[Nat8, R], start: Index, final: Index): Option[Entry] is
+        var a: Index := start;
+        while (a < final) and isBlank(text[a]) do
+            a := a + 1;
+        end while;
+        if (a = final) or (text[a] = '#') then
+            let none: Option[Entry] := None();
+            return none;
+        end if;
+        if ((a + 7) <= final) and startsExport(text, a) then
+            a := a + 7;
+        end if;
+        var eq: Index := a;
+        while (eq < final) and (text[eq] /= '=') do
+            eq := eq + 1;
+        end while;
+        if eq = final then
+            let none: Option[Entry] := None();
+            return none;
+        end if;
+        var nameEnd: Index := eq;
+        while (nameEnd > a) and isBlank(text[nameEnd - 1]) do
+            nameEnd := nameEnd - 1;
+        end while;
+        var vs: Index := eq + 1;
+        while (vs < final) and isBlank(text[vs]) do
+            vs := vs + 1;
+        end while;
+        var ve: Index := final;
+        while (ve > vs) and (isBlank(text[ve - 1]) or (text[ve - 1] = '\r')) do
+            ve := ve - 1;
+        end while;
+        if ((ve - vs) >= 2) and ((text[vs] = text[ve - 1]) and ((text[vs] = '"') or (text[vs] = '\''))) then
+            vs := vs + 1;
+            ve := ve - 1;
+        end if;
+        let some: Option[Entry] := Some(value => Entry(nameStart => a, nameEnd => nameEnd, valueStart => vs, valueEnd => ve));
+        return some;
+    end;
+
+    -- Whether the entry names name.
+    generic [R: Region, S: Region]
+    function names(text: Span[Nat8, R], entry: Entry, name: Span[Nat8, S]): Bool is
+        let size: Index := entry.nameEnd - entry.nameStart;
+        if size /= spanLength(name) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if text[entry.nameStart + i] /= name[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The value of the line of name, a copy.
+    generic [R: Region, S: Region]
+    function valueOf(text: Span[Nat8, R], name: Span[Nat8, S]): Option[String] is
+        var start: Index := 0;
+        while start < spanLength(text) do
+            let final: Index := lineEnd(text, start);
+            case entryOf(text, start, final) of
+                when Some(value as entry: Entry) do
+                    if names(text, entry, name) then
+                        let some: Option[String] := Some(value => copyOf(text, entry.valueStart, entry.valueEnd - entry.valueStart));
+                        return some;
+                    end if;
+                when None do
+                    skip;
+            end case;
+            start := final + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    -- The text with the line of name set to name=value, or the line put
+    -- at the end when there is none.  Every line ends with a newline.
+    generic [R: Region, S: Region, T: Region]
+    function withValue(text: Span[Nat8, R], name: Span[Nat8, S], value: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var placed: Bool := false;
+        var start: Index := 0;
+        while start < spanLength(text) do
+            let final: Index := lineEnd(text, start);
+            var replace: Bool := false;
+            case entryOf(text, start, final) of
+                when Some(value as entry: Entry) do
+                    replace := (not placed) and names(text, entry, name);
+                when None do
+                    skip;
+            end case;
+            if replace then
+                writeString(&!out, name);
+                writeByte(&!out, '=');
+                writeString(&!out, value);
+                placed := true;
+            else
+                writeString(&!out, spanPart(text, start, final - start));
+            end if;
+            writeByte(&!out, '\n');
+            start := final + 1;
+        end while;
+        if not placed then
+            writeString(&!out, name);
+            writeByte(&!out, '=');
+            writeString(&!out, value);
+            writeByte(&!out, '\n');
+        end if;
+        return finalize(out);
+    end;
+
+    -- The text without the lines of name.
+    generic [R: Region, S: Region]
+    function withoutName(text: Span[Nat8, R], name: Span[Nat8, S]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var start: Index := 0;
+        while start < spanLength(text) do
+            let final: Index := lineEnd(text, start);
+            var keep: Bool := true;
+            case entryOf(text, start, final) of
+                when Some(value as entry: Entry) do
+                    keep := not names(text, entry, name);
+                when None do
+                    skip;
+            end case;
+            if keep then
+                writeString(&!out, spanPart(text, start, final - start));
+                writeByte(&!out, '\n');
+            end if;
+            start := final + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The names of the lines, without the one of the key.
+    generic [R: Region, S: Region]
+    function namesOf(text: Span[Nat8, R], keyName: Span[Nat8, S]): Buffer[String] is
+        var found: Buffer[String] := allocateEmpty();
+        var start: Index := 0;
+        while start < spanLength(text) do
+            let final: Index := lineEnd(text, start);
+            case entryOf(text, start, final) of
+                when Some(value as entry: Entry) do
+                    if not names(text, entry, keyName) then
+                        insertBack(&!found, copyOf(text, entry.nameStart, entry.nameEnd - entry.nameStart));
+                    end if;
+                when None do
+                    skip;
+            end case;
+            start := final + 1;
+        end while;
+        return found;
+    end;
+
+    ---
+    --- Keys
+    ---
+
+    -- The cipher keys of a key and a pepper, in one string of 48 bytes:
+    -- the HMAC-SHA256 of key and the format mark under the pepper, whose
+    -- first 16 bytes sign, then its HMAC-SHA256 over the context of the
+    -- format, which encrypts.
+    generic [R: Region, S: Region]
+    function derive(envKey: Span[Nat8, R], pepper: Span[Nat8, S]): Option[String] is
+        var message: String := makeString(spanLength(envKey) + 1, formatMark);
+        var i: Index := 0;
+        while i < spanLength(envKey) do
+            storeNth(&!message, i, envKey[i]);
+            i := i + 1;
+        end while;
+        let made: Option[String] := hmacSha256(pepper, asSpan(&message));
+        destroyWiped(message);
+        case made of
+            when Some(value as derived: String) do
+                let expanded: Option[String] := hmacSha256(asSpan(&derived), "quantum-encryption-key-v1");
+                case expanded of
+                    when Some(value as encryption: String) do
+                        let keys: String := joined(spanPart(asSpan(&derived), 0, 16), asSpan(&encryption));
+                        destroyWiped(derived);
+                        destroyWiped(encryption);
+                        let some: Option[String] := Some(value => keys);
+                        return some;
+                    when None do
+                        destroyWiped(derived);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The cipher keys of the key text of the .env and a pepper.
+    generic [R: Region, S: Region]
+    function keysOf(keyText: Span[Nat8, R], pepper: Span[Nat8, S]): Either[VaultError, String] is
+        case decodeUrl(keyText) of
+            when Some(value as envKey: String) do
+                if length(&envKey) /= 32 then
+                    destroyWiped(envKey);
+                    return Left(left => KeyInvalid());
+                end if;
+                let keys: Option[String] := derive(asSpan(&envKey), pepper);
+                destroyWiped(envKey);
+                case keys of
+                    when Some(value as made: String) do
+                        return Right(right => made);
+                    when None do
+                        return Left(left => CryptoFailed());
+                end case;
+            when None do
+                return Left(left => KeyInvalid());
+        end case;
+    end;
+
+    -- A new key of 32 random bytes, as the text of its line.
+    function newKeyText(): Option[String] is
+        case randomBytes(32) of
+            when Some(value as bytes: String) do
+                let text: String := encodeUrl(asSpan(&bytes));
+                destroyWiped(bytes);
+                let some: Option[String] := Some(value => text);
+                return some;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    ---
+    --- Values
+    ---
+
+    -- The mark and the time in seconds, big end first: the additional data
+    -- of the cipher and the first 9 bytes of a value.
+    function header(): String is
+        var out: String := makeString(9, formatMark);
+        var seconds: Nat64 := wallNanos() / 1000000000;
+        var i: Index := 8;
+        while i > 0 do
+            storeNth(&!out, i, lowByte(seconds));
+            seconds := seconds / 256;
+            i := i - 1;
+        end while;
+        return out;
+    end;
+
+    -- A value sealed under the 48 bytes of keys, as the text of its line.
+    generic [R: Region, T: Region]
+    function seal(keys: Span[Nat8, R], plaintext: Span[Nat8, T]): Option[String] is
+        case randomBytes(24) of
+            when Some(value as nonce: String) do
+                let aad: String := header();
+                let sealed: Option[String] := sealXChaCha20Poly1305(spanPart(keys, 16, 32), asSpan(&nonce), plaintext, asSpan(&aad));
+                case sealed of
+                    when Some(value as content: String) do
+                        let front: String := joined(asSpan(&aad), asSpan(&nonce));
+                        let inner: String := joined(asSpan(&front), asSpan(&content));
+                        destroyString(front);
+                        destroyString(content);
+                        destroyString(aad);
+                        destroyString(nonce);
+                        case hmacSha3_512(spanPart(keys, 0, 16), asSpan(&inner)) of
+                            when Some(value as code: String) do
+                                let token: String := joined(asSpan(&inner), asSpan(&code));
+                                destroyString(inner);
+                                destroyString(code);
+                                let text: String := encodeUrl(asSpan(&token));
+                                destroyString(token);
+                                let some: Option[String] := Some(value => text);
+                                return some;
+                            when None do
+                                destroyString(inner);
+                                let none: Option[String] := None();
+                                return none;
+                        end case;
+                    when None do
+                        destroyString(aad);
+                        destroyString(nonce);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The plaintext of a value: the code checked first, in constant time,
+    -- then the tag.
+    generic [R: Region, T: Region]
+    function unseal(keys: Span[Nat8, R], text: Span[Nat8, T]): Either[VaultError, String] is
+        case decodeUrl(text) of
+            when Some(value as token: String) do
+                let size: Index := length(&token);
+                if (size < ((headerSize + 16) + codeSize)) or (nthByte(&token, 0) /= formatMark) then
+                    destroyString(token);
+                    return Left(left => Damaged());
+                end if;
+                let innerSize: Index := size - codeSize;
+                let expected: Option[String] := hmacSha3_512(spanPart(keys, 0, 16), spanPart(asSpan(&token), 0, innerSize));
+                var matches: Bool := false;
+                case expected of
+                    when Some(value as code: String) do
+                        matches := constantTimeEqual(asSpan(&code), spanPart(asSpan(&token), innerSize, codeSize));
+                        destroyString(code);
+                    when None do
+                        skip;
+                end case;
+                if not matches then
+                    destroyString(token);
+                    return Left(left => Damaged());
+                end if;
+                let opened: Option[String] := openXChaCha20Poly1305(spanPart(keys, 16, 32), spanPart(asSpan(&token), 9, 24), spanPart(asSpan(&token), headerSize, innerSize - headerSize), spanPart(asSpan(&token), 0, 9));
+                destroyString(token);
+                case opened of
+                    when Some(value as plaintext: String) do
+                        return Right(right => plaintext);
+                    when None do
+                        return Left(left => Damaged());
+                end case;
+            when None do
+                return Left(left => Damaged());
+        end case;
+    end;
+
+    ---
+    --- The vault
+    ---
+
+    generic [R: Region]
+    function createPepper(path: Span[Nat8, R]): Either[VaultError, Unit] is
+        if not missing(path) then
+            return Left(left => PepperExists());
+        end if;
+        case randomBytes(32) of
+            when Some(value as pepper: String) do
+                let written: Either[AtomicFailure, Unit] := writeAtomically(path, asSpan(&pepper), ownerOnly);
+                destroyWiped(pepper);
+                case written of
+                    when Right(right as done: Unit) do
+                        return Right(right => nil);
+                    when Left(left as failure: AtomicFailure) do
+                        return Left(left => WriteFailed());
+                end case;
+            when None do
+                return Left(left => CryptoFailed());
+        end case;
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function createKey(envPath: Span[Nat8, R], pepperPath: Span[Nat8, S], keyName: Span[Nat8, T]): Either[VaultError, Unit] is
+        if not validName(keyName) then
+            return Left(left => NameInvalid());
+        end if;
+        case readPepper(pepperPath) of
+            when Right(right as pepper: String) do
+                destroyWiped(pepper);
+            when Left(left as error: VaultError) do
+                return Left(left => error);
+        end case;
+        case readEnv(envPath) of
+            when Some(value as text: String) do
+                case valueOf(asSpan(&text), keyName) of
+                    when Some(value as old: String) do
+                        destroyWiped(old);
+                        destroyWiped(text);
+                        return Left(left => KeyExists());
+                    when None do
+                        skip;
+                end case;
+                case newKeyText() of
+                    when Some(value as key: String) do
+                        let next: String := withValue(asSpan(&text), keyName, asSpan(&key));
+                        destroyWiped(key);
+                        destroyWiped(text);
+                        let written: Either[VaultError, Unit] := writeEnv(envPath, asSpan(&next));
+                        destroyWiped(next);
+                        return written;
+                    when None do
+                        destroyWiped(text);
+                        return Left(left => CryptoFailed());
+                end case;
+            when None do
+                return Left(left => EnvUnreadable());
+        end case;
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function openVault(envPath: Span[Nat8, R], pepperPath: Span[Nat8, S], keyName: Span[Nat8, T]): Either[VaultError, Vault] is
+        if not validName(keyName) then
+            return Left(left => NameInvalid());
+        end if;
+        case readText(envPath) of
+            when Some(value as text: String) do
+                let keyText: Option[String] := valueOf(asSpan(&text), keyName);
+                destroyWiped(text);
+                case keyText of
+                    when Some(value as key: String) do
+                        case readPepper(pepperPath) of
+                            when Right(right as pepper: String) do
+                                let keys: Either[VaultError, String] := keysOf(asSpan(&key), asSpan(&pepper));
+                                destroyWiped(key);
+                                destroyWiped(pepper);
+                                case keys of
+                                    when Right(right as made: String) do
+                                        var paths: Buffer[String] := allocateEmpty();
+                                        insertBack(&!paths, fromSpan(pepperPath));
+                                        return Right(right => Vault(envPath => fromSpan(envPath), pepper => paths, keyName => fromSpan(keyName), keys => made));
+                                    when Left(left as error: VaultError) do
+                                        return Left(left => error);
+                                end case;
+                            when Left(left as error: VaultError) do
+                                destroyWiped(key);
+                                return Left(left => error);
+                        end case;
+                    when None do
+                        return Left(left => KeyMissing());
+                end case;
+            when None do
+                return Left(left => EnvUnreadable());
+        end case;
+    end;
+
+    function closeVault(vault: Vault): Unit is
+        let { envPath: String, pepper: Buffer[String], keyName: String, keys: String } := vault;
+        var paths: Buffer[String] := pepper;
+        while bufferLength(&paths) > 0 do
+            destroyString(removeLast(&!paths));
+        end while;
+        destroyEmpty(paths);
+        destroyString(envPath);
+        destroyString(keyName);
+        destroyWiped(keys);
+        return nil;
+    end;
+
+    -- The parts of the vault, each through a function of its own, so that a
+    -- write reference can be borrowed again for each.
+    generic [R: Region]
+    function envOf(vault: &[Vault, R]): Span[Nat8, R] is
+        return asSpan(&(vault->envPath));
+    end;
+
+    generic [R: Region]
+    function keysIn(vault: &[Vault, R]): Span[Nat8, R] is
+        return asSpan(&(vault->keys));
+    end;
+
+    generic [R: Region]
+    function keyNameOf(vault: &[Vault, R]): Span[Nat8, R] is
+        return asSpan(&(vault->keyName));
+    end;
+
+    generic [R: Region]
+    function pepperOf(vault: &[Vault, R]): Span[Nat8, R] is
+        return asSpan(nthRef(&(vault->pepper), 0));
+    end;
+
+    generic [R: Region]
+    function envOfMut(vault: &![Vault, R]): Span[Nat8, R] is
+        return asSpan(&(vault->envPath));
+    end;
+
+    generic [R: Region]
+    function keysInMut(vault: &![Vault, R]): Span[Nat8, R] is
+        return asSpan(&(vault->keys));
+    end;
+
+    generic [R: Region]
+    function keyNameOfMut(vault: &![Vault, R]): Span[Nat8, R] is
+        return asSpan(&(vault->keyName));
+    end;
+
+    generic [R: Region]
+    function pepperOfMut(vault: &![Vault, R]): Span[Nat8, R] is
+        return asSpan(nthRef(&(vault->pepper), 0));
+    end;
+
+    generic [R: Region]
+    function keysMut(vault: &![Vault, R]): &![String, R] is
+        return &!(vault->keys);
+    end;
+
+    generic [R: Region]
+    function pepperMut(vault: &![Vault, R]): &![Buffer[String], R] is
+        return &!(vault->pepper);
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function setSecret(vault: &![Vault, R], name: Span[Nat8, S], value: Span[Nat8, T]): Either[VaultError, Unit] is
+        if (not validName(name)) or constantTimeEqual(keyNameOfMut(&~vault), name) then
+            return Left(left => NameInvalid());
+        end if;
+        case readText(envOfMut(&~vault)) of
+            when Some(value as text: String) do
+                case seal(keysInMut(&~vault), value) of
+                    when Some(value as sealed: String) do
+                        let next: String := withValue(asSpan(&text), name, asSpan(&sealed));
+                        destroyString(sealed);
+                        destroyWiped(text);
+                        let written: Either[VaultError, Unit] := writeEnv(envOfMut(&~vault), asSpan(&next));
+                        destroyWiped(next);
+                        return written;
+                    when None do
+                        destroyWiped(text);
+                        return Left(left => CryptoFailed());
+                end case;
+            when None do
+                return Left(left => EnvUnreadable());
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function getSecret(vault: &[Vault, R], name: Span[Nat8, S]): Either[VaultError, String] is
+        if (not validName(name)) or constantTimeEqual(keyNameOf(vault), name) then
+            return Left(left => NameInvalid());
+        end if;
+        case readText(envOf(vault)) of
+            when Some(value as text: String) do
+                let found: Option[String] := valueOf(asSpan(&text), name);
+                destroyWiped(text);
+                case found of
+                    when Some(value as sealed: String) do
+                        let opened: Either[VaultError, String] := unseal(keysIn(vault), asSpan(&sealed));
+                        destroyString(sealed);
+                        return opened;
+                    when None do
+                        return Left(left => NotFound());
+                end case;
+            when None do
+                return Left(left => EnvUnreadable());
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function deleteSecret(vault: &![Vault, R], name: Span[Nat8, S]): Either[VaultError, Bool] is
+        if (not validName(name)) or constantTimeEqual(keyNameOfMut(&~vault), name) then
+            return Left(left => NameInvalid());
+        end if;
+        case readText(envOfMut(&~vault)) of
+            when Some(value as text: String) do
+                case valueOf(asSpan(&text), name) of
+                    when Some(value as old: String) do
+                        destroyString(old);
+                        let next: String := withoutName(asSpan(&text), name);
+                        destroyWiped(text);
+                        let written: Either[VaultError, Unit] := writeEnv(envOfMut(&~vault), asSpan(&next));
+                        destroyWiped(next);
+                        case written of
+                            when Right(right as done: Unit) do
+                                return Right(right => true);
+                            when Left(left as error: VaultError) do
+                                return Left(left => error);
+                        end case;
+                    when None do
+                        destroyWiped(text);
+                        return Right(right => false);
+                end case;
+            when None do
+                return Left(left => EnvUnreadable());
+        end case;
+    end;
+
+    generic [R: Region]
+    function secretNames(vault: &[Vault, R]): Either[VaultError, Buffer[String]] is
+        case readText(envOf(vault)) of
+            when Some(value as text: String) do
+                let found: Buffer[String] := namesOf(asSpan(&text), keyNameOf(vault));
+                destroyWiped(text);
+                return Right(right => found);
+            when None do
+                return Left(left => EnvUnreadable());
+        end case;
+    end;
+
+    -- A text and how many values it holds.
+    record Resealed: Linear is
+        text: String;
+        count: Index;
+    end;
+
+    -- The text with every value opened under the old keys and sealed under
+    -- the new, and the key line set to keyText.
+    generic [R: Region, S: Region, T: Region, U: Region, V: Region]
+    function resealed(text: Span[Nat8, R], keyName: Span[Nat8, S], keyText: Span[Nat8, T], oldKeys: Span[Nat8, U], newKeys: Span[Nat8, V]): Either[VaultError, Resealed] is
+        var out: String := withValue(text, keyName, keyText);
+        var count: Index := 0;
+        var start: Index := 0;
+        while start < spanLength(text) do
+            let final: Index := lineEnd(text, start);
+            case entryOf(text, start, final) of
+                when Some(value as entry: Entry) do
+                    if not names(text, entry, keyName) then
+                        let opened: Either[VaultError, String] := unseal(oldKeys, spanPart(text, entry.valueStart, entry.valueEnd - entry.valueStart));
+                        case opened of
+                            when Right(right as plaintext: String) do
+                                let sealed: Option[String] := seal(newKeys, asSpan(&plaintext));
+                                destroyWiped(plaintext);
+                                case sealed of
+                                    when Some(value as fresh: String) do
+                                        let next: String := withValue(asSpan(&out), spanPart(text, entry.nameStart, entry.nameEnd - entry.nameStart), asSpan(&fresh));
+                                        destroyString(fresh);
+                                        destroyWiped(out);
+                                        out := next;
+                                        count := count + 1;
+                                    when None do
+                                        destroyWiped(out);
+                                        return Left(left => CryptoFailed());
+                                end case;
+                            when Left(left as error: VaultError) do
+                                destroyWiped(out);
+                                return Left(left => error);
+                        end case;
+                    end if;
+                when None do
+                    skip;
+            end case;
+            start := final + 1;
+        end while;
+        return Right(right => Resealed(text => out, count => count));
+    end;
+
+    -- Writes the resealed text and, when it is written, writes the new keys
+    -- over the vault's; otherwise the vault keeps the old ones.
+    generic [R: Region]
+    function finishRotation(vault: &![Vault, R], done: Either[VaultError, Resealed], keys: String): Either[VaultError, Index] is
+        case done of
+            when Right(right as result: Resealed) do
+                let { text: String, count: Index } := result;
+                let written: Either[VaultError, Unit] := writeEnv(envOfMut(&~vault), asSpan(&text));
+                destroyWiped(text);
+                case written of
+                    when Right(right as ok: Unit) do
+                        var i: Index := 0;
+                        while i < 48 do
+                            storeNth(keysMut(&~vault), i, nthByte(&keys, i));
+                            i := i + 1;
+                        end while;
+                        destroyWiped(keys);
+                        return Right(right => count);
+                    when Left(left as error: VaultError) do
+                        destroyWiped(keys);
+                        return Left(left => error);
+                end case;
+            when Left(left as error: VaultError) do
+                destroyWiped(keys);
+                return Left(left => error);
+        end case;
+    end;
+
+    generic [R: Region]
+    function rotateKey(vault: &![Vault, R]): Either[VaultError, Index] is
+        case readPepper(pepperOfMut(&~vault)) of
+            when Right(right as pepper: String) do
+                case newKeyText() of
+                    when Some(value as keyText: String) do
+                        let made: Either[VaultError, String] := keysOf(asSpan(&keyText), asSpan(&pepper));
+                        destroyWiped(pepper);
+                        case made of
+                            when Right(right as keys: String) do
+                                return rotateWith(&~vault, keyText, keys);
+                            when Left(left as error: VaultError) do
+                                destroyWiped(keyText);
+                                return Left(left => error);
+                        end case;
+                    when None do
+                        destroyWiped(pepper);
+                        return Left(left => CryptoFailed());
+                end case;
+            when Left(left as error: VaultError) do
+                return Left(left => error);
+        end case;
+    end;
+
+    -- Seals every value of the .env again under keys, with keyText as the
+    -- key line, and writes it.
+    generic [R: Region]
+    function rotateWith(vault: &![Vault, R], keyText: String, keys: String): Either[VaultError, Index] is
+        case readText(envOfMut(&~vault)) of
+            when Some(value as text: String) do
+                let name: String := fromSpan(keyNameOfMut(&~vault));
+                let old: String := copyOf(keysInMut(&~vault), 0, 48);
+                let done: Either[VaultError, Resealed] := resealed(asSpan(&text), asSpan(&name), asSpan(&keyText), asSpan(&old), asSpan(&keys));
+                destroyString(name);
+                destroyWiped(old);
+                destroyWiped(keyText);
+                destroyWiped(text);
+                return finishRotation(&~vault, done, keys);
+            when None do
+                destroyWiped(keyText);
+                destroyWiped(keys);
+                return Left(left => EnvUnreadable());
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function rotatePepper(vault: &![Vault, R], path: Span[Nat8, S]): Either[VaultError, Index] is
+        let samePlace: Bool := constantTimeEqual(pepperOfMut(&~vault), path);
+        if (not samePlace) and (not missing(path)) then
+            return Left(left => PepperExists());
+        end if;
+        -- The new pepper is written beside the place it goes to and moved
+        -- there only after the .env is written.
+        let staging: String := joined(path, ".new");
+        case createPepper(asSpan(&staging)) of
+            when Right(right as made: Unit) do
+                skip;
+            when Left(left as error: VaultError) do
+                destroyString(staging);
+                return Left(left => error);
+        end case;
+        case readText(envOfMut(&~vault)) of
+            when Some(value as text: String) do
+                let keyText: Option[String] := valueOf(asSpan(&text), keyNameOfMut(&~vault));
+                destroyWiped(text);
+                case keyText of
+                    when Some(value as key: String) do
+                        case readPepper(asSpan(&staging)) of
+                            when Right(right as pepper: String) do
+                                let made: Either[VaultError, String] := keysOf(asSpan(&key), asSpan(&pepper));
+                                destroyWiped(pepper);
+                                case made of
+                                    when Right(right as keys: String) do
+                                        let result: Either[VaultError, Index] := rotateWith(&~vault, key, keys);
+                                        return placePepper(&~vault, result, staging, path);
+                                    when Left(left as error: VaultError) do
+                                        destroyWiped(key);
+                                        return dropStaging(staging, error);
+                                end case;
+                            when Left(left as error: VaultError) do
+                                destroyWiped(key);
+                                return dropStaging(staging, error);
+                        end case;
+                    when None do
+                        return dropStaging(staging, KeyMissing());
+                end case;
+            when None do
+                return dropStaging(staging, EnvUnreadable());
+        end case;
+    end;
+
+    -- Removes the staged pepper and gives the error.
+    function dropStaging(staging: String, error: VaultError): Either[VaultError, Index] is
+        let removed: Bool := removeFileIfThere(asSpan(&staging));
+        destroyString(staging);
+        return Left(left => error);
+    end;
+
+    -- After the .env is written under the new pepper, moves the pepper to
+    -- path and makes path the vault's pepper; after a failure before that,
+    -- removes it.  When the move itself fails the staged pepper stays, the
+    -- one the .env now needs.
+    generic [R: Region, S: Region]
+    function placePepper(vault: &![Vault, R], result: Either[VaultError, Index], staging: String, path: Span[Nat8, S]): Either[VaultError, Index] is
+        case result of
+            when Right(right as count: Index) do
+                let moved: Bool := renameFile(asSpan(&staging), path);
+                destroyString(staging);
+                if not moved then
+                    return Left(left => WriteFailed());
+                end if;
+                let old: String := swapNth(pepperMut(&~vault), 0, fromSpan(path));
+                destroyString(old);
+                return Right(right => count);
+            when Left(left as error: VaultError) do
+                return dropStaging(staging, error);
+        end case;
+    end;
+end module body.

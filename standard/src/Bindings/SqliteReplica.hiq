@@ -1,0 +1,427 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullPointer,
+    nullCheck,
+    allocateBuffer,
+    load,
+    deallocate
+);
+import Standard.String (
+    String,
+    fromSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Bindings.C.Sqlite3 (
+    OpenFlags,
+    combineOpenFlags,
+    rawOpenFlags,
+    SQLITE_OPEN_CREATE,
+    SQLITE_OPEN_EXRESCODE,
+    SQLITE_OPEN_NOMUTEX,
+    SQLITE_OPEN_READWRITE,
+    SQLITE_OK,
+    SQLITE_DONE,
+    sqlite3_open_v2,
+    sqlite3_close_v2,
+    sqlite3_extended_errcode,
+    sqlite3_errmsg,
+    sqlite3_busy_timeout,
+    sqlite3_prepare_v3,
+    sqlite3_step,
+    sqlite3_finalize,
+    sqlite3_bind_int64,
+    sqlite3_bind_double,
+    sqlite3_bind_text,
+    sqlite3_bind_blob,
+    sqlite3_bind_null,
+    sqlite3_column_type,
+    sqlite3_column_int64,
+    sqlite3_column_double,
+    sqlite3_column_text,
+    sqlite3_column_blob,
+    sqlite3_column_bytes,
+    sqlite3_changes64,
+    sqlite3_stmt_readonly,
+    sqlite3_bind_parameter_count,
+    sqlite3_column_count,
+    sqlite3_backup_init,
+    sqlite3_backup_step,
+    sqlite3_backup_finish
+);
+
+module body Bindings.SqliteReplica is
+    record Database: Linear is
+        handle: Address[Unit];
+    end;
+
+    record Statement: Linear is
+        statement: Address[Unit];
+    end;
+
+    ---
+    --- C memory
+    ---
+
+    -- The address of a span's first byte, never null: SQLite reads a null
+    -- text or blob as an SQL null, so an empty span points at an empty
+    -- string.
+    generic [R: Region]
+    function bytesOf(value: Span[Nat8, R]): Address[Nat8] is
+        if spanLength(value) = 0 then
+            return @embed(Address[Nat8], "(hilde_nat8_t*)\"\"");
+        end if;
+        return @embed(Address[Nat8], "(hilde_nat8_t*)($1).data", value);
+    end;
+
+    function int32Of(size: Index): Int32 is
+        case toInt32(size) of
+            when Some(value as v: Int32) do
+                return v;
+            when None do
+                abort("Standard.SqliteReplica: a length over 2 GiB");
+        end case;
+    end;
+
+    function indexOf(value: Int32): Index is
+        case toIndex(value) of
+            when Some(value as v: Index) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A copy of the span with a zero byte after it, for a file name.
+    generic [R: Region]
+    function terminated(value: Span[Nat8, R]): Pointer[Nat8] is
+        let size: Index := spanLength(value);
+        let address: Address[Nat8] := allocateBuffer(size + 1);
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[Nat8]) do
+                let source: Address[Nat8] := bytesOf(value);
+                @embed(Address[Nat8], "hilde_memcpy($1, $2, $3)", pointer, source, size);
+                @embed(Unit, "(((hilde_nat8_t*)($1))[$2] = 0)", pointer, size);
+                return pointer;
+            when None do
+                abort("Standard.SqliteReplica: out of memory");
+        end case;
+    end;
+
+    function slotOf(): Pointer[Address[Unit]] is
+        let address: Address[Address[Unit]] := allocateBuffer(1);
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[Address[Unit]]) do
+                return pointer;
+            when None do
+                abort("Standard.SqliteReplica: out of memory");
+        end case;
+    end;
+
+    function tailSlotOf(): Pointer[Address[Nat8]] is
+        let address: Address[Address[Nat8]] := allocateBuffer(1);
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[Address[Nat8]]) do
+                return pointer;
+            when None do
+                abort("Standard.SqliteReplica: out of memory");
+        end case;
+    end;
+
+    function isNull(address: Address[Unit]): Bool is
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[Unit]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- The words of a C string, or fallback for none.
+    function wordsOf(text: Address[Nat8], fallback: Span[Nat8, Static]): String is
+        case nullCheck(text) of
+            when Some(value as start: Pointer[Nat8]) do
+                var out: StringBuilder := makeStringBuilder();
+                var i: Index := 0;
+                var byte: Nat8 := @embed(Nat8, "($1)[$2]", text, i);
+                while byte /= 0 do
+                    writeByte(&!out, byte);
+                    i := i + 1;
+                    byte := @embed(Nat8, "($1)[$2]", text, i);
+                end while;
+                return finalize(out);
+            when None do
+                return fromSpan(fallback);
+        end case;
+    end;
+
+    function flagBits(flags: OpenFlags): Int32 is
+        case toInt32(rawOpenFlags(flags)) of
+            when Some(value as v: Int32) do
+                return v;
+            when None do
+                abort("Standard.SqliteReplica: a flag does not fit an int");
+        end case;
+    end;
+
+    ---
+    --- Opening and closing
+    ---
+
+    -- The handle of the file at path, or the handle that failed and its
+    -- code; the handle must be closed either way when it is not null.
+    generic [R: Region]
+    function openHandle(path: Span[Nat8, R]): Address[Unit] is
+        let name: Pointer[Nat8] := terminated(path);
+        let slot: Pointer[Address[Unit]] := slotOf();
+        let noVfs: Address[Nat8] := nullPointer();
+        let flags: OpenFlags := combineOpenFlags(combineOpenFlags(SQLITE_OPEN_READWRITE, SQLITE_OPEN_CREATE),
+            combineOpenFlags(SQLITE_OPEN_EXRESCODE, SQLITE_OPEN_NOMUTEX));
+        let rc: Int32 := sqlite3_open_v2(@embed(Address[Nat8], "$1", name), @embed(Address[Address[Unit]], "$1", slot),
+            flagBits(flags), noVfs);
+        deallocate(name);
+        let handle: Address[Unit] := load(slot);
+        deallocate(slot);
+        if rc /= SQLITE_OK then
+            if not isNull(handle) then
+                let closed: Int32 := sqlite3_close_v2(handle);
+            end if;
+            return @embed(Address[Unit], "NULL");
+        end if;
+        return handle;
+    end;
+
+    generic [R: Region]
+    function openDatabase(path: Span[Nat8, R]): Either[String, Database] is
+        let handle: Address[Unit] := openHandle(path);
+        if isNull(handle) then
+            let left: Either[String, Database] := Left(left => fromSpan("Standard.SqliteReplica: the database could not be opened"));
+            return left;
+        end if;
+        let timeout: Int32 := sqlite3_busy_timeout(handle, 5000);
+        let right: Either[String, Database] := Right(right => Database(handle => handle));
+        return right;
+    end;
+
+    function closeDatabase(db: Database): Unit is
+        let { handle: Address[Unit] } := db;
+        let closed: Int32 := sqlite3_close_v2(handle);
+        return nil;
+    end;
+
+    ---
+    --- Statements
+    ---
+
+    -- Whether the bytes from at on are only white space and semicolons.
+    generic [R: Region]
+    function onlyBlankFrom(sql: Span[Nat8, R], at: Index): Bool is
+        var i: Index := at;
+        while i < spanLength(sql) do
+            let byte: Nat8 := sql[i];
+            if ((((byte /= 32) and (byte /= 9)) and (byte /= 10)) and (byte /= 13)) and (byte /= 59) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [D: Region, R: Region]
+    function prepareOne(db: &[Database, D], sql: Span[Nat8, R]): Either[String, Statement] is
+        let handle: Address[Unit] := (db->handle);
+        let slot: Pointer[Address[Unit]] := slotOf();
+        let tail: Pointer[Address[Nat8]] := tailSlotOf();
+        let start: Address[Nat8] := bytesOf(sql);
+        let noFlags: Nat32 := 0;
+        let rc: Int32 := sqlite3_prepare_v3(handle, start, int32Of(spanLength(sql)), noFlags,
+            @embed(Address[Address[Unit]], "$1", slot),
+            @embed(Address[Address[Nat8]], "$1", tail));
+        let statement: Address[Unit] := load(slot);
+        let rest: Address[Nat8] := load(tail);
+        deallocate(slot);
+        deallocate(tail);
+        if rc /= SQLITE_OK then
+            let left: Either[String, Statement] := Left(left => wordsOf(sqlite3_errmsg(handle), "the statement did not prepare"));
+            return left;
+        end if;
+        if isNull(statement) then
+            let none: Either[String, Statement] := Left(left => fromSpan("Standard.SqliteReplica: no statement"));
+            return none;
+        end if;
+        let used: Index := @embed(Index, "((size_t)((const char*)($1) - (const char*)($2)))", rest, start);
+        if not onlyBlankFrom(sql, used) then
+            let finalized: Int32 := sqlite3_finalize(statement);
+            let more: Either[String, Statement] := Left(left => fromSpan("Standard.SqliteReplica: more than one statement"));
+            return more;
+        end if;
+        let right: Either[String, Statement] := Right(right => Statement(statement => statement));
+        return right;
+    end;
+
+    generic [R: Region]
+    function isReadOnly(statement: &[Statement, R]): Bool is
+        return sqlite3_stmt_readonly((statement->statement)) /= 0;
+    end;
+
+    generic [R: Region]
+    function parameterCount(statement: &[Statement, R]): Index is
+        return indexOf(sqlite3_bind_parameter_count((statement->statement)));
+    end;
+
+    generic [R: Region]
+    function columnCount(statement: &[Statement, R]): Index is
+        return indexOf(sqlite3_column_count((statement->statement)));
+    end;
+
+    -- SQLITE_TRANSIENT: SQLite copies the bytes before the call returns.
+    function transient(): Address[Unit] is
+        return @embed(Address[Unit], "((void*)(intptr_t)-1)");
+    end;
+
+    generic [R: Region]
+    function bindInt64(statement: &![Statement, R], position: Index, value: Int64): Int32 is
+        return sqlite3_bind_int64((statement->statement), int32Of(position), value);
+    end;
+
+    generic [R: Region]
+    function bindFloat64(statement: &![Statement, R], position: Index, value: Float64): Int32 is
+        return sqlite3_bind_double((statement->statement), int32Of(position), value);
+    end;
+
+    generic [R: Region, S: Region]
+    function bindText(statement: &![Statement, R], position: Index, value: Span[Nat8, S]): Int32 is
+        return sqlite3_bind_text((statement->statement), int32Of(position), bytesOf(value), int32Of(spanLength(value)), transient());
+    end;
+
+    generic [R: Region, S: Region]
+    function bindBlob(statement: &![Statement, R], position: Index, value: Span[Nat8, S]): Int32 is
+        return sqlite3_bind_blob((statement->statement), int32Of(position), @embed(Address[Unit], "(void*)$1", bytesOf(value)),
+            int32Of(spanLength(value)), transient());
+    end;
+
+    generic [R: Region]
+    function bindNull(statement: &![Statement, R], position: Index): Int32 is
+        return sqlite3_bind_null((statement->statement), int32Of(position));
+    end;
+
+    generic [R: Region]
+    function stepStatement(statement: &![Statement, R]): Int32 is
+        return sqlite3_step((statement->statement));
+    end;
+
+    generic [R: Region]
+    function columnKind(statement: &[Statement, R], column: Index): Int32 is
+        return sqlite3_column_type((statement->statement), int32Of(column));
+    end;
+
+    generic [R: Region]
+    function columnInt64(statement: &[Statement, R], column: Index): Int64 is
+        return sqlite3_column_int64((statement->statement), int32Of(column));
+    end;
+
+    generic [R: Region]
+    function columnFloat64(statement: &[Statement, R], column: Index): Float64 is
+        return sqlite3_column_double((statement->statement), int32Of(column));
+    end;
+
+    -- The bytes of a text or blob column, copied; sqlite3_column_bytes
+    -- after the pointer, as SQLite's documentation orders it.
+    generic [R: Region]
+    function columnBytes(statement: &[Statement, R], column: Index): String is
+        let at: Int32 := int32Of(column);
+        if sqlite3_column_type((statement->statement), at) = 4 then
+            let blob: Address[Unit] := sqlite3_column_blob((statement->statement), at);
+            let size: Int32 := sqlite3_column_bytes((statement->statement), at);
+            return fromSpan(@embed(Span[Nat8, R], "hilde_make_span((void*)$1, (size_t)$2)", blob, size));
+        end if;
+        let text: Address[Nat8] := sqlite3_column_text((statement->statement), at);
+        let size: Int32 := sqlite3_column_bytes((statement->statement), at);
+        return fromSpan(@embed(Span[Nat8, R], "hilde_make_span((void*)$1, (size_t)$2)", text, size));
+    end;
+
+    function finalizeStatement(statement: Statement): Unit is
+        let { statement as raw: Address[Unit] } := statement;
+        let finalized: Int32 := sqlite3_finalize(raw);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function changes(db: &[Database, R]): Int64 is
+        return sqlite3_changes64((db->handle));
+    end;
+
+    generic [R: Region]
+    function errorCode(db: &[Database, R]): Int32 is
+        return sqlite3_extended_errcode((db->handle));
+    end;
+
+    generic [R: Region]
+    function errorWords(db: &[Database, R]): String is
+        return wordsOf(sqlite3_errmsg((db->handle)), "no words");
+    end;
+
+    ---
+    --- The online backup
+    ---
+
+    -- Every page of source copied into destination at once.
+    function copyAll(destination: Address[Unit], source: Address[Unit]): Bool is
+        let main: Address[Nat8] := @embed(Address[Nat8], "(hilde_nat8_t*)\"main\"");
+        let backup: Address[Unit] := sqlite3_backup_init(destination, main, source, main);
+        if isNull(backup) then
+            return false;
+        end if;
+        let stepped: Int32 := sqlite3_backup_step(backup, -1);
+        let finished: Int32 := sqlite3_backup_finish(backup);
+        return (stepped = SQLITE_DONE) and (finished = SQLITE_OK);
+    end;
+
+    generic [D: Region, R: Region]
+    function backupInto(db: &[Database, D], path: Span[Nat8, R]): Bool is
+        let file: Address[Unit] := openHandle(path);
+        if isNull(file) then
+            return false;
+        end if;
+        let copied: Bool := copyAll(file, (db->handle));
+        let closed: Int32 := sqlite3_close_v2(file);
+        return copied and (closed = SQLITE_OK);
+    end;
+
+    generic [D: Region, R: Region]
+    function restoreFrom(db: &[Database, D], path: Span[Nat8, R]): Bool is
+        let file: Address[Unit] := openHandle(path);
+        if isNull(file) then
+            return false;
+        end if;
+        let copied: Bool := copyAll((db->handle), file);
+        let closed: Int32 := sqlite3_close_v2(file);
+        return copied and (closed = SQLITE_OK);
+    end;
+
+    ---
+    --- Bits
+    ---
+
+    function int64Bits(value: Int64): Nat64 is
+        return @embed(Nat64, "((uint64_t)($1))", value);
+    end;
+
+    function int64OfBits(bits: Nat64): Int64 is
+        return @embed(Int64, "((int64_t)($1))", bits);
+    end;
+end module body.

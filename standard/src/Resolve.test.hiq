@@ -1,0 +1,269 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    length as stringLength,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    destroyFree,
+    length,
+    nth
+);
+import Standard.Ip (
+    IpAddress,
+    parseIp,
+    sameIp
+);
+import Standard.Resolve (
+    Family,
+    AnyFamily,
+    OnlyIpv4,
+    OnlyIpv6,
+    ResolveFailure,
+    NotAHostName,
+    UnknownName,
+    ResolverUnavailable,
+    NoAddressOfFamily,
+    ResolveFailed,
+    validHostname,
+    resolveHost
+);
+
+module body Standard.Resolve.Test is
+    ---
+    --- Helpers
+    ---
+
+    -- piece written times times, then tail.
+    function repeated(piece: Span[Nat8, Static], times: Index, tail: Span[Nat8, Static]): String is
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < times do
+            var j: Index := 0;
+            while j < spanLength(piece) do
+                writeByte(&!builder, piece[j]);
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        var k: Index := 0;
+        while k < spanLength(tail) do
+            writeByte(&!builder, tail[k]);
+            k := k + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    function validAsString(name: String): Bool is
+        let valid: Bool := validHostname(asSpan(&name));
+        destroyString(name);
+        return valid;
+    end;
+
+    function failureCode(failure: ResolveFailure): Int32 is
+        case failure of
+            when NotAHostName do
+                return 1;
+            when UnknownName do
+                return 2;
+            when ResolverUnavailable do
+                return 3;
+            when NoAddressOfFamily do
+                return 4;
+            when ResolveFailed do
+                return 5;
+        end case;
+    end;
+
+    -- The answer for name holds exactly one address, expected.
+    function onlyAddress(name: Span[Nat8, Static], family: Family, expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case resolveHost(name, family) of
+            when Right(right as found: Buffer[IpAddress]) do
+                let one: Index := 1;
+                var same: Bool := false;
+                if length(&found) = one then
+                    case parseIp(expected) of
+                        when Some(value as want: IpAddress) do
+                            same := sameIp(nth(&found, 0), want);
+                        when None do
+                            skip;
+                    end case;
+                end if;
+                assertTrue(same, message);
+                destroyFree(found);
+            when Left(left as failure: ResolveFailure) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- Resolving name fails with the failure of the given code.
+    function failsWith(name: Span[Nat8, Static], family: Family, code: Int32, message: Span[Nat8, Static]): Unit is
+        case resolveHost(name, family) of
+            when Right(right as found: Buffer[IpAddress]) do
+                destroyFree(found);
+                assertTrue(false, message);
+            when Left(left as failure: ResolveFailure) do
+                assertTrue(failureCode(failure) = code, message);
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Host names
+    ---
+
+    function testValidHostnames(): Unit is
+        assertTrue(validHostname("example.com"), "example.com");
+        assertTrue(validHostname("www.ssllabs.com"), "www.ssllabs.com");
+        assertTrue(validHostname("a.b.c.d.example.org"), "five labels");
+        assertTrue(validHostname("xn--bcher-kva.example"), "a name in its xn-- form");
+        assertTrue(validHostname("host-with-hyphen.example.com"), "hyphens inside a label");
+        assertTrue(validHostname("1.2.3.4"), "digits only");
+        assertTrue(validHostname("localhost"), "one label");
+        assertTrue(validHostname("EXAMPLE.COM"), "capitals");
+        assertTrue(validAsString(repeated("a", 63, ".com")), "a label of 63");
+        return nil;
+    end;
+
+    function testInvalidHostnames(): Unit is
+        assertFalse(validHostname(""), "empty");
+        assertFalse(validHostname("example..com"), "an empty label");
+        assertFalse(validHostname(".example.com"), "a leading dot");
+        assertFalse(validHostname("example.com."), "a trailing dot");
+        assertFalse(validHostname("-example.com"), "a label beginning with a hyphen");
+        assertFalse(validHostname("example-.com"), "a label ending with a hyphen");
+        assertFalse(validHostname("exa mple.com"), "a space");
+        assertFalse(validHostname("exam_ple.com"), "an underscore");
+        assertFalse(validHostname("http://example.com"), "a scheme");
+        assertFalse(validHostname("example.com/path"), "a path");
+        assertFalse(validHostname("host:443"), "a port");
+        var unicode: StringBuilder := makeStringBuilder();
+        writeByte(&!unicode, 'e');
+        writeByte(&!unicode, 'x');
+        writeByte(&!unicode, 195);
+        writeByte(&!unicode, 164);
+        writeByte(&!unicode, 'm');
+        assertFalse(validAsString(finalize(unicode)), "a name in Unicode");
+        assertFalse(validAsString(repeated("a", 64, ".com")), "a label of 64");
+        assertFalse(validAsString(repeated("a.", 127, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")), "294 bytes");
+        return nil;
+    end;
+
+    -- The two sides of the length limit: 253 bytes
+    -- pass, 254 do not.
+    function testLengthBoundaries(): Unit is
+        let long: String := repeated("ab.", 83, "ab.xy");
+        assertTrue(stringLength(&long) = 254, "the long name is 254 bytes");
+        assertFalse(validHostname(asSpan(&long)), "254 bytes");
+        destroyString(long);
+        let limit: String := repeated("ab.", 83, "ab.x");
+        assertTrue(stringLength(&limit) = 253, "the limit is 253 bytes");
+        assertTrue(validHostname(asSpan(&limit)), "253 bytes");
+        destroyString(limit);
+        return nil;
+    end;
+
+    ---
+    --- Literals, which never reach the resolver
+    ---
+
+    function testLiterals(): Unit is
+        onlyAddress("1.2.3.4", AnyFamily(), "1.2.3.4", "an IPv4 literal");
+        onlyAddress("2001:db8::24", AnyFamily(), "2001:db8::24", "an IPv6 literal");
+        onlyAddress("::ffff:1.2.3.4", OnlyIpv4(), "1.2.3.4", "a mapped IPv4 address is IPv4");
+        onlyAddress("::FFFF:1.2.3.4", AnyFamily(), "1.2.3.4", "the mapped prefix in capitals");
+        onlyAddress("::ffff:7f00:1", OnlyIpv4(), "127.0.0.1", "a mapped IPv4 address in groups is IPv4");
+        onlyAddress("::ffff:0102:0304", AnyFamily(), "1.2.3.4", "a mapped IPv4 address in groups, leading zeros");
+        onlyAddress("1.2.3.4", OnlyIpv4(), "1.2.3.4", "IPv4 kept by OnlyIpv4");
+        onlyAddress("2001:db8::24", OnlyIpv6(), "2001:db8::24", "IPv6 kept by OnlyIpv6");
+        return nil;
+    end;
+
+    function testFamilies(): Unit is
+        failsWith("1.2.3.4", OnlyIpv6(), 4, "IPv4 dropped by OnlyIpv6");
+        failsWith("2001:db8::24", OnlyIpv4(), 4, "IPv6 dropped by OnlyIpv4");
+        failsWith("::ffff:1.2.3.4", OnlyIpv6(), 4, "a mapped address is not IPv6");
+        return nil;
+    end;
+
+    function testNotAHostName(): Unit is
+        failsWith("", AnyFamily(), 1, "the empty name");
+        failsWith("example..com", AnyFamily(), 1, "an empty label");
+        failsWith("host:443", AnyFamily(), 1, "a port");
+        failsWith("::ffff:1.2.3", AnyFamily(), 1, "a mapped prefix before three groups");
+        return nil;
+    end;
+
+    ---
+    --- The resolver
+    ---
+
+    -- The hosts file of the gate's image and of the OpenBSD guest both give
+    -- localhost as 127.0.0.1 and ::1 (measured).
+    function testLocalhost(): Unit is
+        onlyAddress("localhost", OnlyIpv4(), "127.0.0.1", "localhost as IPv4");
+        return nil;
+    end;
+
+    -- A test of its own, so that it runs whatever the one above found: a
+    -- test ends at its first assertion that does not hold.
+    function testEveryAddressOnce(): Unit is
+        case resolveHost("localhost", AnyFamily()) of
+            when Right(right as found: Buffer[IpAddress]) do
+                let count: Index := length(&found);
+                assertTrue(count >= 1, "localhost has an address");
+                var twice: Bool := false;
+                var i: Index := 0;
+                while i < count do
+                    var j: Index := i + 1;
+                    while j < count do
+                        if sameIp(nth(&found, i), nth(&found, j)) then
+                            twice := true;
+                        end if;
+                        j := j + 1;
+                    end while;
+                    i := i + 1;
+                end while;
+                assertFalse(twice, "every address once");
+                destroyFree(found);
+            when Left(left as failure: ResolveFailure) do
+                assertTrue(false, "localhost resolves");
+        end case;
+        return nil;
+    end;
+
+    -- The .invalid domain never resolves (RFC 6761).  Where there is no
+    -- resolver to ask, as in the gate's container, the answer is
+    -- ResolverUnavailable instead of UnknownName; both are right, and a
+    -- name that is not refused as a host name is what this holds.
+    function testUnknownName(): Unit is
+        case resolveHost("this.host.does.not.exist.invalid", AnyFamily()) of
+            when Right(right as found: Buffer[IpAddress]) do
+                destroyFree(found);
+                assertTrue(false, "an .invalid name has no address");
+            when Left(left as failure: ResolveFailure) do
+                let code: Int32 := failureCode(failure);
+                assertTrue((code = 2) or (code = 3), "an .invalid name is unknown or the resolver unavailable");
+        end case;
+        return nil;
+    end;
+end module body.

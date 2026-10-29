@@ -1,0 +1,308 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    Sender,
+    Receiver,
+    Channel,
+    openChannel,
+    send,
+    closeSender,
+    closeReceiver,
+    Selected,
+    receiveEither
+);
+
+module body Test is
+    -- Send first, first + 1 and first + 2, then close.
+    function produce(sender: Sender[Int32]): Unit is
+        var out: Sender[Int32] := sender;
+        let first: Int32 := 1;
+        var k: Int32 := 0;
+        while k < 3 do
+            case send(&!out, first + k) of
+                when Some(value as back: Int32) do
+                    printLn(-back);
+                when None do
+                    skip;
+            end case;
+            k := k + 1;
+        end while;
+        closeSender(out);
+        return nil;
+    end;
+
+    -- Send 10, 20 and 30, then close.
+    function produceTens(sender: Sender[Int32]): Unit is
+        var out: Sender[Int32] := sender;
+        var k: Int32 := 1;
+        while k <= 3 do
+            case send(&!out, k * 10) of
+                when Some(value as back: Int32) do
+                    printLn(-back);
+                when None do
+                    skip;
+            end case;
+            k := k + 1;
+        end while;
+        closeSender(out);
+        return nil;
+    end;
+
+    -- Take from both until both are closed; print how many values came
+    -- from each and their sums, which do not depend on the order.
+    function drainBoth(first: Receiver[Int32], second: Receiver[Int32]): Unit is
+        var a: Receiver[Int32] := first;
+        var b: Receiver[Int32] := second;
+        var fromA: Int32 := 0;
+        var sumA: Int32 := 0;
+        var fromB: Int32 := 0;
+        var sumB: Int32 := 0;
+        var more: Bool := true;
+        while more do
+            case receiveEither(&!a, &!b) of
+                when FromFirst(value as v: Int32) do
+                    fromA := fromA + 1;
+                    sumA := sumA + v;
+                when FromSecond(value as v: Int32) do
+                    fromB := fromB + 1;
+                    sumB := sumB + v;
+                when AllClosed do
+                    more := false;
+            end case;
+        end while;
+        closeReceiver(a);
+        closeReceiver(b);
+        printLn(fromA);
+        printLn(sumA);
+        printLn(fromB);
+        printLn(sumB);
+        return nil;
+    end;
+
+    -- Two producer tasks, main taking from both.
+    generic [R: Region]
+    function twoProducers(scope: &![Scope, R], capacity: Index): Unit is
+        let made1: Option[Channel[Int32]] := openChannel(capacity);
+        case made1 of
+            when Some(value as ones: Channel[Int32]) do
+                let made2: Option[Channel[Int32]] := openChannel(capacity);
+                case made2 of
+                    when Some(value as tens: Channel[Int32]) do
+                        let { sender as s1: Sender[Int32], receiver as r1: Receiver[Int32] } := ones;
+                        let { sender as s2: Sender[Int32], receiver as r2: Receiver[Int32] } := tens;
+                        let work: Fn[Sender[Int32], Unit] := produce;
+                        let workTens: Fn[Sender[Int32], Unit] := produceTens;
+                        case spawn(&~scope, work, s1) of
+                            when Right(right as t1: Task[Unit]) do
+                                case spawn(&~scope, workTens, s2) of
+                                    when Right(right as t2: Task[Unit]) do
+                                        drainBoth(r1, r2);
+                                        join(t1);
+                                        join(t2);
+                                    when Left(left as unused: Sender[Int32]) do
+                                        closeSender(unused);
+                                        drainBoth(r1, r2);
+                                        join(t1);
+                                        printLn(-2);
+                                end case;
+                            when Left(left as unused: Sender[Int32]) do
+                                closeSender(unused);
+                                closeSender(s2);
+                                drainBoth(r1, r2);
+                                printLn(-2);
+                        end case;
+                    when None do
+                        let { sender as s1: Sender[Int32], receiver as r1: Receiver[Int32] } := ones;
+                        closeSender(s1);
+                        closeReceiver(r1);
+                        printLn(-1);
+                end case;
+            when None do
+                printLn(-1);
+        end case;
+        return nil;
+    end;
+
+    -- Both channels full before the first wait: the values come in turn,
+    -- the first channel first.
+    function inTurn(): Unit is
+        let made3: Option[Channel[Int32]] := openChannel(3);
+        case made3 of
+            when Some(value as ones: Channel[Int32]) do
+                let made4: Option[Channel[Int32]] := openChannel(3);
+                case made4 of
+                    when Some(value as tens: Channel[Int32]) do
+                        let { sender as s1: Sender[Int32], receiver as r1: Receiver[Int32] } := ones;
+                        let { sender as s2: Sender[Int32], receiver as r2: Receiver[Int32] } := tens;
+                        produce(s1);
+                        produceTens(s2);
+                        var a: Receiver[Int32] := r1;
+                        var b: Receiver[Int32] := r2;
+                        var more: Bool := true;
+                        while more do
+                            case receiveEither(&!a, &!b) of
+                                when FromFirst(value as v: Int32) do
+                                    printLn(v);
+                                when FromSecond(value as v: Int32) do
+                                    printLn(v);
+                                when AllClosed do
+                                    more := false;
+                            end case;
+                        end while;
+                        closeReceiver(a);
+                        closeReceiver(b);
+                    when None do
+                        let { sender as s1: Sender[Int32], receiver as r1: Receiver[Int32] } := ones;
+                        closeSender(s1);
+                        closeReceiver(r1);
+                        printLn(-1);
+                end case;
+            when None do
+                printLn(-1);
+        end case;
+        return nil;
+    end;
+
+    -- Linear values: the first channel closed and empty from the start,
+    -- the second with two strings; both strings come, then AllClosed.
+    function closedAndStrings(): Unit is
+        let made5: Option[Channel[String]] := openChannel(1);
+        case made5 of
+            when Some(value as silent: Channel[String]) do
+                let made6: Option[Channel[String]] := openChannel(2);
+                case made6 of
+                    when Some(value as words: Channel[String]) do
+                        let { sender as s1: Sender[String], receiver as r1: Receiver[String] } := silent;
+                        let { sender as s2: Sender[String], receiver as r2: Receiver[String] } := words;
+                        closeSender(s1);
+                        var out: Sender[String] := s2;
+                        case send(&!out, fromLiteral("north")) of
+                            when Some(value as back: String) do
+                                destroyString(back);
+                            when None do
+                                skip;
+                        end case;
+                        case send(&!out, fromLiteral("south")) of
+                            when Some(value as back: String) do
+                                destroyString(back);
+                            when None do
+                                skip;
+                        end case;
+                        closeSender(out);
+                        var a: Receiver[String] := r1;
+                        var b: Receiver[String] := r2;
+                        var more: Bool := true;
+                        while more do
+                            case receiveEither(&!a, &!b) of
+                                when FromFirst(value as w: String) do
+                                    printLn(-1);
+                                    destroyString(w);
+                                when FromSecond(value as w: String) do
+                                    printLn(length(&w));
+                                    destroyString(w);
+                                when AllClosed do
+                                    more := false;
+                            end case;
+                        end while;
+                        closeReceiver(a);
+                        closeReceiver(b);
+                        printLn(0);
+                    when None do
+                        let { sender as s1: Sender[String], receiver as r1: Receiver[String] } := silent;
+                        closeSender(s1);
+                        closeReceiver(r1);
+                        printLn(-1);
+                end case;
+            when None do
+                printLn(-1);
+        end case;
+        return nil;
+    end;
+
+    -- Close the sender without sending.
+    function closeOnly(sender: Sender[Int32]): Unit is
+        closeSender(sender);
+        return nil;
+    end;
+
+    -- The first channel closed and empty, the second's sender a task that
+    -- closes it without sending: the wait ends only because the close of
+    -- the second sender wakes it.
+    generic [R: Region]
+    function closedWhileWaiting(scope: &![Scope, R]): Unit is
+        let quiet: Option[Channel[Int32]] := openChannel(1);
+        case quiet of
+            when Some(value as c1: Channel[Int32]) do
+                let later: Option[Channel[Int32]] := openChannel(1);
+                case later of
+                    when Some(value as c2: Channel[Int32]) do
+                        let { sender as s1: Sender[Int32], receiver as r1: Receiver[Int32] } := c1;
+                        let { sender as s2: Sender[Int32], receiver as r2: Receiver[Int32] } := c2;
+                        closeSender(s1);
+                        let work: Fn[Sender[Int32], Unit] := closeOnly;
+                        case spawn(&~scope, work, s2) of
+                            when Right(right as closer: Task[Unit]) do
+                                var a: Receiver[Int32] := r1;
+                                var b: Receiver[Int32] := r2;
+                                case receiveEither(&!a, &!b) of
+                                    when FromFirst(value as v: Int32) do
+                                        printLn(-v);
+                                    when FromSecond(value as v: Int32) do
+                                        printLn(-v);
+                                    when AllClosed do
+                                        printLn(0);
+                                end case;
+                                closeReceiver(a);
+                                closeReceiver(b);
+                                join(closer);
+                            when Left(left as unused: Sender[Int32]) do
+                                closeSender(unused);
+                                closeReceiver(r1);
+                                closeReceiver(r2);
+                                printLn(-2);
+                        end case;
+                    when None do
+                        let { sender as s1: Sender[Int32], receiver as r1: Receiver[Int32] } := c1;
+                        closeSender(s1);
+                        closeReceiver(r1);
+                        printLn(-1);
+                end case;
+            when None do
+                printLn(-1);
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                -- Channels of capacity 1, and rendezvous channels.
+                printLn(900);
+                twoProducers(&!scope, 1);
+                printLn(901);
+                twoProducers(&!scope, 0);
+                -- A wait that the close of a sender ends.
+                printLn(904);
+                closedWhileWaiting(&!scope);
+                closeScope(scope);
+            when None do
+                printLn(-2);
+        end case;
+        printLn(902);
+        inTurn();
+        printLn(903);
+        closedAndStrings();
+        return ExitSuccess();
+    end;
+end module body.

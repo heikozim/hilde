@@ -1,0 +1,429 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: it reads bytes through spans and keeps the entries as
+-- strings in a buffer; it binds no C.
+import Standard.String (
+    String,
+    makeEmpty,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    length as bufferLength,
+    nthRef,
+    insertBack,
+    removeLast,
+    swapNth
+);
+import Standard.Text (
+    substring
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Hash (
+    Hashable
+);
+import Standard.HashMap (
+    HashMap,
+    makeHashMap,
+    destroyEmpty as destroyEmptyMap,
+    size as mapSize,
+    get,
+    put,
+    removeAt
+);
+
+module body Standard.Ini is
+    record Entry: Linear is
+        section: String;
+        name: String;
+        value: String;
+    end;
+
+    -- index finds an entry by its section and name: the key is made by
+    -- entryKey, the value is the place of the entry in entries.  Every
+    -- entry has its key, so the two hold the same number.
+    record IniFile: Linear is
+        entries: Buffer[Entry];
+        skipped: Index;
+        index: HashMap[String, Index];
+        invariant mapSize(&index) = bufferLength(&entries);
+    end;
+
+    ---
+    --- Small pieces
+    ---
+
+    function isBlank(byte: Nat8): Bool is
+        return (byte = ' ') or ((byte = '\t') or (byte = '\r'));
+    end;
+
+    -- The place of the line feed that ends the line from at on, or the
+    -- length.
+    generic [R: Region]
+    function endOfLine(text: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(text);
+        var i: Index := at;
+        while (i < size) and (text[i] /= '\n') do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- The first place from start up to final that is not blank, or final.
+    generic [R: Region]
+    function skipBlank(text: Span[Nat8, R], start: Index, final: Index): Index is
+        var i: Index := start;
+        while (i < final) and isBlank(text[i]) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- The place after the last byte from start up to final that is not
+    -- blank, or start.
+    generic [R: Region]
+    function trimEnd(text: Span[Nat8, R], start: Index, final: Index): Index is
+        var i: Index := final;
+        while (i > start) and isBlank(text[i - 1]) do
+            i := i - 1;
+        end while;
+        return i;
+    end;
+
+    -- The place of the first = from start up to final, or final.
+    generic [R: Region]
+    function equalsAt(text: Span[Nat8, R], start: Index, final: Index): Index is
+        var i: Index := start;
+        while (i < final) and (text[i] /= '=') do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    function destroyEntry(entry: Entry): Unit is
+        let { section: String, name: String, value: String } := entry;
+        destroyString(section);
+        destroyString(name);
+        destroyString(value);
+        return nil;
+    end;
+
+    function destroyEntries(entries: Buffer[Entry]): Unit is
+        var rest: Buffer[Entry] := entries;
+        while bufferLength(&rest) > 0 do
+            destroyEntry(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- The number in decimal digits.
+    generic [B: Region]
+    function writeDecimal(out: &![StringBuilder, B], number: Index): Unit is
+        let ten: Index := 10;
+        if number >= ten then
+            writeDecimal(&~out, number / ten);
+        end if;
+        case toNat8(number - ((number / ten) * ten)) of
+            when Some(value as digit: Nat8) do
+                writeByte(&~out, digit + 48);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The key of the index for the name in text from start up to final, in
+    -- section: the length of section in decimal, a colon, section and the
+    -- name.  The length keeps apart two pairs whose bytes join to the same.
+    generic [S: Region, N: Region]
+    function entryKey(section: Span[Nat8, S], text: Span[Nat8, N], start: Index, final: Index): String is
+        var builder: StringBuilder := makeStringBuilder();
+        writeDecimal(&!builder, spanLength(section));
+        writeByte(&!builder, ':');
+        writeString(&!builder, section);
+        appendBytes(&!builder, text, start, final);
+        return finalize(builder);
+    end;
+
+    -- Give back the key of an entry the index let go.
+    function dropOld(old: Option[Pair[String, Index]]): Unit is
+        case old of
+            when Some(value as pair: Pair[String, Index]) do
+                let { first: String, second: Index } := pair;
+                destroyString(first);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function destroyIndex(index: HashMap[String, Index]): Unit is
+        var map: HashMap[String, Index] := index;
+        while mapSize(&map) > 0 do
+            let last: Index := mapSize(&map) - 1;
+            dropOld(removeAt(&!map, last));
+        end while;
+        destroyEmptyMap(map);
+        return nil;
+    end;
+
+    -- The place of the entry for the name that stands in text from start
+    -- up to final, in section, or the number of entries when there is
+    -- none.
+    generic [R: Region, M: Region, S: Region, N: Region]
+    function findEntry(entries: &[Buffer[Entry], R], index: &[HashMap[String, Index], M], section: Span[Nat8, S], text: Span[Nat8, N], start: Index, final: Index): Index is
+        let key: String := entryKey(section, text, start, final);
+        let found: Option[Index] := get(index, &key);
+        destroyString(key);
+        case found of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                return bufferLength(entries);
+        end case;
+    end;
+
+    -- Store the value of the name in text from start up to final, in
+    -- section; a name already there in its section gets the new value in
+    -- its old place.
+    generic [R: Region, M: Region, S: Region, N: Region]
+    function store(entries: &![Buffer[Entry], R], index: &![HashMap[String, Index], M], section: Span[Nat8, S], text: Span[Nat8, N], start: Index, final: Index, value: String): Unit is
+        let key: String := entryKey(section, text, start, final);
+        let found: Option[Index] := get(&index, &key);
+        let entry: Entry := Entry(section => fromSpan(section), name => fromSpan(substring(text, start, final)), value => value);
+        case found of
+            when Some(value as at: Index) do
+                destroyString(key);
+                let old: Entry := swapNth(&~entries, at, entry);
+                destroyEntry(old);
+            when None do
+                let at: Index := bufferLength(&entries);
+                insertBack(&~entries, entry);
+                dropOld(put(&~index, key, at));
+        end case;
+        return nil;
+    end;
+
+    generic [B: Region, R: Region]
+    function appendBytes(builder: &![StringBuilder, B], text: Span[Nat8, R], start: Index, final: Index): Unit is
+        var i: Index := start;
+        while i < final do
+            writeByte(&~builder, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    generic [R: Region]
+    function readIni(text: Span[Nat8, R]): IniFile is
+        let size: Index := spanLength(text);
+        var entries: Buffer[Entry] := allocateEmpty();
+        var index: HashMap[String, Index] := makeHashMap();
+        var section: String := makeEmpty();
+        var skipped: Index := 0;
+        var at: Index := 0;
+        while at < size do
+            let lineEnd: Index := endOfLine(text, at);
+            let next: Index := if lineEnd < size then lineEnd + 1 else size;
+            let start: Index := skipBlank(text, at, lineEnd);
+            let final: Index := trimEnd(text, start, lineEnd);
+            if start = final then
+                at := next;
+            else if (text[start] = '#') or (text[start] = ';') then
+                at := next;
+            else if text[start] = '[' then
+                if ((final - start) >= 2) and (text[final - 1] = ']') then
+                    let nameStart: Index := skipBlank(text, start + 1, final - 1);
+                    let nameEnd: Index := trimEnd(text, nameStart, final - 1);
+                    destroyString(section);
+                    section := fromSpan(substring(text, nameStart, nameEnd));
+                else
+                    skipped := skipped + 1;
+                end if;
+                at := next;
+            else
+                let equals: Index := equalsAt(text, start, final);
+                let nameEnd: Index := trimEnd(text, start, equals);
+                if (equals = final) or (nameEnd = start) then
+                    skipped := skipped + 1;
+                    at := next;
+                else
+                    let valueStart: Index := skipBlank(text, equals + 1, final);
+                    var builder: StringBuilder := makeStringBuilder();
+                    var more: Bool := (final > valueStart) and (text[final - 1] = '\\');
+                    if more then
+                        appendBytes(&!builder, text, valueStart, final - 1);
+                    else
+                        appendBytes(&!builder, text, valueStart, final);
+                    end if;
+                    var cursor: Index := next;
+                    while more and (cursor < size) do
+                        let moreEnd: Index := endOfLine(text, cursor);
+                        let moreStart: Index := skipBlank(text, cursor, moreEnd);
+                        let moreFinal: Index := trimEnd(text, moreStart, moreEnd);
+                        if (moreFinal > moreStart) and (text[moreFinal - 1] = '\\') then
+                            appendBytes(&!builder, text, moreStart, moreFinal - 1);
+                        else
+                            appendBytes(&!builder, text, moreStart, moreFinal);
+                            more := false;
+                        end if;
+                        cursor := if moreEnd < size then moreEnd + 1 else size;
+                    end while;
+                    at := cursor;
+                    store(&!entries, &!index, asSpan(&section), text, start, nameEnd, finalize(builder));
+                end if;
+            end if;
+        end while;
+        destroyString(section);
+        return IniFile(entries => entries, skipped => skipped, index => index);
+    end;
+
+    function destroyIni(file: IniFile): Unit is
+        let { entries: Buffer[Entry], skipped: Index, index: HashMap[String, Index] } := file;
+        destroyEntries(entries);
+        destroyIndex(index);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function skippedLines(file: &[IniFile, R]): Index is
+        return file->skipped;
+    end;
+
+    generic [R: Region, S: Region, N: Region]
+    function iniValue(file: &[IniFile, R], section: Span[Nat8, S], name: Span[Nat8, N]): Option[Span[Nat8, R]] is
+        let entries: &[Buffer[Entry], R] := &(file->entries);
+        let at: Index := findEntry(entries, &(file->index), section, name, 0, spanLength(name));
+        if at < bufferLength(entries) then
+            let entry: &[Entry, R] := nthRef(entries, at);
+            return Some(value => asSpan(&(entry->value)));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region, D: Region, S: Region, N: Region]
+    function iniValueWith(file: &[IniFile, R], defaults: &[IniFile, D], section: Span[Nat8, S], name: Span[Nat8, N]): Option[String] is
+        case iniValue(file, section, name) of
+            when Some(value as found: Span[Nat8, R]) do
+                return Some(value => fromSpan(found));
+            when None do
+                let inherited: Span[Nat8, D] := iniValue(defaults, section, name)?;
+                return Some(value => fromSpan(inherited));
+        end case;
+    end;
+
+    function lower(byte: Nat8): Nat8 is
+        if (byte >= 'A') and (byte <= 'Z') then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    -- Whether the bytes from start up to final are word, without regard
+    -- to case.
+    generic [R: Region]
+    function isWord(text: Span[Nat8, R], start: Index, final: Index, word: Span[Nat8, Static]): Bool is
+        let size: Index := spanLength(word);
+        if (final - start) /= size then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if lower(text[start + i]) /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function isAnyBlank(byte: Nat8): Bool is
+        return isBlank(byte) or (byte = '\n');
+    end;
+
+    generic [R: Region]
+    function isOn(value: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(value);
+        var start: Index := 0;
+        while (start < size) and isAnyBlank(value[start]) do
+            start := start + 1;
+        end while;
+        var final: Index := size;
+        while (final > start) and isAnyBlank(value[final - 1]) do
+            final := final - 1;
+        end while;
+        return isWord(value, start, final, "yes") or isWord(value, start, final, "true");
+    end;
+
+    generic [R: Region, S: Region, N: Region]
+    function iniSwitch(file: &[IniFile, R], section: Span[Nat8, S], name: Span[Nat8, N]): Bool is
+        case iniValue(file, section, name) of
+            when Some(value as found: Span[Nat8, R]) do
+                return isOn(found);
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function entryCount(file: &[IniFile, R]): Index is
+        return bufferLength(&(file->entries));
+    end;
+
+    generic [R: Region]
+    function entrySection(file: &[IniFile, R], n: Index): Option[Span[Nat8, R]] is
+        let entries: &[Buffer[Entry], R] := &(file->entries);
+        if n >= bufferLength(entries) then
+            return None();
+        end if;
+        let entry: &[Entry, R] := nthRef(entries, n);
+        return Some(value => asSpan(&(entry->section)));
+    end;
+
+    generic [R: Region]
+    function entryName(file: &[IniFile, R], n: Index): Option[Span[Nat8, R]] is
+        let entries: &[Buffer[Entry], R] := &(file->entries);
+        if n >= bufferLength(entries) then
+            return None();
+        end if;
+        let entry: &[Entry, R] := nthRef(entries, n);
+        return Some(value => asSpan(&(entry->name)));
+    end;
+
+    generic [R: Region]
+    function entryValue(file: &[IniFile, R], n: Index): Option[Span[Nat8, R]] is
+        let entries: &[Buffer[Entry], R] := &(file->entries);
+        if n >= bufferLength(entries) then
+            return None();
+        end if;
+        let entry: &[Entry, R] := nthRef(entries, n);
+        return Some(value => asSpan(&(entry->value)));
+    end;
+end module body.

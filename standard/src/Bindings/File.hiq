@@ -1,0 +1,725 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Binds the file, directory, process, environment and socket calls of the
+-- C library through the runtime.  It hands the kernel the address of a
+-- string's bytes and holds a directory stream as a pointer, so it is an
+-- unsafe module; Standard.File is the safe module built on it.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullCheck,
+    allocateBuffer,
+    load,
+    deallocate,
+    positiveOffset,
+    spanToPointer,
+    spanWriteToPointer,
+    arraySizeInBytes
+);
+import Standard.String (
+    String,
+    length,
+    nthByte,
+    getSpan,
+    getSpanMut
+);
+
+module body Bindings.File is
+    ---
+    --- What is handed to C
+    ---
+
+    -- The number of zero bytes in the string.
+    generic [R: Region]
+    function zeroBytes(string: &[String, R]): Index is
+        let size: Index := length(string);
+        var count: Index := 0;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if nthByte(string, i) = 0 then
+                    count := count + 1;
+                end if;
+            end for;
+        end if;
+        return count;
+    end;
+
+    -- A path C may read: not empty, its last byte the zero byte that ends
+    -- it, and no zero byte before that one.  The kernel reads up to the
+    -- first zero byte: a string without one at its end would be read past,
+    -- and a zero byte inside would name a shorter path than the one the
+    -- caller checked.
+    generic [R: Region]
+    function readable(path: &[String, R]): Bool is
+        let size: Index := length(path);
+        if size = 0 then
+            return false;
+        end if;
+        if nthByte(path, size - 1) /= 0 then
+            return false;
+        end if;
+        return zeroBytes(path) = 1;
+    end;
+
+    -- The address of the first byte.  Only called on a string that is not
+    -- empty: the span [0, 0] names its first byte.
+    generic [R: Region]
+    function firstByte(string: &[String, R]): Pointer[Nat8] is
+        return spanToPointer(getSpan(string, 0, 0));
+    end;
+
+    generic [R: Region]
+    function firstByteMut(string: &![String, R]): Pointer[Nat8] is
+        return spanWriteToPointer(getSpanMut(string, 0, 0));
+    end;
+
+    ---
+    --- Files
+    ---
+
+    generic [R: Region]
+    function openRead(path: &[String, R]): Int32 is
+        if not readable(path) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_file_open_read($1)", address);
+    end;
+
+    generic [R: Region]
+    function openWrite(path: &[String, R]): Int32 is
+        if not readable(path) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_file_open_write($1)", address);
+    end;
+
+    generic [R: Region]
+    function openAppend(path: &[String, R], mode: Nat32): Int32 is
+        if not readable(path) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_file_open_append($1, $2)", address, mode);
+    end;
+
+    generic [R: Region]
+    function reopenAppend(number: Int32, path: &[String, R], mode: Nat32): Bool is
+        if not readable(path) then
+            return false;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_file_reopen_append($1, $2, $3)", number, address, mode) = 1;
+    end;
+
+    function closeNumber(number: Int32): Bool is
+        return @embed(Int32, "hilde_file_close($1)", number) = 1;
+    end;
+
+    generic [R: Region]
+    function readInto(number: Int32, buffer: &![String, R], at: Index, count: Index): Int64 is
+        let size: Index := length(&buffer);
+        -- at + count is not computed before at and count are known to fit:
+        -- the sum of two large numbers would stop the programme.
+        if (count = 0) or (at >= size) then
+            return -1;
+        end if;
+        if count > (size - at) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByteMut(&~buffer);
+        let wanted: ByteSize := arraySizeInBytes(sizeof(Nat8), count);
+        return @embed(Int64, "hilde_file_read($1, $2 + $3, $4)", number, address, at, wanted);
+    end;
+
+    generic [R: Region]
+    function readWithinInto(number: Int32, buffer: &![String, R], at: Index, count: Index, milliseconds: Nat32): Int64 is
+        let size: Index := length(&buffer);
+        if (count = 0) or (at >= size) then
+            return -1;
+        end if;
+        if count > (size - at) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByteMut(&~buffer);
+        let wanted: ByteSize := arraySizeInBytes(sizeof(Nat8), count);
+        return @embed(Int64, "hilde_socket_read_within($1, $2 + $3, $4, $5)", number, address, at, wanted, milliseconds);
+    end;
+
+    generic [R: Region]
+    function writeWithinNumber(number: Int32, data: Span[Nat8, R], milliseconds: Nat32): Int32 is
+        let size: Index := spanLength(data);
+        if size = 0 then
+            return 1;
+        end if;
+        let address: Pointer[Nat8] := spanToPointer(data);
+        let bytes: ByteSize := arraySizeInBytes(sizeof(Nat8), size);
+        let written: Int64 := @embed(Int64, "hilde_socket_write_within($1, $2, $3, $4)", number, address, bytes, milliseconds);
+        if written < 0 then
+            case toInt32(written) of
+                when Some(value as code: Int32) do
+                    return code;
+                when None do
+                    return -1;
+            end case;
+        end if;
+        return 1;
+    end;
+
+    function nonblockingNumber(number: Int32): Bool is
+        return @embed(Int32, "hilde_socket_nonblocking($1)", number) = 1;
+    end;
+
+    generic [R: Region]
+    function writeAll(number: Int32, data: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(data);
+        if size = 0 then
+            -- Nothing to write, and no first byte to point write(2) at.
+            return true;
+        end if;
+        let address: Pointer[Nat8] := spanToPointer(data);
+        let bytes: ByteSize := arraySizeInBytes(sizeof(Nat8), size);
+        return @embed(Int32, "hilde_file_write_all($1, $2, $3)", number, address, bytes) = 1;
+    end;
+
+    generic [R: Region]
+    function kindCode(path: &[String, R], follow: Int32): Int32 is
+        if not readable(path) then
+            return 0;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_file_kind($1, $2)", address, follow);
+    end;
+
+    generic [R: Region, S: Region]
+    function readLink(path: &[String, R], buffer: &![String, S]): Int64 is
+        let size: Index := length(&buffer);
+        if (not readable(path)) or (size = 0) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        let into: Pointer[Nat8] := firstByteMut(&~buffer);
+        let wanted: ByteSize := arraySizeInBytes(sizeof(Nat8), size);
+        return @embed(Int64, "hilde_file_read_link($1, $2, $3)", address, into, wanted);
+    end;
+
+    generic [R: Region, S: Region]
+    function makeLink(target: &[String, R], name: &[String, S]): Bool is
+        if (not readable(target)) or (not readable(name)) then
+            return false;
+        end if;
+        let a: Pointer[Nat8] := firstByte(target);
+        let b: Pointer[Nat8] := firstByte(name);
+        return @embed(Int32, "hilde_file_make_link($1, $2)", a, b) = 1;
+    end;
+
+    record PipeNumbers: Free is
+        reading: Int32;
+        writing: Int32;
+    end;
+
+    function openPipeNumbers(): Option[PipeNumbers] is
+        -- The two numbers come back through memory because the kernel call
+        -- writes them into an array, and Hilde has no way to receive two
+        -- return values from C.  Two slots, read out, given back.
+        let address: Address[Int32] := allocateBuffer(2);
+        case nullCheck(address) of
+            when Some(value as slots: Pointer[Int32]) do
+                let made: Bool := @embed(Int32, "hilde_pipe_open($1)", slots) = 1;
+                if made then
+                    let reading: Int32 := load(slots);
+                    let writing: Int32 := load(positiveOffset(slots, 1));
+                    deallocate(slots);
+                    let some: Option[PipeNumbers] :=
+                        Some(value => PipeNumbers(reading => reading, writing => writing));
+                    return some;
+                else
+                    deallocate(slots);
+                    let none: Option[PipeNumbers] := None();
+                    return none;
+                end if;
+            when None do
+                let none: Option[PipeNumbers] := None();
+                return none;
+        end case;
+    end;
+
+    function seekNumber(number: Int32, offset: Int64, origin: Int32): Int64 is
+        return @embed(Int64, "hilde_file_seek($1, $2, $3)", number, offset, origin);
+    end;
+
+    ---
+    --- Directories
+    ---
+
+    generic [R: Region]
+    function makeDirectory(path: &[String, R]): Bool is
+        if not readable(path) then
+            return false;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_dir_make($1)", address) = 1;
+    end;
+
+    generic [R: Region]
+    function removeDirectory(path: &[String, R]): Bool is
+        if not readable(path) then
+            return false;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_dir_remove($1)", address) = 1;
+    end;
+
+    record Stream: Linear is
+        -- The directory stream of the C library, never loaded through.
+        handle: Pointer[Nat8];
+    end;
+
+    generic [R: Region]
+    function openStream(path: &[String, R]): Option[Stream] is
+        if not readable(path) then
+            let none: Option[Stream] := None();
+            return none;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        let stream: Address[Nat8] := @embed(Address[Nat8], "hilde_dir_open($1)", address);
+        case nullCheck(stream) of
+            when Some(value as handle: Pointer[Nat8]) do
+                let some: Option[Stream] := Some(value => Stream(handle => handle));
+                return some;
+            when None do
+                let none: Option[Stream] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function nextName(stream: &[Stream, R], buffer: &![String, S]): Int64 is
+        let size: Index := length(&buffer);
+        if size = 0 then
+            return -3;
+        end if;
+        let handle: Pointer[Nat8] := stream->handle;
+        let into: Pointer[Nat8] := firstByteMut(&~buffer);
+        let wanted: ByteSize := arraySizeInBytes(sizeof(Nat8), size);
+        return @embed(Int64, "hilde_dir_next($1, $2, $3)", handle, into, wanted);
+    end;
+
+    function closeStream(stream: Stream): Bool is
+        let { handle: Pointer[Nat8] } := stream;
+        return @embed(Int32, "hilde_dir_close($1)", handle) = 1;
+    end;
+
+    ---
+    --- Processes
+    ---
+
+    record Spawned: Free is
+        pid: Int32;
+        input: Int32;
+        output: Int32;
+        errors: Int32;
+    end;
+
+    generic [R: Region]
+    function spawnPacked(packed: &[String, R], count: Index): Option[Spawned] is
+        -- The runtime walks count arguments through packed, each up to its
+        -- zero byte.  A count above the number of zero bytes would read past
+        -- the string, so the two must be equal and the last byte a zero
+        -- byte.
+        let size: Index := length(packed);
+        if (count = 0) or (size = 0) then
+            let none: Option[Spawned] := None();
+            return none;
+        end if;
+        if (nthByte(packed, size - 1) /= 0) or (zeroBytes(packed) /= count) then
+            let none: Option[Spawned] := None();
+            return none;
+        end if;
+        let slotsAddress: Address[Int32] := allocateBuffer(3);
+        case nullCheck(slotsAddress) of
+            when Some(value as slots: Pointer[Int32]) do
+                -- The path of the programme is the first entry of packed.
+                let first: Pointer[Nat8] := firstByte(packed);
+                let pid: Int32 :=
+                    @embed(Int32, "hilde_process_spawn($1, $2, $3, $4, $5)", first, first, size, count, slots);
+                if pid < 0 then
+                    deallocate(slots);
+                    let none: Option[Spawned] := None();
+                    return none;
+                end if;
+                let input: Int32 := load(slots);
+                let output: Int32 := load(positiveOffset(slots, 1));
+                let errors: Int32 := load(positiveOffset(slots, 2));
+                deallocate(slots);
+                let some: Option[Spawned] :=
+                    Some(value => Spawned(pid => pid, input => input, output => output, errors => errors));
+                return some;
+            when None do
+                let none: Option[Spawned] := None();
+                return none;
+        end case;
+    end;
+
+    function terminatePid(pid: Int32): Bool is
+        return @embed(Int32, "hilde_process_terminate($1)", pid) = 1;
+    end;
+
+    function waitPid(pid: Int32): Int32 is
+        return @embed(Int32, "hilde_process_wait($1)", pid);
+    end;
+
+    function terminationSignal(): Int32 is
+        return @embed(Int32, "hilde_process_sigterm()");
+    end;
+
+    ---
+    --- The environment
+    ---
+
+    -- The C, declared rather than embedded, so that the C compiler holds
+    -- the declaration against the definition, hilde_environment_value in
+    -- lib/prelude.c.
+    pragma Foreign_Import(External_Name => "hilde_environment_value");
+    function cEnvironmentValue(name: Pointer[Nat8], into: Pointer[Nat8], capacity: ByteSize): Int64 is
+    end;
+
+    generic [R: Region, S: Region]
+    function environmentInto(name: &[String, R], buffer: &![String, S]): Int64 is
+        let size: Index := length(&buffer);
+        if (not readable(name)) or (size = 0) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByte(name);
+        let into: Pointer[Nat8] := firstByteMut(&~buffer);
+        let wanted: ByteSize := arraySizeInBytes(sizeof(Nat8), size);
+        return cEnvironmentValue(address, into, wanted);
+    end;
+
+    generic [R: Region]
+    function removePath(path: &[String, R]): Bool is
+        if not readable(path) then
+            return false;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_file_remove($1)", address) = 1;
+    end;
+
+    generic [R: Region]
+    function removePathIfThere(path: &[String, R]): Bool is
+        if not readable(path) then
+            return false;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_file_remove_if_there($1)", address) = 1;
+    end;
+
+    generic [R: Region]
+    function secureRemovePath(path: &[String, R]): Int32 is
+        if not readable(path) then
+            return 0;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "(int32_t) hilde_file_secure_delete($1)", address);
+    end;
+
+    function setModeNumber(number: Int32, mode: Nat32): Bool is
+        return @embed(Int32, "hilde_file_set_mode($1, $2)", number, mode) = 1;
+    end;
+
+    ---
+    --- What a file is, renames, links and syncs
+    ---
+
+    record StatusNumbers: Free is
+        found: Int32;
+        kind: Nat32;
+        mode: Nat32;
+        owner: Nat32;
+        group: Nat32;
+        size: Nat64;
+        device: Nat64;
+        inode: Nat64;
+        links: Nat64;
+    end;
+
+    function noStatus(found: Int32): StatusNumbers is
+        let zero: Nat32 := 0;
+        let none: Nat64 := 0;
+        return StatusNumbers(found => found, kind => zero, mode => zero, owner => zero, group => zero, size => none, device => none, inode => none, links => none);
+    end;
+
+    -- The runtime writes the kind, the mode, the owner and the group into
+    -- four narrow slots and the size, the device, the inode and the count
+    -- of links into four wide ones, since Hilde has no way to receive more than one value
+    -- from C.  found is what the call returned; the slots are read only
+    -- when it is 1.
+    function readStatus(found: Int32, slots: Pointer[Nat32], wide: Pointer[Nat64]): StatusNumbers is
+        if found /= 1 then
+            return noStatus(found);
+        end if;
+        return StatusNumbers(
+            found => found,
+            kind => load(slots),
+            mode => load(positiveOffset(slots, 1)),
+            owner => load(positiveOffset(slots, 2)),
+            group => load(positiveOffset(slots, 3)),
+            size => load(wide),
+            device => load(positiveOffset(wide, 1)),
+            inode => load(positiveOffset(wide, 2)),
+            links => load(positiveOffset(wide, 3))
+        );
+    end;
+
+    generic [R: Region]
+    function statusNumbers(path: &[String, R], follow: Int32): StatusNumbers is
+        if not readable(path) then
+            return noStatus(-1);
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        let slotsAddress: Address[Nat32] := allocateBuffer(4);
+        case nullCheck(slotsAddress) of
+            when Some(value as slots: Pointer[Nat32]) do
+                let wideAddress: Address[Nat64] := allocateBuffer(4);
+                case nullCheck(wideAddress) of
+                    when Some(value as wide: Pointer[Nat64]) do
+                        let found: Int32 := @embed(Int32, "hilde_file_status($1, $2, $3, $4)", address, follow, slots, wide);
+                        let status: StatusNumbers := readStatus(found, slots, wide);
+                        deallocate(wide);
+                        deallocate(slots);
+                        return status;
+                    when None do
+                        deallocate(slots);
+                        return noStatus(-1);
+                end case;
+            when None do
+                return noStatus(-1);
+        end case;
+    end;
+
+    function statusOpenNumbers(number: Int32): StatusNumbers is
+        let slotsAddress: Address[Nat32] := allocateBuffer(4);
+        case nullCheck(slotsAddress) of
+            when Some(value as slots: Pointer[Nat32]) do
+                let wideAddress: Address[Nat64] := allocateBuffer(4);
+                case nullCheck(wideAddress) of
+                    when Some(value as wide: Pointer[Nat64]) do
+                        var found: Int32 := @embed(Int32, "hilde_file_status_open($1, $2, $3)", number, slots, wide);
+                        if found /= 1 then
+                            found := -1;
+                        end if;
+                        let status: StatusNumbers := readStatus(found, slots, wide);
+                        deallocate(wide);
+                        deallocate(slots);
+                        return status;
+                    when None do
+                        deallocate(slots);
+                        return noStatus(-1);
+                end case;
+            when None do
+                return noStatus(-1);
+        end case;
+    end;
+
+    function setOwnerNumber(number: Int32, owner: Nat32, group: Nat32): Bool is
+        return @embed(Int32, "hilde_file_set_owner($1, $2, $3)", number, owner, group) = 1;
+    end;
+
+    function syncNumber(number: Int32): Bool is
+        return @embed(Int32, "hilde_file_sync($1)", number) = 1;
+    end;
+
+    generic [R: Region]
+    function syncDirectoryPath(path: &[String, R]): Bool is
+        if not readable(path) then
+            return false;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_dir_sync($1)", address) = 1;
+    end;
+
+    generic [R: Region, S: Region]
+    function renamePath(source: &[String, R], target: &[String, S]): Bool is
+        if (not readable(source)) or (not readable(target)) then
+            return false;
+        end if;
+        let a: Pointer[Nat8] := firstByte(source);
+        let b: Pointer[Nat8] := firstByte(target);
+        return @embed(Int32, "hilde_file_rename($1, $2)", a, b) = 1;
+    end;
+
+    generic [R: Region, S: Region]
+    function linkPath(existing: &[String, R], name: &[String, S]): Bool is
+        if (not readable(existing)) or (not readable(name)) then
+            return false;
+        end if;
+        let a: Pointer[Nat8] := firstByte(existing);
+        let b: Pointer[Nat8] := firstByte(name);
+        return @embed(Int32, "hilde_file_link($1, $2)", a, b) = 1;
+    end;
+
+    -- A template mkstemp(3) takes: a readable path whose last six bytes
+    -- before the zero byte are X.
+    generic [R: Region]
+    function isTemplate(template: &[String, R]): Bool is
+        if not readable(template) then
+            return false;
+        end if;
+        let size: Index := length(template);
+        if size < 7 then
+            return false;
+        end if;
+        var all: Bool := true;
+        for i from size - 7 to size - 2 do
+            if nthByte(template, i) /= 'X' then
+                all := false;
+            end if;
+        end for;
+        return all;
+    end;
+
+    generic [R: Region]
+    function makeTemporary(template: &![String, R]): Int32 is
+        if not isTemplate(&template) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByteMut(&~template);
+        return @embed(Int32, "hilde_file_make_temporary($1)", address);
+    end;
+
+    generic [R: Region]
+    function createNewNumber(path: &[String, R], mode: Nat32): Int32 is
+        if not readable(path) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_file_create_new($1, $2)", address, mode);
+    end;
+
+    generic [R: Region]
+    function openOverwriteNumber(path: &[String, R]): Int32 is
+        if not readable(path) then
+            return -1;
+        end if;
+        let address: Pointer[Nat8] := firstByte(path);
+        return @embed(Int32, "hilde_file_open_overwrite($1)", address);
+    end;
+
+    ---
+    --- A Unix domain socket
+    ---
+
+    pragma Foreign_Import(External_Name => "hilde_socket_path_limit");
+    function cSocketPathLimit(): Index is
+    end;
+
+    pragma Foreign_Import(External_Name => "hilde_socket_listen");
+    function cSocketListen(path: Pointer[Nat8], mode: Nat32): Int32 is
+    end;
+
+    pragma Foreign_Import(External_Name => "hilde_socket_accept");
+    function cSocketAccept(listener: Int32): Int32 is
+    end;
+
+    pragma Foreign_Import(External_Name => "hilde_socket_accept_within");
+    function cSocketAcceptWithin(listener: Int32, milliseconds: Nat32): Int32 is
+    end;
+
+    pragma Foreign_Import(External_Name => "hilde_socket_connect");
+    function cSocketConnect(path: Pointer[Nat8]): Int32 is
+    end;
+
+    pragma Foreign_Import(External_Name => "hilde_socket_close_listener");
+    function cSocketCloseListener(listener: Int32, path: Pointer[Nat8]): Int32 is
+    end;
+
+    function socketPathLimit(): Index is
+        return cSocketPathLimit();
+    end;
+
+    generic [R: Region]
+    function listenAt(path: &[String, R], mode: Nat32): Int32 is
+        if not readable(path) then
+            return -1;
+        end if;
+        return cSocketListen(firstByte(path), mode);
+    end;
+
+    function acceptNumber(listener: Int32): Int32 is
+        return cSocketAccept(listener);
+    end;
+
+    function acceptNumberWithin(listener: Int32, milliseconds: Nat32): Int32 is
+        return cSocketAcceptWithin(listener, milliseconds);
+    end;
+
+    generic [R: Region]
+    function connectTo(path: &[String, R]): Int32 is
+        if not readable(path) then
+            return -1;
+        end if;
+        return cSocketConnect(firstByte(path));
+    end;
+
+    generic [R: Region]
+    function closeListening(number: Int32, path: &[String, R]): Bool is
+        if not readable(path) then
+            -- The socket is closed all the same, and its path left.
+            return @embed(Int32, "hilde_file_close($1)", number) = 1;
+        end if;
+        return cSocketCloseListener(number, firstByte(path)) = 1;
+    end;
+
+    ---
+    --- A TCP connection
+    ---
+
+    pragma Foreign_Import(External_Name => "hilde_tcp_connect");
+    function cTcpConnect(address: Pointer[Nat8], size: Index, port: Nat16, milliseconds: Nat32): Int32 is
+    end;
+
+    generic [R: Region]
+    function connectTcpNumber(address: Span[Nat8, R], port: Nat16, milliseconds: Nat32): Int32 is
+        let size: Index := spanLength(address);
+        -- Only the two sizes of an address are handed on: the runtime reads
+        -- exactly size bytes, and an empty span has no first byte.
+        if (size /= 4) and (size /= 16) then
+            return -4;
+        end if;
+        return cTcpConnect(spanToPointer(address), size, port, milliseconds);
+    end;
+
+    ---
+    --- A TCP listener
+    ---
+
+    pragma Foreign_Import(External_Name => "hilde_tcp_listen");
+    function cTcpListen(address: Pointer[Nat8], size: Index, port: Nat16): Int32 is
+    end;
+
+    pragma Foreign_Import(External_Name => "hilde_tcp_local_port");
+    function cTcpLocalPort(number: Int32): Nat16 is
+    end;
+
+    generic [R: Region]
+    function listenTcpNumber(address: Span[Nat8, R], port: Nat16): Int32 is
+        let size: Index := spanLength(address);
+        if (size /= 4) and (size /= 16) then
+            return -1;
+        end if;
+        return cTcpListen(spanToPointer(address), size, port);
+    end;
+
+    function tcpLocalPort(number: Int32): Nat16 is
+        return cTcpLocalPort(number);
+    end;
+end module body.

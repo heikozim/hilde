@@ -1,0 +1,264 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  Bits are gathered in a Nat64 five bytes at a time on the
+-- way in and eight characters at a time on the way out, so no shift ever
+-- needs more than 40 bits.
+import Standard.String (
+    String,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+
+module body Standard.Base32 is
+    constant zeroNat: Nat64 := 0;
+    constant thirtyTwo: Nat64 := 32;
+    constant twoFiftySix: Nat64 := 256;
+    constant noIndex: Index := 0;
+    constant noByte: Nat8 := 0;
+    constant four: Index := 4;
+    constant five: Index := 5;
+    constant seven: Index := 7;
+    constant eight: Index := 8;
+
+    -- The character of the digit at, 0 to 31.
+    function letter(at: Index): Nat8 is
+        let alphabet: Span[Nat8, Static] := "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        return alphabet[at];
+    end;
+
+    function natOf(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                abort("Standard.Base32: a byte did not fit a Nat64");
+        end case;
+    end;
+
+    function indexOf(wide: Nat64): Index is
+        case toIndex(wide) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.Base32: a digit did not fit an Index");
+        end case;
+    end;
+
+    function byteOf(wide: Nat64): Nat8 is
+        case toNat8(wide) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                abort("Standard.Base32: a byte did not fit a Nat8");
+        end case;
+    end;
+
+    -- The number 32 to the power of count.
+    function powerOf32(count: Index): Nat64 is
+        var result: Nat64 := 1;
+        var i: Index := 0;
+        while i < count do
+            result := result * thirtyTwo;
+            i := i + 1;
+        end while;
+        return result;
+    end;
+
+    -- Writes the group of up to five bytes from at as eight characters,
+    -- the ones no byte reaches as padding when padded.
+    generic [R: Region, B: Region]
+    function writeGroup(bytes: Span[Nat8, R], at: Index, out: &![StringBuilder, B], padded: Bool): Unit is
+        let size: Index := spanLength(bytes);
+        var count: Index := size - at;
+        if count > 5 then
+            count := indexOfNumber(5);
+        end if;
+        var value: Nat64 := zeroNat;
+        var i: Index := 0;
+        while i < 5 do
+            value := value * twoFiftySix;
+            if i < count then
+                value := value + natOf(bytes[at + i]);
+            end if;
+            i := i + 1;
+        end while;
+        -- 1 byte gives 2 characters, 2 give 4, 3 give 5, 4 give 7, 5 give 8.
+        var used: Index := 8;
+        if count = 1 then
+            used := indexOfNumber(2);
+        else if count = 2 then
+            used := indexOfNumber(4);
+        else if count = 3 then
+            used := indexOfNumber(5);
+        else if count = 4 then
+            used := indexOfNumber(7);
+        end if;
+        var digit: Index := 0;
+        while digit < 8 do
+            if digit < used then
+                let place: Nat64 := powerOf32(seven - digit);
+                let index: Nat64 := (value / place) - ((value / (place * thirtyTwo)) * thirtyTwo);
+                writeByte(&~out, letter(indexOf(index)));
+            else if padded then
+                writeByte(&~out, '=');
+            end if;
+            digit := digit + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function encodeWith(bytes: Span[Nat8, R], padded: Bool): String is
+        var out: StringBuilder := makeStringBuilder();
+        var at: Index := 0;
+        while at < spanLength(bytes) do
+            writeGroup(bytes, at, &!out, padded);
+            at := at + 5;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function encodeBase32(bytes: Span[Nat8, R]): String is
+        return encodeWith(bytes, true);
+    end;
+
+    generic [R: Region]
+    function encodeBase32Unpadded(bytes: Span[Nat8, R]): String is
+        return encodeWith(bytes, false);
+    end;
+
+    -- The value of a character, or 32 when it is none.
+    function digitValue(byte: Nat8): Nat64 is
+        if (byte >= 'A') and (byte <= 'Z') then
+            return natOf(byte - 'A');
+        end if;
+        if (byte >= 'a') and (byte <= 'z') then
+            return natOf(byte - 'a');
+        end if;
+        if (byte >= '2') and (byte <= '7') then
+            return natOf(byte - '2') + 26;
+        end if;
+        return thirtyTwo;
+    end;
+
+    generic [R: Region]
+    function decodeBase32(text: Span[Nat8, R]): Option[String] is
+        let size: Index := spanLength(text);
+        -- The characters before the padding.
+        var count: Index := size;
+        while (count > 0) and (text[count - 1] = '=') do
+            count := count - 1;
+        end while;
+        if (count < size) and ((size - ((size / eight) * eight)) /= 0) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if (count < size) and ((size - count) > 6) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        -- A last group of 1, 3 or 6 characters is no encoding of any bytes.
+        let rest: Index := count - ((count / eight) * eight);
+        if ((rest = 1) or (rest = 3)) or (rest = 6) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if (count < size) and ((((count + seven) / eight) * eight) /= size) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        var good: Bool := true;
+        var at: Index := 0;
+        while good and (at < count) do
+            var group: Index := count - at;
+            if group > 8 then
+                group := indexOfNumber(8);
+            end if;
+            var value: Nat64 := zeroNat;
+            var i: Index := 0;
+            while i < 8 do
+                value := value * thirtyTwo;
+                if i < group then
+                    let digit: Nat64 := digitValue(text[at + i]);
+                    if digit = thirtyTwo then
+                        good := false;
+                    else
+                        value := value + digit;
+                    end if;
+                end if;
+                i := i + 1;
+            end while;
+            -- 2 characters give 1 byte, 4 give 2, 5 give 3, 7 give 4, 8 give 5.
+            var bytes: Index := 5;
+            if group = 2 then
+                bytes := indexOfNumber(1);
+            else if group = 4 then
+                bytes := indexOfNumber(2);
+            else if group = 5 then
+                bytes := indexOfNumber(3);
+            else if group = 7 then
+                bytes := indexOfNumber(4);
+            end if;
+            -- The bits after the last whole byte must be zero.
+            let unused: Index := five - bytes;
+            var j: Index := 0;
+            var low: Nat64 := value;
+            while j < unused do
+                if (low - ((low / twoFiftySix) * twoFiftySix)) /= 0 then
+                    good := false;
+                end if;
+                low := low / twoFiftySix;
+                j := j + 1;
+            end while;
+            var k: Index := 0;
+            while k < bytes do
+                let place: Nat64 := powerOf256(four - k);
+                writeByte(&!out, byteOf((value / place) - ((value / (place * twoFiftySix)) * twoFiftySix)));
+                k := k + 1;
+            end while;
+            at := at + 8;
+        end while;
+        let decoded: String := finalize(out);
+        if good then
+            let some: Option[String] := Some(value => decoded);
+            return some;
+        else
+            destroyString(decoded);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    -- A small number as an Index; the literal alone would be an Int32.
+    function indexOfNumber(number: Int32): Index is
+        case toIndex(number) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.Base32: a negative count");
+        end case;
+    end;
+
+    function powerOf256(count: Index): Nat64 is
+        var result: Nat64 := 1;
+        var i: Index := 0;
+        while i < count do
+            result := result * twoFiftySix;
+            i := i + 1;
+        end while;
+        return result;
+    end;
+end module body.

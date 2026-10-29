@@ -1,0 +1,496 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength,
+    nthRef
+);
+import Standard.File (
+    removeFile
+);
+import Standard.SqlCipher (
+    makeKey
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Transaction,
+    Cursor,
+    closeDatabase,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    execute,
+    start,
+    advance,
+    columnInt64,
+    finish
+);
+import Standard.Database.Sqlite (
+    openSqlite,
+    openSqlCipher
+);
+import Standard.Search (
+    SearchError,
+    SearchHit,
+    NoWords,
+    SearchUnsupported,
+    prepareSearch,
+    indexDocument,
+    indexDocumentIn,
+    removeDocument,
+    searchQuery,
+    search,
+    countMatches,
+    destroyHits
+);
+
+module body Standard.Search.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function removeDatabase(name: Span[Nat8, Static]): Unit is
+        let path: String := fromLiteral(name);
+        let removed: Bool := removeFile(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+
+    -- before, a byte, after: the way to write a byte the test source, which
+    -- is plain ASCII, cannot hold.
+    function withBytes(before: Span[Nat8, Static], first: Nat8, second: Nat8, after: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, before);
+        writeByte(&!out, first);
+        if second /= 0 then
+            writeByte(&!out, second);
+        end if;
+        writeString(&!out, after);
+        return finalize(out);
+    end;
+
+    generic [R: Region, K: Region, T: Region, B: Region]
+    function add(db: &![Database[Writing], R], key: Span[Nat8, K], title: Span[Nat8, T], content: Span[Nat8, B]): Unit is
+        case indexDocument(&~db, key, title, content) of
+            when Right(right as done: Unit) do
+                skip;
+            when Left(left as error: SearchError) do
+                abort("not indexed");
+        end case;
+        return nil;
+    end;
+
+    -- A fresh database with the index and five documents, or an abort.
+    function fresh(name: Span[Nat8, Static]): Database[Writing] is
+        removeDatabase(name);
+        case openSqlite(name) of
+            when Right(right as db: Database[Writing]) do
+                var open: Database[Writing] := db;
+                case prepareSearch(&!open) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as error: SearchError) do
+                        abort("no index: SQLite without FTS5?");
+                end case;
+                add(&!open, "doc/1", "Coffee at night", "A cafe serves coffee late. Tea is served too.");
+                add(&!open, "doc/2", "Tea", "Green tea and black tea, no coffee at all.");
+                let title: String := withBytes("Caf", 195, 169, " notes");
+                let content: String := withBytes("The Caf", 195, 169, " on the corner opens at seven.");
+                add(&!open, "doc/3", asSpan(&title), asSpan(&content));
+                destroyString(title);
+                destroyString(content);
+                add(&!open, "doc/4", "Markup", "Write <b>bold</b> & \"quoted\" text with care.");
+                let marked: String := withBytes("alpha", 1, 2, "beta");
+                add(&!open, "doc/5", "Marks", asSpan(&marked));
+                destroyString(marked);
+                return open;
+            when Left(left as error: DbError) do
+                abort("no database");
+        end case;
+    end;
+
+    generic [R: Region]
+    function counted(db: &![Database[Writing], R], text: Span[Nat8, Static]): Int64 is
+        case countMatches(&~db, text) of
+            when Right(right as count: Int64) do
+                return count;
+            when Left(left as error: SearchError) do
+                let none: Int64 := -1;
+                return none;
+        end case;
+    end;
+
+    function queryIs(text: Span[Nat8, Static], expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case searchQuery(text) of
+            when Some(value as query: String) do
+                assertTrue(same(&query, expected), message);
+                destroyString(query);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function noQuery(text: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case searchQuery(text) of
+            when Some(value as query: String) do
+                destroyString(query);
+                assertFailure(message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        return nil;
+    end;
+
+    function testQuery(): Unit is
+        queryIs("coffee tea", "\"coffee\" \"tea\"", "two words, both quoted");
+        queryIs("caf*", "\"caf\"*", "a prefix");
+        queryIs("title:x OR y NEAR(z)", "\"title\" \"x\" \"OR\" \"y\" \"NEAR\" \"z\"", "column filters and operators are words");
+        queryIs("\"a\" \"\" b\"c", "\"a\" \"b\" \"c\"", "quotes split words");
+        let accented: String := withBytes("m", 195, 188, "de");
+        case searchQuery(asSpan(&accented)) of
+            when Some(value as query: String) do
+                assertTrue(length(&query) = 7, "bytes above 127 belong to words");
+                destroyString(query);
+            when None do
+                assertFailure("bytes above 127 belong to words");
+        end case;
+        destroyString(accented);
+        queryIs("1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18",
+            "\"1\" \"2\" \"3\" \"4\" \"5\" \"6\" \"7\" \"8\" \"9\" \"10\" \"11\" \"12\" \"13\" \"14\" \"15\" \"16\"", "at most 16 words");
+        queryIs("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa b", "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" \"b\"", "a word of 64 bytes taken");
+        noQuery("", "an empty text");
+        noQuery("  ,.;:!?()*^- \t", "only punctuation");
+        noQuery("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "a word of 65 bytes dropped");
+        return nil;
+    end;
+
+    function testCounts(): Unit is
+        var db: Database[Writing] := fresh("search-test-1.db");
+        assertTrue(counted(&!db, "coffee") = 2, "two documents hold coffee");
+        assertTrue(counted(&!db, "COFFEE tea") = 2, "two hold both words, in any case");
+        assertTrue(counted(&!db, "cafe") = 2, "cafe without and with its accent");
+        assertTrue(counted(&!db, "caf*") = 2, "a prefix");
+        assertTrue(counted(&!db, "zebra") = 0, "a word no document holds");
+        assertTrue(counted(&!db, "title:tea") = 0, "a column filter is two words, and title is in no document");
+        assertTrue(counted(&!db, "coffee NOT tea") = 0, "NOT is a word");
+        assertTrue(counted(&!db, "alphabeta") = 1, "the bytes that mark a snippet are taken out of a body");
+        assertTrue(counted(&!db, "!!!") = -1, "no word, no count");
+        closeDatabase(db);
+        removeDatabase("search-test-1.db");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function hitIs(hits: &[Buffer[SearchHit], R], n: Index, key: Span[Nat8, Static], snippet: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let hit: &[SearchHit, R] := nthRef(hits, n);
+        assertTrue(same(&(hit->key), key), message);
+        assertTrue(same(&(hit->snippet), snippet), message);
+        assertTrue(hit->rank < 0.0, message);
+        return nil;
+    end;
+
+    function testSearch(): Unit is
+        var db: Database[Writing] := fresh("search-test-2.db");
+        case search(&!db, "tea", 10, 0, "<mark>", "</mark>") of
+            when Right(right as hits: Buffer[SearchHit]) do
+                assertTrue(bufferLength(&hits) = 2, "two hits for tea");
+                hitIs(&hits, 0, "doc/2", "Green <mark>tea</mark> and black <mark>tea</mark>, no coffee at all.", "the title counts most");
+                destroyHits(hits);
+            when Left(left as error: SearchError) do
+                assertFailure("a search for tea");
+        end case;
+        case search(&!db, "bold", 10, 0, "[", "]") of
+            when Right(right as hits: Buffer[SearchHit]) do
+                assertTrue(bufferLength(&hits) = 1, "one hit for bold");
+                hitIs(&hits, 0, "doc/4", "Write &lt;b&gt;[bold]&lt;/b&gt; &amp; &quot;quoted&quot; text with care.", "the snippet is escaped, the markers are not");
+                destroyHits(hits);
+            when Left(left as error: SearchError) do
+                assertFailure("a search for bold");
+        end case;
+        case search(&!db, "coffee", 1, 1, "<", ">") of
+            when Right(right as hits: Buffer[SearchHit]) do
+                assertTrue(bufferLength(&hits) = 1, "one hit after the first");
+                destroyHits(hits);
+            when Left(left as error: SearchError) do
+                assertFailure("a page of hits");
+        end case;
+        let below: Int64 := -5;
+        case search(&!db, "coffee", 0, below, "<", ">") of
+            when Right(right as hits: Buffer[SearchHit]) do
+                assertTrue(bufferLength(&hits) = 1, "a limit of 0 is 1, an offset below 0 is 0");
+                destroyHits(hits);
+            when Left(left as error: SearchError) do
+                assertFailure("a limit held");
+        end case;
+        case search(&!db, "?!", 10, 0, "<", ">") of
+            when Right(right as hits: Buffer[SearchHit]) do
+                destroyHits(hits);
+                assertFailure("no words");
+            when Left(left as error: SearchError) do
+                case error of
+                    when NoWords do
+                        assertTrue(true, "no words");
+                    when SearchStorageFailed(error as failure: DbError) do
+                        assertFailure("no words");
+                    when SearchUnsupported do
+                        assertFailure("no words");
+                end case;
+        end case;
+        closeDatabase(db);
+        removeDatabase("search-test-2.db");
+        return nil;
+    end;
+
+    function testChanges(): Unit is
+        var db: Database[Writing] := fresh("search-test-3.db");
+        add(&!db, "doc/1", "Water", "Only water at night.");
+        assertTrue(counted(&!db, "coffee") = 1, "indexed again, a key has its new text only");
+        assertTrue(counted(&!db, "water") = 1, "and the new text is found");
+        case removeDocument(&!db, "doc/2") of
+            when Right(right as removed: Bool) do
+                assertTrue(removed, "a document removed");
+            when Left(left as error: SearchError) do
+                assertFailure("a document removed");
+        end case;
+        case removeDocument(&!db, "doc/2") of
+            when Right(right as removed: Bool) do
+                assertTrue(not removed, "removed twice, nothing the second time");
+            when Left(left as error: SearchError) do
+                assertFailure("removed twice");
+        end case;
+        assertTrue(counted(&!db, "tea") = 0, "tea was in the two documents changed");
+        closeDatabase(db);
+        removeDatabase("search-test-3.db");
+        return nil;
+    end;
+
+    -- The first column of the first row of sql, or -1 when there is none.
+    generic [R: Region]
+    function scalar(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Int64 is
+        var cursor: Cursor := start(&~db, sql, noValues());
+        var first: Int64 := -1;
+        if advance(&!cursor) then
+            first := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                abort("a statement of the test failed");
+            when None do
+                skip;
+        end case;
+        return first;
+    end;
+
+    generic [R: Region]
+    function statement(db: &![Database[Writing], R], sql: Span[Nat8, Static]): Unit is
+        case execute(&~db, sql, noValues()) of
+            when Right(right as changed: Nat64) do
+                skip;
+            when Left(left as error: DbError) do
+                abort("a statement of the test failed");
+        end case;
+        return nil;
+    end;
+
+    -- Every document has the id of its key as its rowid, and every key a
+    -- document.
+    generic [R: Region]
+    function keysMatch(db: &![Database[Writing], R]): Bool is
+        let documents: Int64 := scalar(&~db, "SELECT count(*) FROM hilde_search");
+        let keys: Int64 := scalar(&~db, "SELECT count(*) FROM hilde_search_keys");
+        let joined: Int64 := scalar(&~db, "SELECT count(*) FROM hilde_search AS s JOIN hilde_search_keys AS k ON k.id = s.rowid AND k.key = s.key");
+        return (documents = keys) and (keys = joined);
+    end;
+
+    function testKeys(): Unit is
+        var db: Database[Writing] := fresh("search-test-4.db");
+        assertTrue(scalar(&!db, "SELECT count(*) FROM hilde_search_keys") = 5, "five keys for five documents");
+        assertTrue(keysMatch(&!db), "each document under the id of its key");
+        add(&!db, "doc/1", "Water", "Only water at night.");
+        assertTrue(scalar(&!db, "SELECT count(*) FROM hilde_search_keys") = 5, "indexed again, the key keeps its one row");
+        assertTrue(scalar(&!db, "SELECT count(*) FROM hilde_search") = 5, "and the document its one row");
+        assertTrue(keysMatch(&!db), "still each document under its key");
+        case removeDocument(&!db, "doc/3") of
+            when Right(right as removed: Bool) do
+                assertTrue(removed, "a document removed");
+            when Left(left as error: SearchError) do
+                assertFailure("a document removed");
+        end case;
+        assertTrue(scalar(&!db, "SELECT count(*) FROM hilde_search_keys") = 4, "its key goes with it");
+        assertTrue(keysMatch(&!db), "the rest match");
+        case removeDocument(&!db, "doc/9") of
+            when Right(right as removed: Bool) do
+                assertTrue(not removed, "a key never indexed");
+            when Left(left as error: SearchError) do
+                assertFailure("a key never indexed");
+        end case;
+        closeDatabase(db);
+        removeDatabase("search-test-4.db");
+        return nil;
+    end;
+
+    generic [R: Region, X: Region]
+    function addIn(db: &![Database[Writing], R], transaction: &[Transaction, X], key: Span[Nat8, Static], content: Span[Nat8, Static]): Unit is
+        case indexDocumentIn(&~db, transaction, key, "Batch", content) of
+            when Right(right as done: Unit) do
+                skip;
+            when Left(left as error: SearchError) do
+                abort("not indexed in the transaction");
+        end case;
+        return nil;
+    end;
+
+    function testInTransaction(): Unit is
+        var db: Database[Writing] := fresh("search-test-5.db");
+        case begin(&!db) of
+            when Right(right as transaction: Transaction) do
+                addIn(&!db, &transaction, "batch/1", "first line of a batch");
+                addIn(&!db, &transaction, "batch/2", "second line of a batch");
+                addIn(&!db, &transaction, "doc/2", "the tea document replaced in the batch");
+                case commit(&!db, transaction) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as error: DbError) do
+                        assertFailure("the batch committed");
+                end case;
+            when Left(left as error: DbError) do
+                assertFailure("a transaction begun");
+        end case;
+        assertTrue(counted(&!db, "batch") = 3, "three documents under one commit");
+        assertTrue(counted(&!db, "green") = 0, "the old text of a replaced key is gone");
+        assertTrue(keysMatch(&!db), "each under its key");
+        case begin(&!db) of
+            when Right(right as transaction: Transaction) do
+                addIn(&!db, &transaction, "batch/3", "a third line rolled back");
+                case indexDocument(&!db, "batch/4", "Inner", "its own transaction inside another") of
+                    when Right(right as done: Unit) do
+                        assertFailure("indexDocument inside a transaction of the caller");
+                    when Left(left as error: SearchError) do
+                        assertTrue(true, "indexDocument inside a transaction of the caller fails");
+                end case;
+                rollback(&!db, transaction);
+            when Left(left as error: DbError) do
+                assertFailure("a second transaction begun");
+        end case;
+        assertTrue(counted(&!db, "third") = 0, "rolled back, the document is not there");
+        assertTrue(counted(&!db, "inner") = 0, "nor the one of the failed call");
+        assertTrue(scalar(&!db, "SELECT count(*) FROM hilde_search_keys") = 7, "nor their keys");
+        assertTrue(keysMatch(&!db), "and the rest match");
+        closeDatabase(db);
+        removeDatabase("search-test-5.db");
+        return nil;
+    end;
+
+    -- An index made before the key table: prepareSearch gives its rows
+    -- their keys, and they are then replaced and removed by key.
+    function testOldIndex(): Unit is
+        removeDatabase("search-test-6.db");
+        case openSqlite("search-test-6.db") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                statement(&!db, "CREATE VIRTUAL TABLE hilde_search USING fts5(key UNINDEXED, title, body, tokenize = 'unicode61 remove_diacritics 2')");
+                statement(&!db, "INSERT INTO hilde_search (rowid, key, title, body) VALUES (40, 'old/1', 'Old', 'an old lantern')");
+                statement(&!db, "INSERT INTO hilde_search (rowid, key, title, body) VALUES (41, 'old/2', 'Old', 'an old map')");
+                case prepareSearch(&!db) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as error: SearchError) do
+                        abort("no index: SQLite without FTS5?");
+                end case;
+                assertTrue(scalar(&!db, "SELECT count(*) FROM hilde_search_keys") = 2, "the old rows have keys");
+                assertTrue(scalar(&!db, "SELECT id FROM hilde_search_keys WHERE key = 'old/2'") = 41, "under their old rowids");
+                assertTrue(keysMatch(&!db), "and match");
+                add(&!db, "old/1", "New", "a new lamp");
+                assertTrue(counted(&!db, "lantern") = 0, "an old row replaced by its key");
+                assertTrue(counted(&!db, "lamp") = 1, "with its new text");
+                add(&!db, "new/1", "New", "a new key after the old ones");
+                assertTrue(scalar(&!db, "SELECT id FROM hilde_search_keys WHERE key = 'new/1'") = 42, "a new key takes the rowid FTS5 gives");
+                statement(&!db, "INSERT INTO hilde_search (rowid, key, title, body) VALUES (50, 'stray', 'Stray', 'a stray row written past the module')");
+                add(&!db, "new/2", "New", "a second new key");
+                assertTrue(scalar(&!db, "SELECT id FROM hilde_search_keys WHERE key = 'new/2'") = 51, "a new key never takes the rowid of a row already there");
+                assertTrue(counted(&!db, "stray") = 1, "the row written past the module is untouched");
+                statement(&!db, "DELETE FROM hilde_search WHERE rowid = 50");
+                case prepareSearch(&!db) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as error: SearchError) do
+                        assertFailure("prepared twice");
+                end case;
+                assertTrue(scalar(&!db, "SELECT count(*) FROM hilde_search_keys") = 4, "prepared again, nothing added");
+                case removeDocument(&!db, "old/2") of
+                    when Right(right as removed: Bool) do
+                        assertTrue(removed, "an old row removed by its key");
+                    when Left(left as error: SearchError) do
+                        assertFailure("an old row removed");
+                end case;
+                assertTrue(counted(&!db, "map") = 0, "and gone");
+                assertTrue(keysMatch(&!db), "the rest match");
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                abort("no database");
+        end case;
+        removeDatabase("search-test-6.db");
+        return nil;
+    end;
+
+    -- The index in an encrypted database: SQLCipher has FTS5 as SQLite does.
+    function testSqlCipher(): Unit is
+        removeDatabase("search-cipher.db");
+        case openSqlCipher("search-cipher.db", makeKey("search test key")) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case prepareSearch(&!db) of
+                    when Right(right as done: Unit) do
+                        add(&!db, "doc/1", "Coffee", "A cafe serves coffee late.");
+                        assertTrue(counted(&!db, "coffee") = 1, "found in SQLCipher");
+                    when Left(left as error: SearchError) do
+                        assertFailure("prepareSearch on SQLCipher");
+                end case;
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertFailure("SQLCipher opens");
+        end case;
+        removeDatabase("search-cipher.db");
+        return nil;
+    end;
+end module body.

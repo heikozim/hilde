@@ -1,0 +1,564 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: every call into the kernel is one of Standard.File's.
+-- The order of the steps is the point of the module, and each step that
+-- fails removes the temporary file before it returns, so that a failure
+-- leaves the path as it was.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    kindRegular,
+    sameKind,
+    FileStatus,
+    FileLookup,
+    FileFound,
+    FileMissing,
+    FileUnreadable,
+    Temporary,
+    statusOf,
+    statusOfOpen,
+    setFileOwner,
+    setFileMode,
+    syncFile,
+    syncDirectory,
+    renameFile,
+    linkFile,
+    createTemporaryBeside,
+    openRead,
+    readExactly,
+    writeAll,
+    closeFile,
+    removeFile,
+    removeFileIfThere
+);
+
+module body Standard.AtomicFile is
+    -- The largest mode: the permission bits with set-user, set-group and
+    -- the sticky bit, octal 7777.
+    constant largestMode: Nat32 := 4095;
+
+    function describeAtomicFailure(failure: AtomicFailure): String is
+        case failure of
+            when BadInput do
+                return fromLiteral("bad path or mode");
+            when NotAFile do
+                return fromLiteral("not an ordinary file");
+            when LookFailed do
+                return fromLiteral("could not look at the file");
+            when TemporaryFailed do
+                return fromLiteral("could not make a temporary file");
+            when WriteFailed do
+                return fromLiteral("could not write the temporary file");
+            when OwnerFailed do
+                return fromLiteral("could not keep the owner");
+            when ModeFailed do
+                return fromLiteral("could not set the mode");
+            when BackupFailed do
+                return fromLiteral("could not keep the backup");
+            when RenameFailed do
+                return fromLiteral("could not rename into place");
+            when NotDurable do
+                return fromLiteral("written, but the directory was not synced");
+        end case;
+    end;
+
+    generic [R: Region]
+    function backupName(path: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(path);
+        if size > 0 then
+            for i from 0 to size - 1 do
+                writeByte(&!out, path[i]);
+            end for;
+        end if;
+        writeByte(&!out, '.');
+        writeByte(&!out, 'b');
+        writeByte(&!out, 'a');
+        writeByte(&!out, 'k');
+        return finalize(out);
+    end;
+
+    -- A path and a mode this module takes: the path not empty, without a
+    -- zero byte and not ending in a slash, which would name a directory;
+    -- the mode no more than the permission bits.
+    generic [R: Region]
+    function validInput(path: Span[Nat8, R], mode: Nat32): Bool is
+        let size: Index := spanLength(path);
+        if size = 0 then
+            return false;
+        end if;
+        if mode > largestMode then
+            return false;
+        end if;
+        if path[size - 1] = '/' then
+            return false;
+        end if;
+        var holdsZero: Bool := false;
+        for i from 0 to size - 1 do
+            if path[i] = 0 then
+                holdsZero := true;
+            end if;
+        end for;
+        return not holdsZero;
+    end;
+
+    -- The directory to sync after a rename in path: the bytes before its
+    -- last slash, a slash alone when that is its first byte, a dot when
+    -- it has none.  Only called on a path validInput took.
+    generic [R: Region]
+    function directoryOf(path: Span[Nat8, R]): String is
+        let size: Index := spanLength(path);
+        var last: Index := 0;
+        var found: Bool := false;
+        for i from 0 to size - 1 do
+            if path[i] = '/' then
+                last := i;
+                found := true;
+            end if;
+        end for;
+        if not found then
+            return fromLiteral(".");
+        end if;
+        if last = 0 then
+            return fromLiteral("/");
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        for i from 0 to last - 1 do
+            writeByte(&!out, path[i]);
+        end for;
+        return finalize(out);
+    end;
+
+    function problem(failure: AtomicFailure): Option[AtomicFailure] is
+        let some: Option[AtomicFailure] := Some(value => failure);
+        return some;
+    end;
+
+    function noProblem(): Option[AtomicFailure] is
+        let none: Option[AtomicFailure] := None();
+        return none;
+    end;
+
+    function isProblem(outcome: Option[AtomicFailure]): Bool is
+        case outcome of
+            when Some(value: AtomicFailure) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The failure in outcome.  Only called when isProblem is true; for
+    -- None it says WriteFailed rather than stop.
+    function firstProblem(outcome: Option[AtomicFailure]): AtomicFailure is
+        case outcome of
+            when Some(value as failure: AtomicFailure) do
+                return failure;
+            when None do
+                return WriteFailed();
+        end case;
+    end;
+
+    -- Syncs the directory of path after a rename in it: Right when it is
+    -- on the disk, NotDurable when the rename may not survive a crash.
+    generic [R: Region]
+    function synced(path: Span[Nat8, R]): Either[AtomicFailure, Unit] is
+        let directory: String := directoryOf(path);
+        let done: Bool := syncDirectory(asSpan(&directory));
+        destroyString(directory);
+        if done then
+            let right: Either[AtomicFailure, Unit] := Right(right => nil);
+            return right;
+        end if;
+        let left: Either[AtomicFailure, Unit] := Left(left => NotDurable());
+        return left;
+    end;
+
+    -- What stands in the way of replacing what statusOf found: something
+    -- that is no ordinary file, or a name that could not be looked at.
+    function obstacle(before: FileLookup): Option[AtomicFailure] is
+        case before of
+            when FileFound(status: FileStatus) do
+                if sameKind(status.kind, kindRegular) then
+                    return noProblem();
+                end if;
+                return problem(NotAFile());
+            when FileMissing do
+                return noProblem();
+            when FileUnreadable do
+                return problem(LookFailed());
+        end case;
+    end;
+
+    function wasFound(before: FileLookup): Bool is
+        case before of
+            when FileFound(status: FileStatus) do
+                return true;
+            when FileMissing do
+                return false;
+            when FileUnreadable do
+                return false;
+        end case;
+    end;
+
+    -- Gives the open file the owner and group of the file before, when it
+    -- does not have them already.  True when it has them afterwards, and
+    -- when there was no file before.
+    generic [R: Region]
+    function giveOwner(file: &![FileDescriptor, R], before: FileLookup): Bool is
+        case before of
+            when FileFound(status as old: FileStatus) do
+                case statusOfOpen(&file) of
+                    when Some(value as mine: FileStatus) do
+                        if (mine.owner = old.owner) and (mine.group = old.group) then
+                            return true;
+                        end if;
+                        return setFileOwner(&~file, old.owner, old.group);
+                    when None do
+                        return false;
+                end case;
+            when FileMissing do
+                return true;
+            when FileUnreadable do
+                return true;
+        end case;
+    end;
+
+    -- Fills the temporary file and closes it: content written and synced,
+    -- the owner and group of before given, the mode set, in this order, so
+    -- that a change of owner cannot clear a set-user or set-group bit of
+    -- the mode.  The mode is set on the open file, so the umask does not
+    -- change it.  The file is closed on every way out.
+    generic [R: Region]
+    function fill(file: FileDescriptor, content: Span[Nat8, R], mode: Nat32, before: FileLookup): Option[AtomicFailure] is
+        var open: FileDescriptor := file;
+        var outcome: Option[AtomicFailure] := noProblem();
+        if not writeAll(&!open, content) then
+            outcome := problem(WriteFailed());
+        else
+            if not syncFile(&!open) then
+                outcome := problem(WriteFailed());
+            else
+                if not giveOwner(&!open, before) then
+                    outcome := problem(OwnerFailed());
+                else
+                    if not setFileMode(&!open, mode) then
+                        outcome := problem(ModeFailed());
+                    end if;
+                end if;
+            end if;
+        end if;
+        let closed: Bool := closeFile(open);
+        case outcome of
+            when Some(value as failure: AtomicFailure) do
+                return problem(failure);
+            when None do
+                if not closed then
+                    return problem(WriteFailed());
+                end if;
+                return noProblem();
+        end case;
+    end;
+
+    -- Links the file at path to its backup's name, after removing an older
+    -- backup.  True when the backup is the file at path.
+    generic [R: Region]
+    function keepBackup(path: Span[Nat8, R]): Bool is
+        let backup: String := backupName(path);
+        var kept: Bool := false;
+        case statusOf(asSpan(&backup)) of
+            when FileFound(status: FileStatus) do
+                if sameKind(status.kind, kindRegular) then
+                    if removeFileIfThere(asSpan(&backup)) then
+                        kept := linkFile(path, asSpan(&backup));
+                    end if;
+                end if;
+            when FileMissing do
+                kept := linkFile(path, asSpan(&backup));
+            when FileUnreadable do
+                kept := false;
+        end case;
+        destroyString(backup);
+        return kept;
+    end;
+
+    function failed(failure: AtomicFailure): Either[AtomicFailure, Unit] is
+        let left: Either[AtomicFailure, Unit] := Left(left => failure);
+        return left;
+    end;
+
+    -- The steps after the checks: a temporary file beside path, filled,
+    -- the old file kept as the backup when backup is true and there is
+    -- one, the temporary file renamed over path, the directory synced.
+    -- Every failure before the rename removes the temporary file.
+    generic [R: Region, S: Region]
+    function replace(path: Span[Nat8, R], content: Span[Nat8, S], mode: Nat32, before: FileLookup, backup: Bool): Either[AtomicFailure, Unit] is
+        case createTemporaryBeside(path) of
+            when Some(value as made: Temporary) do
+                let { file: FileDescriptor, name: String } := made;
+                let filled: Option[AtomicFailure] := fill(file, content, mode, before);
+                var failure: Option[AtomicFailure] := filled;
+                case filled of
+                    when Some(value as why: AtomicFailure) do
+                        skip;
+                    when None do
+                        if backup and wasFound(before) then
+                            if not keepBackup(path) then
+                                failure := problem(BackupFailed());
+                            end if;
+                        end if;
+                end case;
+                if isProblem(failure) then
+                    let removed: Bool := removeFile(asSpan(&name));
+                    destroyString(name);
+                    return failed(firstProblem(failure));
+                else
+                    let renamed: Bool := renameFile(asSpan(&name), path);
+                    if not renamed then
+                        let removed: Bool := removeFile(asSpan(&name));
+                        destroyString(name);
+                        return failed(RenameFailed());
+                    else
+                        destroyString(name);
+                        return synced(path);
+                    end if;
+                end if;
+            when None do
+                return failed(TemporaryFailed());
+        end case;
+    end;
+
+    -- The checks every write starts with: the input, then what is at path.
+    -- Right with what statusOf found when the write may go on.
+    generic [R: Region]
+    function look(path: Span[Nat8, R], mode: Nat32): Either[AtomicFailure, FileLookup] is
+        if not validInput(path, mode) then
+            let bad: Either[AtomicFailure, FileLookup] := Left(left => BadInput());
+            return bad;
+        end if;
+        let before: FileLookup := statusOf(path);
+        case obstacle(before) of
+            when Some(value as why: AtomicFailure) do
+                let refused: Either[AtomicFailure, FileLookup] := Left(left => why);
+                return refused;
+            when None do
+                let fine: Either[AtomicFailure, FileLookup] := Right(right => before);
+                return fine;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeAtomically(path: Span[Nat8, R], content: Span[Nat8, S], mode: Nat32): Either[AtomicFailure, Unit] is
+        case look(path, mode) of
+            when Right(right as before: FileLookup) do
+                return replace(path, content, mode, before, false);
+            when Left(left as why: AtomicFailure) do
+                return failed(why);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeWithBackup(path: Span[Nat8, R], content: Span[Nat8, S], mode: Nat32): Either[AtomicFailure, Bool] is
+        case look(path, mode) of
+            when Right(right as before: FileLookup) do
+                case replace(path, content, mode, before, true) of
+                    when Right(right: Unit) do
+                        let done: Either[AtomicFailure, Bool] := Right(right => wasFound(before));
+                        return done;
+                    when Left(left as why: AtomicFailure) do
+                        let refused: Either[AtomicFailure, Bool] := Left(left => why);
+                        return refused;
+                end case;
+            when Left(left as why: AtomicFailure) do
+                let refused: Either[AtomicFailure, Bool] := Left(left => why);
+                return refused;
+        end case;
+    end;
+
+    -- What comparing the file at path with content and mode found.
+    union Comparison: Free is
+        case Same;
+        case Different;
+        case Unread;
+    end;
+
+    -- Opens the file at path and compares it with content and mode: the
+    -- open file's kind, mode and size first, and its bytes only when those
+    -- agree, reading no more than content holds.
+    generic [R: Region, S: Region]
+    function compare(path: Span[Nat8, R], content: Span[Nat8, S], mode: Nat32): Comparison is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var result: Comparison := Unread();
+                case statusOfOpen(&file) of
+                    when Some(value as status: FileStatus) do
+                        result := compareOpen(&!file, status, content, mode);
+                    when None do
+                        result := Unread();
+                end case;
+                let closed: Bool := closeFile(file);
+                return result;
+            when None do
+                return Unread();
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function compareOpen(file: &![FileDescriptor, R], status: FileStatus, content: Span[Nat8, S], mode: Nat32): Comparison is
+        if not sameKind(status.kind, kindRegular) then
+            return Different();
+        end if;
+        if status.mode /= mode then
+            return Different();
+        end if;
+        let size: Index := spanLength(content);
+        case toNat64(size) of
+            when Some(value as wanted: Nat64) do
+                if status.size /= wanted then
+                    return Different();
+                end if;
+            when None do
+                return Different();
+        end case;
+        if size = 0 then
+            return Same();
+        end if;
+        case readExactly(file, size) of
+            when Some(value as bytes: String) do
+                var same: Bool := length(&bytes) = size;
+                if same then
+                    for i from 0 to size - 1 do
+                        if nthByte(&bytes, i) /= content[i] then
+                            same := false;
+                        end if;
+                    end for;
+                end if;
+                destroyString(bytes);
+                if same then
+                    return Same();
+                end if;
+                return Different();
+            when None do
+                return Unread();
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeIfChanged(path: Span[Nat8, R], content: Span[Nat8, S], mode: Nat32): Either[AtomicFailure, Change] is
+        case look(path, mode) of
+            when Right(right as before: FileLookup) do
+                let found: Bool := wasFound(before);
+                if found then
+                    case compare(path, content, mode) of
+                        when Same do
+                            let unchanged: Either[AtomicFailure, Change] := Right(right => Unchanged());
+                            return unchanged;
+                        when Different do
+                            skip;
+                        when Unread do
+                            let unread: Either[AtomicFailure, Change] := Left(left => LookFailed());
+                            return unread;
+                    end case;
+                end if;
+                case replace(path, content, mode, before, found) of
+                    when Right(right: Unit) do
+                        if found then
+                            let replaced: Either[AtomicFailure, Change] := Right(right => Replaced());
+                            return replaced;
+                        end if;
+                        let created: Either[AtomicFailure, Change] := Right(right => Created());
+                        return created;
+                    when Left(left as why: AtomicFailure) do
+                        let refused: Either[AtomicFailure, Change] := Left(left => why);
+                        return refused;
+                end case;
+            when Left(left as why: AtomicFailure) do
+                let refused: Either[AtomicFailure, Change] := Left(left => why);
+                return refused;
+        end case;
+    end;
+
+    -- What is at the backup's name, for restoreBackup: Right true for an
+    -- ordinary file, Right false for nothing, and the failure otherwise.
+    generic [R: Region]
+    function backupThere(backup: Span[Nat8, R]): Either[AtomicFailure, Bool] is
+        case statusOf(backup) of
+            when FileFound(status: FileStatus) do
+                if sameKind(status.kind, kindRegular) then
+                    let file: Either[AtomicFailure, Bool] := Right(right => true);
+                    return file;
+                end if;
+                let other: Either[AtomicFailure, Bool] := Left(left => NotAFile());
+                return other;
+            when FileMissing do
+                let none: Either[AtomicFailure, Bool] := Right(right => false);
+                return none;
+            when FileUnreadable do
+                let unread: Either[AtomicFailure, Bool] := Left(left => LookFailed());
+                return unread;
+        end case;
+    end;
+
+    generic [R: Region]
+    function restoreBackup(path: Span[Nat8, R]): Either[AtomicFailure, Bool] is
+        let zero: Nat32 := 0;
+        case look(path, zero) of
+            when Right(right as before: FileLookup) do
+                let backup: String := backupName(path);
+                let there: Either[AtomicFailure, Bool] := backupThere(asSpan(&backup));
+                var renamed: Bool := false;
+                case there of
+                    when Right(right as file: Bool) do
+                        if file then
+                            renamed := renameFile(asSpan(&backup), path);
+                        end if;
+                    when Left(left: AtomicFailure) do
+                        skip;
+                end case;
+                destroyString(backup);
+                case there of
+                    when Right(right as file: Bool) do
+                        if not file then
+                            return there;
+                        end if;
+                        if not renamed then
+                            let refused: Either[AtomicFailure, Bool] := Left(left => RenameFailed());
+                            return refused;
+                        end if;
+                        case synced(path) of
+                            when Right(right: Unit) do
+                                let restored: Either[AtomicFailure, Bool] := Right(right => true);
+                                return restored;
+                            when Left(left as why: AtomicFailure) do
+                                let late: Either[AtomicFailure, Bool] := Left(left => why);
+                                return late;
+                        end case;
+                    when Left(left: AtomicFailure) do
+                        return there;
+                end case;
+            when Left(left as why: AtomicFailure) do
+                let refused: Either[AtomicFailure, Bool] := Left(left => why);
+                return refused;
+        end case;
+    end;
+end module body.

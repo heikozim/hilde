@@ -1,0 +1,1 @@
+A graph that still holds a node with a String value given to destroyEmpty: the programme stops with the contract of destroyEmpty, whose message names the line of the call, because the String would be lost.

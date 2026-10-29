@@ -1,0 +1,96 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The pipe comes from the runtime's own hilde_pipe_open.  A chain of
+-- reading ends is a list of nodes in lib/prelude.c, each with a count of
+-- the references to it; a level below takes a reference to the level
+-- above instead of copies of its descriptors, and the wait collects the
+-- reading ends of the chain into one poll(2).
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullPointer,
+    nullCheck,
+    allocateBuffer,
+    load,
+    positiveOffset,
+    deallocate
+);
+
+module body Bindings.Context is
+    record Ends: Free is
+        reading: Int32;
+        writing: Int32;
+    end;
+
+    record Node: Linear is
+        -- The C side's node, or the null address for the empty chain.
+        -- Nat8 rather than a void-shaped type because Hilde has none, and
+        -- nothing here ever loads through it.
+        handle: Address[Nat8];
+    end;
+
+    -- No contract: the pipe is the kernel's answer, an I/O result.
+    function openEnds(): Option[Ends] is
+        let address: Address[Int32] := allocateBuffer(2);
+        case nullCheck(address) of
+            when Some(value as slots: Pointer[Int32]) do
+                if @embed(Int32, "hilde_pipe_open($1)", slots) = 1 then
+                    let reading: Int32 := load(slots);
+                    let writing: Int32 := load(positiveOffset(slots, 1));
+                    deallocate(slots);
+                    let some: Option[Ends] := Some(value => Ends(reading => reading, writing => writing));
+                    return some;
+                else
+                    deallocate(slots);
+                    let none: Option[Ends] := None();
+                    return none;
+                end if;
+            when None do
+                let none: Option[Ends] := None();
+                return none;
+        end case;
+    end;
+
+    function closeNumber(number: Int32): Unit is
+        let closed: Int32 := @embed(Int32, "hilde_file_close($1)", number);
+        return nil;
+    end;
+
+    function emptyNode(): Node is
+        let none: Address[Nat8] := nullPointer();
+        return Node(handle => none);
+    end;
+
+    -- No contract: whether there was memory for the node is an I/O result.
+    generic [R: Region]
+    function nodeBelow(reading: Int32, parent: &[Node, R]): Option[Node] is
+        let above: Address[Nat8] := parent->handle;
+        let made: Address[Nat8] := @embed(Address[Nat8], "hilde_context_node_make($1, $2)", reading, above);
+        if @embed(Bool, "(($1) == NULL)", made) then
+            let none: Option[Node] := None();
+            return none;
+        end if;
+        let some: Option[Node] := Some(value => Node(handle => made));
+        return some;
+    end;
+
+    function releaseNode(node: Node): Unit is
+        let { handle: Address[Nat8] } := node;
+        @embed(Unit, "hilde_context_node_release($1)", handle);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function nodeReady(node: &[Node, R], milliseconds: Int32): Int32 is
+        let handle: Address[Nat8] := node->handle;
+        return @embed(Int32, "hilde_context_node_wait($1, $2)", handle, milliseconds);
+    end;
+end module body.

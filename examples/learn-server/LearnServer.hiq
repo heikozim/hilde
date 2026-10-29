@@ -1,0 +1,286 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    Listener,
+    TcpListener,
+    listenUnix,
+    connectUnix,
+    closeListener,
+    removeFile,
+    listenTcp,
+    tcpListenerPort,
+    closeTcpListener,
+    readAll,
+    writeAll,
+    closeFile
+);
+import Standard.Text (
+    replace
+);
+import Standard.Fcgi (
+    RecordHeader,
+    typeBeginRequest,
+    typeParams,
+    typeStdin,
+    typeStdout,
+    readHeader,
+    headerKind,
+    recordLength,
+    readContent,
+    makeRecord,
+    makePair
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    closeScope,
+    spawn,
+    join,
+    sleepFor
+);
+import Standard.Signal (
+    Signals,
+    Wanted,
+    watchSignals,
+    stopWatching
+);
+import Standard.FcgiServer (
+    Limits,
+    Request,
+    defaultLimits,
+    requestParam,
+    destroyRequest,
+    cgiResponse,
+    serveUnix
+);
+
+module body Example.LearnServer is
+    -- The handler: a greeting for the name in the query string.
+    function greet(request: Request): String is
+        var text: StringBuilder := makeStringBuilder();
+        writeString(&!text, "hello, ");
+        case requestParam(&request, "QUERY_STRING") of
+            when Some(value as query: String) do
+                writeString(&!text, asSpan(&query));
+                destroyString(query);
+            when None do
+                writeString(&!text, "nobody");
+        end case;
+        destroyRequest(request);
+        let greeting: String := finalize(text);
+        let output: String := cgiResponse(200, "text/plain", asSpan(&greeting));
+        destroyString(greeting);
+        return output;
+    end;
+
+    generic [B: Region, S: Region]
+    function addRecord(out: &![StringBuilder, B], kind: Nat8, content: Span[Nat8, S]): Unit is
+        let id: Nat64 := 1;
+        case makeRecord(kind, id, content) of
+            when Some(value as bytes: String) do
+                writeString(&~out, asSpan(&bytes));
+                destroyString(bytes);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- What a web server would send: FCGI_BEGIN_REQUEST for a responder,
+    -- two parameters, an empty body.
+    function webRequest(): String is
+        var out: StringBuilder := makeStringBuilder();
+        -- The role 1, a responder, in two bytes; no flags; five zeros.
+        var begin: String := makeString(8, 0);
+        storeNth(&!begin, 1, 1);
+        addRecord(&!out, typeBeginRequest, asSpan(&begin));
+        destroyString(begin);
+        var pairs: StringBuilder := makeStringBuilder();
+        case makePair("REQUEST_METHOD", "GET") of
+            when Some(value as pair: String) do
+                writeString(&!pairs, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                skip;
+        end case;
+        case makePair("QUERY_STRING", "name=hilde") of
+            when Some(value as pair: String) do
+                writeString(&!pairs, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                skip;
+        end case;
+        let block: String := finalize(pairs);
+        addRecord(&!out, typeParams, asSpan(&block));
+        destroyString(block);
+        addRecord(&!out, typeParams, "");
+        addRecord(&!out, typeStdin, "");
+        return finalize(out);
+    end;
+
+    -- The client, a task: it connects, sends the request and returns the
+    -- content of the stdout records it got back.
+    function client(path: String): String is
+        var answer: StringBuilder := makeStringBuilder();
+        var tries: Index := 0;
+        var done: Bool := false;
+        while (not done) and (tries < 50) do
+            case connectUnix(asSpan(&path)) of
+                when Some(value as opened: FileDescriptor) do
+                    var socket: FileDescriptor := opened;
+                    let sent: String := webRequest();
+                    if writeAll(&!socket, asSpan(&sent)) then
+                        case readAll(&!socket) of
+                            when Some(value as bytes: String) do
+                                stdoutOf(&bytes, &!answer);
+                                destroyString(bytes);
+                            when None do
+                                skip;
+                        end case;
+                    end if;
+                    destroyString(sent);
+                    let closed: Bool := closeFile(socket);
+                    done := true;
+                when None do
+                    sleepFor(20);
+                    tries := tries + 1;
+            end case;
+        end while;
+        destroyString(path);
+        return finalize(answer);
+    end;
+
+    generic [R: Region, B: Region]
+    function stdoutOf(bytes: &[String, R], out: &![StringBuilder, B]): Unit is
+        var at: Index := 0;
+        var going: Bool := true;
+        while going do
+            case readHeader(asSpan(bytes), at) of
+                when Some(value as header: RecordHeader) do
+                    if headerKind(header) = typeStdout then
+                        case readContent(asSpan(bytes), at, header) of
+                            when Some(value as content: String) do
+                                writeString(&~out, asSpan(&content));
+                                destroyString(content);
+                            when None do
+                                skip;
+                        end case;
+                    end if;
+                    at := at + recordLength(header);
+                when None do
+                    going := false;
+            end case;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    function serveOnce(): Unit is
+        let path: String := fromLiteral("learn-server.sock");
+        let removed: Bool := removeFile(asSpan(&path));
+        case listenUnix(asSpan(&path), #o600) of
+            when Some(value as listener: Listener) do
+                case openScope() of
+                    when Some(value as opened: Scope) do
+                        var scope: Scope := opened;
+                        let talk: Fn[String, String] := client;
+                        case spawn(&!scope, talk, fromLiteral("learn-server.sock")) of
+                            when Right(right as task: Task[String]) do
+                                let base: Limits := defaultLimits();
+                                -- One connection, then the loop returns.
+                                let limits: Limits := Limits(
+                                    workers => 2,
+                                    connections => 1,
+                                    paramsBytes => base.paramsBytes,
+                                    bodyBytes => base.bodyBytes,
+                                    requestMilliseconds => 5000,
+                                    writeMilliseconds => 5000
+                                );
+                                let wanted: Wanted := Wanted(hangup => false, interrupt => true, terminate => true, user1 => false, user2 => false);
+                                case watchSignals(wanted) of
+                                    when Some(value as watching: Signals) do
+                                        var signals: Signals := watching;
+                                        case serveUnix(&listener, greet, limits, &!signals) of
+                                            when Some(value as accepted: Index) do
+                                                print("connections accepted: ");
+                                                printLn(accepted);
+                                            when None do
+                                                printLn("the loop could not start");
+                                        end case;
+                                        let stopped: Bool := stopWatching(signals);
+                                    when None do
+                                        printLn("no signals");
+                                end case;
+                                let answer: String := join(task);
+                                printLn("what the web server got back, its CR LF printed as LF:");
+                                let lines: String := replace(asSpan(&answer), "\r\n", "\n");
+                                printText(&lines);
+                                destroyString(lines);
+                                printLn("");
+                                destroyString(answer);
+                            when Left(left as back: String) do
+                                destroyString(back);
+                                printLn("the client did not start");
+                        end case;
+                        closeScope(scope);
+                    when None do
+                        printLn("no scope");
+                end case;
+                print("listener closed: ");
+                printLn(closeListener(listener));
+            when None do
+                printLn("listenUnix failed");
+        end case;
+        destroyString(path);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        serveOnce();
+        -- A TCP listener on 127.0.0.1, port 0: the kernel chooses one.
+        var loopback: String := makeString(4, 0);
+        storeNth(&!loopback, 0, 127);
+        storeNth(&!loopback, 3, 1);
+        case listenTcp(asSpan(&loopback), 0) of
+            when Some(value as listener: TcpListener) do
+                print("a TCP port was chosen: ");
+                printLn(tcpListenerPort(&listener) > 0);
+                print("TCP listener closed: ");
+                printLn(closeTcpListener(listener));
+            when None do
+                printLn("listenTcp failed");
+        end case;
+        destroyString(loopback);
+        return ExitSuccess();
+    end;
+end module body.

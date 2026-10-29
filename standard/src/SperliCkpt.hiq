@@ -1,0 +1,774 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as count,
+    nth,
+    insertBack,
+    remove,
+    removeLast,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    makeEmpty,
+    length,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    bytesToHex,
+    formatNat,
+    parseNat,
+    equal
+);
+import Standard.Libcrypto (
+    sha256
+);
+import Standard.CompositeSig (
+    CompositeKey,
+    sign,
+    verify,
+    openSshLabel,
+    signatureBytes
+);
+import Standard.AtomicFile (
+    AtomicFailure,
+    writeAtomically
+);
+import Standard.File (
+    FileDescriptor,
+    FileStatus,
+    FileLookup,
+    FileFound,
+    FileMissing,
+    FileUnreadable,
+    Directory,
+    sameKind,
+    kindRegular,
+    kindDirectory,
+    statusOf,
+    openRead,
+    readAll,
+    closeFile,
+    createDirectory,
+    removeDirectory,
+    removeFile,
+    removeFileIfThere,
+    openDirectory,
+    nextEntry,
+    closeDirectory
+);
+import Standard.SperliError (
+    badCheckpointFile,
+    digestMismatch,
+    badCommit,
+    resumeRefused,
+    sizeMismatch
+);
+
+module body Standard.SperliCkpt is
+    constant byteMask: Nat64 := 255;
+    constant byteBase: Nat64 := 256;
+    constant ownerOnly: Nat32 := 384;
+    constant commitHead: Index := 36;
+
+    function fileHeaderBytes(): Index is
+        return 80;
+    end;
+
+    function digestBytes(): Index is
+        return 32;
+    end;
+
+    function maxStateBytes(): Index is
+        return 268435456;
+    end;
+
+    function chunkBytes(): Index is
+        return 1048576;
+    end;
+
+    function commitContext(): Span[Nat8, Static] is
+        return "SPERLI-COMMIT-1";
+    end;
+
+    instance Checkpointable(String) is
+        generic [R: Region]
+        method encodeState(value: &[String, R]): String is
+            return fromSpan(asSpan(value));
+        end;
+
+        generic [B: Region]
+        method decodeState(bytes: Span[Nat8, B]): Option[String] is
+            let state: Option[String] := Some(value => fromSpan(bytes));
+            return state;
+        end;
+    end;
+
+    ---
+    --- Numbers
+    ---
+
+    function wide(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliCkpt: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function wide32(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliCkpt: a Nat32 did not fit a Nat64");
+        end case;
+    end;
+
+    function narrow(value: Nat64): Index is
+        case toIndex(value) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.SperliCkpt: a length did not fit an Index");
+        end case;
+    end;
+
+    function narrow32(value: Nat64): Nat32 is
+        case toNat32(value) of
+            when Some(value as at: Nat32) do
+                return at;
+            when None do
+                abort("Standard.SperliCkpt: a number did not fit a Nat32");
+        end case;
+    end;
+
+    function lowByte(value: Nat64): Nat8 is
+        case toNat8(bitwiseAnd(value, byteMask)) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                abort("Standard.SperliCkpt: a byte did not fit a Nat8");
+        end case;
+    end;
+
+    function byteValue(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.SperliCkpt: a byte did not fit a Nat64");
+        end case;
+    end;
+
+    -- value in width bytes, least significant first.
+    generic [R: Region]
+    function putNumber(out: &![StringBuilder, R], value: Nat64, width: Index): Unit is
+        var rest: Nat64 := value;
+        var i: Index := 0;
+        while i < width do
+            writeByte(&~out, lowByte(rest));
+            rest := rest / byteBase;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- width bytes of bytes from at on, least significant first.  The caller
+    -- has checked that they are there.
+    generic [B: Region]
+    function takeNumber(bytes: Span[Nat8, B], at: Index, width: Index): Nat64 is
+        var value: Nat64 := 0;
+        var i: Index := width;
+        while i > 0 do
+            i := i - 1;
+            value := modularAdd(modularMultiply(value, byteBase), byteValue(bytes[at + i]));
+        end while;
+        return value;
+    end;
+
+    -- Whether the bytes of a and b from the given places are the same, amount of them.
+    generic [A: Region, B: Region]
+    function sameBytes(a: Span[Nat8, A], atA: Index, b: Span[Nat8, B], atB: Index, amount: Index): Bool is
+        var i: Index := 0;
+        while i < amount do
+            if a[atA + i] /= b[atB + i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether the first four bytes of bytes are the four letters.
+    generic [B: Region]
+    function startsWith(bytes: Span[Nat8, B], letters: Span[Nat8, Static]): Bool is
+        return (spanLength(bytes) >= 4) and sameBytes(bytes, 0, letters, 0, 4);
+    end;
+
+    generic [B: Region]
+    function digestOf(bytes: Span[Nat8, B]): Option[String] is
+        return sha256(bytes);
+    end;
+
+    ---
+    --- Rank files
+    ---
+
+    generic [J: Region, P: Region]
+    function rankFile(job: Span[Nat8, J], epoch: Nat64, rank: Nat32, size: Nat32, payload: Span[Nat8, P]): Option[String] is
+        case sha256(payload) of
+            when None do
+                let none: Option[String] := None();
+                return none;
+            when Some(value as digest: String) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, "SPCK");
+                putNumber(&!out, 1, 2);
+                putNumber(&!out, 0, 2);
+                writeString(&!out, job);
+                putNumber(&!out, epoch, 8);
+                putNumber(&!out, wide32(rank), 4);
+                putNumber(&!out, wide32(size), 4);
+                putNumber(&!out, wide(spanLength(payload)), 8);
+                writeString(&!out, asSpan(&digest));
+                writeString(&!out, payload);
+                destroyString(digest);
+                let file: Option[String] := Some(value => finalize(out));
+                return file;
+        end case;
+    end;
+
+    generic [F: Region, J: Region]
+    function checkRankFile(file: Span[Nat8, F], job: Span[Nat8, J], epoch: Nat64, rank: Nat32, size: Nat32): Int32 is
+        if spanLength(file) < 80 then
+            return badCheckpointFile();
+        end if;
+        if (not startsWith(file, "SPCK")) or (takeNumber(file, 4, 2) /= 1) or (takeNumber(file, 6, 2) /= 0) then
+            return badCheckpointFile();
+        end if;
+        if not sameBytes(file, 8, job, 0, 16) then
+            return badCheckpointFile();
+        end if;
+        if (takeNumber(file, 24, 8) /= epoch) or (takeNumber(file, 32, 4) /= wide32(rank)) or (takeNumber(file, 36, 4) /= wide32(size)) then
+            return badCheckpointFile();
+        end if;
+        let announced: Nat64 := takeNumber(file, 40, 8);
+        if (announced > wide(maxStateBytes())) or ((wide(spanLength(file)) - 80) /= announced) then
+            return badCheckpointFile();
+        end if;
+        case sha256(spanPart(file, 80, narrow(announced))) of
+            when None do
+                return digestMismatch();
+            when Some(value as digest: String) do
+                let same: Bool := sameBytes(file, 48, asSpan(&digest), 0, 32);
+                destroyString(digest);
+                if not same then
+                    return digestMismatch();
+                end if;
+                return 0;
+        end case;
+    end;
+
+    generic [F: Region]
+    function rankFilePayload(file: Span[Nat8, F]): String is
+        if spanLength(file) = 80 then
+            return makeEmpty();
+        end if;
+        return fromSpan(spanPart(file, 80, spanLength(file) - 80));
+    end;
+
+    ---
+    --- COMMIT files
+    ---
+
+    generic [J: Region, D: Region]
+    function commitBody(job: Span[Nat8, J], epoch: Nat64, digests: Span[Nat8, D]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "SPCM");
+        putNumber(&!out, 1, 2);
+        putNumber(&!out, 0, 2);
+        writeString(&!out, job);
+        putNumber(&!out, epoch, 8);
+        putNumber(&!out, wide(spanLength(digests) / 32), 4);
+        writeString(&!out, digests);
+        return finalize(out);
+    end;
+
+    generic [K: Region, B: Region]
+    function signCommit(key: &[CompositeKey, K], content: Span[Nat8, B]): Option[String] is
+        case sign(key, openSshLabel(), content, commitContext()) of
+            when None do
+                let none: Option[String] := None();
+                return none;
+            when Some(value as signature: String) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, content);
+                putNumber(&!out, wide(length(&signature)), 2);
+                writeString(&!out, asSpan(&signature));
+                destroyString(signature);
+                let commit: Option[String] := Some(value => finalize(out));
+                return commit;
+        end case;
+    end;
+
+    generic [C: Region, K: Region, J: Region]
+    function checkCommit(commit: Span[Nat8, C], publicKey: Span[Nat8, K], job: Span[Nat8, J], epoch: Nat64, size: Nat32): Int32 is
+        if spanLength(commit) < commitHead then
+            return badCommit();
+        end if;
+        if (not startsWith(commit, "SPCM")) or (takeNumber(commit, 4, 2) /= 1) or (takeNumber(commit, 6, 2) /= 0) then
+            return badCommit();
+        end if;
+        let named: Nat64 := takeNumber(commit, 32, 4);
+        if (named < 1) or (named > 4096) then
+            return badCommit();
+        end if;
+        let bodyLength: Index := commitHead + (32 * narrow(named));
+        if (spanLength(commit) < (bodyLength + 2)) or (takeNumber(commit, bodyLength, 2) /= wide(signatureBytes())) then
+            return badCommit();
+        end if;
+        if spanLength(commit) /= ((bodyLength + 2) + signatureBytes()) then
+            return badCommit();
+        end if;
+        if not verify(publicKey, openSshLabel(), spanPart(commit, 0, bodyLength), commitContext(), spanPart(commit, bodyLength + 2, signatureBytes())) then
+            return badCommit();
+        end if;
+        if (not sameBytes(commit, 8, job, 0, 16)) or (takeNumber(commit, 24, 8) /= epoch) then
+            return badCommit();
+        end if;
+        if named /= wide32(size) then
+            return sizeMismatch();
+        end if;
+        return 0;
+    end;
+
+    generic [C: Region]
+    function commitEpoch(commit: Span[Nat8, C]): Nat64 is
+        if spanLength(commit) < commitHead then
+            return 0;
+        end if;
+        return takeNumber(commit, 24, 8);
+    end;
+
+    generic [C: Region]
+    function commitDigest(commit: Span[Nat8, C], rank: Nat32): String is
+        if spanLength(commit) < commitHead then
+            return makeEmpty();
+        end if;
+        let at: Index := commitHead + (32 * narrow(wide32(rank)));
+        if (takeNumber(commit, 32, 4) <= wide32(rank)) or (spanLength(commit) < (at + 32)) then
+            return makeEmpty();
+        end if;
+        return fromSpan(spanPart(commit, at, 32));
+    end;
+
+    ---
+    --- Frame payloads
+    ---
+
+    function beginPayload(size: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        putNumber(&!out, 1, 4);
+        putNumber(&!out, wide32(size), 4);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function beginIs(payload: Span[Nat8, P], size: Nat32): Bool is
+        return (spanLength(payload) = 8) and (takeNumber(payload, 0, 4) = 1) and (takeNumber(payload, 4, 4) = wide32(size));
+    end;
+
+    generic [C: Region]
+    function dataPayload(kind: Nat8, owner: Nat32, offset: Nat64, total: Nat64, chunk: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, kind);
+        putNumber(&!out, 0, 3);
+        putNumber(&!out, wide32(owner), 4);
+        putNumber(&!out, offset, 8);
+        putNumber(&!out, total, 8);
+        writeString(&!out, chunk);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function dataIs(payload: Span[Nat8, P]): Bool is
+        if (spanLength(payload) < 24) or (payload[0] > 4) then
+            return false;
+        end if;
+        if (takeNumber(payload, 1, 3) /= 0) or (spanLength(payload) > (24 + chunkBytes())) then
+            return false;
+        end if;
+        if (payload[0] = 1) or (payload[0] = 3) or (payload[0] = 4) then
+            return spanLength(payload) = 24;
+        end if;
+        return true;
+    end;
+
+    generic [P: Region]
+    function dataKindOf(payload: Span[Nat8, P]): Nat8 is
+        return payload[0];
+    end;
+
+    generic [P: Region]
+    function dataOwner(payload: Span[Nat8, P]): Nat32 is
+        return narrow32(takeNumber(payload, 4, 4));
+    end;
+
+    generic [P: Region]
+    function dataOffset(payload: Span[Nat8, P]): Nat64 is
+        return takeNumber(payload, 8, 8);
+    end;
+
+    generic [P: Region]
+    function dataTotal(payload: Span[Nat8, P]): Nat64 is
+        return takeNumber(payload, 16, 8);
+    end;
+
+    generic [P: Region]
+    function dataChunk(payload: Span[Nat8, P]): String is
+        if spanLength(payload) = 24 then
+            return makeEmpty();
+        end if;
+        return fromSpan(spanPart(payload, 24, spanLength(payload) - 24));
+    end;
+
+    generic [D: Region, C: Region]
+    function resumePayload(size: Nat32, status: Nat32, fingerprint: Span[Nat8, D], commit: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        putNumber(&!out, wide32(size), 4);
+        putNumber(&!out, wide32(status), 4);
+        writeString(&!out, fingerprint);
+        writeString(&!out, commit);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function resumeIs(payload: Span[Nat8, P]): Bool is
+        return (spanLength(payload) >= 40) and (takeNumber(payload, 4, 4) <= 3);
+    end;
+
+    generic [P: Region]
+    function resumeSize(payload: Span[Nat8, P]): Nat32 is
+        return narrow32(takeNumber(payload, 0, 4));
+    end;
+
+    generic [P: Region]
+    function resumeStatus(payload: Span[Nat8, P]): Nat32 is
+        return narrow32(takeNumber(payload, 4, 4));
+    end;
+
+    generic [P: Region]
+    function resumeCommit(payload: Span[Nat8, P]): String is
+        if spanLength(payload) = 40 then
+            return makeEmpty();
+        end if;
+        return fromSpan(spanPart(payload, 40, spanLength(payload) - 40));
+    end;
+
+    ---
+    --- Places on disk
+    ---
+
+    generic [D: Region, J: Region]
+    function jobDirectory(directory: Span[Nat8, D], job: Span[Nat8, J]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, directory);
+        writeString(&!out, "/");
+        let hex: String := bytesToHex(job);
+        writeString(&!out, asSpan(&hex));
+        destroyString(hex);
+        return finalize(out);
+    end;
+
+    generic [D: Region, J: Region]
+    function epochDirectory(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        let base: String := jobDirectory(directory, job);
+        writeString(&!out, asSpan(&base));
+        writeString(&!out, "/");
+        let number: String := formatNat(epoch);
+        writeString(&!out, asSpan(&number));
+        destroyString(number);
+        destroyString(base);
+        return finalize(out);
+    end;
+
+    generic [D: Region, J: Region]
+    function rankPath(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64, rank: Nat32, buddy: Bool): String is
+        var out: StringBuilder := makeStringBuilder();
+        let base: String := epochDirectory(directory, job, epoch);
+        writeString(&!out, asSpan(&base));
+        writeString(&!out, "/rank-");
+        let number: String := formatNat(wide32(rank));
+        writeString(&!out, asSpan(&number));
+        writeString(&!out, ".ckpt");
+        if buddy then
+            writeString(&!out, ".buddy");
+        end if;
+        destroyString(number);
+        destroyString(base);
+        return finalize(out);
+    end;
+
+    generic [D: Region, J: Region]
+    function commitPath(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        let base: String := epochDirectory(directory, job, epoch);
+        writeString(&!out, asSpan(&base));
+        writeString(&!out, "/COMMIT");
+        destroyString(base);
+        return finalize(out);
+    end;
+
+    -- Makes the directory at path unless it is there already; true when a directory is there.
+    generic [P: Region]
+    function ensureDirectory(path: Span[Nat8, P]): Bool is
+        case statusOf(path) of
+            when FileFound(status: FileStatus) do
+                return sameKind(status.kind, kindDirectory);
+            when FileMissing do
+                if createDirectory(path) then
+                    return true;
+                end if;
+                -- Another rank on this host may have made it in the meantime.
+                case statusOf(path) of
+                    when FileFound(status: FileStatus) do
+                        return sameKind(status.kind, kindDirectory);
+                    when FileMissing do
+                        return false;
+                    when FileUnreadable do
+                        return false;
+                end case;
+            when FileUnreadable do
+                return false;
+        end case;
+    end;
+
+    generic [D: Region, J: Region]
+    function prepareEpoch(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64): Bool is
+        if not ensureDirectory(directory) then
+            return false;
+        end if;
+        let jobPath: String := jobDirectory(directory, job);
+        let epochPath: String := epochDirectory(directory, job, epoch);
+        let ready: Bool := ensureDirectory(asSpan(&jobPath)) and ensureDirectory(asSpan(&epochPath));
+        destroyString(jobPath);
+        destroyString(epochPath);
+        return ready;
+    end;
+
+    generic [P: Region, B: Region]
+    function storeFile(path: Span[Nat8, P], bytes: Span[Nat8, B]): Bool is
+        case writeAtomically(path, bytes, ownerOnly) of
+            when Right(right as done: Unit) do
+                return true;
+            when Left(left as failure: AtomicFailure) do
+                return false;
+        end case;
+    end;
+
+    function noText(): Option[String] is
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    generic [P: Region]
+    function loadFile(path: Span[Nat8, P], most: Index): Option[String] is
+        case statusOf(path) of
+            when FileFound(status: FileStatus) do
+                if (not sameKind(status.kind, kindRegular)) or (status.size > wide(most)) then
+                    return noText();
+                end if;
+            when FileMissing do
+                return noText();
+            when FileUnreadable do
+                return noText();
+        end case;
+        case openRead(path) of
+            when None do
+                return noText();
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case text of
+                    when None do
+                        return noText();
+                    when Some(value as read: String) do
+                        if length(&read) > most then
+                            destroyString(read);
+                            return noText();
+                        end if;
+                        let whole: Option[String] := Some(value => read);
+                        return whole;
+                end case;
+        end case;
+    end;
+
+    generic [D: Region, J: Region]
+    function removeCommit(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64): Unit is
+        let path: String := commitPath(directory, job, epoch);
+        let removed: Bool := removeFileIfThere(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+
+    -- The epochs that are directories of the job under directory, as the
+    -- names spell them: decimal numbers without a sign or leading zeros.
+    generic [P: Region]
+    function epochsIn(jobPath: Span[Nat8, P]): Buffer[Nat64] is
+        var found: Buffer[Nat64] := allocateEmpty();
+        case openDirectory(jobPath) of
+            when None do
+                return found;
+            when Some(value as opened: Directory) do
+                var listing: Directory := opened;
+                var more: Bool := true;
+                while more do
+                    case nextEntry(&!listing) of
+                        when None do
+                            more := false;
+                        when Some(value as name: String) do
+                            case parseNat(asSpan(&name)) of
+                                when Some(value as number: Nat64) do
+                                    let canonical: String := formatNat(number);
+                                    if (number >= 1) and equal(asSpan(&canonical), asSpan(&name)) then
+                                        insertBack(&!found, number);
+                                    end if;
+                                    destroyString(canonical);
+                                when None do
+                                    skip;
+                            end case;
+                            destroyString(name);
+                    end case;
+                end while;
+                let closed: Bool := closeDirectory(listing);
+                return found;
+        end case;
+    end;
+
+    generic [D: Region, J: Region, K: Region]
+    function bestCommit(directory: Span[Nat8, D], job: Span[Nat8, J], publicKey: Span[Nat8, K], size: Nat32): Either[Int32, String] is
+        let jobPath: String := jobDirectory(directory, job);
+        var epochs: Buffer[Nat64] := epochsIn(asSpan(&jobPath));
+        destroyString(jobPath);
+        var mismatch: Bool := false;
+        var broken: Bool := false;
+        while count(&epochs) > 0 do
+            var highest: Index := 0;
+            var i: Index := 1;
+            while i < count(&epochs) do
+                if nth(&epochs, i) > nth(&epochs, highest) then
+                    highest := i;
+                end if;
+                i := i + 1;
+            end while;
+            let epoch: Nat64 := remove(&!epochs, highest);
+            let path: String := commitPath(directory, job, epoch);
+            case loadFile(asSpan(&path), 140000) of
+                when None do
+                    skip;
+                when Some(value as commit: String) do
+                    let verdict: Int32 := checkCommit(asSpan(&commit), publicKey, job, epoch, size);
+                    if verdict = 0 then
+                        destroyString(path);
+                        destroyFree(epochs);
+                        let best: Either[Int32, String] := Right(right => commit);
+                        return best;
+                    end if;
+                    if verdict = sizeMismatch() then
+                        mismatch := true;
+                    else
+                        broken := true;
+                    end if;
+                    destroyString(commit);
+            end case;
+            destroyString(path);
+        end while;
+        destroyEmpty(epochs);
+        if mismatch then
+            let refused: Either[Int32, String] := Left(left => sizeMismatch());
+            return refused;
+        end if;
+        if broken then
+            let refused: Either[Int32, String] := Left(left => badCommit());
+            return refused;
+        end if;
+        let none: Either[Int32, String] := Left(left => resumeRefused());
+        return none;
+    end;
+
+    -- Removes the files of the directory at path and then the directory.
+    -- A name that is not a file is left, and then the directory stays.
+    generic [P: Region]
+    function removeEpoch(path: Span[Nat8, P]): Unit is
+        var names: Buffer[String] := allocateEmpty();
+        case openDirectory(path) of
+            when None do
+                skip;
+            when Some(value as opened: Directory) do
+                var listing: Directory := opened;
+                var more: Bool := true;
+                while more do
+                    case nextEntry(&!listing) of
+                        when None do
+                            more := false;
+                        when Some(value as name: String) do
+                            insertBack(&!names, name);
+                    end case;
+                end while;
+                let closed: Bool := closeDirectory(listing);
+        end case;
+        while count(&names) > 0 do
+            let name: String := removeLast(&!names);
+            var full: StringBuilder := makeStringBuilder();
+            writeString(&!full, path);
+            writeString(&!full, "/");
+            writeString(&!full, asSpan(&name));
+            let target: String := finalize(full);
+            let removed: Bool := removeFile(asSpan(&target));
+            destroyString(target);
+            destroyString(name);
+        end while;
+        destroyEmpty(names);
+        let gone: Bool := removeDirectory(path);
+        return nil;
+    end;
+
+    generic [D: Region, J: Region]
+    function pruneEpochs(directory: Span[Nat8, D], job: Span[Nat8, J], keep: Nat64): Unit is
+        let jobPath: String := jobDirectory(directory, job);
+        var epochs: Buffer[Nat64] := epochsIn(asSpan(&jobPath));
+        while count(&epochs) > 0 do
+            let epoch: Nat64 := removeLast(&!epochs);
+            -- Epochs after keep belong to a rank that is further on.
+            if (epoch + 1) < keep then
+                let path: String := epochDirectory(directory, job, epoch);
+                removeEpoch(asSpan(&path));
+                destroyString(path);
+            end if;
+        end while;
+        destroyEmpty(epochs);
+        destroyString(jobPath);
+        return nil;
+    end;
+end module body.

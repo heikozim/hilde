@@ -1,0 +1,417 @@
+-- Standard.Acme against
+-- scripts/acme/fake-ca.py, an ACME server that verifies every JWS with the
+-- openssl command: an account, an order for two names, the dns-01
+-- challenge, the request of the certificate, its download, and the chain
+-- verified against the server's CA.  The server answers the first POST
+-- with badNonce, so the retry is in it too.
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    trim,
+    indexOfByte,
+    substring
+);
+import Standard.Time (
+    wallNanos
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    openRead,
+    readExactly,
+    readAll,
+    closeFile
+);
+import Standard.HttpClient (
+    Limits,
+    defaultLimits
+);
+import Standard.X509 (
+    PrivateKey,
+    Certificate,
+    EcP256,
+    Ed25519Key,
+    generateKey,
+    destroyPrivateKey,
+    certificateFromPem,
+    dnsNamesOf,
+    destroyCertificate,
+    certificateRequest,
+    verifyChain
+);
+import Standard.Acme (
+    AcmeError,
+    Account,
+    Order,
+    Challenge,
+    destroyAcmeError,
+    openAccount,
+    closeAccount,
+    keyAuthorization,
+    dnsChallengeValue,
+    destroyOrder,
+    newOrder,
+    destroyChallenge,
+    challengeOf,
+    respond,
+    authorizationStatus,
+    finalizeOrder,
+    downloadCertificate
+);
+
+module body Test is
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    function readFile(name: Span[Nat8, Static]): String is
+        case openRead(name) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var text: String := fromLiteral("");
+                case readAll(&!file) of
+                    when Some(value as read: String) do
+                        destroyString(text);
+                        text := read;
+                    when None do
+                        skip;
+                end case;
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return fromLiteral("");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameText(left: Span[Nat8, R], right: Span[Nat8, S]): Bool is
+        if spanLength(left) /= spanLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(left) do
+            if left[i] /= right[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function sameAsFile(text: &[String, R], name: Span[Nat8, Static]): Bool is
+        let expected: String := readFile(name);
+        let same: Bool := sameText(asSpan(text), trim(asSpan(&expected)));
+        destroyString(expected);
+        return same;
+    end;
+
+    -- A slot of an order or a challenge, by name.
+    generic [R: Region]
+    function orderSlot(order: &[Order, R], name: Span[Nat8, Static]): &[String, R] is
+        if sameText(name, "status") then
+            return &(order->status);
+        else if sameText(name, "authorizations") then
+            return &(order->authorizations);
+        else if sameText(name, "certificateUrl") then
+            return &(order->certificateUrl);
+        else if sameText(name, "finalizeUrl") then
+            return &(order->finalizeUrl);
+        end if;
+        return &(order->url);
+    end;
+
+    generic [R: Region]
+    function challengeSlot(challenge: &[Challenge, R], name: Span[Nat8, Static]): &[String, R] is
+        if sameText(name, "name") then
+            return &(challenge->name);
+        else if sameText(name, "kind") then
+            return &(challenge->kind);
+        else if sameText(name, "token") then
+            return &(challenge->token);
+        end if;
+        return &(challenge->url);
+    end;
+
+    function report(error: AcmeError): Unit is
+        let { kind: String, detail: String } := error;
+        print("refused: ");
+        printText(&kind);
+        print(": ");
+        printText(&detail);
+        printLn("");
+        destroyString(kind);
+        destroyString(detail);
+        return nil;
+    end;
+
+    function limits(): Limits is
+        let base: Limits := defaultLimits();
+        let local: Limits := Limits(connectMillis => base.connectMillis, totalMillis => base.totalMillis,
+            maximumBytes => base.maximumBytes, publicOnly => false);
+        return local;
+    end;
+
+    function now(): Int64 is
+        case toInt64(wallNanos() / 1000000000) of
+            when Some(value as seconds: Int64) do
+                return seconds;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The first URL of a list separated by spaces.
+    generic [R: Region]
+    function firstOf(list: &[String, R]): String is
+        case indexOfByte(asSpan(list), ' ') of
+            when Some(value as at: Index) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, substring(asSpan(list), 0, at));
+                return finalize(out);
+            when None do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, asSpan(list));
+                return finalize(out);
+        end case;
+    end;
+
+    generic [R: Region]
+    function certify(account: &![Account, R]): Unit is
+        case newOrder(&~account, "www.example.org,example.org") of
+            when Right(right as order: Order) do
+                print("order: ");
+                printText(orderSlot(&order, "status"));
+                printLn("");
+                let authorization: String := firstOf(orderSlot(&order, "authorizations"));
+                case challengeOf(&~account, asSpan(&authorization), "dns-01") of
+                    when Right(right as challenge: Challenge) do
+                        print("challenge for ");
+                        printText(challengeSlot(&challenge, "name"));
+                        print(": ");
+                        printText(challengeSlot(&challenge, "kind"));
+                        printLn("");
+                        let value: String := dnsChallengeValue(&~account, asSpan(challengeSlot(&challenge, "token")));
+                        print("the TXT value is the server's: ");
+                        printLn(sameAsFile(&value, "expected-dns.txt"));
+                        destroyString(value);
+                        let keyAuth: String := keyAuthorization(&~account, asSpan(challengeSlot(&challenge, "token")));
+                        print("the key authorization is the server's: ");
+                        printLn(sameAsFile(&keyAuth, "expected-http.txt"));
+                        destroyString(keyAuth);
+                        case respond(&~account, asSpan(challengeSlot(&challenge, "url"))) of
+                            when Right(right as done: Unit) do
+                                printLn("responded");
+                            when Left(left as error: AcmeError) do
+                                report(error);
+                        end case;
+                        destroyChallenge(challenge);
+                    when Left(left as error: AcmeError) do
+                        report(error);
+                end case;
+                case authorizationStatus(&~account, asSpan(&authorization)) of
+                    when Right(right as status: String) do
+                        print("authorization: ");
+                        printText(&status);
+                        printLn("");
+                        destroyString(status);
+                    when Left(left as error: AcmeError) do
+                        report(error);
+                end case;
+                destroyString(authorization);
+                finish(&~account, &order);
+                destroyOrder(order);
+            when Left(left as error: AcmeError) do
+                report(error);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, O: Region]
+    function finish(account: &![Account, R], order: &[Order, O]): Unit is
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                case certificateRequest(&key, "", "www.example.org,example.org") of
+                    when Some(value as request: String) do
+                        case finalizeOrder(&~account, order, asSpan(&request)) of
+                            when Right(right as done: Order) do
+                                print("order after the request: ");
+                                printText(orderSlot(&done, "status"));
+                                printLn("");
+                                case downloadCertificate(&~account, asSpan(orderSlot(&done, "certificateUrl"))) of
+                                    when Right(right as chain: String) do
+                                        case certificateFromPem(asSpan(&chain)) of
+                                            when Some(value as leaf: Certificate) do
+                                                let names: String := dnsNamesOf(&leaf);
+                                                print("the certificate is for ");
+                                                printText(&names);
+                                                printLn("");
+                                                destroyString(names);
+                                                destroyCertificate(leaf);
+                                            when None do
+                                                printLn("the chain holds no certificate");
+                                        end case;
+                                        let ca: String := readFile("server-cert.pem");
+                                        case verifyChain(asSpan(&chain), asSpan(&ca), "example.org", now()) of
+                                            when Some(value as why: String) do
+                                                print("the chain does not verify: ");
+                                                printText(&why);
+                                                printLn("");
+                                                destroyString(why);
+                                            when None do
+                                                printLn("the chain verifies against the CA for example.org");
+                                        end case;
+                                        destroyString(ca);
+                                        destroyString(chain);
+                                    when Left(left as error: AcmeError) do
+                                        report(error);
+                                end case;
+                                destroyOrder(done);
+                            when Left(left as error: AcmeError) do
+                                report(error);
+                        end case;
+                        destroyString(request);
+                    when None do
+                        printLn("no request");
+                end case;
+                destroyPrivateKey(key);
+            when None do
+                printLn("no key");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function talk(port: &[String, R]): Unit is
+        var url: StringBuilder := makeStringBuilder();
+        writeString(&!url, "https://localhost:");
+        writeString(&!url, substring(asSpan(port), 0, 5));
+        writeString(&!url, "/directory");
+        let directory: String := finalize(url);
+        case generateKey(Ed25519Key()) of
+            when Some(value as wrong: PrivateKey) do
+                case openAccount(asSpan(&directory), wrong, "", "server-cert.pem", limits()) of
+                    when Right(right as account: Account) do
+                        printLn("an Ed25519 key was taken");
+                        destroyPrivateKey(closeAccount(account));
+                    when Left(left as error: AcmeError) do
+                        report(error);
+                end case;
+            when None do
+                printLn("no key");
+        end case;
+        case generateKey(EcP256()) of
+            when Some(value as key: PrivateKey) do
+                case openAccount(asSpan(&directory), key, "admin@example.org", "server-cert.pem", limits()) of
+                    when Right(right as opened: Account) do
+                        printLn("account opened");
+                        var account: Account := opened;
+                        certify(&!account);
+                        destroyPrivateKey(closeAccount(account));
+                    when Left(left as error: AcmeError) do
+                        report(error);
+                end case;
+            when None do
+                printLn("no key");
+        end case;
+        destroyString(directory);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/acme/fake-ca.py");
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                var out: FileDescriptor := output;
+                var err: FileDescriptor := errors;
+                case readExactly(&!out, 6) of
+                    when Some(value as port: String) do
+                        talk(&port);
+                        destroyString(port);
+                    when None do
+                        printLn("the server printed no port");
+                end case;
+                let closedInput: Bool := closeFile(input);
+                printLn("-- the server saw:");
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        printText(&text);
+                        destroyString(text);
+                    when None do
+                        printLn("(nothing)");
+                end case;
+                case readAll(&!err) of
+                    when Some(value as text: String) do
+                        if length(&text) > 0 then
+                            printLn("-- and on its error stream:");
+                            printText(&text);
+                        end if;
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                let closedOut: Bool := closeFile(out);
+                let closedErr: Bool := closeFile(err);
+                let status: ProcessStatus := waitProcess(process);
+                print("server exited normally: ");
+                print(exitedNormally(status));
+                print(", code ");
+                printLn(exitCode(status));
+            when None do
+                printLn("the server could not be started");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

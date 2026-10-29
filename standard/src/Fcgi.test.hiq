@@ -1,0 +1,682 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    nthByte,
+    length,
+    fromLiteral,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Fcgi (
+    headerToVariable,
+    RecordHeader,
+    typeStdout,
+    typeEndRequest,
+    typeBeginRequest,
+    roleResponder,
+    statusRequestComplete,
+    readHeader,
+    headerVersion,
+    headerKind,
+    headerRequestId,
+    headerContentLength,
+    headerPaddingLength,
+    recordLength,
+    bytesAfterHeader,
+    readContent,
+    beginRequestRole,
+    beginRequestKeepConnection,
+    pairCount,
+    nthPairName,
+    nthPairValue,
+    makeRecord,
+    makeEndRequest,
+    makePair
+);
+
+module body Standard.Fcgi.Test is
+    constant zeroByte: Nat8 := 0;
+    constant oneByte: Nat8 := 1;
+    constant letterA: Nat8 := 97;
+    -- Division is a typeclass method whose two operands share one type
+    -- parameter, so a bare 256 beside an Index is ambiguous.
+    constant byteStep: Index := 256;
+
+    ---
+    --- A record written and read back
+    ---
+
+    -- makeRecord, readHeader, readContent.
+    function testRecordRoundTrip(): Unit is
+        -- Five bytes of content, so three of padding: the record is a
+        -- multiple of eight, which is what the protocol asks for.
+        assertRecord("hello", 5, 3, "five bytes and three of padding");
+        assertRecord("", 0, 0, "no content and no padding");
+        assertRecord("12345678", 8, 0, "exactly eight, so no padding");
+        assertRecord("1234567", 7, 1, "seven, so one");
+        assertRecord("123456789", 9, 7, "nine, so seven");
+        return nil;
+    end;
+
+    ---
+    --- Headers that must be refused
+    ---
+
+    -- readHeader refuses.
+    function testBadHeader(): Unit is
+        -- A header on its own is fine.
+        let good: String := handHeader(oneByte, 0, 0);
+        assertHeaderOk(&good, "eight bytes and no content");
+        destroyString(good);
+
+        -- The same header, one byte short.
+        let short: String := firstBytes("1234567");
+        assertNoHeader(&short, "seven bytes");
+        destroyString(short);
+
+        let none: String := fromLiteral("");
+        assertNoHeader(&none, "no bytes at all");
+        destroyString(none);
+
+        -- the one that matters: a content length that says more than there
+        -- is.  It comes from the other end, and a reader that believes it
+        -- reads past its own buffer.
+        let lying: String := handHeader(oneByte, 100, 0);
+        assertNoHeader(&lying, "a content length of 100 with 8 bytes present");
+
+        let lyingPad: String := handHeader(oneByte, 0, 100);
+        assertNoHeader(&lyingPad, "a padding length of 100 with 8 bytes present");
+        destroyString(lying);
+        destroyString(lyingPad);
+
+        -- A version this module does not speak.
+        let wrongVersion: String := handHeader(2, 0, 0);
+        assertNoHeader(&wrongVersion, "version 2");
+        destroyString(wrongVersion);
+        return nil;
+    end;
+
+    ---
+    --- How much follows a header
+    ---
+
+    -- bytesAfterHeader reads the lengths from the header alone.
+    function testBytesAfterHeader(): Unit is
+        -- The case readHeader refuses is the one this answers: eight bytes
+        -- announcing more than has arrived yet.
+        let announced: String := handHeader(oneByte, 300, 4);
+        assertNoHeader(&announced, "readHeader: 300 announced, 8 present");
+        assertAfter(&announced, 304, "a content of 300 and a padding of 4");
+        destroyString(announced);
+        let bare: String := handHeader(oneByte, 0, 0);
+        assertAfter(&bare, 0, "an empty record");
+        destroyString(bare);
+        let largest: String := handHeader(oneByte, 65535, 255);
+        assertAfter(&largest, 65790, "the largest a header can announce");
+        destroyString(largest);
+        let short: String := firstBytes("1234567");
+        assertNoAfter(&short, "seven bytes");
+        destroyString(short);
+        let wrongVersion: String := handHeader(2, 5, 3);
+        assertNoAfter(&wrongVersion, "version 2");
+        destroyString(wrongVersion);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertAfter(bytes: &[String, R], want: Index,
+        message: Span[Nat8, Static]): Unit is
+        case bytesAfterHeader(asSpan(bytes)) of
+            when Some(value: Index) do
+                assertTrue(value = want, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertNoAfter(bytes: &[String, R], message: Span[Nat8, Static]): Unit is
+        case bytesAfterHeader(asSpan(bytes)) of
+            when Some(value: Index) do
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- End-request
+    ---
+
+    -- makeEndRequest.
+    function testEndRequest(): Unit is
+        let rec: String := makeEndRequest(1, 0, statusRequestComplete);
+        assertTrue(length(&rec) = 16, "eight of header and eight of body");
+        case readHeader(asSpan(&rec), 0) of
+            when Some(value: RecordHeader) do
+                assertTrue(headerKind(value) = typeEndRequest, "the kind");
+                assertTrue(headerRequestId(value) = 1, "the request id");
+                assertTrue(headerContentLength(value) = 8, "the content length");
+                assertTrue(headerPaddingLength(value) = 0, "no padding");
+                assertTrue(recordLength(value) = 16, "the whole length");
+            when None do
+                assertFailure("the header of an end-request record");
+        end case;
+        destroyString(rec);
+        return nil;
+    end;
+
+    ---
+    --- Begin-request
+    ---
+
+    -- beginRequestRole, beginRequestKeepConnection.
+    function testBeginRequest(): Unit is
+        -- Role 1, keep the connection.
+        let keep: String := beginBody(1, 1);
+        assertRole(&keep, roleResponder, "the responder role");
+        assertKeep(&keep, true, "keep the connection");
+        destroyString(keep);
+
+        let close: String := beginBody(1, 0);
+        assertKeep(&close, false, "close the connection");
+        destroyString(close);
+
+        let filter: String := beginBody(3, 0);
+        assertRole(&filter, 3, "the filter role");
+        destroyString(filter);
+
+        -- A body of the wrong length is not a body.
+        let short: String := firstBytes("1234567");
+        assertNoRole(&short, "seven bytes");
+        destroyString(short);
+
+        -- And the body inside a real begin-request record.
+        let wrapped: String := beginRecord();
+        assertKind(&wrapped, typeBeginRequest, "the kind of a begin-request record");
+        destroyString(wrapped);
+        return nil;
+    end;
+
+    function beginRecord(): String is
+        let inner: String := beginBody(1, 1);
+        let made: Option[String] := makeRecord(typeBeginRequest, 1, asSpan(&inner));
+        destroyString(inner);
+        case made of
+            when Some(value: String) do
+                return value;
+            when None do
+                abort("Standard.Fcgi.Test: makeRecord refused an eight-byte body.");
+        end case;
+    end;
+
+    generic [R: Region]
+    function assertKind(bytes: &[String, R], want: Nat8,
+        message: Span[Nat8, Static]): Unit is
+        case readHeader(asSpan(bytes), 0) of
+            when Some(value: RecordHeader) do
+                assertTrue(headerKind(value) = want, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Name-value pairs
+    ---
+
+    -- makePair, pairCount, nthPairName, nthPairValue.
+    function testPair(): Unit is
+        let one: String := pairOf("SCRIPT_NAME", "/index.hiq");
+        assertPairs(&one, 1, "one pair");
+        assertPairName(&one, 0, "SCRIPT_NAME", "its name");
+        assertPairValue(&one, 0, "/index.hiq", "its value");
+
+        let two: String := joined(pairOf("A", "1"), pairOf("BB", "22"));
+        assertPairs(&two, 2, "two pairs");
+        assertPairName(&two, 0, "A", "the first name");
+        assertPairValue(&two, 0, "1", "the first value");
+        assertPairName(&two, 1, "BB", "the second name");
+        assertPairValue(&two, 1, "22", "the second value");
+        assertNoPairName(&two, 2, "past the last pair");
+
+        -- A name of 128 bytes needs the four-byte length form, which is the
+        -- half of the encoding a short test never reaches.
+        let long: String := longNamePair();
+        assertPairs(&long, 1, "a name of 128 bytes is still one pair");
+        assertPairValue(&long, 0, "v", "and its value survives the long name");
+
+        -- A block that stops in the middle of a pair is a block that ended
+        -- early, not one good pair and one bad.  Seven bytes leave the first
+        -- pair whole (it is four) and cut the second, so the answer is one;
+        -- three bytes cut the first pair, so the answer is none.
+        let cut: String := firstOf(&two, 7);
+        assertPairs(&cut, 1, "a block cut inside the second pair has one");
+        let cutHard: String := firstOf(&two, 3);
+        assertPairs(&cutHard, 0, "a block cut inside the first pair has none");
+        destroyString(cutHard);
+
+        destroyString(one);
+        destroyString(two);
+        destroyString(long);
+        destroyString(cut);
+        return nil;
+    end;
+
+    ---
+    --- Building bytes by hand
+    ---
+
+    function putByte(builder: StringBuilder, byte: Nat8): StringBuilder is
+        var b: StringBuilder := builder;
+        writeByte(&!b, byte);
+        return b;
+    end;
+
+    function putText(builder: StringBuilder, text: Span[Nat8, Static]): StringBuilder is
+        var b: StringBuilder := builder;
+        let piece: String := fromLiteral(text);
+        writeString(&!b, asSpan(&piece));
+        destroyString(piece);
+        return b;
+    end;
+
+    generic [R: Region]
+    function putString(builder: StringBuilder, text: &[String, R]): StringBuilder is
+        var b: StringBuilder := builder;
+        writeString(&!b, asSpan(text));
+        return b;
+    end;
+
+    -- An eight-byte record header, written here rather than by the module
+    -- under test, so that a test can say something the module would never
+    -- produce.
+    function handHeader(version: Nat8, contentLength: Index,
+        paddingLength: Index): String is
+        var b: StringBuilder := makeStringBuilder();
+        b := putByte(b, version);
+        b := putByte(b, typeStdout);
+        b := putByte(b, zeroByte);
+        b := putByte(b, oneByte);
+        b := putByte(b, byteOf(contentLength / byteStep));
+        b := putByte(b, byteOf(contentLength - ((contentLength / byteStep) * byteStep)));
+        b := putByte(b, byteOf(paddingLength));
+        b := putByte(b, zeroByte);
+        return finalize(b);
+    end;
+
+    function beginBody(role: Index, flags: Nat8): String is
+        var b: StringBuilder := makeStringBuilder();
+        b := putByte(b, byteOf(role / byteStep));
+        b := putByte(b, byteOf(role - ((role / byteStep) * byteStep)));
+        b := putByte(b, flags);
+        b := putByte(b, zeroByte);
+        b := putByte(b, zeroByte);
+        b := putByte(b, zeroByte);
+        b := putByte(b, zeroByte);
+        b := putByte(b, zeroByte);
+        return finalize(b);
+    end;
+
+    function byteOf(size: Index): Nat8 is
+        case toNat8(size) of
+            when Some(value: Nat8) do
+                return value;
+            when None do
+                abort("Standard.Fcgi.Test: a test value did not fit in a byte.");
+        end case;
+    end;
+
+    function firstBytes(text: Span[Nat8, Static]): String is
+        var b: StringBuilder := makeStringBuilder();
+        b := putText(b, text);
+        return finalize(b);
+    end;
+
+    generic [R: Region]
+    function firstOf(text: &[String, R], count: Index): String is
+        var b: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            b := putByte(b, nthByte(text, i));
+            i := i + 1;
+        end while;
+        return finalize(b);
+    end;
+
+    function joined(left: String, right: String): String is
+        var a: String := left;
+        var c: String := right;
+        var b: StringBuilder := makeStringBuilder();
+        b := putString(b, &a);
+        b := putString(b, &c);
+        destroyString(a);
+        destroyString(c);
+        return finalize(b);
+    end;
+
+    function pairOf(name: Span[Nat8, Static], text: Span[Nat8, Static]): String is
+        let n: String := fromLiteral(name);
+        let v: String := fromLiteral(text);
+        let made: Option[String] := makePair(asSpan(&n), asSpan(&v));
+        destroyString(n);
+        destroyString(v);
+        case made of
+            when Some(value: String) do
+                return value;
+            when None do
+                abort("Standard.Fcgi.Test: makePair refused a short pair.");
+        end case;
+    end;
+
+    function longNamePair(): String is
+        var nb: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 128 do
+            nb := putByte(nb, letterA);
+            i := i + 1;
+        end while;
+        let n: String := finalize(nb);
+        let v: String := fromLiteral("v");
+        let made: Option[String] := makePair(asSpan(&n), asSpan(&v));
+        destroyString(n);
+        destroyString(v);
+        case made of
+            when Some(value: String) do
+                return value;
+            when None do
+                abort("Standard.Fcgi.Test: makePair refused a 128-byte name.");
+        end case;
+    end;
+
+    ---
+    --- Assertions
+    ---
+
+    generic [R: Region, S: Region]
+    function sameBytes(left: &[String, R], right: &[String, S]): Bool is
+        let size: Index := length(left);
+        if size /= length(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        var same: Bool := true;
+        while i < size do
+            if nthByte(left, i) /= nthByte(right, i) then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    function assertText(produced: String, expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        var made: String := produced;
+        let want: String := fromLiteral(expected);
+        assertTrue(sameBytes(&made, &want), message);
+        destroyString(want);
+        destroyString(made);
+        return nil;
+    end;
+
+    function assertRecord(content: Span[Nat8, Static], contentLength: Index,
+        padding: Index, message: Span[Nat8, Static]): Unit is
+        let payload: String := fromLiteral(content);
+        case makeRecord(typeStdout, 7, asSpan(&payload)) of
+            when Some(value: String) do
+                checkRecord(value, contentLength, padding, content, message);
+            when None do
+                assertFailure(message);
+        end case;
+        destroyString(payload);
+        return nil;
+    end;
+
+    function checkRecord(made: String, contentLength: Index, padding: Index,
+        content: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        var rec: String := made;
+        case readHeader(asSpan(&rec), 0) of
+            when Some(value: RecordHeader) do
+                assertTrue(headerVersion(value) = 1, message);
+                assertTrue(headerKind(value) = typeStdout, message);
+                assertTrue(headerRequestId(value) = 7, message);
+                assertTrue(headerContentLength(value) = contentLength, message);
+                assertTrue(headerPaddingLength(value) = padding, message);
+                assertTrue(recordLength(value) = length(&rec), message);
+                case readContent(asSpan(&rec), 0, value) of
+                    when Some(value as text: String) do
+                        assertText(text, content, message);
+                    when None do
+                        assertFailure(message);
+                end case;
+            when None do
+                assertFailure(message);
+        end case;
+        destroyString(rec);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertHeaderOk(bytes: &[String, R], message: Span[Nat8, Static]): Unit is
+        case readHeader(asSpan(bytes), 0) of
+            when Some(value: RecordHeader) do
+                assertSuccess(message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertNoHeader(bytes: &[String, R], message: Span[Nat8, Static]): Unit is
+        case readHeader(asSpan(bytes), 0) of
+            when Some(value: RecordHeader) do
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertRole(bytes: &[String, R], want: Nat64,
+        message: Span[Nat8, Static]): Unit is
+        case beginRequestRole(asSpan(bytes)) of
+            when Some(value: Nat64) do
+                assertTrue(value = want, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertNoRole(bytes: &[String, R], message: Span[Nat8, Static]): Unit is
+        case beginRequestRole(asSpan(bytes)) of
+            when Some(value: Nat64) do
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertKeep(bytes: &[String, R], want: Bool,
+        message: Span[Nat8, Static]): Unit is
+        case beginRequestKeepConnection(asSpan(bytes)) of
+            when Some(value: Bool) do
+                assertTrue(value = want, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertPairs(block: &[String, R], want: Index,
+        message: Span[Nat8, Static]): Unit is
+        assertTrue(pairCount(asSpan(block)) = want, message);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertPairName(block: &[String, R], n: Index,
+        expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case nthPairName(asSpan(block), n) of
+            when Some(value: String) do
+                assertText(value, expected, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertPairValue(block: &[String, R], n: Index,
+        expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case nthPairValue(asSpan(block), n) of
+            when Some(value: String) do
+                assertText(value, expected, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertNoPairName(block: &[String, R], n: Index,
+        message: Span[Nat8, Static]): Unit is
+        case nthPairName(asSpan(block), n) of
+            when Some(value: String) do
+                destroyString(value);
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Headers
+    ---
+
+    -- headerToVariable.
+    -- A header read from one record, the content asked of other bytes:
+    -- shorter bytes, or a start past their end, answer None.
+    function testContentOfOtherBytes(): Unit is
+        let payload: String := fromLiteral("0123456789");
+        case makeRecord(typeStdout, 7, asSpan(&payload)) of
+            when Some(value as made: String) do
+                checkOtherBytes(made);
+            when None do
+                assertFailure("a record of ten bytes is made");
+        end case;
+        destroyString(payload);
+        return nil;
+    end;
+
+    function checkOtherBytes(made: String): Unit is
+        var rec: String := made;
+        let short: String := fromLiteral("12345678ab");
+        case readHeader(asSpan(&rec), 0) of
+            when Some(value: RecordHeader) do
+                case readContent(asSpan(&short), 0, value) of
+                    when Some(value as text: String) do
+                        destroyString(text);
+                        assertFailure("the content of shorter bytes is None");
+                    when None do
+                        assertTrue(true, "the content of shorter bytes is None");
+                end case;
+                let past: Index := maximum_index;
+                case readContent(asSpan(&rec), past, value) of
+                    when Some(value as text: String) do
+                        destroyString(text);
+                        assertFailure("a start past the end is None");
+                    when None do
+                        assertTrue(true, "a start past the end is None");
+                end case;
+                case readContent(asSpan(&rec), 0, value) of
+                    when Some(value as text: String) do
+                        assertText(text, "0123456789", "the record's own bytes give its content");
+                    when None do
+                        assertFailure("the record's own bytes give its content");
+                end case;
+            when None do
+                assertFailure("the record's header reads");
+        end case;
+        destroyString(short);
+        destroyString(rec);
+        return nil;
+    end;
+
+    function testHeaderToVariable(): Unit is
+        let content: String := fromLiteral("Content-Type: text/html");
+        assertVariable(headerToVariable(asSpan(&content)), "HTTP_CONTENT_TYPE",
+            "Content-Type");
+        destroyString(content);
+
+        let plain: String := fromLiteral("no-colon here");
+        assertNoVariable(headerToVariable(asSpan(&plain)), "no colon");
+        destroyString(plain);
+
+        -- A space in the name would be a way to reach past the variable the
+        -- server meant to set.
+        let spaced: String := fromLiteral("Bad Header: x");
+        assertNoVariable(headerToVariable(asSpan(&spaced)), "a space in the name");
+        destroyString(spaced);
+
+        let leading: String := fromLiteral(": x");
+        assertNoVariable(headerToVariable(asSpan(&leading)), "an empty name");
+        destroyString(leading);
+        return nil;
+    end;
+
+    function assertVariable(got: Option[String], expected: Span[Nat8, Static],
+        message: Span[Nat8, Static]): Unit is
+        case got of
+            when Some(value: String) do
+                assertText(value, expected, message);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function assertNoVariable(got: Option[String],
+        message: Span[Nat8, Static]): Unit is
+        case got of
+            when Some(value: String) do
+                destroyString(value);
+                assertFailure(message);
+            when None do
+                assertSuccess(message);
+        end case;
+        return nil;
+    end;
+end module body.

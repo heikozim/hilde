@@ -1,0 +1,210 @@
+-- Every type of Standard.DuckDB there and back: integer, float, boolean,
+-- text, blob, timestamp, and null.  A text that is an attempt at SQL
+-- injection is stored and read back as the text it is, and the table is
+-- still there.  The migrations run once; the second migrate applies none.
+import Standard.String (
+    String,
+    destroyString,
+    makeString,
+    storeNth,
+    asSpan
+);
+import Standard.DuckDB (
+    Connection,
+    Writing,
+    DuckError,
+    Values,
+    Cursor,
+    describe,
+    lastMessage,
+    openWriter,
+    closeDatabase,
+    migrate,
+    noValues,
+    withInt64,
+    withFloat64,
+    withBool,
+    withTimestamp,
+    withText,
+    withBytes,
+    withTextOrNull,
+    withInt64OrNull,
+    start,
+    execute,
+    advance,
+    columnCount,
+    columnInt64,
+    columnFloat64,
+    columnBool,
+    columnTimestamp,
+    columnText,
+    columnBytes,
+    columnTextOrNone,
+    columnInt64OrNone,
+    finish
+);
+
+module body Test is
+    constant migrations: Span[Nat8, Static] := "124\nCREATE TABLE people (id BIGINT PRIMARY KEY, name VARCHAR NOT NULL, height DOUBLE, alive BOOLEAN, born TIMESTAMP, photo BLOB)72\nCREATE TABLE notes (id BIGINT PRIMARY KEY, person BIGINT, body VARCHAR);";
+
+    function report(error: DuckError): Unit is
+        print("error ");
+        print(error.code);
+        print(": ");
+        printLn(describe(error));
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openWriter("roundtrip.duckdb") of
+            when Left(left as error: DuckError) do
+                report(error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                case migrate(&!db, migrations) of
+                    when Left(left as error: DuckError) do
+                        report(error);
+                        let message: String := lastMessage(&db);
+                        destroyString(message);
+                    when Right(right as count: Index) do
+                        print("migrations applied: ");
+                        printLn(count);
+                end case;
+                case migrate(&!db, migrations) of
+                    when Left(left as error: DuckError) do
+                        report(error);
+                    when Right(right as count: Index) do
+                        print("migrations applied again: ");
+                        printLn(count);
+                end case;
+                insertAll(&!db);
+                readAll(&!db);
+                countPeople(&!db);
+                closeDatabase(db);
+                return ExitSuccess();
+        end case;
+    end;
+
+    generic [R: Region]
+    function insertAll(db: &![Connection[Writing], R]): Unit is
+        var photo: String := makeString(4, 0);
+        storeNth(&!photo, 0, 0);
+        storeNth(&!photo, 1, 1);
+        storeNth(&!photo, 2, 254);
+        storeNth(&!photo, 3, 255);
+        let first: Values := withBytes(withTimestamp(withBool(withFloat64(withText(withInt64(noValues(), 1), "Ada"), 1.65), true), 1700000000123456), asSpan(&photo));
+        show(execute(&~db, "INSERT INTO people (id, name, height, alive, born, photo) VALUES (?, ?, ?, ?, ?, ?)", first));
+        destroyString(photo);
+        let attack: Span[Nat8, Static] := "Bob'); DROP TABLE people; --";
+        let second: Values := withText(withInt64(noValues(), 2), attack);
+        show(execute(&~db, "INSERT INTO people (id, name) VALUES (?, ?)", second));
+        let noPerson: Option[Int64] := None();
+        let noBody: Option[Span[Nat8, Static]] := None();
+        let third: Values := withTextOrNull(withInt64OrNull(withInt64(noValues(), 3), noPerson), noBody);
+        show(execute(&~db, "INSERT INTO notes (id, person, body) VALUES (?, ?, ?)", third));
+        let negative: Values := withTimestamp(withText(withInt64(noValues(), 4), "Old"), -1000000);
+        show(execute(&~db, "INSERT INTO people (id, name, born) VALUES (?, ?, ?)", negative));
+        return nil;
+    end;
+
+    function show(result: Either[DuckError, Nat64]): Unit is
+        case result of
+            when Left(left as error: DuckError) do
+                report(error);
+            when Right(right as count: Nat64) do
+                print("rows changed: ");
+                printLn(count);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function readAll(db: &![Connection[Writing], R]): Unit is
+        var cursor: Cursor := start(&~db, "SELECT id, name, height, alive, born, photo FROM people WHERE id = ?", withInt64(noValues(), 1));
+        print("columns: ");
+        printLn(columnCount(&cursor));
+        while advance(&!cursor) do
+            print(columnInt64(&cursor, 0));
+            print(" ");
+            print(columnText(&cursor, 1));
+            print(" ");
+            print(columnFloat64(&cursor, 2));
+            print(" ");
+            print(columnBool(&cursor, 3));
+            print(" ");
+            print(columnTimestamp(&cursor, 4));
+            print(" photo bytes:");
+            printBytes(columnBytes(&cursor, 5));
+        end while;
+        ended(finish(&~db, cursor));
+        var named: Cursor := start(&~db, "SELECT name FROM people WHERE id = ?", withInt64(noValues(), 2));
+        while advance(&!named) do
+            print("stored as text: ");
+            printLn(columnText(&named, 0));
+        end while;
+        ended(finish(&~db, named));
+        var old: Cursor := start(&~db, "SELECT born FROM people WHERE id = ?", withInt64(noValues(), 4));
+        while advance(&!old) do
+            print("before 1970: ");
+            printLn(columnTimestamp(&old, 0));
+        end while;
+        ended(finish(&~db, old));
+        var nulls: Cursor := start(&~db, "SELECT person, body FROM notes WHERE id = ?", withInt64(noValues(), 3));
+        while advance(&!nulls) do
+            case columnInt64OrNone(&nulls, 0) of
+                when Some(value as person: Int64) do
+                    printLn(person);
+                when None do
+                    printLn("person: NULL");
+            end case;
+            printNote(columnTextOrNone(&nulls, 1));
+        end while;
+        ended(finish(&~db, nulls));
+        return nil;
+    end;
+
+    generic [S: Region]
+    function printBytes(bytes: Span[Nat8, S]): Unit is
+        var i: Index := 0;
+        while i < spanLength(bytes) do
+            print(" ");
+            print(bytes[i]);
+            i := i + 1;
+        end while;
+        printLn("");
+        return nil;
+    end;
+
+    generic [S: Region]
+    function printNote(note: Option[Span[Nat8, S]]): Unit is
+        case note of
+            when Some(value as text: Span[Nat8, S]) do
+                printLn(text);
+            when None do
+                printLn("body: NULL");
+        end case;
+        return nil;
+    end;
+
+    function ended(failure: Option[DuckError]): Unit is
+        case failure of
+            when Some(value as error: DuckError) do
+                report(error);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function countPeople(db: &![Connection[Writing], R]): Unit is
+        var cursor: Cursor := start(&~db, "SELECT count(*) FROM people", noValues());
+        while advance(&!cursor) do
+            print("people: ");
+            printLn(columnInt64(&cursor, 0));
+        end while;
+        ended(finish(&~db, cursor));
+        return nil;
+    end;
+end module body.

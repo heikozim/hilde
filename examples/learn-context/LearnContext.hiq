@@ -1,0 +1,133 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Task (
+    Lending,
+    Task,
+    openLending,
+    closeLending,
+    spawnLending,
+    join,
+    sleepFor
+);
+import Standard.Context (
+    Context,
+    Canceller,
+    Derived,
+    Done,
+    NotDone,
+    Cancelled,
+    DeadlineExceeded,
+    background,
+    withCancel,
+    withTimeout,
+    cancel,
+    isDone,
+    waitDone,
+    destroyContext
+);
+
+module body Example.LearnContext is
+    function describe(state: Done): Span[Nat8, Static] is
+        case state of
+            when NotDone do
+                return "not done";
+            when Cancelled do
+                return "cancelled";
+            when DeadlineExceeded do
+                return "past its deadline";
+        end case;
+    end;
+
+    -- A worker: it works in small steps until its context is done, and
+    -- says whether it did work at all.
+    generic [R: Region]
+    function worker(context: &[Context, R]): Bool is
+        var steps: Index := 0;
+        while not isDone(context) do
+            sleepFor(5);
+            steps := steps + 1;
+        end while;
+        return steps > 0;
+    end;
+
+    -- Two workers below a request, and a cancel at the top of the chain.
+    generic [R: Region]
+    function request(top: &[Context, R], stop: Canceller): Unit is
+        case withCancel(top) of
+            when Some(value as made: Derived) do
+                let { context: Context, canceller: Canceller } := made;
+                borrow lent: &[Context, rho] := &context do
+                    case openLending(lent) of
+                        when Some(value as opened: Lending[rho]) do
+                            var scope: Lending[rho] := opened;
+                            let work: Fn[&[Context, rho], Bool] := worker;
+                            case spawnLending(&!scope, work, lent) of
+                                when Right(right as first: Task[Bool]) do
+                                    case spawnLending(&!scope, work, lent) of
+                                        when Right(right as second: Task[Bool]) do
+                                            sleepFor(50);
+                                            printLn("the top of the chain is cancelled");
+                                            cancel(stop);
+                                            closeLending(scope);
+                                            print("both workers stopped after doing some work: ");
+                                            let one: Bool := join(first);
+                                            let two: Bool := join(second);
+                                            printLn(one and two);
+                                        when Left(left as back: &[Context, rho]) do
+                                            cancel(stop);
+                                            closeLending(scope);
+                                            let ended: Bool := join(first);
+                                            printLn("the second worker did not start");
+                                    end case;
+                                when Left(left as back: &[Context, rho]) do
+                                    cancel(stop);
+                                    closeLending(scope);
+                                    printLn("the first worker did not start");
+                            end case;
+                        when None do
+                            cancel(stop);
+                            printLn("no lending scope");
+                    end case;
+                end borrow;
+                print("the request's context: ");
+                printLn(describe(waitDone(&context, 0)));
+                cancel(canceller);
+                destroyContext(context);
+            when None do
+                cancel(stop);
+                printLn("no context");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        let root: Context := background();
+        print("the background: ");
+        printLn(describe(waitDone(&root, 10)));
+        case withCancel(&root) of
+            when Some(value as made: Derived) do
+                let { context as top: Context, canceller as stop: Canceller } := made;
+                request(&top, stop);
+                destroyContext(top);
+            when None do
+                printLn("no context");
+        end case;
+        case withTimeout(&root, 50) of
+            when Some(value as timed: Derived) do
+                let { context: Context, canceller: Canceller } := timed;
+                print("a context of 50 ms, waited on for 10 s: ");
+                printLn(describe(waitDone(&context, 10000)));
+                cancel(canceller);
+                destroyContext(context);
+            when None do
+                printLn("no context");
+        end case;
+        destroyContext(root);
+        return ExitSuccess();
+    end;
+end module body.

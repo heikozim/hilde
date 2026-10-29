@@ -1,0 +1,117 @@
+-- A begin while a transaction is open is refused with alreadyInTransaction,
+-- and the open transaction goes on: rolled back, its row is gone, so the
+-- refused begin committed nothing.  A begin after the end works again.
+import Standard.MariaDB (
+    Connection,
+    Writing,
+    MariaError,
+    Transaction,
+    Cursor,
+    alreadyInTransaction,
+    describe,
+    closeDatabase,
+    migrate,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    withInt64,
+    start,
+    execute,
+    advance,
+    columnInt64,
+    finish
+);
+import MariaTest (
+    openTest
+);
+
+module body Test is
+    constant migrations: Span[Nat8, Static] := "43\nCREATE TABLE items (id BIGINT PRIMARY KEY);";
+
+    generic [R: Region]
+    function insert(db: &![Connection[Writing], R], id: Int64): Unit is
+        case execute(db, "INSERT INTO items (id) VALUES (?)", withInt64(noValues(), id)) of
+            when Left(left as error: MariaError) do
+                print("insert ");
+                print(id);
+                print(": ");
+                printLn(describe(error));
+            when Right(right as count: Nat64) do
+                print("insert ");
+                printLn(id);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function count(db: &![Connection[Writing], R]): Unit is
+        var rows: Cursor := start(&~db, "SELECT count(*) FROM items", noValues());
+        while advance(&!rows) do
+            print("items: ");
+            printLn(columnInt64(&rows, 0));
+        end while;
+        case finish(&~db, rows) of
+            when Some(value as error: MariaError) do
+                printLn(describe(error));
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openTest() of
+            when Left(left as error: MariaError) do
+                printLn(describe(error));
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                case migrate(&!db, migrations) of
+                    when Left(left as error: MariaError) do
+                        printLn(describe(error));
+                    when Right(right as applied: Index) do
+                        skip;
+                end case;
+                case begin(&!db) of
+                    when Left(left as error: MariaError) do
+                        printLn(describe(error));
+                    when Right(right as outer: Transaction) do
+                        insert(&!db, 1);
+                        case begin(&!db) of
+                            when Left(left as error: MariaError) do
+                                print("inner: ");
+                                printLn(describe(error));
+                                print("inner is alreadyInTransaction: ");
+                                printLn(error.code = alreadyInTransaction);
+                            when Right(right as inner: Transaction) do
+                                printLn("inner: began");
+                                case commit(&!db, inner) of
+                                    when Left(left as error: MariaError) do
+                                        printLn(describe(error));
+                                    when Right(right as done: Unit) do
+                                        printLn("inner: committed");
+                                end case;
+                        end case;
+                        rollback(&!db, outer);
+                        printLn("outer rolled back");
+                end case;
+                count(&!db);
+                case begin(&!db) of
+                    when Left(left as error: MariaError) do
+                        printLn(describe(error));
+                    when Right(right as again: Transaction) do
+                        insert(&!db, 2);
+                        case commit(&!db, again) of
+                            when Left(left as error: MariaError) do
+                                printLn(describe(error));
+                            when Right(right as done: Unit) do
+                                printLn("commit: committed");
+                        end case;
+                end case;
+                count(&!db);
+                closeDatabase(db);
+                return ExitSuccess();
+        end case;
+    end;
+end module body.

@@ -1,0 +1,183 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    openWrite,
+    closeFile,
+    readAll,
+    writeAll,
+    removeFile,
+    Command,
+    makeCommand,
+    addArgument,
+    Process,
+    Running,
+    spawnProcess,
+    waitProcess,
+    ProcessStatus,
+    exitedNormally,
+    exitCode
+);
+import Standard.Sandbox (
+    Policy,
+    Report,
+    makePolicy,
+    allowPromises,
+    allowPath,
+    applyPolicy,
+    reportApplied
+);
+
+module body Test is
+    -- Whether the file opens for reading; it is closed again.
+    function opens(path: Span[Nat8, Static]): Bool is
+        let name: String := fromLiteral(path);
+        let opened: Option[FileDescriptor] := openRead(asSpan(&name));
+        destroyString(name);
+        case opened of
+            when Some(value as file: FileDescriptor) do
+                closeFile(file);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function same(text: &[String, R], literal: Span[Nat8, Static]): Bool is
+        let expected: String := fromLiteral(literal);
+        let size: Index := length(&expected);
+        var equal: Bool := (length(text) = size);
+        if equal then
+            for i from 0 to size - 1 do
+                if nthByte(text, i) /= nthByte(&expected, i) then
+                    equal := false;
+                end if;
+            end for;
+        end if;
+        destroyString(expected);
+        return equal;
+    end;
+
+    -- Writes the file under a name relative to the working directory.
+    function written(): Bool is
+        case openWrite("dot-grant.txt") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let done: Bool := writeAll(&!file, "in the grant\n");
+                closeFile(file);
+                return done;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Reads it back under another spelling of the same name.
+    function readBack(): Bool is
+        case openRead("./dot-grant.txt") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var good: Bool := false;
+                case readAll(&!file) of
+                    when Some(value as text: String) do
+                        good := same(&text, "in the grant\n");
+                        destroyString(text);
+                    when None do
+                        good := false;
+                end case;
+                closeFile(file);
+                return good;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The child: confined to the working directory, given as ".", it writes,
+    -- reads back and removes a file there by relative names, and cannot
+    -- open a path outside it.
+    function child(): ExitCode is
+        let promises: String := fromLiteral("stdio rpath wpath cpath");
+        let path: String := fromLiteral(".");
+        let rights: String := fromLiteral("rwc");
+        let policy: Policy := allowPath(allowPromises(makePolicy(), asSpan(&promises)), asSpan(&path), asSpan(&rights));
+        destroyString(promises);
+        destroyString(path);
+        destroyString(rights);
+        let report: Report := applyPolicy(policy);
+        if not reportApplied(report) then
+            printLn("nothing confined the child");
+            return ExitSuccess();
+        end if;
+        if not written() then
+            printLn("the write failed");
+            return ExitSuccess();
+        end if;
+        if not readBack() then
+            printLn("the read failed");
+            return ExitSuccess();
+        end if;
+        if not removeFile("dot-grant.txt") then
+            printLn("the remove failed");
+            return ExitSuccess();
+        end if;
+        if opens("/etc/hosts") then
+            printLn("the other path opened");
+        else
+            printLn("done");
+        end if;
+        return ExitSuccess();
+    end;
+
+    function main(): ExitCode is
+        if argumentCount() > 1 then
+            return child();
+        end if;
+        -- The control: unconfined, the path outside opens, so that its
+        -- refusal in the child is the policy's.
+        if not opens("/etc/hosts") then
+            printLn("the path does not open unconfined either");
+            return ExitSuccess();
+        end if;
+        let self: String := fromLiteral(nthArgument(0));
+        let mode: String := fromLiteral("child");
+        let command: Command := addArgument(makeCommand(asSpan(&self)), asSpan(&mode));
+        destroyString(self);
+        destroyString(mode);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                var fromChild: FileDescriptor := output;
+                var good: Bool := false;
+                case readAll(&!fromChild) of
+                    when Some(value as said: String) do
+                        good := same(&said, "done\n");
+                        if not good then
+                            printLn("the child said something else");
+                        end if;
+                        destroyString(said);
+                    when None do
+                        good := false;
+                end case;
+                closeFile(fromChild);
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                if (good and exitedNormally(status)) and (exitCode(status) = 0) then
+                    printLn("the working directory as a grant holds a relative name");
+                else
+                    printLn("the child did not work in its grant");
+                end if;
+            when None do
+                printLn("the child did not start");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

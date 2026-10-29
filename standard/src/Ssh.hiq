@@ -1,0 +1,330 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module over the processes of Standard.File.  runCommand reads the
+-- output and the errors of the child in turns of at most 50 milliseconds
+-- each, so a child that fills one pipe while the other is read cannot hold
+-- the call, and the deadline is checked on the monotonic clock between the
+-- turns.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Process,
+    Running,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    terminateProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    closeFile,
+    makeNonblocking,
+    readWithin,
+    WaitFailure
+);
+import Standard.Time (
+    monotonicNanos
+);
+
+module body Standard.Ssh is
+    constant zeroNat: Nat64 := 0;
+    constant turnMilliseconds: Nat64 := 50;
+    constant chunkBytes: Index := 65536;
+
+    function destroyResult(result: CommandResult): Unit is
+        let { code: Int32, output: String, errors: String } := result;
+        destroyString(output);
+        destroyString(errors);
+        return nil;
+    end;
+
+    ---
+    --- The command line
+    ---
+
+    generic [R: Region]
+    function isHost(host: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(host);
+        if (size = 0) or (size > 253) then
+            return false;
+        end if;
+        if host[0] = '-' then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := host[i];
+            let letter: Bool := ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+            let other: Bool := ((byte >= '0') and (byte <= '9')) or ((byte = '.') or (byte = '-'));
+            if not (letter or other) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function isUser(user: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(user);
+        if size = 0 then
+            return true;
+        end if;
+        if (size > 32) or (user[0] = '-') then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := user[i];
+            let letter: Bool := ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+            let other: Bool := ((byte >= '0') and (byte <= '9')) or (((byte = '.') or (byte = '-')) or (byte = '_'));
+            if not (letter or other) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function digitOf(number: Index): Nat8 is
+        let digits: Span[Nat8, Static] := "0123456789";
+        return digits[number];
+    end;
+
+    -- number in decimal after prefix.
+    function decimal(prefix: Span[Nat8, Static], number: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, prefix);
+        var power: Index := 1;
+        while (number / power) >= 10 do
+            power := power * 10;
+        end while;
+        var rest: Index := number;
+        while power > 0 do
+            writeByte(&!out, digitOf(rest / power));
+            rest := rest - ((rest / power) * power);
+            power := power / 10;
+        end while;
+        return finalize(out);
+    end;
+
+    function withOwned(command: Command, argument: String): Command is
+        let added: Command := addArgument(command, asSpan(&argument));
+        destroyString(argument);
+        return added;
+    end;
+
+    generic [P: Region, H: Region, U: Region]
+    function sshCommand(program: Span[Nat8, P], host: Span[Nat8, H], user: Span[Nat8, U], port: Index, connectSeconds: Index): Either[SshError, Command] is
+        let portFits: Bool := (port > 0) and (port <= 65535);
+        let timeFits: Bool := (connectSeconds > 0) and (connectSeconds <= 3600);
+        if not (((isHost(host) and isUser(user)) and portFits) and timeFits) then
+            let refused: Either[SshError, Command] := Left(left => BadTarget());
+            return refused;
+        end if;
+        var command: Command := makeCommand(program);
+        command := addArgument(command, "-T");
+        command := addArgument(command, "-o");
+        command := addArgument(command, "BatchMode=yes");
+        command := addArgument(command, "-o");
+        command := addArgument(command, "StrictHostKeyChecking=yes");
+        command := addArgument(command, "-o");
+        command := withOwned(command, decimal("ConnectTimeout=", connectSeconds));
+        command := addArgument(command, "-p");
+        command := withOwned(command, decimal("", port));
+        if spanLength(user) > 0 then
+            command := addArgument(command, "-l");
+            command := addArgument(command, user);
+        end if;
+        command := addArgument(command, "--");
+        command := addArgument(command, host);
+        let built: Either[SshError, Command] := Right(right => command);
+        return built;
+    end;
+
+    generic [R: Region]
+    function shellQuote(word: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, 39 : Nat8);
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if word[i] = 39 then
+                writeByte(&!out, 39 : Nat8);
+                writeByte(&!out, 92 : Nat8);
+                writeByte(&!out, 39 : Nat8);
+                writeByte(&!out, 39 : Nat8);
+            else
+                writeByte(&!out, word[i]);
+            end if;
+            i := i + 1;
+        end while;
+        writeByte(&!out, 39 : Nat8);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function addRemoteWord(command: Command, word: Span[Nat8, R]): Command is
+        return withOwned(command, shellQuote(word));
+    end;
+
+    ---
+    --- Running
+    ---
+
+    function now(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as nanos: Nat64) do
+                return nanos;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    -- The milliseconds from now to deadline, at most turn, at least 0.
+    function waitFor(deadline: Nat64, turn: Nat64): Nat32 is
+        let current: Nat64 := now();
+        var left: Nat64 := 0;
+        if deadline > current then
+            left := (deadline - current) / 1000000;
+        end if;
+        if left > turn then
+            left := turn;
+        end if;
+        case toNat32(left) of
+            when Some(value as small: Nat32) do
+                return small;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- One turn on one pipe: what came is added to into.
+    generic [F: Region, B: Region]
+    function readTurn(file: &![FileDescriptor, F], into: &![StringBuilder, B], have: Index, most: Index, milliseconds: Nat32): Index is
+        case readWithin(&~file, chunkBytes, milliseconds) of
+            when Right(right as piece: String) do
+                let size: Index := spanLength(asSpan(&piece));
+                writeString(&~into, asSpan(&piece));
+                destroyString(piece);
+                if size = 0 then
+                    -- The end of the stream.
+                    return most + 2;
+                end if;
+                return have + size;
+            when Left(left as failure: WaitFailure) do
+                case failure of
+                    when WaitTimedOut do
+                        return have;
+                    when WaitFailed do
+                        return most + 3;
+                end case;
+        end case;
+    end;
+
+    function runCommand(command: Command, milliseconds: Nat32, outputBytes: Index): Either[SshError, CommandResult] is
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input as feed: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                var toChild: FileDescriptor := feed;
+                var fromChild: FileDescriptor := output;
+                var errorsOfChild: FileDescriptor := errors;
+                let deadline: Nat64 := now() + (natOf32(milliseconds) * 1000000);
+                var trouble: Index := 0;
+                -- The child reads the end of its input at once.
+                let closedInput: Bool := closeFile(toChild);
+                if not (makeNonblocking(&!fromChild) and makeNonblocking(&!errorsOfChild)) then
+                    trouble := 3 : Index;
+                end if;
+                var out: StringBuilder := makeStringBuilder();
+                var err: StringBuilder := makeStringBuilder();
+                var outHave: Index := 0;
+                var errHave: Index := 0;
+                var outDone: Bool := false;
+                var errDone: Bool := false;
+                while (trouble = 0) and ((not outDone) or (not errDone)) do
+                    if now() >= deadline then
+                        trouble := 1 : Index;
+                    else
+                        if not outDone then
+                            outHave := readTurn(&!fromChild, &!out, outHave, outputBytes, waitFor(deadline, turnMilliseconds));
+                            if outHave = (outputBytes + 2) then
+                                outDone := true;
+                            else if outHave = (outputBytes + 3) then
+                                trouble := 3 : Index;
+                            else if outHave > outputBytes then
+                                trouble := 2 : Index;
+                            end if;
+                        end if;
+                        if (trouble = 0) and (not errDone) then
+                            errHave := readTurn(&!errorsOfChild, &!err, errHave, outputBytes, waitFor(deadline, turnMilliseconds));
+                            if errHave = (outputBytes + 2) then
+                                errDone := true;
+                            else if errHave = (outputBytes + 3) then
+                                trouble := 3 : Index;
+                            else if errHave > outputBytes then
+                                trouble := 2 : Index;
+                            end if;
+                        end if;
+                    end if;
+                end while;
+                if trouble /= 0 then
+                    let ended: Bool := terminateProcess(&process);
+                end if;
+                let closedOutput: Bool := closeFile(fromChild);
+                let closedErrors: Bool := closeFile(errorsOfChild);
+                let status: ProcessStatus := waitProcess(process);
+                let outText: String := finalize(out);
+                let errText: String := finalize(err);
+                if trouble /= 0 then
+                    destroyString(outText);
+                    destroyString(errText);
+                    var reason: SshError := PipeFailed();
+                    if trouble = 1 then
+                        reason := CommandTimedOut();
+                    else if trouble = 2 then
+                        reason := OutputTooLarge();
+                    end if;
+                    let failed: Either[SshError, CommandResult] := Left(left => reason);
+                    return failed;
+                else
+                    var code: Int32 := -1;
+                    if exitedNormally(status) then
+                        code := exitCode(status);
+                    end if;
+                    let result: Either[SshError, CommandResult] := Right(right => CommandResult(code => code, output => outText, errors => errText));
+                    return result;
+                end if;
+            when None do
+                let failed: Either[SshError, CommandResult] := Left(left => NotStarted());
+                return failed;
+        end case;
+    end;
+
+    function natOf32(number: Nat32): Nat64 is
+        case toNat64(number) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+end module body.

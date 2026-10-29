@@ -1,0 +1,233 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+SQLite replicated through Standard.Raft: every write is an entry of the log, applied by every node in the same order.
+
+- A write is one statement whose values are all bound parameters; a quoted literal in it is refused.
+- random, randomblob, the current time and date, and a time function given now are refused.
+- attach, detach, pragma, vacuum and the statements of transactions are refused; each write is its own.
+- A write is checked against the leader's database before it enters the log, as far as that is current.
+- The result of a write, its changed rows or SQLite's code, is kept for the last resultLimit entries.
+- A local read sees what the node applied; a linearizable read waits for a barrier of the leader's term.
+- A snapshot is the database copied with SQLite's online backup.
+
+    case proposeWrite(&!node, &store, "INSERT INTO kv (k, v) VALUES (?, ?)", &values) of
+        when Right(right as index: Nat64) do
+            skip;
+        when Left(left as refusal: Nat8) do
+            skip;
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.Buffer (
+    Buffer
+);
+import Standard.String (
+    String
+);
+import Standard.Raft (
+    StateMachine,
+    Node
+);
+
+module Standard.SqliteReplica is
+    """
+    A value of a parameter or of a column.  kind is one of the kinds
+    below; number holds an integer, real a float of a column, bytes a
+    text or a blob.  Linear: destroyValue gives it back.
+    """
+    record Value: Linear is
+        kind: Nat8;
+        number: Int64;
+        real: Float64;
+        bytes: String;
+    end;
+
+    """
+    The kinds of values: null, integer, real, text and blob.  A real comes
+    only out of a read; a write takes it as text and casts it in its SQL.
+    """
+    function kindNull(): Nat8
+        ensures result = 0;
+    function kindInteger(): Nat8
+        ensures result = 1;
+    function kindReal(): Nat8
+        ensures result = 2;
+    function kindText(): Nat8
+        ensures result = 3;
+    function kindBlob(): Nat8
+        ensures result = 4;
+
+    function nullValue(): Value
+        ensures result.kind = 0;
+    function integerValue(number: Int64): Value
+        ensures result.kind = 1;
+    generic [R: Region]
+    function textValue(text: Span[Nat8, R]): Value
+        ensures result.kind = 3;
+    generic [R: Region]
+    function blobValue(bytes: Span[Nat8, R]): Value
+        ensures result.kind = 4;
+    """
+    Frees value.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyValue(value: Value): Unit;
+    """
+    Frees values.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyValues(values: Buffer[Value]): Unit;
+
+    """
+    Why a write was refused: 0 for none, then an empty statement, a
+    quoted literal, a function whose answer differs between nodes, a kind
+    of statement a replica does not run, a node that is not the leader,
+    SQL that does not prepare, a statement that only reads, and a count
+    of values that is not the count of the statement's parameters.
+    """
+    function refusedNot(): Nat8
+        ensures result = 0;
+    function refusedEmpty(): Nat8
+        ensures result = 1;
+    function refusedLiteral(): Nat8
+        ensures result = 2;
+    function refusedNondeterministic(): Nat8
+        ensures result = 3;
+    function refusedStatementKind(): Nat8
+        ensures result = 4;
+    function refusedNotLeader(): Nat8
+        ensures result = 5;
+    function refusedDoesNotPrepare(): Nat8
+        ensures result = 6;
+    function refusedReadOnly(): Nat8
+        ensures result = 7;
+    function refusedParameterCount(): Nat8
+        ensures result = 8;
+
+    """
+    What the text of sql and its values say about a write, without a
+    database: refusedNot, or the first of refusedEmpty, refusedLiteral,
+    refusedNondeterministic and refusedStatementKind that holds.
+    """
+    generic [S: Region, V: Region]
+    function textRefusal(sql: Span[Nat8, S], values: &[Buffer[Value], V]): Nat8
+        ensures result <= 4;
+
+    """
+    The database of a node and what it keeps of the results of writes.
+    Linear: closeStore gives it back.
+    """
+    type Store: Linear;
+
+    """
+    The store of the database file at path; its snapshots pass through
+    files in the directory scratch.  Left with SQLite's words when the
+    file cannot be opened.
+    """
+    generic [P: Region, S: Region]
+    function openStore(path: Span[Nat8, P], scratch: Span[Nat8, S]): Either[String, Store]
+        requires (spanLength(path) > 0) and (spanLength(scratch) > 0);
+    """
+    Closes the handle it is given.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeStore(store: Store): Unit;
+
+    """
+    A store is the state machine of its node: it applies the writes and
+    barriers of the log, and its snapshot is the database.
+    """
+    instance StateMachine(Store);
+
+    """
+    The most results a store keeps: 1024.
+    """
+    function resultLimit(): Index
+        ensures result = 1024;
+
+    """
+    The result of the write at a log index: whether it ran, the rows it
+    changed, and SQLite's extended code when it did not.
+    """
+    record WriteResult: Free is
+        index: Nat64;
+        applied: Bool;
+        changes: Int64;
+        code: Int32;
+    end;
+
+    """
+    The result of the write at index, when the store applied it and still
+    keeps it.
+    No contract: None is the answer for a write not applied.
+    """
+    generic [R: Region]
+    function resultOf(store: &[Store, R], index: Nat64): Option[WriteResult];
+
+    """
+    A write proposed to the log by node, the leader, after the checks of
+    textRefusal and a prepare against store, the leader's database; the
+    index its entry takes comes back.  Left with the refusal otherwise.
+    While the leader has entries it has not applied, a write that does not
+    prepare yet is taken, and its result tells.  The write runs only when
+    the entry is committed and applied.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [N: Region, T: Region, S: Region, V: Region]
+    function proposeWrite(node: &![Node, N], store: &[Store, T], sql: Span[Nat8, S], values: &[Buffer[Value], V]): Either[Nat8, Nat64];
+
+    """
+    A barrier for a linearizable read: an empty entry in the leader's
+    term, and that term.
+    """
+    record Barrier: Free is
+        index: Nat64;
+        term: Nat64;
+    end;
+
+    """
+    The barrier node proposes, None when it is not the leader.
+    No contract: None is the answer of a follower.
+    """
+    generic [N: Region]
+    function readBarrier(node: &![Node, N]): Option[Barrier];
+
+    """
+    Whether a read on node now is linearizable for barrier: node is still
+    the leader in the barrier's term and has applied the barrier, so no
+    other leader can have committed anything it does not have.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [N: Region]
+    function linearizableReady(node: &[Node, N], barrier: Barrier): Bool;
+
+    """
+    The rows of a statement that only reads, run on store as it is: each
+    row a buffer of its columns.  Left with SQLite's words when it does
+    not prepare, does not only read, takes another count of values, or
+    fails.
+    No contract: the rows are those of the database.
+    """
+    generic [T: Region, S: Region, V: Region]
+    function queryLocal(store: &[Store, T], sql: Span[Nat8, S], values: &[Buffer[Value], V]): Either[String, Buffer[Buffer[Value]]];
+
+    """
+    queryLocal after linearizableReady holds for node and barrier; Left
+    when it does not.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [T: Region, N: Region, S: Region, V: Region]
+    function queryLinearizable(store: &[Store, T], node: &[Node, N], barrier: Barrier, sql: Span[Nat8, S], values: &[Buffer[Value], V]): Either[String, Buffer[Buffer[Value]]];
+
+    """
+    Frees rows.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyRows(rows: Buffer[Buffer[Value]]): Unit;
+end module.

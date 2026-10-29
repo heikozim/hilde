@@ -1,0 +1,285 @@
+pragma Unsafe_Module;
+
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    makeString,
+    storeNth,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    closeFile,
+    readAll,
+    writeAll,
+    fileNumber,
+    Pipe,
+    openPipe,
+    closePipe,
+    readEnd,
+    Command,
+    makeCommand,
+    addArgument,
+    discardCommand,
+    Process,
+    Running,
+    spawnProcess,
+    processId,
+    terminateProcess,
+    waitProcess,
+    ProcessStatus,
+    exitedNormally,
+    exitCode,
+    endedBySignal,
+    signalNumber,
+    waitFailed,
+    terminationSignal
+);
+
+module body Test is
+    function widen(value: Bool): Int32 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(left: &[String, R], right: &[String, S]): Bool is
+        let size: Index := length(left);
+        if size /= length(right) then
+            return false;
+        end if;
+        if size = 0 then
+            return true;
+        end if;
+        var same: Bool := true;
+        for i from 0 to size - 1 do
+            if nthByte(left, i) /= nthByte(right, i) then
+                same := false;
+            end if;
+        end for;
+        return same;
+    end;
+
+    -- Read a pipe end to its end, compare, and close it.
+    generic [R: Region]
+    function drainIs(file: FileDescriptor, expected: &[String, R]): Bool is
+        var pipeEnd: FileDescriptor := file;
+        var verdict: Bool := false;
+        case readAll(&!pipeEnd) of
+            when Some(value as got: String) do
+                verdict := sameBytes(&got, expected);
+                destroyString(got);
+            when None do
+                verdict := false;
+        end case;
+        closeFile(pipeEnd);
+        return verdict;
+    end;
+
+    -- /bin/sh -c <script>, with the script as the only argument after
+    -- the name the script sees as $0.
+    generic [R: Region]
+    function shell(script: &[String, R]): Command is
+        var sh: String := fromLiteral("/bin/sh");
+        var dashC: String := fromLiteral("-c");
+        var zero: String := fromLiteral("hilde-040");
+        let c1: Command := makeCommand(asSpan(&sh));
+        let c2: Command := addArgument(c1, asSpan(&dashC));
+        let c3: Command := addArgument(c2, asSpan(script));
+        let c4: Command := addArgument(c3, asSpan(&zero));
+        destroyString(sh);
+        destroyString(dashC);
+        destroyString(zero);
+        return c4;
+    end;
+
+    -- Run a script with nothing on its input, and compare its output.
+    generic [R: Region, S: Region]
+    function outputOf(script: &[String, R], expected: &[String, S]): Bool is
+        case spawnProcess(shell(script)) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                let same: Bool := drainIs(output, expected);
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                if exitedNormally(status) then
+                    return same;
+                end if;
+                return false;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function main(): ExitCode is
+        -- 1. Input in, output and errors out, and the exit code comes back.
+        var script: String :=
+            fromLiteral("read line; echo \"got:$line\"; echo oops >&2; exit 3");
+        var hello: String := fromLiteral("hello\n");
+        var gotHello: String := fromLiteral("got:hello\n");
+        var oops: String := fromLiteral("oops\n");
+        case spawnProcess(shell(&script)) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                printLn(widen(processId(&process) > 0));
+                var toChild: FileDescriptor := input;
+                printLn(widen(writeAll(&!toChild, asSpan(&hello))));
+                -- Closing the input is how the child's read ends.
+                closeFile(toChild);
+                printLn(widen(drainIs(output, &gotHello)));
+                printLn(widen(drainIs(errors, &oops)));
+                let status: ProcessStatus := waitProcess(process);
+                printLn(widen(exitedNormally(status)));
+                printLn(exitCode(status));
+                printLn(widen(not endedBySignal(status)));
+                printLn(widen(not waitFailed(status)));
+            when None do
+                printLn(0);
+        end case;
+
+        -- 2. Arguments arrive as they were given: one with a space, an empty
+        --    one, and a plain one -- no word splitting, no dropping.
+        var sh: String := fromLiteral("/bin/sh");
+        var dashC: String := fromLiteral("-c");
+        var printArgs: String := fromLiteral("printf '%s|' \"$@\"");
+        var zero: String := fromLiteral("hilde-040");
+        var withSpace: String := fromLiteral("a b");
+        var empty: String := fromLiteral("");
+        var plain: String := fromLiteral("c");
+        var expectedArgs: String := fromLiteral("a b||c|");
+        let argCommand: Command := addArgument(addArgument(addArgument(
+            addArgument(addArgument(makeCommand(asSpan(&sh)), asSpan(&dashC)), asSpan(&printArgs)),
+            asSpan(&zero)), asSpan(&withSpace)), asSpan(&empty));
+        case spawnProcess(addArgument(argCommand, asSpan(&plain))) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                printLn(widen(drainIs(output, &expectedArgs)));
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                printLn(exitCode(status));
+            when None do
+                printLn(0);
+                printLn(0);
+        end case;
+
+        -- 3. A programme that is not there is None, known before spawn
+        --    returns -- not an exit status of 127 later.
+        var missing: String := fromLiteral("/nonexistent/hilde-040-no-such-binary");
+        case spawnProcess(makeCommand(asSpan(&missing))) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                closeFile(output);
+                closeFile(errors);
+                waitProcess(process);
+                printLn(0);
+            when None do
+                printLn(1);
+        end case;
+
+        -- 4. An argument with a zero byte spoils the command, and it is not
+        --    run with the argument cut short.  The same command without the
+        --    zero byte ran in 1, which is the control for this.
+        var poisoned: String := makeString(3, 'x');
+        storeNth(&!poisoned, 1, 0);
+        case spawnProcess(addArgument(shell(&script), asSpan(&poisoned))) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                closeFile(output);
+                closeFile(errors);
+                waitProcess(process);
+                printLn(0);
+            when None do
+                printLn(1);
+        end case;
+        -- And a command that is never run can be thrown away.
+        discardCommand(shell(&script));
+
+        -- 5. A child can be asked to end, and it ended by that signal.
+        var sleeper: String := fromLiteral("exec sleep 30");
+        case spawnProcess(shell(&sleeper)) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                printLn(widen(terminateProcess(&process)));
+                closeFile(input);
+                closeFile(output);
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                printLn(widen(endedBySignal(status)));
+                printLn(widen(signalNumber(status) = terminationSignal()));
+                printLn(widen(not exitedNormally(status)));
+            when None do
+                printLn(0);
+                printLn(0);
+                printLn(0);
+                printLn(0);
+        end case;
+
+        -- 6. A descriptor without close-on-exec does not reach the child.
+        --    dup2 makes descriptor 7 a copy of a pipe end, and dup2 never
+        --    sets close-on-exec -- the case the child-side close exists for.
+        --    The shell probe first shows that it can say "open" (its own
+        --    standard input is open), then asks about 7.  The probe runs in
+        --    a subshell, and that is measured rather than tidy: : is a
+        --    special built-in, and a failed redirection on one ends a
+        --    non-interactive POSIX shell outright -- the first version of
+        --    this probe printed nothing and exited 2, while ls in the same
+        --    child listed 0, 1, 2 and 3 and no 7.
+        var probeZero: String :=
+            fromLiteral("if ( : <&0 ) 2>/dev/null; then echo open; else echo closed; fi");
+        var probeSeven: String :=
+            fromLiteral("if ( : <&7 ) 2>/dev/null; then echo open; else echo closed; fi");
+        var saysOpen: String := fromLiteral("open\n");
+        var saysClosed: String := fromLiteral("closed\n");
+        case openPipe() of
+            when Some(value as made: Pipe) do
+                var pipe: Pipe := made;
+                let number: Int32 := fileNumber(readEnd(&pipe));
+                let copied: Int32 := @embed(Int32, "dup2($1, 7)", number);
+                printLn(widen(copied = 7));
+                printLn(widen(outputOf(&probeZero, &saysOpen)));
+                printLn(widen(outputOf(&probeSeven, &saysClosed)));
+                let closed7: Int32 := @embed(Int32, "close(7)");
+                closePipe(pipe);
+            when None do
+                printLn(0);
+                printLn(0);
+                printLn(0);
+        end case;
+
+        destroyString(script);
+        destroyString(hello);
+        destroyString(gotHello);
+        destroyString(oops);
+        destroyString(sh);
+        destroyString(dashC);
+        destroyString(printArgs);
+        destroyString(zero);
+        destroyString(withSpace);
+        destroyString(empty);
+        destroyString(plain);
+        destroyString(expectedArgs);
+        destroyString(missing);
+        destroyString(poisoned);
+        destroyString(sleeper);
+        destroyString(probeZero);
+        destroyString(probeSeven);
+        destroyString(saysOpen);
+        destroyString(saysClosed);
+        return ExitSuccess();
+    end;
+end module body.

@@ -1,0 +1,244 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.Text (
+    bytesToHex
+);
+import Standard.Png (
+    Image,
+    imageWidth,
+    imagePixels,
+    destroyImage
+);
+import Standard.Qr (
+    QrLevel,
+    QrCode,
+    QrLow,
+    QrMedium,
+    QrQuartile,
+    QrHigh,
+    encodeQr,
+    qrVersion,
+    qrSize,
+    qrMask,
+    qrModule,
+    qrToImage,
+    qrCodewords,
+    destroyQr
+);
+
+module body Standard.Qr.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The version of the code of text at level, 0 when it does not fit.
+    generic [R: Region]
+    function versionOf(text: Span[Nat8, R], level: QrLevel): Index is
+        case encodeQr(text, level) of
+            when Some(value as code: QrCode) do
+                let version: Index := qrVersion(&code);
+                destroyQr(code);
+                return version;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A text of size copies of byte.
+    function filled(size: Index, byte: Nat8): String is
+        return makeString(size, byte);
+    end;
+
+    function fitsUpTo(size: Index, byte: Nat8, level: QrLevel, version: Index, message: Span[Nat8, Static]): Unit is
+        let exact: String := filled(size, byte);
+        assertTrue(versionOf(asSpan(&exact), level) = version, message);
+        destroyString(exact);
+        let more: String := filled(size + 1, byte);
+        assertTrue(versionOf(asSpan(&more), level) /= version, message);
+        destroyString(more);
+        return nil;
+    end;
+
+    -- The capacities of the standard: bytes, alphanumeric characters and
+    -- digits at the first and the last version.
+    function testCapacities(): Unit is
+        fitsUpTo(17, 'a', QrLow(), 1, "17 bytes in version 1 low");
+        fitsUpTo(14, 'a', QrMedium(), 1, "14 bytes in version 1 medium");
+        fitsUpTo(11, 'a', QrQuartile(), 1, "11 bytes in version 1 quartile");
+        fitsUpTo(7, 'a', QrHigh(), 1, "7 bytes in version 1 high");
+        fitsUpTo(25, 'A', QrLow(), 1, "25 alphanumeric in version 1 low");
+        fitsUpTo(10, 'A', QrHigh(), 1, "10 alphanumeric in version 1 high");
+        fitsUpTo(41, '7', QrLow(), 1, "41 digits in version 1 low");
+        fitsUpTo(17, '7', QrHigh(), 1, "17 digits in version 1 high");
+        fitsUpTo(213, 'a', QrMedium(), 10, "213 bytes in version 10 medium");
+        fitsUpTo(2953, 'a', QrLow(), 40, "2953 bytes in version 40 low");
+        fitsUpTo(1273, 'a', QrHigh(), 40, "1273 bytes in version 40 high");
+        fitsUpTo(7089, '7', QrLow(), 40, "7089 digits in version 40 low");
+        fitsUpTo(4296, 'A', QrLow(), 40, "4296 alphanumeric in version 40 low");
+        return nil;
+    end;
+
+    -- The greeting of the worked example of the tutorial of Thonky, which
+    -- follows the standard step by step, at version 1 quartile: its 13 data
+    -- codewords and its 13 of error correction.
+    function testCodewords(): Unit is
+        case qrCodewords("HELLO WORLD", QrQuartile()) of
+            when Some(value as words: String) do
+                let hex: String := bytesToHex(asSpan(&words));
+                assertTrue(same(&hex, "205b0b78d172dc4d4340ec11eca8481652d9369c002e0fb47a10"), "the codewords of HELLO WORLD");
+                destroyString(hex);
+                destroyString(words);
+            when None do
+                assertFailure("HELLO WORLD");
+        end case;
+        return nil;
+    end;
+
+    -- The finder pattern whose top left module is at x, y.
+    generic [R: Region]
+    function finderAt(code: &[QrCode, R], x: Index, y: Index): Bool is
+        var dy: Index := 0;
+        while dy < 7 do
+            var dx: Index := 0;
+            while dx < 7 do
+                let ring: Bool := ((dx = 1) or (dx = 5)) or ((dy = 1) or (dy = 5));
+                let inside: Bool := ((dx >= 1) and (dx <= 5)) and ((dy >= 1) and (dy <= 5));
+                let light: Bool := inside and (ring and (not (((dx >= 2) and (dx <= 4)) and ((dy >= 2) and (dy <= 4)))));
+                if qrModule(code, x + dx, y + dy) = light then
+                    return false;
+                end if;
+                dx := dx + 1;
+            end while;
+            dy := dy + 1;
+        end while;
+        return true;
+    end;
+
+    -- The three finders, the two timing lines, the dark module, and for
+    -- version 7 and above the version information of the standard.
+    generic [R: Region]
+    function structureHolds(code: &[QrCode, R], versionInfo: Span[Nat8, Static]): Bool is
+        let size: Index := qrSize(code);
+        if size /= ((qrVersion(code) * 4) + 17) then
+            return false;
+        end if;
+        if not ((finderAt(code, 0, 0) and finderAt(code, size - 7, 0)) and finderAt(code, 0, size - 7)) then
+            return false;
+        end if;
+        var i: Index := 8;
+        while i < (size - 8) do
+            let dark: Bool := (i - ((i / 2) * 2)) = 0;
+            if (qrModule(code, i, 6) /= dark) or (qrModule(code, 6, i) /= dark) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        if not qrModule(code, 8, size - 8) then
+            return false;
+        end if;
+        if qrMask(code) > 7 then
+            return false;
+        end if;
+        if spanLength(versionInfo) = 18 then
+            -- Bit k, from the least significant, at column size - 11 + k
+            -- modulo 3 and row k / 3, and mirrored.
+            var k: Index := 0;
+            while k < 18 do
+                let dark: Bool := versionInfo[17 - k] = '1';
+                let far: Index := (size - 11) + (k - ((k / 3) * 3));
+                let near: Index := k / 3;
+                if (qrModule(code, far, near) /= dark) or (qrModule(code, near, far) /= dark) then
+                    return false;
+                end if;
+                k := k + 1;
+            end while;
+        end if;
+        return true;
+    end;
+
+    function testStructure(): Unit is
+        case encodeQr("HELLO WORLD", QrQuartile()) of
+            when Some(value as code: QrCode) do
+                assertTrue(qrVersion(&code) = 1, "HELLO WORLD is version 1 at quartile");
+                assertTrue(structureHolds(&code, ""), "the patterns of version 1");
+                destroyQr(code);
+            when None do
+                assertFailure("HELLO WORLD");
+        end case;
+        let long: String := filled(150, 'q');
+        case encodeQr(asSpan(&long), QrMedium()) of
+            when Some(value as code: QrCode) do
+                assertTrue(qrVersion(&code) = 8, "150 bytes are version 8 at medium");
+                assertTrue(structureHolds(&code, "001000010110111100"), "the patterns and the version information of version 8");
+                destroyQr(code);
+            when None do
+                assertFailure("150 bytes");
+        end case;
+        destroyString(long);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pixelAt(image: &[Image, R], at: Index): Nat8 is
+        let pixels: Span[Nat8, R] := imagePixels(image);
+        return pixels[at];
+    end;
+
+    function testImage(): Unit is
+        case encodeQr("https://example.org/", QrMedium()) of
+            when Some(value as code: QrCode) do
+                case qrToImage(&code, 3, 4) of
+                    when Some(value as image: Image) do
+                        let side: Index := (qrSize(&code) + 8) * 3;
+                        assertTrue(imageWidth(&image) = side, "the side: the modules and the quiet zone, three pixels each");
+                        assertTrue(pixelAt(&image, 0) = 255, "the quiet zone is white");
+                        assertTrue(pixelAt(&image, (side * 12) + 12) = 0, "the corner of the first finder is black");
+                        assertTrue(pixelAt(&image, (side * 14) + 14) = 0, "three pixels for a module");
+                        assertTrue(pixelAt(&image, (side * 15) + 15) = 255, "the light ring of the finder");
+                        destroyImage(image);
+                    when None do
+                        assertFailure("an image");
+                end case;
+                case qrToImage(&code, 0, 4) of
+                    when Some(value as image: Image) do
+                        destroyImage(image);
+                        assertFailure("a scale of 0");
+                    when None do
+                        assertTrue(true, "a scale of 0 refused");
+                end case;
+                destroyQr(code);
+            when None do
+                assertFailure("a URL");
+        end case;
+        return nil;
+    end;
+end module body.

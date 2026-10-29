@@ -1,0 +1,178 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+SFTP version 3 over the pipes of a child process.
+
+- The child speaks SFTP on its standard input and output: ssh -s for a host, or sftp-server.
+- There is no cryptography and no SSH here: OpenSSH keeps the connection, its keys and host checks.
+- Every call waits for its reply and checks that the type and the request id are the ones asked for.
+- A reply that does not parse or a server gone is a negative code, and spoils the session.
+- A spoiled session answers every later call the same, without writing anything.
+- The caller gives startSession the milliseconds one whole exchange may last; there is no default.
+- An exchange not done in time ends as timedOut, even from a server that sends a byte at a time.
+- A timed out session is spoiled and its child is sent SIGTERM, so endSession does not wait.
+- Files move in pieces of 32768 bytes; a reply over 256 KiB is refused rather than allocated.
+
+    case startSession(command, 30000) of
+        when Some(value as opened: Session) do
+            var session: Session := opened;
+            let content: Either[SftpError, String] := readFile(&!session, "/srv/data/report.csv");
+            let status: ProcessStatus := endSession(session);
+            store(content);
+        when None do
+            reportNoServer();
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+import Standard.File (
+    Command,
+    ProcessStatus
+);
+
+module Standard.Sftp is
+    """
+    A child process that speaks SFTP, and the parent's ends of its pipes.
+    Linear: endSession closes the pipes and waits for the child.
+    """
+    type Session: Linear;
+
+    """
+    What went wrong.  A positive code is the server's STATUS code -- 2 no
+    such file, 3 permission denied, 4 failure, 8 not supported, and the
+    others of the protocol -- and a negative one this module's own.
+    """
+    record SftpError: Free is
+        code: Int32;
+    end;
+
+    """
+    The server went away, or could not be written to.
+    """
+    constant serverGone: Int32;
+
+    """
+    A reply that does not parse, or is not the reply to the request.
+    """
+    constant badReply: Int32;
+
+    """
+    An earlier failure spoiled the session.
+    """
+    constant sessionSpoiled: Int32;
+
+    """
+    A request longer than the protocol's four-byte lengths can say: a path
+    or data of 4 GiB or more.  Nothing was sent, and the session is still
+    good.
+    """
+    constant requestTooLong: Int32;
+
+    """
+    The session has sent as many requests as a four-byte request id can
+    number, 2^32; it is spoiled, and a new session starts counting again.
+    """
+    constant requestIdsUsedUp: Int32;
+
+    """
+    An exchange was not done within the milliseconds given to startSession:
+    the server did not take the request or did not send the whole reply in
+    time.  The session is spoiled and the child has been sent SIGTERM.
+    """
+    constant timedOut: Int32;
+
+    """
+    Words for a code.
+    No contract: a view into its argument, whose length depends on it.
+    """
+    function describe(error: SftpError): Span[Nat8, Static];
+
+    """
+    Start the child and agree on version 3.  milliseconds is the most one
+    exchange may last, here and in every later call; there is no default and
+    no value that means none.  With 0 no wait is allowed, so against a real
+    server no session starts.  None when the child could not be started,
+    did not answer INIT with
+    version 3, or did not do so within milliseconds; the child is then ended
+    and waited for.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    function startSession(command: Command, milliseconds: Nat32): Option[Session];
+
+    """
+    Close the child's input -- it sees the end of its input and ends -- and
+    wait for it to close its output for at most the milliseconds of the
+    session; a child still running after that is sent SIGTERM.  Then close
+    the other pipes and wait for the child.  A child that ignores SIGTERM
+    still holds this call.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function endSession(session: Session): ProcessStatus;
+
+    """
+    The whole file.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function readFile(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, String];
+
+    """
+    Write the whole file, creating it with the permissions 0600 -- the reason
+    Standard.File.openWrite gives -- or truncating it.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function writeFile(session: &![Session, R], path: Span[Nat8, S], data: Span[Nat8, T]): Either[SftpError, Unit];
+
+    """
+    The names in a directory, without . and .., sorted by their bytes.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function listDirectory(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Buffer[String]];
+
+    """
+    The size of a file, from STAT.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function sizeOf(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Nat64];
+
+    """
+    Make a directory, with the permissions 0700.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function makeDirectory(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Unit];
+
+    """
+    Remove a file (REMOVE).
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function deleteFile(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Unit];
+
+    """
+    Remove an empty directory (RMDIR).
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function deleteDirectory(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Unit];
+
+    """
+    Rename (RENAME, version 3: a target that exists is an error).
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function renamePath(session: &![Session, R], oldPath: Span[Nat8, S], newPath: Span[Nat8, T]): Either[SftpError, Unit];
+end module.

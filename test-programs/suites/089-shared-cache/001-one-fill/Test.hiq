@@ -1,0 +1,133 @@
+-- Sixteen tasks on four workers miss the same key at once; the fill sleeps
+-- long enough that they overlap, and it runs exactly once, and every task
+-- gets its value.  The control: sixteen tasks with a key each run sixteen
+-- fills, so the count does count fills.
+import Standard.Task (
+    Lending,
+    openLending,
+    closeLending,
+    Task,
+    spawnLending,
+    join,
+    sleepFor
+);
+import Standard.Buffer (
+    Buffer,
+    destroyFree
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Hash (
+    Hashable
+);
+import Standard.Cache (
+    Filled
+);
+import Standard.SharedCache (
+    SharedCache,
+    makeSharedCache,
+    destroySharedCache,
+    getWith,
+    fillCount,
+    sharedCount
+);
+
+module body Test is
+    -- Ten times the key, after 20 milliseconds.
+    function slowFill(key: Nat64): Option[Filled[Nat64]] is
+        sleepFor(20);
+        let one: Nat64 := 1;
+        return Some(value => Filled(value => key * 10, size => one));
+    end;
+
+    record Job[R: Region]: Free is
+        cache: &[SharedCache[Nat64, Nat64], R];
+        key: Nat64;
+    end;
+
+    -- 1 when the task got ten times its key, else 0.
+    generic [R: Region]
+    function ask(job: Job[R]): Int64 is
+        let now: Nat64 := 0;
+        case getWith(job.cache, job.key, now, slowFill) of
+            when Some(value as got: Nat64) do
+                if got = (job.key * 10) then
+                    return 1;
+                end if;
+                return 0;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- left tasks, all started before any is joined; how many got their
+    -- value.  sameKey gives every task the key 7, else each its own.
+    generic [R: Region, S: Region]
+    function many(scope: &![Lending[R], S], cache: &[SharedCache[Nat64, Nat64], R], left: Nat64, sameKey: Bool): Int64 is
+        let zero: Nat64 := 0;
+        if left = zero then
+            return 0;
+        end if;
+        var key: Nat64 := 7;
+        if not sameKey then
+            key := left + 100;
+        end if;
+        let work: Fn[Job[R], Int64] := ask;
+        case spawnLending(&~scope, work, Job(cache => cache, key => key)) of
+            when Right(right as task: Task[Int64]) do
+                let rest: Int64 := many(&~scope, cache, left - 1, sameKey);
+                return rest + join(task);
+            when Left(left as back: Job[R]) do
+                return -100;
+        end case;
+    end;
+
+    function main(): ExitCode is
+        let limit: Index := 100;
+        let sizeLimit: Nat64 := 1000;
+        let forever: Nat64 := 0;
+        let tasks: Nat64 := 16;
+        let attempt: Option[SharedCache[Nat64, Nat64]] := makeSharedCache(limit, sizeLimit, forever);
+        case attempt of
+            when None do
+                printLn("no shared cache");
+                return ExitFailure();
+            when Some(value as made: SharedCache[Nat64, Nat64]) do
+                var same: Int64 := 0;
+                var distinct: Int64 := 0;
+                var fillsAfterSame: Nat64 := 0;
+                var fillsAfterDistinct: Nat64 := 0;
+                var entries: Index := 0;
+                borrow c: &[SharedCache[Nat64, Nat64], rho] := &made do
+                    case openLending(c) of
+                        when Some(value as opened: Lending[rho]) do
+                            var scope: Lending[rho] := opened;
+                            same := many(&!scope, c, tasks, true);
+                            fillsAfterSame := fillCount(c);
+                            distinct := many(&!scope, c, tasks, false);
+                            fillsAfterDistinct := fillCount(c);
+                            entries := sharedCount(c);
+                            closeLending(scope);
+                        when None do
+                            printLn("no lending scope");
+                    end case;
+                end borrow;
+                print("same key: tasks with the value ");
+                printLn(same);
+                print("same key: fills ");
+                printLn(fillsAfterSame);
+                print("own keys: tasks with the value ");
+                printLn(distinct);
+                print("own keys: fills ");
+                printLn(fillsAfterDistinct - fillsAfterSame);
+                print("entries ");
+                printLn(entries);
+                destroyFree(destroySharedCache(made));
+                return ExitSuccess();
+        end case;
+    end;
+end module body.

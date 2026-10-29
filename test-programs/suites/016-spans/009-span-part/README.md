@@ -1,0 +1,1 @@
+Test that spanPart gives the part of a span it names, the same elements in the same memory: bytes of a literal, empty parts at the start, inside and at the end, and three elements of eight bytes each from the middle of a buffer.

@@ -1,0 +1,257 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    destroyFree,
+    insertBack,
+    remove,
+    nth,
+    nthMut,
+    lengthMut,
+    length
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Order (
+    TotalOrder,
+    equal
+);
+import Standard.Hash (
+    Hashable
+);
+import Standard.Shared (
+    Mutex,
+    Key,
+    makeMutex,
+    acquire,
+    release,
+    destroyMutex
+);
+import Standard.Task (
+    yieldNow
+);
+import Standard.Cache (
+    Cache,
+    Filled,
+    Ticket,
+    makeCache,
+    drainCache,
+    count,
+    get,
+    startFill,
+    finishFill,
+    clear as cacheClear,
+    flush as cacheFlush
+);
+
+module body Standard.SharedCache is
+    -- What the mutex guards: the cache, the keys whose fill runs now, and
+    -- how many fills ran.
+    record State[K: Type, V: Type]: Linear is
+        cache: Cache[K, V];
+        filling: Buffer[K];
+        fills: Nat64;
+    end;
+
+    record SharedCache[K: Type, V: Type]: Linear is
+        mutex: Mutex[State[K, V]];
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type]
+    function makeSharedCache(limit: Index, sizeLimit: Nat64, lifetime: Nat64): Option[SharedCache[K, V]] is
+        let none: Nat64 := 0;
+        let cache: Cache[K, V] := makeCache(limit, sizeLimit, lifetime);
+        let filling: Buffer[K] := allocateEmpty();
+        case makeMutex(State(cache => cache, filling => filling, fills => none)) of
+            when Right(right as mutex: Mutex[State[K, V]]) do
+                return Some(value => SharedCache(mutex => mutex));
+            when Left(left as back: State[K, V]) do
+                let { cache as empty: Cache[K, V], filling as keys: Buffer[K], fills: Nat64 } := back;
+                destroyEmpty(drainCache(empty));
+                destroyFree(keys);
+                return None();
+        end case;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type]
+    function destroySharedCache(shared: SharedCache[K, V]): Buffer[Pair[K, V]] is
+        let { mutex: Mutex[State[K, V]] } := shared;
+        let { cache: Cache[K, V], filling: Buffer[K], fills: Nat64 } := destroyMutex(mutex);
+        destroyFree(filling);
+        return drainCache(cache);
+    end;
+
+    ---
+    --- The state, one use of a field each
+    ---
+
+    generic [K: Free(TotalOrder, Hashable), V: Free, R: Region]
+    function lookUp(state: &![State[K, V], R], key: K, now: Nat64): Option[V] is
+        return get(&!(state->cache), &key, now);
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), S: Region]
+    function holds(keys: &[Buffer[K], S], key: K): Bool is
+        var i: Index := 0;
+        while i < length(keys) do
+            let candidate: K := nth(keys, i);
+            if equal(&candidate, &key) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function isFilling(state: &![State[K, V], R], key: K): Bool is
+        return holds(&(state->filling), key);
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function markFilling(state: &![State[K, V], R], key: K): Unit is
+        insertBack(&!(state->filling), key);
+        return nil;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), S: Region]
+    function dropKey(keys: &![Buffer[K], S], key: K): Unit is
+        var i: Index := 0;
+        while i < lengthMut(&~keys) do
+            let candidate: K := nthMut(&~keys, i);
+            if equal(&candidate, &key) then
+                let gone: K := remove(&~keys, i);
+                return nil;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function unmarkFilling(state: &![State[K, V], R], key: K): Unit is
+        dropKey(&!(state->filling), key);
+        return nil;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function ticketOf(state: &![State[K, V], R]): Ticket is
+        return startFill(&(state->cache));
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Free, R: Region]
+    function store(state: &![State[K, V], R], ticket: Ticket, key: K, filled: Filled[V], now: Nat64): Unit is
+        case finishFill(&!(state->cache), ticket, key, filled.value, filled.size, now) of
+            when Left(left as given: Pair[K, V]) do
+                skip;
+            when Right(right as pushed: Buffer[Pair[K, V]]) do
+                destroyFree(pushed);
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- The functions of the module
+    ---
+
+    -- The cache sits behind a mutex of Standard.Shared.  The fill runs
+    -- outside the mutex, so other keys stay usable meanwhile.  A task that
+    -- finds its key being filled lets the mutex go, yields, and looks again.
+    generic [K: Free(TotalOrder, Hashable), V: Free, R: Region]
+    function getWith(shared: &[SharedCache[K, V], R], key: K, now: Nat64, fill: Fn[K, Option[Filled[V]]]): Option[V] is
+        var result: Option[V] := None();
+        var done: Bool := false;
+        while not done do
+            let { value as state: State[K, V], key as lock: Key } := acquire(&(shared->mutex));
+            var held: State[K, V] := state;
+            case lookUp(&!held, key, now) of
+                when Some(value as found: V) do
+                    release(&(shared->mutex), held, lock);
+                    result := Some(value => found);
+                    done := true;
+                when None do
+                    if isFilling(&!held, key) then
+                        release(&(shared->mutex), held, lock);
+                        yieldNow();
+                    else
+                        markFilling(&!held, key);
+                        let ticket: Ticket := ticketOf(&!held);
+                        held.fills := held.fills + 1;
+                        release(&(shared->mutex), held, lock);
+                        let made: Option[Filled[V]] := fill(key);
+                        let { value as again: State[K, V], key as relock: Key } := acquire(&(shared->mutex));
+                        var after: State[K, V] := again;
+                        unmarkFilling(&!after, key);
+                        case made of
+                            when Some(value as filled: Filled[V]) do
+                                store(&!after, ticket, key, filled, now);
+                                result := Some(value => filled.value);
+                            when None do
+                                skip;
+                        end case;
+                        release(&(shared->mutex), after, relock);
+                        done := true;
+                    end if;
+            end case;
+        end while;
+        return result;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function clearIn(state: &![State[K, V], R], key: K): Option[Pair[K, V]] is
+        return cacheClear(&!(state->cache), &key);
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function clear(shared: &[SharedCache[K, V], R], key: K): Option[Pair[K, V]] is
+        let { value as state: State[K, V], key as lock: Key } := acquire(&(shared->mutex));
+        var held: State[K, V] := state;
+        let removed: Option[Pair[K, V]] := clearIn(&!held, key);
+        release(&(shared->mutex), held, lock);
+        return removed;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function flushIn(state: &![State[K, V], R]): Buffer[Pair[K, V]] is
+        return cacheFlush(&!(state->cache));
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function flush(shared: &[SharedCache[K, V], R]): Buffer[Pair[K, V]] is
+        let { value as state: State[K, V], key as lock: Key } := acquire(&(shared->mutex));
+        var held: State[K, V] := state;
+        let removed: Buffer[Pair[K, V]] := flushIn(&!held);
+        release(&(shared->mutex), held, lock);
+        return removed;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function fillCount(shared: &[SharedCache[K, V], R]): Nat64 is
+        let { value as state: State[K, V], key as lock: Key } := acquire(&(shared->mutex));
+        let fills: Nat64 := state.fills;
+        release(&(shared->mutex), state, lock);
+        return fills;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function countIn(state: &![State[K, V], R]): Index is
+        return count(&(state->cache));
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function sharedCount(shared: &[SharedCache[K, V], R]): Index is
+        let { value as state: State[K, V], key as lock: Key } := acquire(&(shared->mutex));
+        var held: State[K, V] := state;
+        let entries: Index := countIn(&!held);
+        release(&(shared->mutex), held, lock);
+        return entries;
+    end;
+end module body.

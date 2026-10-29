@@ -1,0 +1,114 @@
+-- Unsafe, because it keeps a raw pointer into an arena past freeArena --
+-- the use after free that safe code cannot write (031/002), written here
+-- on purpose, to show what the quarantine does with it.
+pragma Unsafe_Module;
+
+import Standard.Arena (
+    Arena,
+    createArena,
+    arenaSpan,
+    freeArena
+);
+import Hilde.Memory (
+    Address,
+    nullPointer,
+    nullCheck,
+    Pointer,
+    spanWriteToPointer,
+    store,
+    load
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal,
+    writeByte
+);
+import Standard.IO.Terminal (
+    StandardError,
+    acquireError,
+    releaseError
+);
+
+module body Test is
+    function openArena(): Arena is
+        let asked: ByteSize := 1;
+        case createArena(asked) of
+            when Some(value: Arena) do
+                return value;
+            when None do
+                abort("Arena creation failed.");
+        end case;
+    end;
+
+    -- A pointer into an arena that has been freed.  Before the free it is
+    -- good: 7 is written through it and read back -- the positive half,
+    -- without which the fault below would say nothing about the free.
+    function stalePointer(): Pointer[Nat8] is
+        var arena: Arena := openArena();
+        var kept: Address[Nat8] := nullPointer();
+        borrow r: &![Arena, R] := &!arena do
+            let got: Option[Span![Nat8, R]] := arenaSpan(r, 16);
+            case got of
+                when Some(value as piece: Span![Nat8, R]) do
+                    kept := @embed(Address[Nat8], "$1", spanWriteToPointer(piece));
+                when None do
+                    abort("The arena was full.");
+            end case;
+        end borrow;
+        case nullCheck(kept) of
+            when Some(value as good: Pointer[Nat8]) do
+                let seven: Nat8 := 7;
+                store(good, seven);
+                if load(good) /= seven then
+                    abort("The arena did not hold what was written.");
+                end if;
+                freeArena(arena);
+                return good;
+            when None do
+                freeArena(arena);
+                abort("No pointer into the arena.");
+        end case;
+    end;
+
+    generic [R: Region]
+    function sayWhatIsAboutToHappen(term: &![TerminalCapability, R]): Unit is
+        var stderr: StandardError := acquireError(&~term);
+        writeByte(&!stderr, 'q');
+        writeByte(&!stderr, 'u');
+        writeByte(&!stderr, 'a');
+        writeByte(&!stderr, 'r');
+        writeByte(&!stderr, 'a');
+        writeByte(&!stderr, 'n');
+        writeByte(&!stderr, 't');
+        writeByte(&!stderr, 'i');
+        writeByte(&!stderr, 'n');
+        writeByte(&!stderr, 'e');
+        writeByte(&!stderr, 10);
+        releaseError(stderr);
+        return nil;
+    end;
+
+    -- The quarantine of the arena: a freed arena lies in the quarantine,
+    -- unreadable and unwritable, and its addresses are not given back
+    -- while it lies there.  So a pointer kept past the free faults --
+    -- even after a new arena of the same size has been made, which is
+    -- what a system without the quarantine may place at the very same
+    -- address.  The one line of stderr is
+    -- written before the store, as in 032/001.
+    function main(root: RootCapability): ExitCode is
+        var mutRoot: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!mutRoot);
+        sayWhatIsAboutToHappen(&!terminal);
+        releaseTerminal(terminal);
+        surrenderRoot(mutRoot);
+
+        let stale: Pointer[Nat8] := stalePointer();
+        let next: Arena := openArena();
+        -- This store must not return.
+        let nine: Nat8 := 9;
+        store(stale, nine);
+        freeArena(next);
+        return ExitSuccess();
+    end;
+end module body.

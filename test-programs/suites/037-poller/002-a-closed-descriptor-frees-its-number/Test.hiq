@@ -1,0 +1,149 @@
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    fileNumber,
+    Pipe,
+    openPipe,
+    closePipe,
+    readEnd,
+    writeEndMut,
+    writeAll
+);
+import Standard.Poller (
+    Backend,
+    backendNone,
+    backendAvailable,
+    sameBackend,
+    Poller,
+    createPoller,
+    destroyPoller,
+    interestRead,
+    watchFile,
+    unwatchFile,
+    watchedCount,
+    waitFor,
+    Event,
+    nthEvent,
+    eventDescriptor,
+    eventReadable
+);
+
+module body Test is
+    function widen(value: Bool): Int32 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    function hasBackend(): Bool is
+        return not sameBackend(backendAvailable(), backendNone);
+    end;
+
+    generic [R: Region]
+    function readyOr(poller: &![Poller, R], timeout: Int32,
+        fallback: Index): Index is
+        case waitFor(poller, timeout) of
+            when Some(value as ready: Index) do
+                return ready;
+            when None do
+                return fallback;
+        end case;
+    end;
+
+    generic [R: Region]
+    function eventIsFor(poller: &[Poller, R], number: Int32): Bool is
+        let first: Index := 0;
+        case nthEvent(poller, first) of
+            when Some(value as event: Event) do
+                if eventDescriptor(event) /= number then
+                    return false;
+                end if;
+                return eventReadable(event);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function main(): ExitCode is
+        -- Without a backend the test fails at its first line.
+        if not hasBackend() then
+            printLn(0);
+            return ExitSuccess();
+        end if;
+
+        var payload: String := fromLiteral("x");
+        let zero: Index := 0;
+        let one: Index := 1;
+        let two: Index := 2;
+        let unreachable: Index := 99;
+
+        -- 1. There is a backend.
+        printLn(1);
+
+        case createPoller() of
+            when Some(value as made: Poller) do
+                var poller: Poller := made;
+                -- 2. It builds a poller.
+                printLn(1);
+
+                case openPipe() of
+                    when Some(value as first: Pipe) do
+                        let old: Pipe := first;
+                        let number: Int32 := fileNumber(readEnd(&old));
+                        -- 3. The reading end of a first pipe is watched.
+                        printLn(widen(watchFile(&!poller, readEnd(&old),
+                            interestRead)));
+                        -- 4. The pipe is closed without unwatching it.
+                        printLn(widen(closePipe(old)));
+                        -- 5. The kernel forgot it, the count did not.
+                        printLn(widen(watchedCount(&poller) = one));
+
+                        case openPipe() of
+                            when Some(value as second: Pipe) do
+                                var pipe: Pipe := second;
+                                -- 6. The new pipe's reading end has the
+                                --    number of the closed one, or this
+                                --    test does not test what it says.
+                                printLn(widen(fileNumber(readEnd(&pipe)) = number));
+                                -- 7. That number can be watched again.
+                                printLn(widen(watchFile(&!poller, readEnd(&pipe),
+                                    interestRead)));
+                                -- 8. It is counted on top of the closed one.
+                                printLn(widen(watchedCount(&poller) = two));
+                                -- 9. Nothing written, nothing ready: the
+                                --    control for line 11.
+                                printLn(widen(readyOr(&!poller, 0, unreachable) = zero));
+                                -- 10. One byte into the new pipe.
+                                printLn(widen(writeAll(writeEndMut(&!pipe),
+                                    asSpan(&payload))));
+                                -- 11. Exactly one descriptor is ready,
+                                printLn(widen(readyOr(&!poller, 0, unreachable) = one));
+                                -- 12. and it is the new reading end.
+                                printLn(widen(eventIsFor(&poller,
+                                    fileNumber(readEnd(&pipe)))));
+                                -- 13. Unwatching it is accepted,
+                                printLn(widen(unwatchFile(&!poller, readEnd(&pipe))));
+                                -- 14. and the closed one is still counted.
+                                printLn(widen(watchedCount(&poller) = one));
+                                -- 15. Both ends close.
+                                printLn(widen(closePipe(pipe)));
+                            when None do
+                                printLn(0);
+                        end case;
+                    when None do
+                        printLn(0);
+                end case;
+                destroyPoller(poller);
+            when None do
+                printLn(0);
+        end case;
+        destroyString(payload);
+        return ExitSuccess();
+    end;
+end module body.

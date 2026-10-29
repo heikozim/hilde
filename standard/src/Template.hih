@@ -1,0 +1,399 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Jinja2 templates, checked when the programme is compiled, and what their generated code calls.
+
+- The syntax is Jinja2's, apart from what is refused or done differently.
+- @template reads the file beside the module and writes Hilde code that writes into out.
+- Every name comes from page, a reference to one record type; a name it lacks does not compile.
+- A value that cannot be printed, or an Option printed unasked, is an error at the template's line.
+- Each value is escaped for where it lands: HTML text, attributes, URL parts, JavaScript, CSS.
+- A value in a place no escaping makes safe, such as a comment or a tag name, does not compile.
+- Only |safe writes a value unescaped, and it can be found with a grep.
+- A module that uses @template imports this one, since the instances come with the import.
+
+    var out: StringBuilder := makeStringBuilder();
+    @template("page.jinja", page, out);
+    return finalize(out);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.Buffer (
+    Buffer
+);
+import Standard.String (
+    String
+);
+import Standard.StringBuilder (
+    StringBuilder
+);
+
+module Standard.Template is
+    """
+    What {{ value }} prints, before it is escaped.  Jinja2's own spelling
+    where there is one: True and False, and integers in decimal.
+    """
+    typeclass Render(T: Type) is
+        """
+        No contract: a text whose length follows its input.
+        """
+        generic [R: Region]
+        method display(value: &[T, R]): String;
+    end;
+
+    instance Render(String);
+    instance Render(Bool);
+    instance Render(Nat8);
+    instance Render(Nat16);
+    instance Render(Nat32);
+    instance Render(Nat64);
+    instance Render(Int8);
+    instance Render(Int16);
+    instance Render(Int32);
+    instance Render(Int64);
+    instance Render(Index);
+
+    """
+    What {% if value %} asks: Jinja2's truth -- an empty string, a zero,
+    an empty buffer and a missing Option are false.
+    """
+    typeclass Truth(T: Type) is
+        """
+        No contract: the answer is a Bool, nothing cheaper holds.
+        """
+        generic [R: Region]
+        method truthy(value: &[T, R]): Bool;
+    end;
+
+    instance Truth(String);
+    instance Truth(Bool);
+    instance Truth(Nat8);
+    instance Truth(Nat16);
+    instance Truth(Nat32);
+    instance Truth(Nat64);
+    instance Truth(Int8);
+    instance Truth(Int16);
+    instance Truth(Int32);
+    instance Truth(Int64);
+    instance Truth(Index);
+
+    generic [U: Type]
+    instance Truth(Option[U]);
+
+    generic [U: Type]
+    instance Truth(Buffer[U]);
+
+    """
+    What |length counts: the code points of a string, as Python counts
+    them, and the elements of a buffer.
+    """
+    typeclass Sized(T: Type) is
+        """
+        No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+        """
+        generic [R: Region]
+        method size(value: &[T, R]): Index;
+    end;
+
+    instance Sized(String);
+
+    generic [U: Type]
+    instance Sized(Buffer[U]);
+
+    """
+    Is the Option there?  What is not none asks.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [T: Type, R: Region]
+    function isPresent(value: &[Option[T], R]): Bool;
+
+    """
+    The value inside an Option that is there.  The generated code calls it
+    only inside {% if value is not none %}; called on a missing value it
+    aborts, which would be a defect of the compiler and not of a template.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [T: Type, R: Region]
+    function present(value: &[Option[T], R]): &[T, R];
+
+    """
+    How many elements a {% for %} walks over.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [T: Type, R: Region]
+    function count(sequence: &[Buffer[T], R]): Index;
+
+    """
+    The element a {% for %} stands on, by reference: it is not copied.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [T: Type, R: Region]
+    function element(sequence: &[Buffer[T], R], position: Index): &[T, R];
+
+    """
+    The number zero as an Index, for the counter of a loop.
+    """
+    function zero(): Index
+        ensures result = 0;
+
+    """
+    An Index in decimal: loop.index, |length.
+    No contract: a text whose length follows its input.
+    """
+    function displayIndex(value: Index): String;
+
+    """
+    value == "literal".
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function textEquals(value: Span[Nat8, R], literal: Span[Nat8, Static]): Bool;
+
+    """
+    Text of the template itself, as it stands.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeText(out: &![StringBuilder, B], text: Span[Nat8, Static]): Unit;
+
+    """
+    A value in HTML text or in a quoted attribute: &, <, >, " and
+    ' are written as &amp;, &lt;, &gt;, &#34; and &#39; -- byte
+    for byte what Jinja2's escaping (MarkupSafe) writes.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeHtml(out: &![StringBuilder, B], text: String): Unit;
+
+    """
+    A value at the start of a URL attribute (href="{{ url }}").  A scheme
+    other than http, https and mailto -- javascript: above all -- makes
+    the whole value #ZgotmplZ, as Go's html/template does; otherwise the
+    value is percent-encoded as writeUrlPath does it.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeUrl(out: &![StringBuilder, B], text: String): Unit;
+
+    """
+    A value in the path of a URL (href="/p/{{ name }}"): every byte that
+    is not allowed in a URL is written %xx (lowercase hex), and ', ( and
+    ) as well; the reserved characters and % stay.  Then it is escaped
+    as HTML, as writeHtml does.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeUrlPath(out: &![StringBuilder, B], text: String): Unit;
+
+    """
+    A value after ? or # of a URL (href="/s?q={{ term }}"): every byte
+    but letters, digits and -._~ is written %xx.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeUrlQuery(out: &![StringBuilder, B], text: String): Unit;
+
+    """
+    A value marked |safe: written as it is.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeRaw(out: &![StringBuilder, B], text: String): Unit;
+
+    """
+    |upper, |lower: ASCII letters only, unlike Jinja2.
+    No contract: a text whose length follows its input.
+    """
+    function upper(text: String): String;
+    """
+    No contract: a text whose length follows its input.
+    """
+    function lower(text: String): String;
+
+    """
+    |trim: ASCII white space at both ends, unlike Jinja2.
+    No contract: a text whose length follows its input.
+    """
+    function trim(text: String): String;
+
+    """
+    |capitalize: the first character in upper case and the rest in lower
+    case; |title: the same for every word, a word beginning after a
+    hyphen, white space or one of ( { [ <.  ASCII letters only, as
+    |upper.
+    No contract: a text whose length follows its input.
+    """
+    function capitalize(text: String): String;
+    """
+    No contract: a text whose length follows its input.
+    """
+    function title(text: String): String;
+
+    """
+    |replace: every old replaced by new, from the left; when limited is
+    true, the first limit only.  The compiler refuses an empty old.
+    No contract: a text whose length follows its input.
+    """
+    function replaceText(text: String, old: Span[Nat8, Static], new: Span[Nat8, Static],
+        limited: Bool, limit: Index): String;
+
+    """
+    |truncate: a text of at most limit plus leeway code points as it is;
+    a longer one cut to limit code points with the ending, at the last
+    space before the cut unless killWords is true.  The compiler makes
+    sure that the ending fits into limit.
+    No contract: a text whose length follows its input.
+    """
+    function truncate(text: String, limit: Index, killWords: Bool, ending: Span[Nat8, Static],
+        leeway: Index): String;
+
+    """
+    |center: padded with spaces to width code points, as Python's
+    str.center pads.
+    No contract: a text whose length follows its input.
+    """
+    function center(text: String, width: Index): String;
+
+    """
+    |join: the elements of the buffer displayed, with the separator
+    between them.
+    No contract: a text whose length follows its input.
+    """
+    generic [T: Type(Render), R: Region]
+    function joinDisplayed(sequence: &[Buffer[T], R], separator: Span[Nat8, Static]): String;
+
+    """
+    The operator ~: the two texts one after the other.
+    No contract: a text whose length follows its input.
+    """
+    function concat(left: String, right: String): String;
+
+    """
+    The operator in: whether the text stands in a string, as a part of it
+    (the empty text stands in every string), or in a buffer, as the
+    displayed text of one of its elements.
+    """
+    typeclass Holds(T: Type) is
+        """
+        No contract: the answer is a Bool, nothing cheaper holds.
+        """
+        generic [R: Region, S: Region]
+        method holds(value: &[T, R], text: Span[Nat8, S]): Bool;
+    end;
+
+    instance Holds(String);
+
+    generic [U: Type(Render)]
+    instance Holds(Buffer[U]);
+
+    """
+    What a number the template computed prints.
+    No contract: a text whose length follows its input.
+    """
+    generic [T: Free(Render)]
+    function displayValue(value: T): String;
+
+    """
+    The builder a {% set %} block or a {% filter %} block writes into,
+    and the text it wrote, escaped already.  discard gives back a text a
+    {% set %} kept until the end of its scope.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function makeCapture(): StringBuilder;
+    """
+    No contract: a text whose length follows its input.
+    """
+    function captured(capture: StringBuilder): String;
+    """
+    No contract: it only frees or closes what it is given.
+    """
+    function discard(text: String): Unit;
+
+    """
+    A value where a JavaScript expression goes (var v = {{ x }};), as Go's
+    html/template writes it: a string as a double-quoted literal (JSON's
+    escapes, and &, <, >, U+2028 and U+2029 as \u escapes, so the
+    text can never close the script), a number or a boolean bare, with a
+    space on each side so that it cannot run into what stands around it.
+    """
+    typeclass JsValue(T: Type) is
+        """
+        No contract: a text whose length follows its input.
+        """
+        generic [R: Region]
+        method jsValue(value: &[T, R]): String;
+    end;
+
+    instance JsValue(String);
+    instance JsValue(Bool);
+    instance JsValue(Nat8);
+    instance JsValue(Nat16);
+    instance JsValue(Nat32);
+    instance JsValue(Nat64);
+    instance JsValue(Int8);
+    instance JsValue(Int16);
+    instance JsValue(Int32);
+    instance JsValue(Int64);
+    instance JsValue(Index);
+
+    """
+    A string as a JavaScript string literal, as JsValue writes one.
+    No contract: a text whose length follows its input.
+    """
+    function jsQuote(text: String): String;
+
+    """
+    An Index where a JavaScript expression goes: bare, between spaces.
+    No contract: a text whose length follows its input.
+    """
+    function jsIndex(value: Index): String;
+
+    """
+    A value inside a quoted JavaScript string ('{{ x }}'): the quotes, +,
+    /, &, <, >, the backtick, the backslash and the controls as
+    escapes -- Go's table.  The second writes the result escaped as HTML,
+    for an on... attribute.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeJsString(out: &![StringBuilder, B], text: String): Unit;
+    """
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeJsStringAttribute(out: &![StringBuilder, B], text: String): Unit;
+
+    """
+    A value where a CSS value goes (color: {{ c }}): written as it is,
+    unless it holds a character that could leave the value -- a quote, a
+    bracket, /, ;, @, <, >, a backtick, a backslash -- or --, or
+    spells expression or mozbinding; then it is ZgotmplZ, as in Go.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeCssValue(out: &![StringBuilder, B], text: String): Unit;
+    """
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeCssValueAttribute(out: &![StringBuilder, B], text: String): Unit;
+
+    """
+    A value inside a quoted CSS string: a scheme other than http, https and
+    mailto makes it #ZgotmplZ (a CSS string may be a URL), and otherwise
+    the characters that could leave the string are hex escapes, with a
+    space after one where a hex digit, a space or the end follows.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeCssString(out: &![StringBuilder, B], text: String): Unit;
+    """
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [B: Region]
+    function writeCssStringAttribute(out: &![StringBuilder, B], text: String): Unit;
+end module.

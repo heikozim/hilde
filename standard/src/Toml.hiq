@@ -1,0 +1,2038 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Toml.  A safe module: it reads bytes through spans and binds no
+-- C.  The document is a flat list of nodes, each naming its parent: the
+-- top table is node 0, a table's keys and an array's elements are the
+-- nodes whose parent it is, in the order they were read.  Beside each node
+-- stands how it came to be, which decides what may still be added to it.
+-- A hash map finds the child of a node by its key, and a list beside the
+-- nodes holds the last child of each, so that a document of many keys is
+-- read in time that grows with its length and not with its square.
+-- Arrays and inline tables are read by recursion, one level per level of
+-- nesting, and refused past mostDepth, so that the input cannot decide the
+-- depth of the stack.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty as destroyEmptyBuffer,
+    destroyFree as destroyFreeBuffer,
+    length as bufferLength,
+    nth,
+    nthRef,
+    storeNth,
+    insertBack,
+    removeLast
+);
+import Standard.String (
+    String,
+    makeEmpty,
+    fromLiteral,
+    fromSpan,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Hash (
+    Hashable
+);
+import Standard.HashMap (
+    HashMap,
+    makeHashMap,
+    destroyEmpty as destroyEmptyMap,
+    size as mapSize,
+    get as mapGet,
+    put as mapPut,
+    removeAt as mapRemoveAt
+);
+import Standard.Utf8 (
+    CodePoint,
+    Decoded,
+    makeCodePoint,
+    decodeAt,
+    decodedWidth,
+    appendCodePoint,
+    isValid
+);
+
+module body Standard.Toml is
+    constant mostDepth: Index := 128;
+    constant noIndex: Index := maximum_index;
+    constant zeroIndex: Index := 0;
+    constant oneIndex: Index := 1;
+    constant zeroWhole: Int64 := 0;
+    constant oneWhole: Int64 := 1;
+
+    -- The kinds of a node.
+    constant kindString: Nat8 := 1;
+    constant kindInteger: Nat8 := 2;
+    constant kindFloat: Nat8 := 3;
+    constant kindBoolean: Nat8 := 4;
+    constant kindOffsetDateTime: Nat8 := 5;
+    constant kindLocalDateTime: Nat8 := 6;
+    constant kindLocalDate: Nat8 := 7;
+    constant kindLocalTime: Nat8 := 8;
+    constant kindArray: Nat8 := 9;
+    constant kindTable: Nat8 := 10;
+
+    -- How a table or an array came to be.  A table named on the way to
+    -- another in a header is implicit and may still get a header of its
+    -- own; one with a header, or made by dotted keys, is defined; an
+    -- inline table or an array written as a value is closed, and so is
+    -- everything in it; the array of [[name]] takes elements, each a
+    -- table with a header.
+    constant byImplicit: Nat8 := 0;
+    constant byHeader: Nat8 := 1;
+    constant byDotted: Nat8 := 2;
+    constant byClosed: Nat8 := 3;
+    constant byArrayOfTables: Nat8 := 4;
+
+    record Node: Linear is
+        parent: Index;
+        key: String;
+        kind: Nat8;
+        text: String;
+        whole: Int64;
+    end;
+
+    -- lasts holds the last child of each node, or noIndex.  children finds
+    -- the first child of a node by its key: the key is made by childKey,
+    -- the value is the child.  The top table is no node's child.
+    record Toml: Linear is
+        nodes: Buffer[Node];
+        hows: Buffer[Nat8];
+        lasts: Buffer[Index];
+        children: HashMap[String, Index];
+        invariant bufferLength(&hows) = bufferLength(&nodes);
+        invariant bufferLength(&lasts) = bufferLength(&nodes);
+        invariant mapSize(&children) < bufferLength(&nodes);
+    end;
+
+    -- Where the reading is: the next byte, or the fault and its byte.
+    record Pos: Free is
+        at: Index;
+        failed: Bool;
+        fault: TomlFault;
+        place: Index;
+    end;
+
+    function goOn(at: Index): Pos is
+        return Pos(at => at, failed => false, fault => CutShort(), place => at);
+    end;
+
+    function stop(fault: TomlFault, place: Index): Pos is
+        return Pos(at => place, failed => true, fault => fault, place => place);
+    end;
+
+    ---
+    --- The document's lists
+    ---
+
+    generic [R: Region]
+    function nodesRead(doc: &[Toml, R]): &[Buffer[Node], R] is
+        return &(doc->nodes);
+    end;
+
+    generic [R: Region]
+    function nodesMut(doc: &![Toml, R]): &![Buffer[Node], R] is
+        return &!(doc->nodes);
+    end;
+
+    generic [R: Region]
+    function howsRead(doc: &[Toml, R]): &[Buffer[Nat8], R] is
+        return &(doc->hows);
+    end;
+
+    generic [R: Region]
+    function howsMut(doc: &![Toml, R]): &![Buffer[Nat8], R] is
+        return &!(doc->hows);
+    end;
+
+    generic [R: Region]
+    function lastsMut(doc: &![Toml, R]): &![Buffer[Index], R] is
+        return &!(doc->lasts);
+    end;
+
+    generic [R: Region]
+    function childrenRead(doc: &[Toml, R]): &[HashMap[String, Index], R] is
+        return &(doc->children);
+    end;
+
+    generic [R: Region]
+    function childrenMut(doc: &![Toml, R]): &![HashMap[String, Index], R] is
+        return &!(doc->children);
+    end;
+
+    -- The number in decimal digits.
+    generic [B: Region]
+    function writeDecimal(out: &![StringBuilder, B], number: Index): Unit is
+        let ten: Index := 10;
+        if number >= ten then
+            writeDecimal(&~out, number / ten);
+        end if;
+        case toNat8(number - ((number / ten) * ten)) of
+            when Some(value as digit: Nat8) do
+                writeByte(&~out, digit + 48);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- The key of children for the child named key of parent: parent in
+    -- decimal, a colon and the key.  The digits end at the first colon.
+    generic [S: Region]
+    function childKey(parent: Index, key: Span[Nat8, S]): String is
+        var builder: StringBuilder := makeStringBuilder();
+        writeDecimal(&!builder, parent);
+        writeByte(&!builder, ':');
+        writeString(&!builder, key);
+        return finalize(builder);
+    end;
+
+    -- Give back the key of an entry the map let go.
+    function dropOld(old: Option[Pair[String, Index]]): Unit is
+        case old of
+            when Some(value as pair: Pair[String, Index]) do
+                let { first: String, second: Index } := pair;
+                destroyString(first);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function destroyChildren(children: HashMap[String, Index]): Unit is
+        var map: HashMap[String, Index] := children;
+        while mapSize(&map) > 0 do
+            let last: Index := mapSize(&map) - 1;
+            dropOld(mapRemoveAt(&!map, last));
+        end while;
+        destroyEmptyMap(map);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function nodeCount(doc: &[Toml, R]): Index is
+        return bufferLength(nodesRead(doc));
+    end;
+
+    generic [R: Region]
+    function kindOf(doc: &[Toml, R], k: Index): Nat8 is
+        let node: &[Node, R] := nthRef(nodesRead(doc), k);
+        return node->kind;
+    end;
+
+    generic [R: Region]
+    function parentOf(doc: &[Toml, R], k: Index): Index is
+        let node: &[Node, R] := nthRef(nodesRead(doc), k);
+        return node->parent;
+    end;
+
+    generic [R: Region]
+    function keyOf(doc: &[Toml, R], k: Index): &[String, R] is
+        let node: &[Node, R] := nthRef(nodesRead(doc), k);
+        return &(node->key);
+    end;
+
+    generic [R: Region]
+    function textOf(doc: &[Toml, R], k: Index): &[String, R] is
+        let node: &[Node, R] := nthRef(nodesRead(doc), k);
+        return &(node->text);
+    end;
+
+    generic [R: Region]
+    function wholeOf(doc: &[Toml, R], k: Index): Int64 is
+        let node: &[Node, R] := nthRef(nodesRead(doc), k);
+        return node->whole;
+    end;
+
+    generic [R: Region]
+    function howOf(doc: &[Toml, R], k: Index): Nat8 is
+        return nth(howsRead(doc), k);
+    end;
+
+    generic [R: Region]
+    function setHow(doc: &![Toml, R], k: Index, how: Nat8): Unit is
+        storeNth(howsMut(&~doc), k, how);
+        return nil;
+    end;
+
+    -- A new node under parent; its index.  It becomes the last child of
+    -- parent, and the child children finds for its key unless an earlier
+    -- child has the same key.
+    generic [R: Region]
+    function addNode(doc: &![Toml, R], parent: Index, key: String, kind: Nat8, how: Nat8, text: String, whole: Int64): Index is
+        let k: Index := nodeCount(&doc);
+        let known: String := childKey(parent, asSpan(&key));
+        insertBack(nodesMut(&~doc), Node(parent => parent, key => key, kind => kind, text => text, whole => whole));
+        insertBack(howsMut(&~doc), how);
+        insertBack(lastsMut(&~doc), noIndex);
+        if parent < k then
+            storeNth(lastsMut(&~doc), parent, k);
+        end if;
+        let earlier: Option[Index] := mapGet(childrenRead(&doc), &known);
+        case earlier of
+            when Some(value as first: Index) do
+                destroyString(known);
+            when None do
+                dropOld(mapPut(childrenMut(&~doc), known, k));
+        end case;
+        return k;
+    end;
+
+    -- The child of parent named key, or noIndex.  With more than one, the
+    -- first.
+    generic [R: Region, S: Region]
+    function findChild(doc: &[Toml, R], parent: Index, key: &[String, S]): Index is
+        let wanted: String := childKey(parent, asSpan(key));
+        let found: Option[Index] := mapGet(childrenRead(doc), &wanted);
+        destroyString(wanted);
+        case found of
+            when Some(value as child: Index) do
+                return child;
+            when None do
+                return noIndex;
+        end case;
+    end;
+
+    -- The last child of parent, or noIndex.
+    generic [R: Region]
+    function lastChild(doc: &[Toml, R], parent: Index): Index is
+        return nth(&(doc->lasts), parent);
+    end;
+
+    -- The child number n of parent, from 0, or noIndex.
+    generic [R: Region]
+    function childAt(doc: &[Toml, R], parent: Index, n: Index): Index is
+        var found: Index := noIndex;
+        var seen: Index := 0;
+        var k: Index := parent + 1;
+        while k < nodeCount(doc) do
+            if (found = noIndex) and (parentOf(doc, k) = parent) then
+                if seen = n then
+                    found := k;
+                end if;
+                seen := seen + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    generic [R: Region]
+    function childCount(doc: &[Toml, R], parent: Index): Index is
+        var count: Index := 0;
+        var k: Index := parent + 1;
+        while k < nodeCount(doc) do
+            if parentOf(doc, k) = parent then
+                count := count + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return count;
+    end;
+
+    function destroyNodes(nodes: Buffer[Node]): Unit is
+        var n: Buffer[Node] := nodes;
+        while bufferLength(&n) > 0 do
+            let { parent: Index, key: String, kind: Nat8, text: String, whole: Int64 } := removeLast(&!n);
+            destroyString(key);
+            destroyString(text);
+        end while;
+        destroyEmptyBuffer(n);
+        return nil;
+    end;
+
+    function destroyToml(document: Toml): Unit is
+        let { nodes: Buffer[Node], hows: Buffer[Nat8], lasts: Buffer[Index], children: HashMap[String, Index] } := document;
+        destroyNodes(nodes);
+        destroyFreeBuffer(hows);
+        destroyFreeBuffer(lasts);
+        destroyChildren(children);
+        return nil;
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var s: Buffer[String] := strings;
+        while bufferLength(&s) > 0 do
+            destroyString(removeLast(&!s));
+        end while;
+        destroyEmptyBuffer(s);
+        return nil;
+    end;
+
+    ---
+    --- Bytes
+    ---
+
+    function isDigit(b: Nat8): Bool is
+        return (b >= '0') and (b <= '9');
+    end;
+
+    function isHexDigit(b: Nat8): Bool is
+        return isDigit(b) or (((b >= 'a') and (b <= 'f')) or ((b >= 'A') and (b <= 'F')));
+    end;
+
+    function isBareKeyByte(b: Nat8): Bool is
+        return ((isDigit(b) or ((b >= 'a') and (b <= 'z'))) or ((b >= 'A') and (b <= 'Z'))) or ((b = '_') or (b = '-'));
+    end;
+
+    -- A control character TOML refuses outside a string's escapes: 0 to
+    -- 31 but the tab, and 127.
+    function isControl(b: Nat8): Bool is
+        let del: Nat8 := 127;
+        let space: Nat8 := 32;
+        return ((b < space) and (b /= '\t')) or (b = del);
+    end;
+
+    -- The first place from at on that is not a space or a tab.
+    generic [R: Region]
+    function skipBlank(text: Span[Nat8, R], at: Index): Index is
+        let n: Index := spanLength(text);
+        var i: Index := at;
+        var going: Bool := i < n;
+        while going do
+            if (text[i] = ' ') or (text[i] = '\t') then
+                i := i + 1;
+                going := i < n;
+            else
+                going := false;
+            end if;
+        end while;
+        return i;
+    end;
+
+    -- Whether the byte at at is there and is b.
+    generic [R: Region]
+    function byteIs(text: Span[Nat8, R], at: Index, b: Nat8): Bool is
+        if at < spanLength(text) then
+            return text[at] = b;
+        end if;
+        return false;
+    end;
+
+    -- Whether bytes at at spell word.
+    generic [R: Region]
+    function wordAt(text: Span[Nat8, R], at: Index, word: Span[Nat8, Static]): Bool is
+        let n: Index := spanLength(word);
+        if (at + n) > spanLength(text) then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < n do
+            if text[at + i] /= word[i] then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    -- A line end at at: a line feed, or a carriage return and a line feed.
+    -- Its length, or 0 when there is none; a lone carriage return is a
+    -- fault the caller sees as 0 at a carriage return.
+    generic [R: Region]
+    function lineEnd(text: Span[Nat8, R], at: Index): Index is
+        if byteIs(text, at, '\n') then
+            return 1;
+        end if;
+        if byteIs(text, at, '\r') and byteIs(text, at + 1, '\n') then
+            return 2;
+        end if;
+        return 0;
+    end;
+
+    -- A comment from at, which holds #, to the end of its line: the place
+    -- of the line end, or a fault for a control character in it.
+    generic [R: Region]
+    function comment(text: Span[Nat8, R], at: Index): Pos is
+        let n: Index := spanLength(text);
+        var i: Index := at + 1;
+        var result: Pos := goOn(n);
+        var going: Bool := true;
+        while going and (i < n) do
+            let b: Nat8 := text[i];
+            if b = '\n' then
+                result := goOn(i);
+                going := false;
+            else if b = '\r' then
+                if lineEnd(text, i) = 2 then
+                    result := goOn(i);
+                else
+                    result := stop(ByteOutOfPlace(), i);
+                end if;
+                going := false;
+            else if isControl(b) then
+                result := stop(ByteOutOfPlace(), i);
+                going := false;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        return result;
+    end;
+
+    -- After a value, a key's line or a header: blanks, a comment, and the
+    -- end of the line or of the text.  The place after the line end.
+    generic [R: Region]
+    function endOfLine(text: Span[Nat8, R], at: Index): Pos is
+        var i: Index := skipBlank(text, at);
+        if i >= spanLength(text) then
+            return goOn(i);
+        end if;
+        if text[i] = '#' then
+            let c: Pos := comment(text, i);
+            if c.failed then
+                return c;
+            end if;
+            i := c.at;
+        end if;
+        if i >= spanLength(text) then
+            return goOn(i);
+        end if;
+        let e: Index := lineEnd(text, i);
+        if e = 0 then
+            return stop(ByteOutOfPlace(), i);
+        end if;
+        return goOn(i + e);
+    end;
+
+    ---
+    --- Strings
+    ---
+
+    function hexValue(b: Nat8): Nat32 is
+        let zero: Nat8 := '0';
+        let lowA: Nat8 := 'a';
+        let highA: Nat8 := 'A';
+        let ten: Nat8 := 10;
+        var v: Nat8 := 0;
+        if isDigit(b) then
+            v := b - zero;
+        else if (b >= 'a') and (b <= 'f') then
+            v := (b - lowA) + ten;
+        else
+            v := (b - highA) + ten;
+        end if;
+        case toNat32(v) of
+            when Some(value as w: Nat32) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- An escape at at, which holds the backslash, written to out: the
+    -- place after it.
+    generic [R: Region, S: Region]
+    function escape(text: Span[Nat8, R], at: Index, out: &![StringBuilder, S]): Pos is
+        let n: Index := spanLength(text);
+        if (at + 1) >= n then
+            return stop(CutShort(), at);
+        end if;
+        let e: Nat8 := text[at + 1];
+        if e = 'b' then
+            let backspace: Nat8 := 8;
+            writeByte(&~out, backspace);
+            return goOn(at + 2);
+        else if e = 't' then
+            writeByte(&~out, '\t');
+            return goOn(at + 2);
+        else if e = 'n' then
+            writeByte(&~out, '\n');
+            return goOn(at + 2);
+        else if e = 'f' then
+            let formFeed: Nat8 := 12;
+            writeByte(&~out, formFeed);
+            return goOn(at + 2);
+        else if e = 'r' then
+            writeByte(&~out, '\r');
+            return goOn(at + 2);
+        else if e = '"' then
+            writeByte(&~out, '"');
+            return goOn(at + 2);
+        else if e = '\\' then
+            writeByte(&~out, '\\');
+            return goOn(at + 2);
+        else if (e = 'u') or (e = 'U') then
+            var width: Index := 4;
+            if e = 'U' then
+                let eight: Index := 8;
+                width := eight;
+            end if;
+            if ((at + 2) + width) > n then
+                return stop(CutShort(), at);
+            end if;
+            var scalar: Nat32 := 0;
+            let sixteen: Nat32 := 16;
+            var i: Index := 0;
+            while i < width do
+                let h: Nat8 := text[(at + 2) + i];
+                if not isHexDigit(h) then
+                    return stop(BadString(), (at + 2) + i);
+                end if;
+                if scalar > 268435455 then
+                    return stop(BadString(), at);
+                end if;
+                scalar := (scalar * sixteen) + hexValue(h);
+                i := i + 1;
+            end while;
+            case makeCodePoint(scalar) of
+                when Some(value as point: CodePoint) do
+                    appendCodePoint(&~out, point);
+                    return goOn((at + 2) + width);
+                when None do
+                    return stop(BadString(), at);
+            end case;
+        else
+            return stop(BadString(), at);
+        end if;
+    end;
+
+    -- One well-formed UTF-8 sequence at at, copied to out; the document
+    -- was checked whole, so the width is known to be there.
+    generic [R: Region, S: Region]
+    function copyChar(text: Span[Nat8, R], at: Index, out: &![StringBuilder, S]): Index is
+        var width: Index := 1;
+        case decodeAt(text, at) of
+            when Some(value as d: Decoded) do
+                width := decodedWidth(d);
+            when None do
+                skip;
+        end case;
+        var i: Index := 0;
+        while i < width do
+            writeByte(&~out, text[at + i]);
+            i := i + 1;
+        end while;
+        return at + width;
+    end;
+
+    -- A basic string on one line from at, which holds its quote, decoded
+    -- into out: the place after the closing quote.
+    generic [R: Region, S: Region]
+    function basicString(text: Span[Nat8, R], at: Index, out: &![StringBuilder, S]): Pos is
+        let n: Index := spanLength(text);
+        var i: Index := at + 1;
+        while i < n do
+            let b: Nat8 := text[i];
+            if b = '"' then
+                return goOn(i + 1);
+            else if b = '\\' then
+                let e: Pos := escape(text, i, &~out);
+                if e.failed then
+                    return e;
+                end if;
+                i := e.at;
+            else if (b = '\n') or (b = '\r') then
+                return stop(BadString(), i);
+            else if isControl(b) then
+                return stop(BadString(), i);
+            else
+                i := copyChar(text, i, &~out);
+            end if;
+        end while;
+        return stop(CutShort(), at);
+    end;
+
+    -- A literal string on one line from at, which holds its apostrophe.
+    generic [R: Region, S: Region]
+    function literalString(text: Span[Nat8, R], at: Index, out: &![StringBuilder, S]): Pos is
+        let n: Index := spanLength(text);
+        var i: Index := at + 1;
+        while i < n do
+            let b: Nat8 := text[i];
+            if b = apostrophe then
+                return goOn(i + 1);
+            else if (b = '\n') or (b = '\r') then
+                return stop(BadString(), i);
+            else if isControl(b) then
+                return stop(BadString(), i);
+            else
+                i := copyChar(text, i, &~out);
+            end if;
+        end while;
+        return stop(CutShort(), at);
+    end;
+
+    -- The byte ' , which has no character literal.
+    constant apostrophe: Nat8 := 39;
+
+    -- How many times b stands at at and after, at most five.
+    generic [R: Region]
+    function runOf(text: Span[Nat8, R], at: Index, b: Nat8): Index is
+        var count: Index := 0;
+        while (count < 5) and byteIs(text, at + count, b) do
+            count := count + 1;
+        end while;
+        return count;
+    end;
+
+    -- A multi-line basic string from at, which holds its three quotes.  A
+    -- line end right after them is dropped; a backslash at the end of a
+    -- line drops it and the white space and line ends after it; up to two
+    -- quotes may stand right before the closing three.
+    generic [R: Region, S: Region]
+    function multiBasic(text: Span[Nat8, R], at: Index, out: &![StringBuilder, S]): Pos is
+        let n: Index := spanLength(text);
+        var i: Index := at + 3;
+        i := i + lineEnd(text, i);
+        while i < n do
+            let b: Nat8 := text[i];
+            if b = '"' then
+                let run: Index := runOf(text, i, '"');
+                if run >= 3 then
+                    var extra: Index := run - 3;
+                    while extra > 0 do
+                        writeByte(&~out, '"');
+                        extra := extra - 1;
+                    end while;
+                    return goOn(i + run);
+                end if;
+                var k: Index := 0;
+                while k < run do
+                    writeByte(&~out, '"');
+                    k := k + 1;
+                end while;
+                i := i + run;
+            else if b = '\\' then
+                -- A line-ending backslash: blanks, then a line end.
+                let after: Index := skipBlank(text, i + 1);
+                if lineEnd(text, after) > 0 then
+                    var j: Index := after;
+                    var going: Bool := true;
+                    while going and (j < n) do
+                        let e: Index := lineEnd(text, j);
+                        if e > 0 then
+                            j := j + e;
+                        else if (text[j] = ' ') or (text[j] = '\t') then
+                            j := j + 1;
+                        else
+                            going := false;
+                        end if;
+                    end while;
+                    i := j;
+                else
+                    let e: Pos := escape(text, i, &~out);
+                    if e.failed then
+                        return e;
+                    end if;
+                    i := e.at;
+                end if;
+            else if b = '\n' then
+                writeByte(&~out, '\n');
+                i := i + 1;
+            else if b = '\r' then
+                if lineEnd(text, i) = 2 then
+                    writeByte(&~out, '\r');
+                    writeByte(&~out, '\n');
+                    i := i + 2;
+                else
+                    return stop(BadString(), i);
+                end if;
+            else if isControl(b) then
+                return stop(BadString(), i);
+            else
+                i := copyChar(text, i, &~out);
+            end if;
+        end while;
+        return stop(CutShort(), at);
+    end;
+
+    -- A multi-line literal string from at, which holds its three
+    -- apostrophes.
+    generic [R: Region, S: Region]
+    function multiLiteral(text: Span[Nat8, R], at: Index, out: &![StringBuilder, S]): Pos is
+        let n: Index := spanLength(text);
+        var i: Index := at + 3;
+        i := i + lineEnd(text, i);
+        while i < n do
+            let b: Nat8 := text[i];
+            if b = apostrophe then
+                let run: Index := runOf(text, i, apostrophe);
+                if run >= 3 then
+                    var extra: Index := run - 3;
+                    while extra > 0 do
+                        writeByte(&~out, apostrophe);
+                        extra := extra - 1;
+                    end while;
+                    return goOn(i + run);
+                end if;
+                var k: Index := 0;
+                while k < run do
+                    writeByte(&~out, apostrophe);
+                    k := k + 1;
+                end while;
+                i := i + run;
+            else if b = '\n' then
+                writeByte(&~out, '\n');
+                i := i + 1;
+            else if b = '\r' then
+                if lineEnd(text, i) = 2 then
+                    writeByte(&~out, '\r');
+                    writeByte(&~out, '\n');
+                    i := i + 2;
+                else
+                    return stop(BadString(), i);
+                end if;
+            else if isControl(b) then
+                return stop(BadString(), i);
+            else
+                i := copyChar(text, i, &~out);
+            end if;
+        end while;
+        return stop(CutShort(), at);
+    end;
+
+    -- Any of the four strings from at, decoded into out.
+    generic [R: Region, S: Region]
+    function anyString(text: Span[Nat8, R], at: Index, out: &![StringBuilder, S]): Pos is
+        if text[at] = '"' then
+            if wordAt(text, at, "\"\"\"") then
+                return multiBasic(text, at, &~out);
+            end if;
+            return basicString(text, at, &~out);
+        end if;
+        if runOf(text, at, apostrophe) >= 3 then
+            return multiLiteral(text, at, &~out);
+        end if;
+        return literalString(text, at, &~out);
+    end;
+
+    ---
+    --- Keys
+    ---
+
+    -- A key's parts, and where reading them ended.
+    record KeyRead: Linear is
+        pos: Pos;
+        parts: Buffer[String];
+    end;
+
+    -- One part of a key from at: bare, or a quoted string on one line.
+    generic [R: Region, S: Region]
+    function keyPart(text: Span[Nat8, R], at: Index, parts: &![Buffer[String], S]): Pos is
+        let n: Index := spanLength(text);
+        if at >= n then
+            return stop(CutShort(), at);
+        end if;
+        let b: Nat8 := text[at];
+        if (b = '"') or (b = apostrophe) then
+            var out: StringBuilder := makeStringBuilder();
+            var p: Pos := goOn(at);
+            if b = '"' then
+                p := basicString(text, at, &!out);
+            else
+                p := literalString(text, at, &!out);
+            end if;
+            insertBack(&~parts, finalize(out));
+            return p;
+        end if;
+        var i: Index := at;
+        while (i < n) and isBareKeyByte(text[i]) do
+            i := i + 1;
+        end while;
+        if i = at then
+            return stop(ByteOutOfPlace(), at);
+        end if;
+        insertBack(&~parts, fromSpan(substring(text, at, i)));
+        return goOn(i);
+    end;
+
+    -- A key of dotted parts from at; blanks may stand around the dots.
+    generic [R: Region]
+    function readKey(text: Span[Nat8, R], at: Index): KeyRead is
+        var parts: Buffer[String] := allocateEmpty();
+        var p: Pos := keyPart(text, at, &!parts);
+        var going: Bool := not p.failed;
+        while going do
+            let i: Index := skipBlank(text, p.at);
+            if byteIs(text, i, '.') then
+                p := keyPart(text, skipBlank(text, i + 1), &!parts);
+                going := not p.failed;
+            else
+                p := goOn(i);
+                going := false;
+            end if;
+        end while;
+        return KeyRead(pos => p, parts => parts);
+    end;
+
+    ---
+    --- Numbers
+    ---
+
+    -- What a number turned out to be.
+    record NumberRead: Free is
+        pos: Pos;
+        kind: Nat8;
+        whole: Int64;
+    end;
+
+    function numberFails(fault: TomlFault, place: Index): NumberRead is
+        return NumberRead(pos => stop(fault, place), kind => kindInteger, whole => zeroWhole);
+    end;
+
+    -- Whether b is a digit of base 2, 8, 10 or 16.
+    function isDigitOf(b: Nat8, base: Nat8): Bool is
+        let two: Nat8 := 2;
+        let eight: Nat8 := 8;
+        if base = two then
+            return (b = '0') or (b = '1');
+        else if base = eight then
+            return (b >= '0') and (b <= '7');
+        else if base = 16 then
+            return isHexDigit(b);
+        else
+            return isDigit(b);
+        end if;
+    end;
+
+    -- Digits of base from at, an underscore only between two digits: the
+    -- place after them, or noIndex when there is no digit or an
+    -- underscore stands wrong.
+    generic [R: Region]
+    function digitsEnd(text: Span[Nat8, R], at: Index, limit: Index, base: Nat8): Index is
+        var i: Index := at;
+        var digits: Index := 0;
+        var lastWasDigit: Bool := false;
+        var bad: Bool := false;
+        var going: Bool := i < limit;
+        while going do
+            let b: Nat8 := text[i];
+            if isDigitOf(b, base) then
+                digits := digits + 1;
+                lastWasDigit := true;
+                i := i + 1;
+            else if b = '_' then
+                if not lastWasDigit then
+                    bad := true;
+                end if;
+                lastWasDigit := false;
+                i := i + 1;
+            else
+                going := false;
+            end if;
+            if i >= limit then
+                going := false;
+            end if;
+        end while;
+        if bad or ((digits = 0) or (not lastWasDigit)) then
+            return noIndex;
+        end if;
+        return i;
+    end;
+
+    -- The value of the digits of base from at to limit, underscores
+    -- skipped, negated when negative; None past Int64.
+    generic [R: Region]
+    function valueOf(text: Span[Nat8, R], at: Index, limit: Index, base: Nat8, negative: Bool): Option[Int64] is
+        let b64: Int64 := wideOf(base);
+        -- Built downwards, as a negative number, so that the smallest
+        -- Int64 fits; the positive one is negated at the end.
+        let lowest: Int64 := -9223372036854775807 - 1;
+        var v: Int64 := 0;
+        var i: Index := at;
+        while i < limit do
+            let c: Nat8 := text[i];
+            if c /= '_' then
+                let d: Int64 := wideOf8(hexValue8(c));
+                if v < ((lowest + d) / b64) then
+                    let none: Option[Int64] := None();
+                    return none;
+                end if;
+                v := (v * b64) - d;
+            end if;
+            i := i + 1;
+        end while;
+        if negative then
+            return Some(value => v);
+        end if;
+        if v = lowest then
+            let none: Option[Int64] := None();
+            return none;
+        end if;
+        return Some(value => zeroWhole - v);
+    end;
+
+    function hexValue8(b: Nat8): Nat8 is
+        case toNat8(hexValue(b)) of
+            when Some(value as v: Nat8) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function wideOf(b: Nat8): Int64 is
+        case toInt64(b) of
+            when Some(value as w: Int64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function wideOf8(b: Nat8): Int64 is
+        return wideOf(b);
+    end;
+
+    -- An integer or a float in bytes at to limit, its float text, if any,
+    -- written without underscores into out.
+    generic [R: Region, S: Region]
+    function readNumber(text: Span[Nat8, R], at: Index, limit: Index, out: &![StringBuilder, S]): NumberRead is
+        var i: Index := at;
+        var negative: Bool := false;
+        let signed: Bool := (text[i] = '+') or (text[i] = '-');
+        if signed then
+            negative := text[i] = '-';
+            i := i + 1;
+        end if;
+        if i >= limit then
+            return numberFails(BadNumber(), at);
+        end if;
+        -- inf and nan, signed or not.
+        if (wordAt(text, i, "inf") or wordAt(text, i, "nan")) and ((i + 3) = limit) then
+            var j: Index := at;
+            while j < limit do
+                writeByte(&~out, text[j]);
+                j := j + 1;
+            end while;
+            return NumberRead(pos => goOn(limit), kind => kindFloat, whole => zeroWhole);
+        end if;
+        -- 0x, 0o and 0b: no sign.
+        if (text[i] = '0') and ((i + 1) < limit) then
+            let p: Nat8 := text[i + 1];
+            if (p = 'x') or ((p = 'o') or (p = 'b')) then
+                if signed then
+                    return numberFails(BadNumber(), at);
+                end if;
+                var base: Nat8 := 16;
+                if p = 'o' then
+                    let octal: Nat8 := 8;
+                    base := octal;
+                else if p = 'b' then
+                    let binary: Nat8 := 2;
+                    base := binary;
+                end if;
+                let e: Index := digitsEnd(text, i + 2, limit, base);
+                if e /= limit then
+                    return numberFails(BadNumber(), at);
+                end if;
+                case valueOf(text, i + 2, limit, base, false) of
+                    when Some(value as v: Int64) do
+                        return NumberRead(pos => goOn(limit), kind => kindInteger, whole => v);
+                    when None do
+                        return numberFails(BadNumber(), at);
+                end case;
+            end if;
+        end if;
+        let ten: Nat8 := 10;
+        let intEnd: Index := digitsEnd(text, i, limit, ten);
+        if intEnd = noIndex then
+            return numberFails(BadNumber(), at);
+        end if;
+        -- A leading zero only for the number zero itself.
+        if (text[i] = '0') and ((intEnd - i) > 1) then
+            return numberFails(BadNumber(), at);
+        end if;
+        if intEnd = limit then
+            case valueOf(text, i, limit, ten, negative) of
+                when Some(value as v: Int64) do
+                    return NumberRead(pos => goOn(limit), kind => kindInteger, whole => v);
+                when None do
+                    return numberFails(BadNumber(), at);
+            end case;
+        end if;
+        -- A float: a fraction, an exponent, or both.
+        var j: Index := intEnd;
+        if text[j] = '.' then
+            let fracEnd: Index := digitsEnd(text, j + 1, limit, ten);
+            if fracEnd = noIndex then
+                return numberFails(BadNumber(), at);
+            end if;
+            j := fracEnd;
+        end if;
+        if j < limit then
+            if (text[j] = 'e') or (text[j] = 'E') then
+                var k: Index := j + 1;
+                if k < limit then
+                    if (text[k] = '+') or (text[k] = '-') then
+                        k := k + 1;
+                    end if;
+                end if;
+                let expEnd: Index := digitsEnd(text, k, limit, ten);
+                if expEnd = noIndex then
+                    return numberFails(BadNumber(), at);
+                end if;
+                j := expEnd;
+            end if;
+        end if;
+        if (j /= limit) or (j = intEnd) then
+            return numberFails(BadNumber(), at);
+        end if;
+        var m: Index := at;
+        while m < limit do
+            if text[m] /= '_' then
+                writeByte(&~out, text[m]);
+            end if;
+            m := m + 1;
+        end while;
+        return NumberRead(pos => goOn(limit), kind => kindFloat, whole => zeroWhole);
+    end;
+
+    ---
+    --- Dates and times
+    ---
+
+    -- The two-digit or four-digit number at at, or noIndex when a byte is
+    -- no digit.
+    generic [R: Region]
+    function fixedDigits(text: Span[Nat8, R], at: Index, count: Index): Index is
+        if (at + count) > spanLength(text) then
+            return noIndex;
+        end if;
+        var v: Index := 0;
+        let ten: Index := 10;
+        var i: Index := 0;
+        while i < count do
+            let b: Nat8 := text[at + i];
+            if not isDigit(b) then
+                return noIndex;
+            end if;
+            let zero: Nat8 := '0';
+            case toIndex(b - zero) of
+                when Some(value as d: Index) do
+                    v := (v * ten) + d;
+                when None do
+                    return noIndex;
+            end case;
+            i := i + 1;
+        end while;
+        return v;
+    end;
+
+    function daysIn(year: Index, month: Index): Index is
+        let four: Index := 4;
+        let hundred: Index := 100;
+        let fourHundred: Index := 400;
+        let zero: Index := 0;
+        if month = 2 then
+            let leap: Bool := ((rem(year, four) = zero) and (rem(year, hundred) /= zero)) or (rem(year, fourHundred) = zero);
+            if leap then
+                return 29;
+            end if;
+            return 28;
+        end if;
+        if (month = 4) or ((month = 6) or ((month = 9) or (month = 11))) then
+            return 30;
+        end if;
+        return 31;
+    end;
+
+    -- A date of year, month and day, as in 1979-05-27, at at: the place
+    -- after it, or a fault.
+    generic [R: Region]
+    function readDate(text: Span[Nat8, R], at: Index): Pos is
+        let year: Index := fixedDigits(text, at, 4);
+        let month: Index := fixedDigits(text, at + 5, 2);
+        let day: Index := fixedDigits(text, at + 8, 2);
+        if ((year = noIndex) or (month = noIndex)) or (day = noIndex) then
+            return stop(BadDateTime(), at);
+        end if;
+        if (not byteIs(text, at + 4, '-')) or (not byteIs(text, at + 7, '-')) then
+            return stop(BadDateTime(), at);
+        end if;
+        if ((month < 1) or (month > 12)) or ((day < 1) or (day > daysIn(year, month))) then
+            return stop(BadDateTime(), at);
+        end if;
+        return goOn(at + 10);
+    end;
+
+    -- A time of hours, minutes and seconds, as in 07:32:00, with an
+    -- optional fraction, at at.
+    generic [R: Region]
+    function readTime(text: Span[Nat8, R], at: Index): Pos is
+        let hour: Index := fixedDigits(text, at, 2);
+        let minute: Index := fixedDigits(text, at + 3, 2);
+        let second: Index := fixedDigits(text, at + 6, 2);
+        if ((hour = noIndex) or (minute = noIndex)) or (second = noIndex) then
+            return stop(BadDateTime(), at);
+        end if;
+        if (not byteIs(text, at + 2, ':')) or (not byteIs(text, at + 5, ':')) then
+            return stop(BadDateTime(), at);
+        end if;
+        if ((hour > 23) or (minute > 59)) or (second > 60) then
+            return stop(BadDateTime(), at);
+        end if;
+        var i: Index := at + 8;
+        if byteIs(text, i, '.') then
+            var j: Index := i + 1;
+            while (j < spanLength(text)) and isDigit(text[j]) do
+                j := j + 1;
+            end while;
+            if j = (i + 1) then
+                return stop(BadDateTime(), at);
+            end if;
+            i := j;
+        end if;
+        return goOn(i);
+    end;
+
+    -- An offset at at: Z, z, or a sign with hours and minutes, as in
+    -- +01:00.
+    generic [R: Region]
+    function readOffset(text: Span[Nat8, R], at: Index): Pos is
+        if byteIs(text, at, 'Z') or byteIs(text, at, 'z') then
+            return goOn(at + 1);
+        end if;
+        if byteIs(text, at, '+') or byteIs(text, at, '-') then
+            let hour: Index := fixedDigits(text, at + 1, 2);
+            let minute: Index := fixedDigits(text, at + 4, 2);
+            if ((hour = noIndex) or (minute = noIndex)) or (not byteIs(text, at + 3, ':')) then
+                return stop(BadDateTime(), at);
+            end if;
+            if (hour > 23) or (minute > 59) then
+                return stop(BadDateTime(), at);
+            end if;
+            return goOn(at + 6);
+        end if;
+        return stop(BadDateTime(), at);
+    end;
+
+    -- Whether a time starts at at: two digits and a colon.
+    generic [R: Region]
+    function timeStarts(text: Span[Nat8, R], at: Index): Bool is
+        if (at + 3) > spanLength(text) then
+            return false;
+        end if;
+        return (isDigit(text[at]) and isDigit(text[at + 1])) and (text[at + 2] = ':');
+    end;
+
+    -- Whether a date starts at at: four digits and a dash.
+    generic [R: Region]
+    function dateStarts(text: Span[Nat8, R], at: Index): Bool is
+        if (at + 5) > spanLength(text) then
+            return false;
+        end if;
+        return ((isDigit(text[at]) and isDigit(text[at + 1])) and (isDigit(text[at + 2]) and isDigit(text[at + 3]))) and (text[at + 4] = '-');
+    end;
+
+    -- What a date or a time turned out to be.
+    record DateRead: Free is
+        pos: Pos;
+        kind: Nat8;
+    end;
+
+    -- A date, a time, or both, at at, its text written into out with a
+    -- capital T and Z.
+    generic [R: Region, S: Region]
+    function readDateTime(text: Span[Nat8, R], at: Index, out: &![StringBuilder, S]): DateRead is
+        if timeStarts(text, at) then
+            let t: Pos := readTime(text, at);
+            if t.failed then
+                return DateRead(pos => t, kind => kindLocalTime);
+            end if;
+            copyNormal(text, at, t.at, &~out);
+            return DateRead(pos => t, kind => kindLocalTime);
+        end if;
+        let d: Pos := readDate(text, at);
+        if d.failed then
+            return DateRead(pos => d, kind => kindLocalDate);
+        end if;
+        -- A time after a T, a t, or a space followed by a time.
+        var timeAt: Index := noIndex;
+        if byteIs(text, d.at, 'T') or byteIs(text, d.at, 't') then
+            timeAt := d.at + 1;
+        else if byteIs(text, d.at, ' ') and timeStarts(text, d.at + 1) then
+            timeAt := d.at + 1;
+        end if;
+        if timeAt = noIndex then
+            copyNormal(text, at, d.at, &~out);
+            return DateRead(pos => d, kind => kindLocalDate);
+        end if;
+        let t: Pos := readTime(text, timeAt);
+        if t.failed then
+            return DateRead(pos => t, kind => kindLocalDateTime);
+        end if;
+        let n: Index := spanLength(text);
+        var offset: Bool := false;
+        if t.at < n then
+            let b: Nat8 := text[t.at];
+            offset := ((b = 'Z') or (b = 'z')) or ((b = '+') or (b = '-'));
+        end if;
+        if not offset then
+            copyNormal(text, at, t.at, &~out);
+            return DateRead(pos => t, kind => kindLocalDateTime);
+        end if;
+        let o: Pos := readOffset(text, t.at);
+        if o.failed then
+            return DateRead(pos => o, kind => kindOffsetDateTime);
+        end if;
+        copyNormal(text, at, o.at, &~out);
+        return DateRead(pos => o, kind => kindOffsetDateTime);
+    end;
+
+    -- Bytes at to limit into out, a t or a space between date and time as
+    -- a capital T and a z as a capital Z.
+    generic [R: Region, S: Region]
+    function copyNormal(text: Span[Nat8, R], at: Index, limit: Index, out: &![StringBuilder, S]): Unit is
+        var i: Index := at;
+        while i < limit do
+            let b: Nat8 := text[i];
+            if ((b = 't') or (b = ' ')) or (b = 'T') then
+                writeByte(&~out, 'T');
+            else if b = 'z' then
+                writeByte(&~out, 'Z');
+            else
+                writeByte(&~out, b);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Values
+    ---
+
+    -- Whether the byte at at ends a value: the end, a blank, a line end, a
+    -- comma, a closing bracket or brace, or a comment.
+    generic [R: Region]
+    function valueEnds(text: Span[Nat8, R], at: Index): Bool is
+        if at >= spanLength(text) then
+            return true;
+        end if;
+        let b: Nat8 := text[at];
+        return (((b = ' ') or (b = '\t')) or ((b = '\n') or (b = '\r'))) or (((b = ',') or (b = ']')) or ((b = '}') or (b = '#')));
+    end;
+
+    -- Inside an array: blanks, line ends and comments from at on.
+    generic [R: Region]
+    function arrayGap(text: Span[Nat8, R], at: Index): Pos is
+        let n: Index := spanLength(text);
+        var i: Index := at;
+        var going: Bool := true;
+        while going and (i < n) do
+            let b: Nat8 := text[i];
+            if (b = ' ') or (b = '\t') then
+                i := i + 1;
+            else if b = '#' then
+                let c: Pos := comment(text, i);
+                if c.failed then
+                    return c;
+                end if;
+                i := c.at;
+            else if (b = '\n') or (b = '\r') then
+                let e: Index := lineEnd(text, i);
+                if e = 0 then
+                    return stop(ByteOutOfPlace(), i);
+                end if;
+                i := i + e;
+            else
+                going := false;
+            end if;
+        end while;
+        return goOn(i);
+    end;
+
+    -- Every table and array below node, and node itself, closed: an inline
+    -- table and an array written as a value take nothing more.
+    generic [R: Region]
+    function seal(doc: &![Toml, R], node: Index): Unit is
+        setHow(&~doc, node, byClosed);
+        var k: Index := node + 1;
+        while k < nodeCount(&doc) do
+            if isBelow(&doc, k, node) then
+                setHow(&~doc, k, byClosed);
+            end if;
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Whether node k stands below node top.
+    generic [R: Region]
+    function isBelow(doc: &[Toml, R], k: Index, top: Index): Bool is
+        var at: Index := parentOf(doc, k);
+        var found: Bool := false;
+        while (at /= noIndex) and (not found) do
+            if at = top then
+                found := true;
+            else
+                at := parentOf(doc, at);
+            end if;
+        end while;
+        return found;
+    end;
+
+    -- The value at at, stored as the node key under parent.  inline says
+    -- whether it stands in an inline table or an array.
+    generic [R: Region, S: Region]
+    function readValue(text: Span[Nat8, R], at: Index, doc: &![Toml, S], parent: Index, key: String, depth: Index): Pos is
+        if at >= spanLength(text) then
+            destroyString(key);
+            return stop(CutShort(), at);
+        else
+            return readValueAt(text, at, &~doc, parent, key, depth);
+        end if;
+    end;
+
+    generic [R: Region, S: Region]
+    function readValueAt(text: Span[Nat8, R], at: Index, doc: &![Toml, S], parent: Index, key: String, depth: Index): Pos is
+        let n: Index := spanLength(text);
+        let b: Nat8 := text[at];
+        if (b = '"') or (b = apostrophe) then
+            var out: StringBuilder := makeStringBuilder();
+            let p: Pos := anyString(text, at, &!out);
+            let value: String := finalize(out);
+            if p.failed then
+                destroyString(key);
+                destroyString(value);
+                return p;
+            else
+                let k: Index := addNode(&~doc, parent, key, kindString, byClosed, value, zeroWhole);
+                return p;
+            end if;
+        else if b = '[' then
+            return readArray(text, at, &~doc, parent, key, depth);
+        else if b = '{' then
+            return readInline(text, at, &~doc, parent, key, depth);
+        else if wordAt(text, at, "true") and valueEnds(text, at + 4) then
+            let k: Index := addNode(&~doc, parent, key, kindBoolean, byClosed, makeEmpty(), oneWhole);
+            return goOn(at + 4);
+        else if wordAt(text, at, "false") and valueEnds(text, at + 5) then
+            let k: Index := addNode(&~doc, parent, key, kindBoolean, byClosed, makeEmpty(), zeroWhole);
+            return goOn(at + 5);
+        else if dateStarts(text, at) or timeStarts(text, at) then
+            var out: StringBuilder := makeStringBuilder();
+            let d: DateRead := readDateTime(text, at, &!out);
+            let value: String := finalize(out);
+            if d.pos.failed then
+                destroyString(key);
+                destroyString(value);
+                return d.pos;
+            else
+                let k: Index := addNode(&~doc, parent, key, d.kind, byClosed, value, zeroWhole);
+                return d.pos;
+            end if;
+        else if isNumberStart(b) then
+            var e: Index := at;
+            while (e < n) and isNumberByte(text[e]) do
+                e := e + 1;
+            end while;
+            var out: StringBuilder := makeStringBuilder();
+            let r: NumberRead := readNumber(text, at, e, &!out);
+            let value: String := finalize(out);
+            if r.pos.failed then
+                destroyString(key);
+                destroyString(value);
+                return r.pos;
+            else
+                let k: Index := addNode(&~doc, parent, key, r.kind, byClosed, value, r.whole);
+                return r.pos;
+            end if;
+        else
+            destroyString(key);
+            return stop(ByteOutOfPlace(), at);
+        end if;
+    end;
+
+    function isNumberStart(b: Nat8): Bool is
+        return (isDigit(b) or ((b = '+') or (b = '-'))) or ((b = 'i') or (b = 'n'));
+    end;
+
+    function isNumberByte(b: Nat8): Bool is
+        return (isBareKeyByte(b) or (b = '+')) or (b = '.');
+    end;
+
+    -- An array at at, which holds [, stored as key under parent.
+    generic [R: Region, S: Region]
+    function readArray(text: Span[Nat8, R], at: Index, doc: &![Toml, S], parent: Index, key: String, depth: Index): Pos is
+        if depth >= mostDepth then
+            destroyString(key);
+            return stop(NestedTooDeep(), at);
+        else
+            let node: Index := addNode(&~doc, parent, key, kindArray, byClosed, makeEmpty(), zeroWhole);
+            return arrayElements(text, at, &~doc, node, depth);
+        end if;
+    end;
+
+    -- The elements of the array node from at, which holds [.
+    generic [R: Region, S: Region]
+    function arrayElements(text: Span[Nat8, R], at: Index, doc: &![Toml, S], node: Index, depth: Index): Pos is
+        var p: Pos := arrayGap(text, at + 1);
+        if p.failed then
+            return p;
+        end if;
+        if byteIs(text, p.at, ']') then
+            return goOn(p.at + 1);
+        end if;
+        var going: Bool := true;
+        while going do
+            p := readValue(text, p.at, &~doc, node, makeEmpty(), depth + 1);
+            if p.failed then
+                return p;
+            end if;
+            p := arrayGap(text, p.at);
+            if p.failed then
+                return p;
+            end if;
+            if byteIs(text, p.at, ',') then
+                p := arrayGap(text, p.at + 1);
+                if p.failed then
+                    return p;
+                end if;
+                if p.at >= spanLength(text) then
+                    return stop(CutShort(), at);
+                end if;
+                if byteIs(text, p.at, ']') then
+                    going := false;
+                end if;
+            else if byteIs(text, p.at, ']') then
+                going := false;
+            else if p.at >= spanLength(text) then
+                return stop(CutShort(), at);
+            else
+                return stop(ByteOutOfPlace(), p.at);
+            end if;
+        end while;
+        seal(&~doc, node);
+        return goOn(p.at + 1);
+    end;
+
+    -- An inline table at at, which holds {, stored as key under parent.
+    generic [R: Region, S: Region]
+    function readInline(text: Span[Nat8, R], at: Index, doc: &![Toml, S], parent: Index, key: String, depth: Index): Pos is
+        if depth >= mostDepth then
+            destroyString(key);
+            return stop(NestedTooDeep(), at);
+        else
+            let node: Index := addNode(&~doc, parent, key, kindTable, byDotted, makeEmpty(), zeroWhole);
+            return inlineKeys(text, at, &~doc, node, depth);
+        end if;
+    end;
+
+    -- The keys of the inline table node from at, which holds {.
+    generic [R: Region, S: Region]
+    function inlineKeys(text: Span[Nat8, R], at: Index, doc: &![Toml, S], node: Index, depth: Index): Pos is
+        var i: Index := skipBlank(text, at + 1);
+        if byteIs(text, i, '}') then
+            seal(&~doc, node);
+            return goOn(i + 1);
+        end if;
+        var going: Bool := true;
+        while going do
+            let p: Pos := keyValue(text, i, &~doc, node, depth + 1);
+            if p.failed then
+                return p;
+            end if;
+            i := skipBlank(text, p.at);
+            if byteIs(text, i, ',') then
+                i := skipBlank(text, i + 1);
+            else if byteIs(text, i, '}') then
+                going := false;
+            else if i >= spanLength(text) then
+                return stop(CutShort(), at);
+            else
+                return stop(ByteOutOfPlace(), i);
+            end if;
+        end while;
+        seal(&~doc, node);
+        return goOn(i + 1);
+    end;
+
+    ---
+    --- Keys and values, headers
+    ---
+
+    -- The table the parts but the last lead to from base, made by dotted
+    -- keys where missing; noIndex when one of them may not take a key.
+    generic [R: Region, S: Region]
+    function dottedParent(doc: &![Toml, R], base: Index, parts: &[Buffer[String], S]): Index is
+        var at: Index := base;
+        var i: Index := 0;
+        let last: Index := bufferLength(parts) - 1;
+        while i < last do
+            let part: &[String, S] := nthRef(parts, i);
+            let child: Index := findChild(&doc, at, part);
+            if child = noIndex then
+                at := addNode(&~doc, at, copyOf(part), kindTable, byDotted, makeEmpty(), zeroWhole);
+            else if kindOf(&doc, child) /= kindTable then
+                return noIndex;
+            else
+                let how: Nat8 := howOf(&doc, child);
+                if (how = byHeader) or ((how = byClosed) or (how = byArrayOfTables)) then
+                    return noIndex;
+                end if;
+                if how = byImplicit then
+                    setHow(&~doc, child, byDotted);
+                end if;
+                at := child;
+            end if;
+            i := i + 1;
+        end while;
+        return at;
+    end;
+
+    generic [R: Region]
+    function copyOf(s: &[String, R]): String is
+        return fromSpan(asSpan(s));
+    end;
+
+    -- key = value at at, the key relative to base.
+    generic [R: Region, S: Region]
+    function keyValue(text: Span[Nat8, R], at: Index, doc: &![Toml, S], base: Index, depth: Index): Pos is
+        let read: KeyRead := readKey(text, at);
+        let { pos as kp: Pos, parts: Buffer[String] } := read;
+        if kp.failed then
+            destroyStrings(parts);
+            return kp;
+        else
+            return keyValueRest(text, at, kp.at, &~doc, base, parts, depth);
+        end if;
+    end;
+
+    -- After a key's parts, which end before keyEnd: the equals sign, the
+    -- place of the key, and the value.
+    generic [R: Region, S: Region]
+    function keyValueRest(text: Span[Nat8, R], at: Index, keyEnd: Index, doc: &![Toml, S], base: Index, parts: Buffer[String], depth: Index): Pos is
+        let eq: Index := skipBlank(text, keyEnd);
+        var fault: Pos := goOn(at);
+        var ok: Bool := true;
+        var parent: Index := noIndex;
+        if not byteIs(text, eq, '=') then
+            ok := false;
+            if eq >= spanLength(text) then
+                fault := stop(CutShort(), eq);
+            else
+                fault := stop(ByteOutOfPlace(), eq);
+            end if;
+        else
+            parent := dottedParent(&~doc, base, &parts);
+            if parent = noIndex then
+                ok := false;
+                fault := stop(DefinedTwice(), at);
+            end if;
+        end if;
+        var p: Buffer[String] := parts;
+        let name: String := removeLast(&!p);
+        destroyStrings(p);
+        if not ok then
+            destroyString(name);
+            return fault;
+        else if findChild(&doc, parent, &name) /= noIndex then
+            destroyString(name);
+            return stop(DefinedTwice(), at);
+        else
+            return readValue(text, skipBlank(text, eq + 1), &~doc, parent, name, depth);
+        end if;
+    end;
+
+    -- A header's name from at, which holds its first bracket after count
+    -- brackets: the table it leads to, made where missing.
+    record HeaderRead: Free is
+        pos: Pos;
+        table: Index;
+    end;
+
+    generic [R: Region, S: Region]
+    function readHeader(text: Span[Nat8, R], at: Index, doc: &![Toml, S], ofArray: Bool): HeaderRead is
+        var width: Index := 1;
+        if ofArray then
+            width := width + 1;
+        end if;
+        let read: KeyRead := readKey(text, skipBlank(text, at + width));
+        let { pos as kp: Pos, parts: Buffer[String] } := read;
+        var result: HeaderRead := HeaderRead(pos => kp, table => noIndex);
+        if not kp.failed then
+            let close: Index := skipBlank(text, kp.at);
+            var closed: Bool := byteIs(text, close, ']');
+            if ofArray then
+                closed := closed and byteIs(text, close + 1, ']');
+            end if;
+            if not closed then
+                if close >= spanLength(text) then
+                    result := HeaderRead(pos => stop(CutShort(), close), table => noIndex);
+                else
+                    result := HeaderRead(pos => stop(ByteOutOfPlace(), close), table => noIndex);
+                end if;
+            else
+                let table: Index := headerTable(&~doc, &parts, ofArray);
+                if table = noIndex then
+                    result := HeaderRead(pos => stop(DefinedTwice(), at), table => noIndex);
+                else
+                    result := HeaderRead(pos => endOfLine(text, close + width), table => table);
+                end if;
+            end if;
+        end if;
+        destroyStrings(parts);
+        return result;
+    end;
+
+    -- The table a header names, from the top: tables on the way made
+    -- implicit where missing, the last one defined or, for an array of
+    -- tables, a new element; noIndex when the header may not name it.
+    generic [R: Region, S: Region]
+    function headerTable(doc: &![Toml, R], parts: &[Buffer[String], S], ofArray: Bool): Index is
+        var at: Index := 0;
+        var i: Index := 0;
+        let last: Index := bufferLength(parts) - 1;
+        while i < last do
+            let part: &[String, S] := nthRef(parts, i);
+            let child: Index := findChild(&doc, at, part);
+            if child = noIndex then
+                at := addNode(&~doc, at, copyOf(part), kindTable, byImplicit, makeEmpty(), zeroWhole);
+            else if kindOf(&doc, child) = kindTable then
+                if howOf(&doc, child) = byClosed then
+                    return noIndex;
+                end if;
+                at := child;
+            else if (kindOf(&doc, child) = kindArray) and (howOf(&doc, child) = byArrayOfTables) then
+                at := lastChild(&doc, child);
+            else
+                return noIndex;
+            end if;
+            i := i + 1;
+        end while;
+        let name: &[String, S] := nthRef(parts, last);
+        let found: Index := findChild(&doc, at, name);
+        if ofArray then
+            var array: Index := found;
+            if found = noIndex then
+                array := addNode(&~doc, at, copyOf(name), kindArray, byArrayOfTables, makeEmpty(), zeroWhole);
+            else if (kindOf(&doc, found) /= kindArray) or (howOf(&doc, found) /= byArrayOfTables) then
+                return noIndex;
+            end if;
+            return addNode(&~doc, array, makeEmpty(), kindTable, byHeader, makeEmpty(), zeroWhole);
+        end if;
+        if found = noIndex then
+            return addNode(&~doc, at, copyOf(name), kindTable, byHeader, makeEmpty(), zeroWhole);
+        end if;
+        if (kindOf(&doc, found) = kindTable) and (howOf(&doc, found) = byImplicit) then
+            setHow(&~doc, found, byHeader);
+            return found;
+        end if;
+        return noIndex;
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    -- The place of the first byte that is no part of well-formed UTF-8.
+    generic [R: Region]
+    function firstBadByte(text: Span[Nat8, R]): Index is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            case decodeAt(text, i) of
+                when Some(value as d: Decoded) do
+                    i := i + decodedWidth(d);
+                when None do
+                    return i;
+            end case;
+        end while;
+        return i;
+    end;
+
+    -- The whole text read into doc: a fault, or the end.
+    generic [R: Region, S: Region]
+    function readAll(text: Span[Nat8, R], doc: &![Toml, S]): Pos is
+        if not isValid(text) then
+            return stop(NotUtf8(), firstBadByte(text));
+        end if;
+        let n: Index := spanLength(text);
+        var table: Index := 0;
+        var i: Index := 0;
+        while i < n do
+            i := skipBlank(text, i);
+            if i < n then
+                let b: Nat8 := text[i];
+                if (b = '\n') or (b = '\r') then
+                    let e: Index := lineEnd(text, i);
+                    if e = 0 then
+                        return stop(ByteOutOfPlace(), i);
+                    end if;
+                    i := i + e;
+                else if b = '#' then
+                    let c: Pos := comment(text, i);
+                    if c.failed then
+                        return c;
+                    end if;
+                    i := c.at;
+                else if b = '[' then
+                    let h: HeaderRead := readHeader(text, i, &~doc, byteIs(text, i + 1, '['));
+                    if h.pos.failed then
+                        return h.pos;
+                    end if;
+                    table := h.table;
+                    i := h.pos.at;
+                else
+                    let p: Pos := keyValue(text, i, &~doc, table, 0);
+                    if p.failed then
+                        return p;
+                    end if;
+                    let e: Pos := endOfLine(text, p.at);
+                    if e.failed then
+                        return e;
+                    end if;
+                    i := e.at;
+                end if;
+            end if;
+        end while;
+        return goOn(n);
+    end;
+
+    -- The line and the column, both from 1, of place in text.
+    generic [R: Region]
+    function errorAt(text: Span[Nat8, R], fault: TomlFault, place: Index): TomlError is
+        var line: Index := 1;
+        var start: Index := 0;
+        var i: Index := 0;
+        while (i < place) and (i < spanLength(text)) do
+            if text[i] = '\n' then
+                line := line + 1;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return TomlError(fault => fault, line => line, column => (place - start) + 1);
+    end;
+
+    generic [R: Region]
+    function readToml(text: Span[Nat8, R]): Either[TomlError, Toml] is
+        var nodes: Buffer[Node] := allocateEmpty();
+        insertBack(&!nodes, Node(parent => noIndex, key => makeEmpty(), kind => kindTable, text => makeEmpty(), whole => zeroWhole));
+        var hows: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!hows, byHeader);
+        var lasts: Buffer[Index] := allocateEmpty();
+        insertBack(&!lasts, noIndex);
+        var children: HashMap[String, Index] := makeHashMap();
+        var doc: Toml := Toml(nodes => nodes, hows => hows, lasts => lasts, children => children);
+        let p: Pos := readAll(text, &!doc);
+        if p.failed then
+            destroyToml(doc);
+            return Left(left => errorAt(text, p.fault, p.place));
+        else
+            return Right(right => doc);
+        end if;
+    end;
+
+    ---
+    --- Asking
+    ---
+
+    -- The node path leads to, or noIndex.
+    generic [R: Region, P: Region]
+    function walkPath(doc: &[Toml, R], path: Span[Nat8, P]): Index is
+        let n: Index := spanLength(path);
+        if n = 0 then
+            return 0;
+        end if;
+        var at: Index := 0;
+        var i: Index := 0;
+        var going: Bool := true;
+        while going do
+            let step: Pos := pathKey(doc, path, i, at);
+            if step.failed then
+                return noIndex;
+            end if;
+            at := step.place;
+            i := step.at;
+            while byteIs(path, i, '[') do
+                var j: Index := i + 1;
+                var index: Index := 0;
+                let ten: Index := 10;
+                while (j < n) and isDigit(path[j]) do
+                    let zero: Nat8 := '0';
+                    case toIndex(path[j] - zero) of
+                        when Some(value as d: Index) do
+                            if index > (maximum_index / ten) then
+                                return noIndex;
+                            end if;
+                            index := (index * ten) + d;
+                        when None do
+                            return noIndex;
+                    end case;
+                    j := j + 1;
+                end while;
+                if (j = (i + 1)) or (not byteIs(path, j, ']')) then
+                    return noIndex;
+                end if;
+                if kindOf(doc, at) /= kindArray then
+                    return noIndex;
+                end if;
+                at := childAt(doc, at, index);
+                if at = noIndex then
+                    return noIndex;
+                end if;
+                i := j + 1;
+            end while;
+            if i >= n then
+                going := false;
+            else if path[i] = '.' then
+                i := i + 1;
+            else
+                return noIndex;
+            end if;
+        end while;
+        return at;
+    end;
+
+    -- One key of a path at i, looked up in the table at: the place after
+    -- the key, and the child as place; failed when there is none.
+    generic [R: Region, P: Region]
+    function pathKey(doc: &[Toml, R], path: Span[Nat8, P], i: Index, at: Index): Pos is
+        var parts: Buffer[String] := allocateEmpty();
+        let p: Pos := keyPart(path, i, &!parts);
+        var child: Index := noIndex;
+        if (not p.failed) and (bufferLength(&parts) = 1) then
+            if kindOf(doc, at) = kindTable then
+                child := findChild(doc, at, nthRef(&parts, 0));
+            end if;
+        end if;
+        destroyStrings(parts);
+        if child = noIndex then
+            return stop(ByteOutOfPlace(), i);
+        end if;
+        return Pos(at => p.at, failed => false, fault => CutShort(), place => child);
+    end;
+
+    function kindOfCode(kind: Nat8): TomlKind is
+        if kind = kindString then
+            return TomlString();
+        else if kind = kindInteger then
+            return TomlInteger();
+        else if kind = kindFloat then
+            return TomlFloat();
+        else if kind = kindBoolean then
+            return TomlBoolean();
+        else if kind = kindOffsetDateTime then
+            return TomlOffsetDateTime();
+        else if kind = kindLocalDateTime then
+            return TomlLocalDateTime();
+        else if kind = kindLocalDate then
+            return TomlLocalDate();
+        else if kind = kindLocalTime then
+            return TomlLocalTime();
+        else if kind = kindArray then
+            return TomlArray();
+        else
+            return TomlTable();
+        end if;
+    end;
+
+    generic [R: Region, P: Region]
+    function kindAt(document: &[Toml, R], path: Span[Nat8, P]): Option[TomlKind] is
+        let k: Index := walkPath(document, path);
+        if k = noIndex then
+            let none: Option[TomlKind] := None();
+            return none;
+        end if;
+        return Some(value => kindOfCode(kindOf(document, k)));
+    end;
+
+    -- The text of the node at path when its kind is one of low to high.
+    generic [R: Region, P: Region]
+    function textIf(document: &[Toml, R], path: Span[Nat8, P], low: Nat8, high: Nat8): Option[String] is
+        let k: Index := walkPath(document, path);
+        if k /= noIndex then
+            let kind: Nat8 := kindOf(document, k);
+            if (kind >= low) and (kind <= high) then
+                return Some(value => copyOf(textOf(document, k)));
+            end if;
+        end if;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    generic [R: Region, P: Region]
+    function stringAt(document: &[Toml, R], path: Span[Nat8, P]): Option[String] is
+        return textIf(document, path, kindString, kindString);
+    end;
+
+    generic [R: Region, P: Region]
+    function floatAt(document: &[Toml, R], path: Span[Nat8, P]): Option[String] is
+        return textIf(document, path, kindFloat, kindFloat);
+    end;
+
+    generic [R: Region, P: Region]
+    function dateTimeAt(document: &[Toml, R], path: Span[Nat8, P]): Option[String] is
+        return textIf(document, path, kindOffsetDateTime, kindLocalTime);
+    end;
+
+    generic [R: Region, P: Region]
+    function integerAt(document: &[Toml, R], path: Span[Nat8, P]): Option[Int64] is
+        let k: Index := walkPath(document, path);
+        if k /= noIndex then
+            if kindOf(document, k) = kindInteger then
+                return Some(value => wholeOf(document, k));
+            end if;
+        end if;
+        let none: Option[Int64] := None();
+        return none;
+    end;
+
+    generic [R: Region, P: Region]
+    function boolAt(document: &[Toml, R], path: Span[Nat8, P]): Option[Bool] is
+        let k: Index := walkPath(document, path);
+        if k /= noIndex then
+            if kindOf(document, k) = kindBoolean then
+                return Some(value => wholeOf(document, k) /= zeroWhole);
+            end if;
+        end if;
+        let none: Option[Bool] := None();
+        return none;
+    end;
+
+    generic [R: Region, P: Region]
+    function countAt(document: &[Toml, R], path: Span[Nat8, P]): Option[Index] is
+        let k: Index := walkPath(document, path);
+        if k /= noIndex then
+            let kind: Nat8 := kindOf(document, k);
+            if (kind = kindArray) or (kind = kindTable) then
+                return Some(value => childCount(document, k));
+            end if;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region, P: Region]
+    function keyAt(document: &[Toml, R], path: Span[Nat8, P], n: Index): Option[String] is
+        let k: Index := walkPath(document, path);
+        if k /= noIndex then
+            if kindOf(document, k) = kindTable then
+                let child: Index := childAt(document, k, n);
+                if child /= noIndex then
+                    return Some(value => copyOf(keyOf(document, child)));
+                end if;
+            end if;
+        end if;
+        let none: Option[String] := None();
+        return none;
+    end;
+end module body.

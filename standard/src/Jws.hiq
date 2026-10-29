@@ -1,0 +1,1238 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  Public keys from a JWK are written as DER here, from the
+-- fixed beginnings of the SubjectPublicKeyInfo of each curve and from the
+-- integers of RSA, so that no function of libcrypto that OpenSSL 3 has
+-- deprecated is needed; libcrypto then reads them as any other DER key.
+import Standard.String (
+    String,
+    makeEmpty,
+    fromSpan,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Base64 (
+    encodeUnpadded,
+    decodeUnpadded
+);
+import Standard.Text (
+    hexDigitValue,
+    substring
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    JsonKind,
+    JsonString,
+    JsonArray,
+    JsonWriter,
+    readJson,
+    destroyJson,
+    kindAt,
+    stringAt,
+    integerAt,
+    countAt,
+    valueTextAt,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    writeName,
+    writeString as writeJsonString,
+    finishJson
+);
+import Standard.X509 (
+    PrivateKey,
+    KeyKind,
+    EcP256,
+    EcP384,
+    EcP521,
+    Ed25519Key,
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
+    keyKindOf,
+    publicKeyKind,
+    signMessage,
+    verifyMessage
+);
+
+module body Standard.Jws is
+    constant noIndex: Index := 0;
+
+    -- A small number as an Index; a literal alone would be an Int32.
+    function counted(number: Int32): Index is
+        case toIndex(number) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                abort("Standard.Jws: a negative count");
+        end case;
+    end;
+
+    ---
+    --- base64url
+    ---
+
+    generic [R: Region]
+    function base64UrlEncode(bytes: Span[Nat8, R]): String is
+        let plain: String := encodeUnpadded(bytes);
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < length(&plain) do
+            let byte: Nat8 := nthByte(&plain, i);
+            if byte = '+' then
+                writeByte(&!out, '-');
+            else if byte = '/' then
+                writeByte(&!out, '_');
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(plain);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function base64UrlDecode(text: Span[Nat8, R]): Option[String] is
+        var plain: StringBuilder := makeStringBuilder();
+        var good: Bool := true;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if byte = '-' then
+                writeByte(&!plain, '+');
+            else if byte = '_' then
+                writeByte(&!plain, '/');
+            else if (byte = '+') or (byte = '/') then
+                good := false;
+            else
+                writeByte(&!plain, byte);
+            end if;
+            i := i + 1;
+        end while;
+        let standard: String := finalize(plain);
+        if good then
+            let decoded: Option[String] := decodeUnpadded(asSpan(&standard));
+            destroyString(standard);
+            return decoded;
+        else
+            destroyString(standard);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    ---
+    --- Algorithms
+    ---
+
+    function algorithmOf(kind: KeyKind): Span[Nat8, Static] is
+        case kind of
+            when EcP256 do
+                return "ES256";
+            when EcP384 do
+                return "ES384";
+            when EcP521 do
+                return "ES512";
+            when Ed25519Key do
+                return "EdDSA";
+            when Rsa2048 | Rsa3072 | Rsa4096 do
+                return "RS256";
+            when MlDsa44 do
+                return "ML-DSA-44";
+            when MlDsa65 do
+                return "ML-DSA-65";
+            when MlDsa87 do
+                return "ML-DSA-87";
+        end case;
+    end;
+
+    -- The bytes of one number of an ECDSA signature of kind in JOSE form;
+    -- 0 for a kind that is not ECDSA.
+    function numberBytes(kind: KeyKind): Index is
+        case kind of
+            when EcP256 do
+                return 32;
+            when EcP384 do
+                return 48;
+            when EcP521 do
+                return 66;
+            when Ed25519Key | Rsa2048 | Rsa3072 | Rsa4096 | MlDsa44 | MlDsa65 | MlDsa87 do
+                return noIndex;
+        end case;
+    end;
+
+    ---
+    --- DER
+    ---
+
+    -- The length of a DER value in the short or the long form.
+    generic [B: Region]
+    function writeLength(out: &![StringBuilder, B], size: Index): Unit is
+        if size < 128 then
+            writeByte(&~out, byteOf(size));
+        else if size < 256 then
+            writeByte(&~out, 129);
+            writeByte(&~out, byteOf(size));
+        else
+            writeByte(&~out, 130);
+            writeByte(&~out, byteOf(size / 256));
+            writeByte(&~out, byteOf(size - ((size / 256) * 256)));
+        end if;
+        return nil;
+    end;
+
+    function byteOf(number: Index): Nat8 is
+        case toNat8(number) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                abort("Standard.Jws: a byte did not fit a Nat8");
+                let zero: Nat8 := 0;
+                return zero;
+        end case;
+    end;
+
+    -- A DER value of tag around content.
+    generic [C: Region]
+    function wrapped(tag: Nat8, content: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, tag);
+        writeLength(&!out, spanLength(content));
+        writeString(&!out, content);
+        return finalize(out);
+    end;
+
+    -- A DER integer of the unsigned big-endian bytes of number.
+    generic [N: Region]
+    function integerOf(number: Span[Nat8, N]): String is
+        var start: Index := 0;
+        while ((start + 1) < spanLength(number)) and (number[start] = 0) do
+            start := start + 1;
+        end while;
+        var content: StringBuilder := makeStringBuilder();
+        if (spanLength(number) > 0) and (number[start] >= 128) then
+            writeByte(&!content, 0);
+        end if;
+        writeString(&!content, substring(number, start, spanLength(number)));
+        let envelope: String := finalize(content);
+        let integer: String := wrapped(2, asSpan(&envelope));
+        destroyString(envelope);
+        return integer;
+    end;
+
+    -- The bytes that hexadecimal text stands for; the text is this module's.
+    function fromHex(text: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while (i + 1) < spanLength(text) do
+            case hexDigitValue(text[i]) of
+                when Some(value as high: Nat8) do
+                    case hexDigitValue(text[i + 1]) of
+                        when Some(value as low: Nat8) do
+                            writeByte(&!out, (high * 16) + low);
+                        when None do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+            i := i + 2;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The JOSE form of a DER ECDSA signature, each number in size bytes.
+    generic [D: Region]
+    function joseOf(der: Span[Nat8, D], size: Index): Option[String] is
+        let total: Index := spanLength(der);
+        var at: Index := 2;
+        if (total < 8) or (der[0] /= 48) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if der[1] = 129 then
+            at := counted(3);
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        var good: Bool := true;
+        var round: Index := 0;
+        while good and (round < 2) do
+            if ((at + 2) > total) or (der[at] /= 2) then
+                good := false;
+            else
+                case toIndex(der[at + 1]) of
+                    when Some(value as count: Index) do
+                        var start: Index := at + 2;
+                        let stop: Index := start + count;
+                        if stop > total then
+                            good := false;
+                        else
+                            while ((stop - start) > size) and (der[start] = 0) do
+                                start := start + 1;
+                            end while;
+                            if (stop - start) > size then
+                                good := false;
+                            else
+                                var pad: Index := size - (stop - start);
+                                while pad > 0 do
+                                    writeByte(&!out, 0);
+                                    pad := pad - 1;
+                                end while;
+                                writeString(&!out, substring(der, start, stop));
+                                at := stop;
+                            end if;
+                        end if;
+                    when None do
+                        good := false;
+                end case;
+            end if;
+            round := round + 1;
+        end while;
+        let raw: String := finalize(out);
+        if good and (at = total) then
+            let some: Option[String] := Some(value => raw);
+            return some;
+        else
+            destroyString(raw);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    -- The DER form of a JOSE ECDSA signature of two numbers of size bytes.
+    generic [R: Region]
+    function derOf(raw: Span[Nat8, R], size: Index): Option[String] is
+        if spanLength(raw) /= (size + size) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let r: String := integerOf(substring(raw, 0, size));
+        let s: String := integerOf(substring(raw, size, size + size));
+        var both: StringBuilder := makeStringBuilder();
+        writeString(&!both, asSpan(&r));
+        writeString(&!both, asSpan(&s));
+        destroyString(r);
+        destroyString(s);
+        let content: String := finalize(both);
+        let sequence: String := wrapped(48, asSpan(&content));
+        destroyString(content);
+        let some: Option[String] := Some(value => sequence);
+        return some;
+    end;
+
+    ---
+    --- Signing and verifying
+    ---
+
+    generic [K: Region, P: Region, I: Region]
+    function signCompact(key: &[PrivateKey, K], payload: Span[Nat8, P], keyId: Span[Nat8, I]): Option[String] is
+        let kind: KeyKind := keyKindOf(key);
+        var header: JsonWriter := makeJsonWriter();
+        beginObject(&!header);
+        writeName(&!header, "alg");
+        writeJsonString(&!header, algorithmOf(kind));
+        if spanLength(keyId) > 0 then
+            writeName(&!header, "kid");
+            writeJsonString(&!header, keyId);
+        end if;
+        endObject(&!header);
+        case finishJson(header) of
+            when Some(value as headerText: String) do
+                let encodedHeader: String := base64UrlEncode(asSpan(&headerText));
+                destroyString(headerText);
+                let encodedPayload: String := base64UrlEncode(payload);
+                var input: StringBuilder := makeStringBuilder();
+                writeString(&!input, asSpan(&encodedHeader));
+                writeByte(&!input, '.');
+                writeString(&!input, asSpan(&encodedPayload));
+                let signingInput: String := finalize(input);
+                destroyString(encodedHeader);
+                destroyString(encodedPayload);
+                case signMessage(key, asSpan(&signingInput)) of
+                    when Some(value as signature: String) do
+                        var raw: Option[String] := None();
+                        if numberBytes(kind) > 0 then
+                            let previous: Option[String] := raw;
+                            dropText(previous);
+                            raw := joseOf(asSpan(&signature), numberBytes(kind));
+                        else
+                            let previous: Option[String] := raw;
+                            dropText(previous);
+                            raw := Some(value => fromSpan(asSpan(&signature)));
+                        end if;
+                        destroyString(signature);
+                        case raw of
+                            when Some(value as bytes: String) do
+                                let encoded: String := base64UrlEncode(asSpan(&bytes));
+                                destroyString(bytes);
+                                var token: StringBuilder := makeStringBuilder();
+                                writeString(&!token, asSpan(&signingInput));
+                                writeByte(&!token, '.');
+                                writeString(&!token, asSpan(&encoded));
+                                destroyString(encoded);
+                                destroyString(signingInput);
+                                let some: Option[String] := Some(value => finalize(token));
+                                return some;
+                            when None do
+                                destroyString(signingInput);
+                                let none: Option[String] := None();
+                                return none;
+                        end case;
+                    when None do
+                        destroyString(signingInput);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function dropText(text: Option[String]): Unit is
+        case text of
+            when Some(value as found: String) do
+                destroyString(found);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Where the two dots of a compact token stand; both 0 when it has not
+    -- exactly two.
+    record Dots: Free is
+        first: Index;
+        second: Index;
+    end;
+
+    generic [T: Region]
+    function dotsOf(token: Span[Nat8, T]): Dots is
+        var first: Index := 0;
+        var second: Index := 0;
+        var count: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(token) do
+            if token[i] = '.' then
+                count := count + 1;
+                if count = 1 then
+                    first := i;
+                else if count = 2 then
+                    second := i;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        if (count /= 2) or (first = 0) then
+            return Dots(first => noIndex, second => noIndex);
+        end if;
+        return Dots(first => first, second => second);
+    end;
+
+    -- The string at pointer of the JSON text, or an empty one.
+    generic [J: Region]
+    function fieldOf(json: Span[Nat8, J], pointer: Span[Nat8, Static]): String is
+        case readJson(json) of
+            when Right(right as document: Json) do
+                var found: String := makeEmpty();
+                case stringAt(&document, pointer) of
+                    when Some(value as text: String) do
+                        destroyString(found);
+                        found := text;
+                    when None do
+                        skip;
+                end case;
+                destroyJson(document);
+                return found;
+            when Left(left as error: JsonError) do
+                return makeEmpty();
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameText(left: Span[Nat8, R], right: Span[Nat8, S]): Bool is
+        if spanLength(left) /= spanLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(left) do
+            if left[i] /= right[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Region, P: Region]
+    function verifyCompact(token: Span[Nat8, T], publicDer: Span[Nat8, P]): Option[String] is
+        let dots: Dots := dotsOf(token);
+        if dots.first = 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case publicKeyKind(publicDer) of
+            when Some(value as kind: KeyKind) do
+                case base64UrlDecode(substring(token, 0, dots.first)) of
+                    when Some(value as header: String) do
+                        let named: String := fieldOf(asSpan(&header), "/alg");
+                        destroyString(header);
+                        let fits: Bool := sameText(asSpan(&named), algorithmOf(kind));
+                        destroyString(named);
+                        if not fits then
+                            let none: Option[String] := None();
+                            return none;
+                        end if;
+                        return checked(token, dots, publicDer, kind);
+                    when None do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The signature of token checked under publicDer of kind; the payload
+    -- when it holds.
+    generic [T: Region, P: Region]
+    function checked(token: Span[Nat8, T], dots: Dots, publicDer: Span[Nat8, P], kind: KeyKind): Option[String] is
+        case base64UrlDecode(substring(token, dots.second + 1, spanLength(token))) of
+            when Some(value as raw: String) do
+                var signature: Option[String] := None();
+                if numberBytes(kind) > 0 then
+                    let previous: Option[String] := signature;
+                    dropText(previous);
+                    signature := derOf(asSpan(&raw), numberBytes(kind));
+                else
+                    let previous: Option[String] := signature;
+                    dropText(previous);
+                    signature := Some(value => fromSpan(asSpan(&raw)));
+                end if;
+                destroyString(raw);
+                case signature of
+                    when Some(value as bytes: String) do
+                        let holds: Bool := verifyMessage(publicDer, substring(token, 0, dots.second), asSpan(&bytes));
+                        destroyString(bytes);
+                        if holds then
+                            return base64UrlDecode(substring(token, dots.first + 1, dots.second));
+                        end if;
+                        let none: Option[String] := None();
+                        return none;
+                    when None do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    ---
+    --- JSON Web Keys
+    ---
+
+    generic [J: Region]
+    function publicKeyFromJwk(jwk: Span[Nat8, J]): Option[String] is
+        let kty: String := fieldOf(jwk, "/kty");
+        let crv: String := fieldOf(jwk, "/crv");
+        var out: Option[String] := None();
+        if sameText(asSpan(&kty), "EC") then
+            let previous: Option[String] := out;
+            dropText(previous);
+            out := ecKey(jwk, &crv);
+        else if sameText(asSpan(&kty), "OKP") and sameText(asSpan(&crv), "Ed25519") then
+            let previous: Option[String] := out;
+            dropText(previous);
+            out := okpKey(jwk);
+        else if sameText(asSpan(&kty), "RSA") then
+            let previous: Option[String] := out;
+            dropText(previous);
+            out := rsaKey(jwk);
+        else if sameText(asSpan(&kty), "AKP") then
+            let previous: Option[String] := out;
+            dropText(previous);
+            out := akpKey(jwk);
+        end if;
+        destroyString(kty);
+        destroyString(crv);
+        return out;
+    end;
+
+    -- The SubjectPublicKeyInfo of an ML-DSA key before its raw bytes: the
+    -- algorithm with its object identifier (2.16.840.1.101.3.4.3.17, 18 and 19)
+    -- and the head of the bit string; empty for every other kind.
+    function mlDsaPrefix(kind: KeyKind): String is
+        case kind of
+            when MlDsa44 do
+                return fromHex("30820532300b06096086480165030403110382052100");
+            when MlDsa65 do
+                return fromHex("308207b2300b0609608648016503040312038207a100");
+            when MlDsa87 do
+                return fromHex("30820a32300b060960864801650304031303820a2100");
+            when EcP256 | EcP384 | EcP521 | Ed25519Key | Rsa2048 | Rsa3072 | Rsa4096 do
+                return makeEmpty();
+        end case;
+    end;
+
+    -- The length of the raw public key of an ML-DSA kind, FIPS 204; 0 for
+    -- every other kind.
+    function mlDsaSize(kind: KeyKind): Index is
+        case kind of
+            when MlDsa44 do
+                return counted(1312);
+            when MlDsa65 do
+                return counted(1952);
+            when MlDsa87 do
+                return counted(2592);
+            when EcP256 | EcP384 | EcP521 | Ed25519Key | Rsa2048 | Rsa3072 | Rsa4096 do
+                return 0;
+        end case;
+    end;
+
+    -- A key of kty "AKP": alg names the ML-DSA kind and pub holds the raw
+    -- public key, which goes into its SubjectPublicKeyInfo.
+    generic [J: Region]
+    function akpKey(jwk: Span[Nat8, J]): Option[String] is
+        let alg: String := fieldOf(jwk, "/alg");
+        var kind: Option[KeyKind] := None();
+        if sameText(asSpan(&alg), "ML-DSA-44") then
+            kind := Some(value => MlDsa44());
+        else if sameText(asSpan(&alg), "ML-DSA-65") then
+            kind := Some(value => MlDsa65());
+        else if sameText(asSpan(&alg), "ML-DSA-87") then
+            kind := Some(value => MlDsa87());
+        end if;
+        destroyString(alg);
+        case kind of
+            when Some(value as k: KeyKind) do
+                let pubText: String := fieldOf(jwk, "/pub");
+                let pub: Option[String] := base64UrlDecode(asSpan(&pubText));
+                destroyString(pubText);
+                case pub of
+                    when Some(value as bytes: String) do
+                        if length(&bytes) /= mlDsaSize(k) then
+                            destroyString(bytes);
+                            let none: Option[String] := None();
+                            return none;
+                        end if;
+                        var out: StringBuilder := makeStringBuilder();
+                        let prefix: String := mlDsaPrefix(k);
+                        writeString(&!out, asSpan(&prefix));
+                        writeString(&!out, asSpan(&bytes));
+                        destroyString(prefix);
+                        destroyString(bytes);
+                        let some: Option[String] := Some(value => finalize(out));
+                        return some;
+                    when None do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [J: Region, C: Region]
+    function ecKey(jwk: Span[Nat8, J], crv: &[String, C]): Option[String] is
+        var size: Index := 0;
+        var prefix: String := makeEmpty();
+        if sameText(asSpan(crv), "P-256") then
+            size := counted(32);
+            destroyString(prefix);
+            prefix := fromHex("3059301306072a8648ce3d020106082a8648ce3d03010703420004");
+        else if sameText(asSpan(crv), "P-384") then
+            size := counted(48);
+            destroyString(prefix);
+            prefix := fromHex("3076301006072a8648ce3d020106052b8104002203620004");
+        else if sameText(asSpan(crv), "P-521") then
+            size := counted(66);
+            destroyString(prefix);
+            prefix := fromHex("30819b301006072a8648ce3d020106052b810400230381860004");
+        end if;
+        let xText: String := fieldOf(jwk, "/x");
+        let yText: String := fieldOf(jwk, "/y");
+        let x: Option[String] := base64UrlDecode(asSpan(&xText));
+        let y: Option[String] := base64UrlDecode(asSpan(&yText));
+        destroyString(xText);
+        destroyString(yText);
+        case x of
+            when Some(value as xBytes: String) do
+                case y of
+                    when Some(value as yBytes: String) do
+                        let fits: Bool := ((size > 0) and (length(&xBytes) = size)) and (length(&yBytes) = size);
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, asSpan(&prefix));
+                        writeString(&!out, asSpan(&xBytes));
+                        writeString(&!out, asSpan(&yBytes));
+                        destroyString(xBytes);
+                        destroyString(yBytes);
+                        destroyString(prefix);
+                        let der: String := finalize(out);
+                        if fits then
+                            let some: Option[String] := Some(value => der);
+                            return some;
+                        else
+                            destroyString(der);
+                            let none: Option[String] := None();
+                            return none;
+                        end if;
+                    when None do
+                        destroyString(xBytes);
+                        destroyString(prefix);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                dropText(y);
+                destroyString(prefix);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [J: Region]
+    function okpKey(jwk: Span[Nat8, J]): Option[String] is
+        let xText: String := fieldOf(jwk, "/x");
+        let x: Option[String] := base64UrlDecode(asSpan(&xText));
+        destroyString(xText);
+        case x of
+            when Some(value as bytes: String) do
+                if length(&bytes) /= 32 then
+                    destroyString(bytes);
+                    let none: Option[String] := None();
+                    return none;
+                else
+                    var out: StringBuilder := makeStringBuilder();
+                    let prefix: String := fromHex("302a300506032b6570032100");
+                    writeString(&!out, asSpan(&prefix));
+                    writeString(&!out, asSpan(&bytes));
+                    destroyString(prefix);
+                    destroyString(bytes);
+                    let some: Option[String] := Some(value => finalize(out));
+                    return some;
+                end if;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The DER of an RSA public key of at least 2048 bits from its modulus
+    -- and exponent, both given up.
+    function rsaDer(modulus: String, exponent: String): Option[String] is
+        let fits: Bool := (length(&modulus) >= 256) and (length(&exponent) > 0);
+        let nInteger: String := integerOf(asSpan(&modulus));
+        let eInteger: String := integerOf(asSpan(&exponent));
+        destroyString(modulus);
+        destroyString(exponent);
+        var pair: StringBuilder := makeStringBuilder();
+        writeString(&!pair, asSpan(&nInteger));
+        writeString(&!pair, asSpan(&eInteger));
+        destroyString(nInteger);
+        destroyString(eInteger);
+        let pairBody: String := finalize(pair);
+        let rsaPublic: String := wrapped(48, asSpan(&pairBody));
+        destroyString(pairBody);
+        var bits: StringBuilder := makeStringBuilder();
+        writeByte(&!bits, 0);
+        writeString(&!bits, asSpan(&rsaPublic));
+        destroyString(rsaPublic);
+        let bitsBody: String := finalize(bits);
+        let bitString: String := wrapped(3, asSpan(&bitsBody));
+        destroyString(bitsBody);
+        let algorithm: String := fromHex("300d06092a864886f70d0101010500");
+        var whole: StringBuilder := makeStringBuilder();
+        writeString(&!whole, asSpan(&algorithm));
+        writeString(&!whole, asSpan(&bitString));
+        destroyString(algorithm);
+        destroyString(bitString);
+        let wholeBody: String := finalize(whole);
+        let spki: String := wrapped(48, asSpan(&wholeBody));
+        destroyString(wholeBody);
+        if fits then
+            let some: Option[String] := Some(value => spki);
+            return some;
+        else
+            destroyString(spki);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    -- sequence { sequence { rsaEncryption, null }, bit string { 0,
+    -- sequence { n, e } } }.
+    generic [J: Region]
+    function rsaKey(jwk: Span[Nat8, J]): Option[String] is
+        let nText: String := fieldOf(jwk, "/n");
+        let eText: String := fieldOf(jwk, "/e");
+        let n: Option[String] := base64UrlDecode(asSpan(&nText));
+        let e: Option[String] := base64UrlDecode(asSpan(&eText));
+        destroyString(nText);
+        destroyString(eText);
+        case n of
+            when Some(value as modulus: String) do
+                case e of
+                    when Some(value as exponent: String) do
+                        return rsaDer(modulus, exponent);
+                    when None do
+                        destroyString(modulus);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                dropText(e);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The beginning of the SubjectPublicKeyInfo of a curve up to its point.
+    function prefixOf(kind: KeyKind): String is
+        case kind of
+            when EcP256 do
+                return fromHex("3059301306072a8648ce3d020106082a8648ce3d03010703420004");
+            when EcP384 do
+                return fromHex("3076301006072a8648ce3d020106052b8104002203620004");
+            when EcP521 do
+                return fromHex("30819b301006072a8648ce3d020106052b810400230381860004");
+            when Ed25519Key do
+                return fromHex("302a300506032b6570032100");
+            when Rsa2048 | Rsa3072 | Rsa4096 | MlDsa44 | MlDsa65 | MlDsa87 do
+                return makeEmpty();
+        end case;
+    end;
+
+    generic [P: Region, B: Region]
+    function startsWithBytes(bytes: Span[Nat8, P], prefix: &[String, B]): Bool is
+        if spanLength(bytes) < length(prefix) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(prefix) do
+            if bytes[i] /= nthByte(prefix, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- A DER length at at: its value and where the content starts; both 0
+    -- when it is none this module reads.
+    record Length: Free is
+        size: Index;
+        start: Index;
+    end;
+
+    generic [P: Region]
+    function lengthAt(bytes: Span[Nat8, P], at: Index): Length is
+        let total: Index := spanLength(bytes);
+        if at >= total then
+            return Length(size => noIndex, start => noIndex);
+        end if;
+        let first: Nat8 := bytes[at];
+        if first < 128 then
+            return Length(size => indexOf(first), start => at + 1);
+        end if;
+        if (first = 129) and ((at + 1) < total) then
+            return Length(size => indexOf(bytes[at + 1]), start => at + 2);
+        end if;
+        if (first = 130) and ((at + 2) < total) then
+            return Length(size => (indexOf(bytes[at + 1]) * 256) + indexOf(bytes[at + 2]), start => at + 3);
+        end if;
+        return Length(size => noIndex, start => noIndex);
+    end;
+
+    function indexOf(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                return noIndex;
+        end case;
+    end;
+
+    -- The members of an RSA JWK from its DER: the integers n and e inside
+    -- the bit string, each without a leading zero.
+    generic [P: Region, B: Region]
+    function writeRsaMembers(der: Span[Nat8, P], out: &![JsonWriter, B]): Bool is
+        -- sequence, then the algorithm sequence of 15 bytes, then the bit
+        -- string, its unused-bits byte, the sequence of n and e.
+        let outer: Length := lengthAt(der, 1);
+        if (outer.start = 0) or (der[0] /= 48) then
+            return false;
+        end if;
+        let bitsAt: Index := outer.start + 15;
+        if ((bitsAt + 1) >= spanLength(der)) or (der[bitsAt] /= 3) then
+            return false;
+        end if;
+        let bits: Length := lengthAt(der, bitsAt + 1);
+        let pairAt: Index := bits.start + 1;
+        if (bits.start = 0) or ((pairAt + 1) >= spanLength(der)) then
+            return false;
+        end if;
+        let pair: Length := lengthAt(der, pairAt + 1);
+        let nAt: Index := pair.start;
+        if ((nAt = 0) or ((nAt + 1) >= spanLength(der))) or (der[nAt] /= 2) then
+            return false;
+        end if;
+        return writeRsaNumbers(der, nAt, out);
+    end;
+
+    generic [P: Region, B: Region]
+    function writeRsaNumbers(der: Span[Nat8, P], nAt: Index, out: &![JsonWriter, B]): Bool is
+        let n: Length := lengthAt(der, nAt + 1);
+        let eAt: Index := n.start + n.size;
+        if ((n.start = 0) or ((eAt + 1) >= spanLength(der))) or (der[eAt] /= 2) then
+            return false;
+        end if;
+        let e: Length := lengthAt(der, eAt + 1);
+        if (e.start = 0) or ((e.start + e.size) > spanLength(der)) then
+            return false;
+        end if;
+        let eText: String := base64UrlEncode(withoutZero(der, e.start, e.start + e.size));
+        let nText: String := base64UrlEncode(withoutZero(der, n.start, n.start + n.size));
+        writeName(&~out, "e");
+        writeJsonString(&~out, asSpan(&eText));
+        writeName(&~out, "kty");
+        writeJsonString(&~out, "RSA");
+        writeName(&~out, "n");
+        writeJsonString(&~out, asSpan(&nText));
+        destroyString(eText);
+        destroyString(nText);
+        return true;
+    end;
+
+    generic [P: Region]
+    function withoutZero(der: Span[Nat8, P], start: Index, stop: Index): Span[Nat8, P] is
+        var startAt: Index := start;
+        while ((startAt + 1) < stop) and (der[startAt] = 0) do
+            startAt := startAt + 1;
+        end while;
+        return substring(der, startAt, stop);
+    end;
+
+    generic [P: Region]
+    function jwkOfPublicKey(publicDer: Span[Nat8, P]): Option[String] is
+        case publicKeyKind(publicDer) of
+            when Some(value as kind: KeyKind) do
+                var writer: JsonWriter := makeJsonWriter();
+                beginObject(&!writer);
+                var good: Bool := true;
+                let prefix: String := prefixOf(kind);
+                let size: Index := numberBytes(kind);
+                let dsaPrefix: String := mlDsaPrefix(kind);
+                if length(&dsaPrefix) > 0 then
+                    good := startsWithBytes(publicDer, &dsaPrefix) and (spanLength(publicDer) = (length(&dsaPrefix) + mlDsaSize(kind)));
+                    if good then
+                        let pub: String := base64UrlEncode(substring(publicDer, length(&dsaPrefix), spanLength(publicDer)));
+                        writeName(&!writer, "alg");
+                        writeJsonString(&!writer, algorithmOf(kind));
+                        writeName(&!writer, "kty");
+                        writeJsonString(&!writer, "AKP");
+                        writeName(&!writer, "pub");
+                        writeJsonString(&!writer, asSpan(&pub));
+                        destroyString(pub);
+                    end if;
+                else if size > 0 then
+                    good := startsWithBytes(publicDer, &prefix) and (spanLength(publicDer) = (length(&prefix) + (size + size)));
+                    if good then
+                        let x: String := base64UrlEncode(substring(publicDer, length(&prefix), length(&prefix) + size));
+                        let y: String := base64UrlEncode(substring(publicDer, length(&prefix) + size, spanLength(publicDer)));
+                        writeName(&!writer, "crv");
+                        writeJsonString(&!writer, curveOf(kind));
+                        writeName(&!writer, "kty");
+                        writeJsonString(&!writer, "EC");
+                        writeName(&!writer, "x");
+                        writeJsonString(&!writer, asSpan(&x));
+                        writeName(&!writer, "y");
+                        writeJsonString(&!writer, asSpan(&y));
+                        destroyString(x);
+                        destroyString(y);
+                    end if;
+                else if length(&prefix) > 0 then
+                    good := startsWithBytes(publicDer, &prefix) and (spanLength(publicDer) = (length(&prefix) + 32));
+                    if good then
+                        let x: String := base64UrlEncode(substring(publicDer, length(&prefix), spanLength(publicDer)));
+                        writeName(&!writer, "crv");
+                        writeJsonString(&!writer, "Ed25519");
+                        writeName(&!writer, "kty");
+                        writeJsonString(&!writer, "OKP");
+                        writeName(&!writer, "x");
+                        writeJsonString(&!writer, asSpan(&x));
+                        destroyString(x);
+                    end if;
+                else
+                    good := isRsa(kind) and writeRsaMembers(publicDer, &!writer);
+                end if;
+                destroyString(prefix);
+                destroyString(dsaPrefix);
+                endObject(&!writer);
+                let text: Option[String] := finishJson(writer);
+                if good then
+                    return text;
+                else
+                    dropText(text);
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function isRsa(kind: KeyKind): Bool is
+        case kind of
+            when Rsa2048 | Rsa3072 | Rsa4096 do
+                return true;
+            when EcP256 | EcP384 | EcP521 | Ed25519Key | MlDsa44 | MlDsa65 | MlDsa87 do
+                return false;
+        end case;
+    end;
+
+    function curveOf(kind: KeyKind): Span[Nat8, Static] is
+        case kind of
+            when EcP384 do
+                return "P-384";
+            when EcP521 do
+                return "P-521";
+            when EcP256 | Ed25519Key | Rsa2048 | Rsa3072 | Rsa4096 | MlDsa44 | MlDsa65 | MlDsa87 do
+                return "P-256";
+        end case;
+    end;
+
+    generic [T: Region, J: Region]
+    function verifyWithJwks(token: Span[Nat8, T], jwks: Span[Nat8, J]): Option[String] is
+        let dots: Dots := dotsOf(token);
+        if dots.first = 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var kid: String := makeEmpty();
+        case base64UrlDecode(substring(token, 0, dots.first)) of
+            when Some(value as header: String) do
+                destroyString(kid);
+                kid := fieldOf(asSpan(&header), "/kid");
+                destroyString(header);
+            when None do
+                skip;
+        end case;
+        case readJson(jwks) of
+            when Right(right as document: Json) do
+                var result: Option[String] := None();
+                case countAt(&document, "/keys") of
+                    when Some(value as count: Index) do
+                        var i: Index := 0;
+                        while i < count do
+                            let path: String := keyPath(i, "");
+                            let kidPath: String := keyPath(i, "/kid");
+                            var keyKid: String := makeEmpty();
+                            case stringAt(&document, asSpan(&kidPath)) of
+                                when Some(value as found: String) do
+                                    destroyString(keyKid);
+                                    keyKid := found;
+                                when None do
+                                    skip;
+                            end case;
+                            let named: Bool := sameText(asSpan(&keyKid), asSpan(&kid)) and (length(&kid) > 0);
+                            let alone: Bool := (length(&kid) = 0) and (count = 1);
+                            let chosen: Bool := named or alone;
+                            destroyString(keyKid);
+                            destroyString(kidPath);
+                            if chosen then
+                                case valueTextAt(&document, asSpan(&path)) of
+                                    when Some(value as jwkText: String) do
+                                        case publicKeyFromJwk(asSpan(&jwkText)) of
+                                            when Some(value as der: String) do
+                                                let previous: Option[String] := result;
+                                                dropText(previous);
+                                                result := verifyCompact(token, asSpan(&der));
+                                                destroyString(der);
+                                            when None do
+                                                skip;
+                                        end case;
+                                        destroyString(jwkText);
+                                    when None do
+                                        skip;
+                                end case;
+                            end if;
+                            destroyString(path);
+                            i := i + 1;
+                        end while;
+                    when None do
+                        skip;
+                end case;
+                destroyJson(document);
+                destroyString(kid);
+                return result;
+            when Left(left as error: JsonError) do
+                destroyString(kid);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function keyPath(index: Index, rest: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "/keys/");
+        writeDecimal(&!out, index);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    generic [B: Region]
+    function writeDecimal(out: &![StringBuilder, B], number: Index): Unit is
+        let ten: Index := 10;
+        if number >= ten then
+            writeDecimal(&~out, number / ten);
+        end if;
+        writeByte(&~out, byteOf(number - ((number / ten) * ten)) + 48);
+        return nil;
+    end;
+
+    ---
+    --- Claims
+    ---
+
+    function problem(text: Span[Nat8, Static]): Option[String] is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, text);
+        let some: Option[String] := Some(value => finalize(out));
+        return some;
+    end;
+
+    generic [D: Region, A: Region]
+    function audienceHolds(document: &[Json, D], audience: Span[Nat8, A]): Bool is
+        case kindAt(document, "/aud") of
+            when Some(value as kind: JsonKind) do
+                case kind of
+                    when JsonString do
+                        case stringAt(document, "/aud") of
+                            when Some(value as found: String) do
+                                let same: Bool := sameText(asSpan(&found), audience);
+                                destroyString(found);
+                                return same;
+                            when None do
+                                return false;
+                        end case;
+                    when JsonArray do
+                        var holds: Bool := false;
+                        case countAt(document, "/aud") of
+                            when Some(value as count: Index) do
+                                var i: Index := 0;
+                                while i < count do
+                                    var path: StringBuilder := makeStringBuilder();
+                                    writeString(&!path, "/aud/");
+                                    writeDecimal(&!path, i);
+                                    let pointer: String := finalize(path);
+                                    case stringAt(document, asSpan(&pointer)) of
+                                        when Some(value as found: String) do
+                                            if sameText(asSpan(&found), audience) then
+                                                holds := true;
+                                            end if;
+                                            destroyString(found);
+                                        when None do
+                                            skip;
+                                    end case;
+                                    destroyString(pointer);
+                                    i := i + 1;
+                                end while;
+                            when None do
+                                skip;
+                        end case;
+                        return holds;
+                    when JsonNull | JsonBoolean | JsonNumber | JsonObject do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [P: Region, I: Region, A: Region, N: Region]
+    function claimsProblem(payload: Span[Nat8, P], issuer: Span[Nat8, I], audience: Span[Nat8, A],
+        nonce: Span[Nat8, N], now: Int64, leeway: Int64): Option[String] is
+        case readJson(payload) of
+            when Right(right as document: Json) do
+                let result: Option[String] := claimsOf(&document, issuer, audience, nonce, now, leeway);
+                destroyJson(document);
+                return result;
+            when Left(left as error: JsonError) do
+                return problem("the payload is no JSON");
+        end case;
+    end;
+
+    generic [D: Region, I: Region, A: Region, N: Region]
+    function claimsOf(document: &[Json, D], issuer: Span[Nat8, I], audience: Span[Nat8, A],
+        nonce: Span[Nat8, N], now: Int64, leeway: Int64): Option[String] is
+        case stringAt(document, "/iss") of
+            when Some(value as found: String) do
+                let same: Bool := sameText(asSpan(&found), issuer);
+                destroyString(found);
+                if not same then
+                    return problem("iss is another issuer");
+                end if;
+            when None do
+                return problem("there is no iss");
+        end case;
+        if not audienceHolds(document, audience) then
+            return problem("aud does not name the audience");
+        end if;
+        case integerAt(document, "/exp") of
+            when Some(value as expires: Int64) do
+                if (expires + leeway) <= now then
+                    return problem("the token has expired");
+                end if;
+            when None do
+                return problem("there is no exp");
+        end case;
+        case integerAt(document, "/nbf") of
+            when Some(value as notBefore: Int64) do
+                if notBefore > (now + leeway) then
+                    return problem("the token is not valid yet");
+                end if;
+            when None do
+                skip;
+        end case;
+        if spanLength(nonce) > 0 then
+            case stringAt(document, "/nonce") of
+                when Some(value as found: String) do
+                    let same: Bool := sameText(asSpan(&found), nonce);
+                    destroyString(found);
+                    if not same then
+                        return problem("nonce is another nonce");
+                    end if;
+                when None do
+                    return problem("there is no nonce");
+            end case;
+        end if;
+        let none: Option[String] := None();
+        return none;
+    end;
+end module body.

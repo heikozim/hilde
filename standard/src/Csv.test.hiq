@@ -1,0 +1,352 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Tests for Standard.Csv: the examples of RFC 4180 section 2, the
+-- separators a spreadsheet writes, every refusal with its line and byte,
+-- and what the writer writes and refuses.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Text (
+    constantTimeEqual
+);
+import Standard.Csv (
+    CsvFault,
+    QuoteInPlainField,
+    TextAfterQuote,
+    UnclosedQuote,
+    NotUtf8,
+    RaggedRow,
+    BadSeparator,
+    CsvError,
+    CsvTable,
+    CsvWriter,
+    readCsv,
+    readCsvWith,
+    destroyCsv,
+    rowCount,
+    columnCount,
+    fieldAt,
+    makeCsvWriter,
+    makeCsvWriterWith,
+    writeField,
+    endRow,
+    finishCsv
+);
+
+module body Standard.Csv.Test is
+    ---
+    --- Helpers
+    ---
+
+    generic [R: Region, S: Region]
+    function fieldIs(table: &[CsvTable, R], row: Index, column: Index, want: Span[Nat8, S]): Bool is
+        case fieldAt(table, row, column) of
+            when Some(value as field: Span[Nat8, R]) do
+                return constantTimeEqual(field, want);
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function noField(table: &[CsvTable, R], row: Index, column: Index): Bool is
+        case fieldAt(table, row, column) of
+            when Some(value as field: Span[Nat8, R]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function faultNumber(fault: CsvFault): Nat8 is
+        case fault of
+            when QuoteInPlainField do
+                return 1;
+            when TextAfterQuote do
+                return 2;
+            when UnclosedQuote do
+                return 3;
+            when NotUtf8 do
+                return 4;
+            when RaggedRow do
+                return 5;
+            when BadSeparator do
+                return 6;
+        end case;
+    end;
+
+    generic [R: Region]
+    function refusedWith(text: Span[Nat8, R], separator: Nat8, fault: CsvFault, line: Index, offset: Index): Bool is
+        case readCsvWith(text, separator) of
+            when Left(left as error: CsvError) do
+                return ((faultNumber(error.fault) = faultNumber(fault)) and (error.line = line)) and (error.offset = offset);
+            when Right(right as table: CsvTable) do
+                destroyCsv(table);
+                return false;
+        end case;
+    end;
+
+    -- The shape of a table read from text: rows and columns.
+    generic [R: Region]
+    function shapeIs(text: Span[Nat8, R], rows: Index, columns: Index): Bool is
+        case readCsv(text) of
+            when Left(left: CsvError) do
+                return false;
+            when Right(right as table: CsvTable) do
+                let same: Bool := (rowCount(&table) = rows) and (columnCount(&table) = columns);
+                destroyCsv(table);
+                return same;
+        end case;
+    end;
+
+    generic [S: Region]
+    function writes(writer: CsvWriter, want: Span[Nat8, S]): Bool is
+        case finishCsv(writer) of
+            when Some(value as text: String) do
+                let same: Bool := constantTimeEqual(asSpan(&text), want);
+                destroyString(text);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refusesToFinish(writer: CsvWriter): Bool is
+        case finishCsv(writer) of
+            when Some(value as text: String) do
+                destroyString(text);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    ---
+    --- Reading, RFC 4180 section 2
+    ---
+
+    function testRecordsAndLineEnds(): Unit is
+        assertTrue(shapeIs("aaa,bbb,ccc\r\nzzz,yyy,xxx\r\n", 2, 3), "two records with CR LF");
+        assertTrue(shapeIs("aaa,bbb,ccc\r\nzzz,yyy,xxx", 2, 3), "the last one without a line end");
+        assertTrue(shapeIs("aaa,bbb,ccc\nzzz,yyy,xxx\n", 2, 3), "line feeds alone");
+        assertTrue(shapeIs("a,b\n\n\nc,d\n", 2, 2), "empty lines are no rows");
+        assertTrue(shapeIs("", 0, 0), "an empty text is an empty table");
+        assertTrue(shapeIs("a,", 1, 2), "a separator at the end is an empty last field");
+        assertTrue(shapeIs("a,\nb,", 2, 2), "and at the end of every row");
+        return nil;
+    end;
+
+    function testQuotedFields(): Unit is
+        case readCsv("\"aaa\",\"b\r\nbb\",\"ccc\"\r\nzzz,\"y,y\",\"x\"\"x\"\r\n") of
+            when Left(left: CsvError) do
+                assertTrue(false, "the text is read");
+            when Right(right as table: CsvTable) do
+                assertTrue(rowCount(&table) = 2, "two rows");
+                assertTrue(fieldIs(&table, 0, 0, "aaa"), "the quotes are taken off");
+                assertTrue(fieldIs(&table, 0, 1, "b\r\nbb"), "a line break inside quotes");
+                assertTrue(fieldIs(&table, 1, 1, "y,y"), "a comma inside quotes");
+                assertTrue(fieldIs(&table, 1, 2, "x\"x"), "a doubled quote is one");
+                assertTrue(fieldIs(&table, 1, 0, "zzz"), "a plain field beside quoted ones");
+                assertTrue(noField(&table, 2, 0), "no third row");
+                assertTrue(noField(&table, 0, 3), "no fourth column");
+                destroyCsv(table);
+        end case;
+        return nil;
+    end;
+
+    function testEmptyAndSpaces(): Unit is
+        case readCsv("\"\",b, c \n,,\n") of
+            when Left(left: CsvError) do
+                assertTrue(false, "the text is read");
+            when Right(right as table: CsvTable) do
+                assertTrue(fieldIs(&table, 0, 0, ""), "two quotes are an empty field");
+                assertTrue(fieldIs(&table, 0, 2, " c "), "spaces belong to the field");
+                assertTrue(fieldIs(&table, 1, 1, ""), "nothing between separators");
+                assertTrue(columnCount(&table) = 3, "three columns");
+                destroyCsv(table);
+        end case;
+        return nil;
+    end;
+
+    -- The separators a spreadsheet writes, and the mark it puts first.
+    function testSeparatorsAndMark(): Unit is
+        case readCsvWith("Name;Betrag\n\"Mueller; Hans\";3,50\n", ';') of
+            when Left(left: CsvError) do
+                assertTrue(false, "the text is read");
+            when Right(right as table: CsvTable) do
+                assertTrue(fieldIs(&table, 1, 1, "3,50"), "a comma is data where the semicolon separates");
+                assertTrue(columnCount(&table) = 2, "two columns");
+                destroyCsv(table);
+        end case;
+        case readCsvWith("a\tb\nc\td\n", '\t') of
+            when Left(left: CsvError) do
+                assertTrue(false, "the text with tabs is read");
+            when Right(right as table: CsvTable) do
+                assertTrue(fieldIs(&table, 1, 1, "d"), "a tab separates");
+                destroyCsv(table);
+        end case;
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, #xEF);
+        writeByte(&!builder, #xBB);
+        writeByte(&!builder, #xBF);
+        writeByte(&!builder, 'x');
+        writeByte(&!builder, ',');
+        writeByte(&!builder, 'y');
+        let marked: String := finalize(builder);
+        case readCsv(asSpan(&marked)) of
+            when Left(left: CsvError) do
+                assertTrue(false, "a text with a byte order mark is read");
+            when Right(right as table: CsvTable) do
+                assertTrue(fieldIs(&table, 0, 0, "x"), "the mark is not part of the first field");
+                destroyCsv(table);
+        end case;
+        destroyString(marked);
+        return nil;
+    end;
+
+    ---
+    --- Refusals
+    ---
+
+    function testRefusals(): Unit is
+        assertTrue(refusedWith("a\"b,c\n", ',', QuoteInPlainField(), 1, 1), "a quote inside a plain field");
+        assertTrue(refusedWith("\"a\"b,c\n", ',', TextAfterQuote(), 1, 3), "text after the closing quote");
+        assertTrue(refusedWith("x,y\n\"abc", ',', UnclosedQuote(), 2, 4), "a quoted field the text ends inside");
+        assertTrue(refusedWith("a,b\nc\n", ',', RaggedRow(), 2, 4), "a row with fewer fields");
+        assertTrue(refusedWith("a\n\"1\n2\",x\nc\n", ',', RaggedRow(), 2, 2), "a row with more fields, after a line break in quotes");
+        assertTrue(refusedWith("\"1\n2\"\n\"3\"x\n", ',', TextAfterQuote(), 3, 9), "the line after a quoted line break");
+        assertTrue(refusedWith("a,b", '"', BadSeparator(), 1, 0), "a quote as the separator");
+        assertTrue(refusedWith("a,b", '\n', BadSeparator(), 1, 0), "a line feed as the separator");
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, 'a');
+        writeByte(&!builder, '\n');
+        writeByte(&!builder, 'b');
+        writeByte(&!builder, 255);
+        let broken: String := finalize(builder);
+        assertTrue(refusedWith(asSpan(&broken), ',', NotUtf8(), 2, 3), "a byte that is not UTF-8");
+        destroyString(broken);
+        return nil;
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    function testWrite(): Unit is
+        var writer: CsvWriter := makeCsvWriter();
+        writeField(&!writer, "plain");
+        writeField(&!writer, "with,comma");
+        writeField(&!writer, "with \"quote\"");
+        endRow(&!writer);
+        writeField(&!writer, "line\nbreak");
+        writeField(&!writer, "");
+        writeField(&!writer, "x");
+        endRow(&!writer);
+        assertTrue(writes(writer, "plain,\"with,comma\",\"with \"\"quote\"\"\"\r\n\"line\nbreak\",,x\r\n"), "quotes only where needed, CR LF after every row");
+        return nil;
+    end;
+
+    function testWriteSemicolonAndEmpty(): Unit is
+        var writer: CsvWriter := makeCsvWriterWith(';');
+        writeField(&!writer, "3,50");
+        writeField(&!writer, "a;b");
+        endRow(&!writer);
+        assertTrue(writes(writer, "3,50;\"a;b\"\r\n"), "the separator given decides what is quoted");
+        var single: CsvWriter := makeCsvWriter();
+        writeField(&!single, "");
+        endRow(&!single);
+        writeField(&!single, "x");
+        endRow(&!single);
+        case finishCsv(single) of
+            when Some(value as text: String) do
+                assertTrue(constantTimeEqual(asSpan(&text), "\"\"\r\nx\r\n"), "an empty field alone is two quotes");
+                case readCsv(asSpan(&text)) of
+                    when Left(left: CsvError) do
+                        assertTrue(false, "it is read back");
+                    when Right(right as table: CsvTable) do
+                        assertTrue(rowCount(&table) = 2, "and stays a row");
+                        destroyCsv(table);
+                end case;
+                destroyString(text);
+            when None do
+                assertTrue(false, "the writer finishes");
+        end case;
+        return nil;
+    end;
+
+    -- What the writer writes is read back field for field.
+    function testRoundTrip(): Unit is
+        var writer: CsvWriter := makeCsvWriter();
+        writeField(&!writer, "a\"b");
+        writeField(&!writer, "c\r\nd");
+        endRow(&!writer);
+        writeField(&!writer, ",");
+        writeField(&!writer, " ");
+        endRow(&!writer);
+        case finishCsv(writer) of
+            when Some(value as text: String) do
+                case readCsv(asSpan(&text)) of
+                    when Left(left: CsvError) do
+                        assertTrue(false, "what is written is read");
+                    when Right(right as table: CsvTable) do
+                        assertTrue(fieldIs(&table, 0, 0, "a\"b"), "a quote");
+                        assertTrue(fieldIs(&table, 0, 1, "c\r\nd"), "a line break");
+                        assertTrue(fieldIs(&table, 1, 0, ","), "a comma");
+                        assertTrue(fieldIs(&table, 1, 1, " "), "a space");
+                        destroyCsv(table);
+                end case;
+                destroyString(text);
+            when None do
+                assertTrue(false, "the writer finishes");
+        end case;
+        return nil;
+    end;
+
+    function testWriterRefuses(): Unit is
+        var ragged: CsvWriter := makeCsvWriter();
+        writeField(&!ragged, "a");
+        writeField(&!ragged, "b");
+        endRow(&!ragged);
+        writeField(&!ragged, "c");
+        endRow(&!ragged);
+        assertTrue(refusesToFinish(ragged), "a row with fewer fields");
+        var empty: CsvWriter := makeCsvWriter();
+        endRow(&!empty);
+        assertTrue(refusesToFinish(empty), "a row without fields");
+        var open: CsvWriter := makeCsvWriter();
+        writeField(&!open, "a");
+        assertTrue(refusesToFinish(open), "a row not ended");
+        var quote: CsvWriter := makeCsvWriterWith('"');
+        writeField(&!quote, "a");
+        endRow(&!quote);
+        assertTrue(refusesToFinish(quote), "a quote as the separator");
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, 255);
+        let notUtf8: String := finalize(builder);
+        var broken: CsvWriter := makeCsvWriter();
+        writeField(&!broken, asSpan(&notUtf8));
+        endRow(&!broken);
+        assertTrue(refusesToFinish(broken), "a field that is not UTF-8");
+        destroyString(notUtf8);
+        var nothing: CsvWriter := makeCsvWriter();
+        assertTrue(writes(nothing, ""), "no rows is an empty text");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,179 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength,
+    nthRef
+);
+import Standard.Text (
+    equal
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory,
+    createSymlink,
+    kindOf,
+    kindUnknown,
+    sameKind
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    destroyProblem
+);
+import Pkg.Tree (
+    treeFiles,
+    treeSum,
+    copyTree,
+    removeTree
+);
+
+module body Pkg.Tree.Test is
+    -- The checksum of a.txt holding hello and a new line and sub/b.txt
+    -- holding x, as Go's dirhash.Hash1 gives it for the same files.
+    constant knownSum: Span[Nat8, Static] := "h1:0sun7IhfChLljPygSUAzTwodjRy1DIkk5dSyTgM3A1M=";
+
+    function write(path: Span[Nat8, Static], content: Span[Nat8, Static]): Unit is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                assertTrue(writeAll(&!file, content), "a file written");
+                assertTrue(closeFile(file), "a file closed");
+            when None do
+                assertFailure("a file could not be made");
+        end case;
+        return nil;
+    end;
+
+    function sumIs(root: Span[Nat8, Static], want: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case treeSum(root) of
+            when Right(right as sum: String) do
+                assertTrue(equal(asSpan(&sum), want), message);
+                destroyString(sum);
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function cleared(root: Span[Nat8, Static]): Unit is
+        case removeTree(root) of
+            when Right(right as done: Unit) do
+                assertTrue(sameKind(kindOf(root), kindUnknown), "the tree is gone");
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure("the tree was not removed");
+        end case;
+        return nil;
+    end;
+
+    function testSum(): Unit is
+        cleared("_tree-test-sum");
+        assertTrue(createDirectory("_tree-test-sum"), "the root made");
+        assertTrue(createDirectory("_tree-test-sum/sub"), "sub made");
+        write("_tree-test-sum/a.txt", "hello\n");
+        write("_tree-test-sum/sub/b.txt", "x");
+        sumIs("_tree-test-sum", knownSum, "the checksum of Go's dirhash");
+        -- Left out at the top, counted below it.
+        assertTrue(createDirectory("_tree-test-sum/.git"), ".git made");
+        write("_tree-test-sum/.git/HEAD", "ref: x\n");
+        assertTrue(createDirectory("_tree-test-sum/signatures"), "signatures made");
+        write("_tree-test-sum/signatures/v1.0.0.sig", "sig\n");
+        sumIs("_tree-test-sum", knownSum, "the left-out directories change nothing");
+        case treeFiles("_tree-test-sum") of
+            when Right(right as files: Buffer[String]) do
+                assertTrue(bufferLength(&files) = 2, "two files");
+                assertTrue(equal(asSpan(nthRef(&files, 1)), "sub/b.txt"), "sorted, with the directory");
+                destroyArguments(files);
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure("the files were not listed");
+        end case;
+        write("_tree-test-sum/sub/b.txt", "y");
+        case treeSum("_tree-test-sum") of
+            when Right(right as sum: String) do
+                assertTrue(not equal(asSpan(&sum), knownSum), "a changed byte changes the checksum");
+                destroyString(sum);
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure("no checksum");
+        end case;
+        cleared("_tree-test-sum");
+        return nil;
+    end;
+
+    function testCopy(): Unit is
+        cleared("_tree-test-copy");
+        cleared("_tree-test-copied");
+        assertTrue(createDirectory("_tree-test-copy"), "the root made");
+        assertTrue(createDirectory("_tree-test-copy/sub"), "sub made");
+        write("_tree-test-copy/a.txt", "hello\n");
+        write("_tree-test-copy/sub/b.txt", "x");
+        assertTrue(createDirectory("_tree-test-copy/.git"), ".git made");
+        write("_tree-test-copy/.git/HEAD", "ref: x\n");
+        case copyTree("_tree-test-copy", "_tree-test-copied") of
+            when Right(right as done: Unit) do
+                sumIs("_tree-test-copied", knownSum, "the copy has the same checksum");
+                assertTrue(sameKind(kindOf("_tree-test-copied/.git"), kindUnknown), ".git is not copied");
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure("the tree was not copied");
+        end case;
+        case copyTree("_tree-test-copy", "_tree-test-copied") of
+            when Right(right as done: Unit) do
+                assertFailure("a copy over a tree that is there");
+            when Left(left as p: Problem) do
+                assertTrue(p.code = 1519, "a copy does not replace a tree");
+                destroyProblem(p);
+        end case;
+        cleared("_tree-test-copy");
+        cleared("_tree-test-copied");
+        return nil;
+    end;
+
+    function testRefused(): Unit is
+        cleared("_tree-test-link");
+        assertTrue(createDirectory("_tree-test-link"), "the root made");
+        write("_tree-test-link/a.txt", "hello\n");
+        assertTrue(createSymlink("a.txt", "_tree-test-link/b.txt"), "a link made");
+        case treeSum("_tree-test-link") of
+            when Right(right as sum: String) do
+                destroyString(sum);
+                assertFailure("a tree with a link was taken");
+            when Left(left as p: Problem) do
+                assertTrue(p.code = 1510, "a link is refused with H1510");
+                destroyProblem(p);
+        end case;
+        cleared("_tree-test-link");
+        case treeSum("_tree-test-none") of
+            when Right(right as sum: String) do
+                destroyString(sum);
+                assertFailure("a tree that is not there has a checksum");
+            when Left(left as p: Problem) do
+                assertTrue(p.code = 1518, "a tree that is not there is H1518");
+                destroyProblem(p);
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,229 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A client of the ACME protocol of RFC 8555, by which a CA issues certificates for DNS names.
+
+- Every request is a JWS signed with the account key, a P-256 key, and so ES256.
+- Every request carries a fresh nonce of the server and the URL it goes to.
+- Requests go through Standard.HttpClient over HTTPS, verified against the certificates in caFile.
+- A badNonce answer is retried once with the nonce it brought, as the RFC asks.
+- Any other problem the server reports comes back as a Left with its type and detail.
+- The steps are separate functions: between them the caller proves control of each name.
+
+    let opened: Either[AcmeError, Account] := openAccount(directory, key, "", caFile, limits);
+    let order: Either[AcmeError, Order] := newOrder(&!account, "example.org,www.example.org");
+    let challenge: Either[AcmeError, Challenge] := challengeOf(&!account, authorization, "dns-01");
+    let record: String := dnsChallengeValue(&!account, asSpan(&token));
+    let ready: Either[AcmeError, Unit] := respond(&!account, challengeUrl);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String,
+    length
+);
+import Standard.HttpClient (
+    Limits
+);
+import Standard.X509 (
+    PrivateKey
+);
+
+module Standard.Acme is
+    """
+    Why a step failed: the kind, and the words of the server or of this
+    module.  Linear: destroyAcmeError gives it back.
+    """
+    record AcmeError: Linear is
+        """
+        The type URN of the server's problem document, such as
+        urn:ietf:params:acme:error:unauthorized, or a word of this module:
+        transport, protocol, key.
+        """
+        kind: String;
+        detail: String;
+    end;
+
+    """
+    Frees error.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyAcmeError(error: AcmeError): Unit;
+
+    """
+    An account at one CA: its key, its URL, the URLs of the directory and
+    the last nonce.  Linear: closeAccount gives the key back.  Its URL and
+    the two URLs of the directory are never empty, and the coordinates of
+    its key are 43 characters of base64url each; the record says so as
+    invariants.  The nonce may be empty between two requests.
+    """
+    type Account: Linear;
+
+    """
+    Reads the directory at directoryUrl and registers the key, or finds
+    the account it already has; contact is an e-mail address or empty.
+    The terms of service are agreed to.  key must be a P-256 key.
+    """
+    generic [D: Region, C: Region, F: Region]
+    function openAccount(directoryUrl: Span[Nat8, D], key: PrivateKey, contact: Span[Nat8, C],
+        caFile: Span[Nat8, F], limits: Limits): Either[AcmeError, Account]
+        requires spanLength(directoryUrl) > 0;
+
+    """
+    The URL of the account, its key identifier in every later request.
+    """
+    generic [R: Region]
+    function accountUrl(account: &![Account, R]): String
+        ensures length(&result) > 0;
+
+    """
+    The key back; the account at the CA stays.
+    No contract: it only frees or closes what it is given.
+    """
+    function closeAccount(account: Account): PrivateKey;
+
+    """
+    The JWK thumbprint of the account key after RFC 7638, base64url.
+    """
+    generic [R: Region]
+    function thumbprint(account: &![Account, R]): String
+        ensures length(&result) = 43;
+
+    """
+    The key authorization of a challenge's token: the token, a dot and the
+    thumbprint.  http-01 serves it as it is, at /.well-known/acme-challenge/
+    followed by the token.
+    """
+    generic [R: Region, T: Region]
+    function keyAuthorization(account: &![Account, R], token: Span[Nat8, T]): String
+        requires spanLength(token) > 0
+        ensures length(&result) = (spanLength(token) + 44);
+
+    """
+    The value of the TXT record dns-01 asks for: base64url of the SHA-256
+    of the key authorization.  It goes into a TXT record of the name with
+    _acme-challenge before it.
+    """
+    generic [R: Region, T: Region]
+    function dnsChallengeValue(account: &![Account, R], token: Span[Nat8, T]): String
+        requires spanLength(token) > 0
+        ensures length(&result) = 43;
+
+    """
+    An order: its URL, its status, the URL to finalize it at, the URLs of
+    its authorizations separated by spaces, and the URL of the certificate
+    once it is issued, empty before.
+    """
+    record Order: Linear is
+        url: String;
+        status: String;
+        finalizeUrl: String;
+        authorizations: String;
+        certificateUrl: String;
+    end;
+
+    """
+    Frees order.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyOrder(order: Order): Unit;
+
+    """
+    A new order for the DNS names, separated by commas.
+    """
+    generic [R: Region, N: Region]
+    function newOrder(account: &![Account, R], names: Span[Nat8, N]): Either[AcmeError, Order]
+        requires spanLength(names) > 0;
+
+    """
+    The order at url as it stands now.
+    """
+    generic [R: Region, U: Region]
+    function fetchOrder(account: &![Account, R], url: Span[Nat8, U]): Either[AcmeError, Order]
+        requires spanLength(url) > 0;
+
+    """
+    A challenge of an authorization: the name it is for, its type, its
+    token and its URL.
+    """
+    record Challenge: Linear is
+        name: String;
+        kind: String;
+        token: String;
+        url: String;
+    end;
+
+    """
+    Frees challenge.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyChallenge(challenge: Challenge): Unit;
+
+    """
+    The challenge of type kind, dns-01 or http-01, of the authorization at
+    authorizationUrl.  Left when it has none of that type.
+    """
+    generic [R: Region, U: Region, K: Region]
+    function challengeOf(account: &![Account, R], authorizationUrl: Span[Nat8, U], kind: Span[Nat8, K]): Either[AcmeError, Challenge]
+        requires spanLength(authorizationUrl) > 0
+        requires spanLength(kind) > 0;
+
+    """
+    Tells the server the challenge at challengeUrl is ready to be looked
+    at.  authorizationStatus then shows the server's verdict.
+    """
+    generic [R: Region, U: Region]
+    function respond(account: &![Account, R], challengeUrl: Span[Nat8, U]): Either[AcmeError, Unit]
+        requires spanLength(challengeUrl) > 0;
+
+    """
+    The status of the authorization at url: pending, valid, invalid and
+    the others of the RFC.
+    """
+    generic [R: Region, U: Region]
+    function authorizationStatus(account: &![Account, R], url: Span[Nat8, U]): Either[AcmeError, String]
+        requires spanLength(url) > 0;
+
+    """
+    Sends csrDer, a DER certificate request, to the order's finalize URL;
+    the order as it stands after.
+    """
+    generic [R: Region, O: Region, Q: Region]
+    function finalizeOrder(account: &![Account, R], order: &[Order, O], csrDer: Span[Nat8, Q]): Either[AcmeError, Order]
+        requires length(&(order->finalizeUrl)) > 0
+        requires spanLength(csrDer) > 0;
+
+    """
+    The certificate chain at url, as PEM.
+    """
+    generic [R: Region, U: Region]
+    function downloadCertificate(account: &![Account, R], url: Span[Nat8, U]): Either[AcmeError, String]
+        requires spanLength(url) > 0;
+
+    """
+    The bytes in base64url without padding, as JWS writes them.
+    """
+    generic [R: Region]
+    function base64Url(bytes: Span[Nat8, R]): String
+        ensures length(&result) = (((spanLength(bytes) * 4) + 2) / 3);
+
+    """
+    True when signature is None or holds exactly 64 bytes, the size of a
+    JWS ES256 signature: the ensures of joseSignature.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isEs256Size(signature: &[Option[String], R]): Bool;
+
+    """
+    The pair of numbers of a DER ECDSA signature, as the 64 bytes of a JWS
+    ES256 signature.  None when it is not such a signature.
+    """
+    generic [R: Region]
+    function joseSignature(der: Span[Nat8, R]): Option[String]
+        ensures isEs256Size(&result);
+end module.

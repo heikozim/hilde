@@ -1,0 +1,1268 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: the checks are made with Standard.File and
+-- Standard.Account, the commands written for Standard.Platform's system.
+-- A command is a vector of words with the full path of its programme;
+-- doctor prints it quoted for the shell, init runs it without a shell.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty as destroyEmptyBuffer,
+    length as bufferLength,
+    nthRef,
+    insertBack,
+    removeFirst,
+    removeLast
+);
+import Standard.String (
+    String,
+    makeEmpty,
+    fromLiteral,
+    fromSpan,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    formatNat
+);
+import Standard.File (
+    FileDescriptor,
+    FileLookup,
+    FileMissing,
+    FileUnreadable,
+    FileFound,
+    FileStatus,
+    FileKind,
+    kindRegular,
+    kindDirectory,
+    kindOther,
+    sameKind,
+    describeKind,
+    statusOf,
+    connectUnix,
+    closeFile,
+    createNewFile,
+    writeAll,
+    readAll,
+    Command as ProcessCommand,
+    makeCommand as makeProcessCommand,
+    addArgument,
+    Running,
+    Process,
+    spawnProcess,
+    waitProcess,
+    ProcessStatus,
+    exitedNormally,
+    exitCode
+);
+import Standard.Paths (
+    AppKind,
+    Service,
+    UserTool,
+    PathKind,
+    ConfigFile,
+    EnvFile,
+    PepperFile,
+    DataDirectory,
+    CacheDirectory,
+    LogDirectory,
+    RuntimeDirectory,
+    SocketFile,
+    isAppName,
+    serviceAccount,
+    pathMode
+);
+import Standard.Account (
+    AccountLookup,
+    NoAccount,
+    LookupFailed,
+    AccountFound,
+    AccountNumbers,
+    lookupAccount,
+    runningUser,
+    isSuperuser
+);
+import Standard.Platform (
+    systemName
+);
+import Standard.Json (
+    JsonWriter,
+    makeJsonWriter,
+    beginArray,
+    endArray,
+    beginObject,
+    endObject,
+    writeName,
+    writeString as writeJsonString,
+    writeBool,
+    finishJson
+);
+
+module body Standard.Doctor is
+    -- A path the programme needs and what it is for.
+    record Item: Linear is
+        what: PathKind;
+        path: String;
+    end;
+
+    -- A file init writes when it is not there, with its text and mode.
+    record FileItem: Linear is
+        path: String;
+        text: String;
+        mode: Nat32;
+    end;
+
+    -- results are checks made by another module, such as the vault's,
+    -- kept as their findings.
+    record Checkup: Linear is
+        app: String;
+        kind: AppKind;
+        items: Buffer[Item];
+        results: Buffer[Finding];
+        files: Buffer[FileItem];
+    end;
+
+    -- The outcome of one check: what was checked, the path or account
+    -- name, and for a missing one why and the command that fixes it, empty
+    -- when there is none.
+    record Finding: Linear is
+        good: Bool;
+        name: Span[Nat8, Static];
+        path: String;
+        reason: String;
+        fix: String;
+    end;
+
+    -- One thing init does: run a command, or write a new file.
+    union Step: Linear is
+        case RunStep is
+            name: Span[Nat8, Static];
+            path: String;
+            words: Buffer[String];
+        case WriteStep is
+            name: Span[Nat8, Static];
+            path: String;
+            text: String;
+            mode: Nat32;
+    end;
+
+    function makeCheckup(app: Span[Nat8, Static], kind: AppKind): Checkup is
+        let items: Buffer[Item] := allocateEmpty();
+        let results: Buffer[Finding] := allocateEmpty();
+        let files: Buffer[FileItem] := allocateEmpty();
+        return Checkup(app => fromLiteral(app), kind => kind, items => items, results => results, files => files);
+    end;
+
+    generic [R: Region, S: Region]
+    function expectPath(checkup: &![Checkup, R], what: PathKind, path: Span[Nat8, S]): Unit is
+        insertBack(&!(checkup->items), Item(what => what, path => fromSpan(path)));
+        return nil;
+    end;
+
+    function destroyCheckup(checkup: Checkup): Unit is
+        let { app: String, kind: AppKind, items: Buffer[Item], results: Buffer[Finding], files: Buffer[FileItem] } := checkup;
+        var f: Buffer[FileItem] := files;
+        while bufferLength(&f) > 0 do
+            let { path: String, text: String, mode: Nat32 } := removeLast(&!f);
+            destroyString(path);
+            destroyString(text);
+        end while;
+        destroyEmptyBuffer(f);
+        destroyString(app);
+        var b: Buffer[Item] := items;
+        while bufferLength(&b) > 0 do
+            let { what: PathKind, path: String } := removeLast(&!b);
+            destroyString(path);
+        end while;
+        destroyEmptyBuffer(b);
+        var r: Buffer[Finding] := results;
+        while bufferLength(&r) > 0 do
+            let { good: Bool, name: Span[Nat8, Static], path: String, reason: String, fix: String } := removeLast(&!r);
+            destroyString(path);
+            destroyString(reason);
+            destroyString(fix);
+        end while;
+        destroyEmptyBuffer(r);
+        return nil;
+    end;
+
+    generic [R: Region, P: Region]
+    function expectFile(checkup: &![Checkup, R], path: Span[Nat8, P], text: String, mode: Nat32): Unit is
+        insertBack(&!(checkup->files), FileItem(path => fromSpan(path), text => text, mode => mode));
+        return nil;
+    end;
+
+    -- The directory path is in: up to its last slash, the slash left out;
+    -- empty when there is none.
+    generic [P: Region]
+    function parentOf(path: Span[Nat8, P]): String is
+        var last: Index := 0;
+        var found: Bool := false;
+        var i: Index := 0;
+        while i < spanLength(path) do
+            if path[i] = '/' then
+                last := i;
+                found := true;
+            end if;
+            i := i + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        if found then
+            var k: Index := 0;
+            while k < last do
+                writeByte(&!out, path[k]);
+                k := k + 1;
+            end while;
+        end if;
+        return finalize(out);
+    end;
+
+    generic [R: Region, P: Region, W: Region, F: Region]
+    function addResult(checkup: &![Checkup, R], name: Span[Nat8, Static], path: Span[Nat8, P], good: Bool, reason: Span[Nat8, W], fix: Span[Nat8, F]): Unit is
+        insertBack(&!(checkup->results), Finding(good => good, name => name, path => fromSpan(path), reason => fromSpan(reason), fix => fromSpan(fix)));
+        return nil;
+    end;
+
+    function whatName(what: PathKind): Span[Nat8, Static] is
+        case what of
+            when ConfigFile do
+                return "config";
+            when EnvFile do
+                return "env";
+            when PepperFile do
+                return "pepper";
+            when DataDirectory do
+                return "data";
+            when CacheDirectory do
+                return "cache";
+            when LogDirectory do
+                return "log";
+            when RuntimeDirectory do
+                return "runtime";
+            when SocketFile do
+                return "socket";
+        end case;
+    end;
+
+    -- The kind a path of what must have; a socket is kindOther to stat.
+    function wantedKind(what: PathKind): FileKind is
+        case what of
+            when DataDirectory do
+                return kindDirectory;
+            when CacheDirectory do
+                return kindDirectory;
+            when LogDirectory do
+                return kindDirectory;
+            when RuntimeDirectory do
+                return kindDirectory;
+            when SocketFile do
+                return kindOther;
+            when ConfigFile do
+                return kindRegular;
+            when EnvFile do
+                return kindRegular;
+            when PepperFile do
+                return kindRegular;
+        end case;
+    end;
+
+    function isService(kind: AppKind): Bool is
+        case kind of
+            when Service do
+                return true;
+            when UserTool do
+                return false;
+        end case;
+    end;
+
+    function isSocket(what: PathKind): Bool is
+        case what of
+            when SocketFile do
+                return true;
+            when ConfigFile do
+                return false;
+            when EnvFile do
+                return false;
+            when PepperFile do
+                return false;
+            when DataDirectory do
+                return false;
+            when CacheDirectory do
+                return false;
+            when LogDirectory do
+                return false;
+            when RuntimeDirectory do
+                return false;
+        end case;
+    end;
+
+    function valueOr(answer: Option[Nat8], fallback: Nat8): Nat8 is
+        case answer of
+            when Some(value as inner: Nat8) do
+                return inner;
+            when None do
+                return fallback;
+        end case;
+    end;
+
+    -- mode as four octal digits, 0640 for one.
+    generic [R: Region]
+    function writeMode(out: &![StringBuilder, R], mode: Nat32): Unit is
+        let eight: Nat32 := 8;
+        let zero: Nat8 := '0';
+        let fallback: Nat8 := 0;
+        let owner: Nat32 := (mode / 64) - (((mode / 64) / eight) * eight);
+        let group: Nat32 := (mode / eight) - (((mode / eight) / eight) * eight);
+        let other: Nat32 := mode - ((mode / eight) * eight);
+        writeByte(&~out, zero);
+        writeByte(&~out, zero + valueOr(toNat8(owner), fallback));
+        writeByte(&~out, zero + valueOr(toNat8(group), fallback));
+        writeByte(&~out, zero + valueOr(toNat8(other), fallback));
+        return nil;
+    end;
+
+    function modeText(mode: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeMode(&!out, mode);
+        return finalize(out);
+    end;
+
+    -- Whether b may stand in a shell word without quotes.
+    function plainByte(b: Nat8): Bool is
+        if ((b >= 'a') and (b <= 'z')) or ((b >= 'A') and (b <= 'Z')) then
+            return true;
+        end if;
+        if (b >= '0') and (b <= '9') then
+            return true;
+        end if;
+        return (((b = '/') or (b = '.')) or ((b = '_') or (b = '-'))) or ((((b = '+') or (b = ':')) or ((b = '@') or (b = '%'))) or ((b = ',') or (b = '=')));
+    end;
+
+    -- text as one shell word: as it stands when every byte is plain, else
+    -- in single quotes, where a quote in it closes them, stands behind a
+    -- backslash and opens them again, so that the shell reads the word
+    -- back as it was.
+    generic [R: Region, S: Region]
+    function writeQuoted(out: &![StringBuilder, R], text: Span[Nat8, S]): Unit is
+        var plain: Bool := spanLength(text) > 0;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if not plainByte(text[i]) then
+                plain := false;
+            end if;
+            i := i + 1;
+        end while;
+        if plain then
+            writeString(&~out, text);
+            return nil;
+        end if;
+        writeByte(&~out, '\'');
+        i := 0;
+        while i < spanLength(text) do
+            let b: Nat8 := text[i];
+            if b = '\'' then
+                writeByte(&~out, '\'');
+                writeByte(&~out, '\\');
+                writeByte(&~out, '\'');
+                writeByte(&~out, '\'');
+            else
+                writeByte(&~out, b);
+            end if;
+            i := i + 1;
+        end while;
+        writeByte(&~out, '\'');
+        return nil;
+    end;
+
+    ---
+    --- Commands
+    ---
+
+    generic [R: Region]
+    function word(words: &![Buffer[String], R], text: Span[Nat8, Static]): Unit is
+        insertBack(&~words, fromLiteral(text));
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function wordOf(words: &![Buffer[String], R], text: Span[Nat8, S]): Unit is
+        insertBack(&~words, fromSpan(text));
+        return nil;
+    end;
+
+    function destroyWords(words: Buffer[String]): Unit is
+        var rest: Buffer[String] := words;
+        while bufferLength(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmptyBuffer(rest);
+        return nil;
+    end;
+
+    -- The command that makes the service account on the system.
+    generic [S: Region, A: Region]
+    function accountWords(system: Span[Nat8, S], account: Span[Nat8, A]): Buffer[String] is
+        var w: Buffer[String] := allocateEmpty();
+        if equal(system, "openbsd") then
+            word(&!w, "/usr/sbin/useradd");
+            word(&!w, "-L");
+            word(&!w, "daemon");
+            word(&!w, "-s");
+            word(&!w, "/sbin/nologin");
+            word(&!w, "-d");
+            word(&!w, "/var/empty");
+            wordOf(&!w, account);
+        else if equal(system, "freebsd") then
+            word(&!w, "/usr/sbin/pw");
+            word(&!w, "useradd");
+            wordOf(&!w, account);
+            word(&!w, "-s");
+            word(&!w, "/usr/sbin/nologin");
+            word(&!w, "-d");
+            word(&!w, "/nonexistent");
+        else if equal(system, "macos") then
+            var user: StringBuilder := makeStringBuilder();
+            writeString(&!user, "/Users/");
+            writeString(&!user, account);
+            word(&!w, "/usr/bin/dscl");
+            word(&!w, ".");
+            word(&!w, "-create");
+            insertBack(&!w, finalize(user));
+            word(&!w, "UserShell");
+            word(&!w, "/usr/bin/false");
+        else
+            word(&!w, "/usr/sbin/useradd");
+            word(&!w, "--system");
+            word(&!w, "--shell");
+            word(&!w, "/usr/sbin/nologin");
+            word(&!w, "--no-create-home");
+            wordOf(&!w, account);
+        end if;
+        return w;
+    end;
+
+    -- The command that starts the programme, so that it makes its socket.
+    generic [S: Region, A: Region]
+    function startWords(system: Span[Nat8, S], service: Bool, app: Span[Nat8, A]): Buffer[String] is
+        var w: Buffer[String] := allocateEmpty();
+        if not service then
+            wordOf(&!w, app);
+        else if equal(system, "openbsd") then
+            word(&!w, "/usr/sbin/rcctl");
+            word(&!w, "start");
+            wordOf(&!w, app);
+        else if equal(system, "freebsd") then
+            word(&!w, "/usr/sbin/service");
+            wordOf(&!w, app);
+            word(&!w, "start");
+        else if equal(system, "macos") then
+            var target: StringBuilder := makeStringBuilder();
+            writeString(&!target, "system/");
+            writeString(&!target, app);
+            word(&!w, "/bin/launchctl");
+            word(&!w, "kickstart");
+            insertBack(&!w, finalize(target));
+        else
+            word(&!w, "/usr/bin/systemctl");
+            word(&!w, "start");
+            wordOf(&!w, app);
+        end if;
+        return w;
+    end;
+
+    -- The command that makes what at path with its mode, and for a service
+    -- with the account as its owner.
+    generic [A: Region, P: Region]
+    function createWords(service: Bool, account: Span[Nat8, A], what: PathKind, path: Span[Nat8, P]): Buffer[String] is
+        var w: Buffer[String] := allocateEmpty();
+        let directory: Bool := sameKind(wantedKind(what), kindDirectory);
+        word(&!w, "/usr/bin/install");
+        if directory then
+            word(&!w, "-d");
+        end if;
+        if service then
+            word(&!w, "-o");
+            wordOf(&!w, account);
+            word(&!w, "-g");
+            wordOf(&!w, account);
+        end if;
+        word(&!w, "-m");
+        insertBack(&!w, modeText(pathMode(what)));
+        if not directory then
+            word(&!w, "/dev/null");
+        end if;
+        wordOf(&!w, path);
+        return w;
+    end;
+
+    generic [P: Region]
+    function chmodWords(mode: Nat32, path: Span[Nat8, P]): Buffer[String] is
+        var w: Buffer[String] := allocateEmpty();
+        word(&!w, "/bin/chmod");
+        insertBack(&!w, modeText(mode));
+        wordOf(&!w, path);
+        return w;
+    end;
+
+    -- chown is in /sbin on OpenBSD, in /usr/sbin on FreeBSD and macOS, and
+    -- in /bin on Linux.
+    generic [S: Region, A: Region, P: Region]
+    function chownWords(system: Span[Nat8, S], service: Bool, account: Span[Nat8, A], path: Span[Nat8, P]): Buffer[String] is
+        var w: Buffer[String] := allocateEmpty();
+        if equal(system, "openbsd") then
+            word(&!w, "/sbin/chown");
+        else if equal(system, "freebsd") or equal(system, "macos") then
+            word(&!w, "/usr/sbin/chown");
+        else
+            word(&!w, "/bin/chown");
+        end if;
+        var owner: StringBuilder := makeStringBuilder();
+        writeString(&!owner, account);
+        if service then
+            writeByte(&!owner, ':');
+            writeString(&!owner, account);
+        end if;
+        insertBack(&!w, finalize(owner));
+        wordOf(&!w, path);
+        return w;
+    end;
+
+    -- The command that has the service started at boot.
+    generic [S: Region, A: Region]
+    function enableWords(system: Span[Nat8, S], app: Span[Nat8, A]): Buffer[String] is
+        var w: Buffer[String] := allocateEmpty();
+        if equal(system, "openbsd") then
+            word(&!w, "/usr/sbin/rcctl");
+            word(&!w, "enable");
+            wordOf(&!w, app);
+        else if equal(system, "freebsd") then
+            var setting: StringBuilder := makeStringBuilder();
+            writeVariable(&!setting, app);
+            writeString(&!setting, "_enable=YES");
+            word(&!w, "/usr/sbin/sysrc");
+            insertBack(&!w, finalize(setting));
+        else if equal(system, "macos") then
+            word(&!w, "/bin/launchctl");
+            word(&!w, "bootstrap");
+            word(&!w, "system");
+            insertBack(&!w, servicePath(system, app));
+        else
+            word(&!w, "/usr/bin/systemctl");
+            word(&!w, "enable");
+            wordOf(&!w, app);
+        end if;
+        return w;
+    end;
+
+    -- The words as one line for the shell, with doas or sudo in front for
+    -- a service when the process is not the superuser.
+    generic [S: Region, R: Region]
+    function commandLine(system: Span[Nat8, S], service: Bool, superuser: Bool, words: &[Buffer[String], R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        if service and (not superuser) then
+            if equal(system, "openbsd") then
+                writeString(&!out, "doas ");
+            else
+                writeString(&!out, "sudo ");
+            end if;
+        end if;
+        var i: Index := 0;
+        while i < bufferLength(words) do
+            if i > 0 then
+                writeByte(&!out, ' ');
+            end if;
+            writeQuoted(&!out, asSpan(nthRef(words, i)));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- commandLine of words, which it gives back.
+    generic [S: Region]
+    function lineOf(system: Span[Nat8, S], service: Bool, superuser: Bool, words: Buffer[String]): String is
+        let line: String := commandLine(system, service, superuser, &words);
+        destroyWords(words);
+        return line;
+    end;
+
+    -- app as the name of a shell variable: a hyphen as an underscore.
+    generic [R: Region, A: Region]
+    function writeVariable(out: &![StringBuilder, R], app: Span[Nat8, A]): Unit is
+        var i: Index := 0;
+        while i < spanLength(app) do
+            if app[i] = '-' then
+                writeByte(&~out, '_');
+            else
+                writeByte(&~out, app[i]);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Doctor
+    ---
+
+    -- One finding into findings.
+    generic [R: Region, P: Region]
+    function note(findings: &![Buffer[Finding], R], good: Bool, name: Span[Nat8, Static], path: Span[Nat8, P], reason: String, fix: String): Unit is
+        insertBack(&~findings, Finding(good => good, name => name, path => fromSpan(path), reason => reason, fix => fix));
+        return nil;
+    end;
+
+    -- Whether owner is the one wanted; true when none is known.
+    function ownedBy(found: Nat32, wanted: Option[Nat32]): Bool is
+        case wanted of
+            when Some(value as w: Nat32) do
+                return found = w;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function widen(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The check of one path.  owner is the user number the path must
+    -- belong to, account the name the commands give it.
+    generic [S: Region, A: Region, C: Region, P: Region, R: Region]
+    function checkPath(findings: &![Buffer[Finding], R], system: Span[Nat8, S], service: Bool, superuser: Bool, app: Span[Nat8, A], account: Span[Nat8, C], owner: Option[Nat32], what: PathKind, path: Span[Nat8, P]): Unit is
+        let name: Span[Nat8, Static] := whatName(what);
+        case statusOf(path) of
+            when FileMissing do
+                if isSocket(what) then
+                    note(&~findings, false, name, path, fromLiteral("not there"), lineOf(system, service, superuser, startWords(system, service, app)));
+                else
+                    note(&~findings, false, name, path, fromLiteral("not there"), lineOf(system, service, superuser, createWords(service, account, what, path)));
+                end if;
+            when FileUnreadable do
+                note(&~findings, false, name, path, fromLiteral("cannot be looked at"), makeEmpty());
+            when FileFound(status as s: FileStatus) do
+                let wanted: FileKind := wantedKind(what);
+                if not sameKind(s.kind, wanted) then
+                    var why: StringBuilder := makeStringBuilder();
+                    let found: String := describeKind(s.kind);
+                    writeString(&!why, "a ");
+                    writeString(&!why, asSpan(&found));
+                    destroyString(found);
+                    if isSocket(what) then
+                        writeString(&!why, ", not a socket");
+                    else
+                        let wantedText: String := describeKind(wanted);
+                        writeString(&!why, ", not a ");
+                        writeString(&!why, asSpan(&wantedText));
+                        destroyString(wantedText);
+                    end if;
+                    note(&~findings, false, name, path, finalize(why), makeEmpty());
+                else if s.mode /= pathMode(what) then
+                    var why: StringBuilder := makeStringBuilder();
+                    writeString(&!why, "mode ");
+                    writeMode(&!why, s.mode);
+                    writeString(&!why, ", wants ");
+                    writeMode(&!why, pathMode(what));
+                    note(&~findings, false, name, path, finalize(why), lineOf(system, service, superuser, chmodWords(pathMode(what), path)));
+                else if not ownedBy(s.owner, owner) then
+                    var why: StringBuilder := makeStringBuilder();
+                    let number: String := formatNat(widen(s.owner));
+                    writeString(&!why, "owner ");
+                    writeString(&!why, asSpan(&number));
+                    destroyString(number);
+                    writeString(&!why, ", wants ");
+                    writeString(&!why, account);
+                    note(&~findings, false, name, path, finalize(why), lineOf(system, true, superuser, chownWords(system, service, account, path)));
+                else if isSocket(what) then
+                    case connectUnix(path) of
+                        when Some(value as socket: FileDescriptor) do
+                            let closed: Bool := closeFile(socket);
+                            note(&~findings, true, name, path, makeEmpty(), makeEmpty());
+                        when None do
+                            note(&~findings, false, name, path, fromLiteral("nobody accepts on it"), lineOf(system, service, superuser, startWords(system, service, app)));
+                    end case;
+                else
+                    note(&~findings, true, name, path, makeEmpty(), makeEmpty());
+                end if;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, T: Region]
+    function runCheckup(checkup: &[Checkup, R], json: Bool, out: &![StringBuilder, T]): Index is
+        return runCheckupOn(systemName(), isSuperuser(), checkup, json, &~out);
+    end;
+
+    -- The account name of a service, or the running user's number for a
+    -- user tool, and the user number the paths must belong to.
+    generic [R: Region]
+    function ownerOf(checkup: &[Checkup, R]): String is
+        if isService(checkup->kind) then
+            case serviceAccount(asSpan(&(checkup->app))) of
+                when Some(value as name: String) do
+                    return name;
+                when None do
+                    return makeEmpty();
+            end case;
+        end if;
+        return formatNat(widen(runningUser()));
+    end;
+
+    generic [S: Region, R: Region, T: Region]
+    function runCheckupOn(system: Span[Nat8, S], superuser: Bool, checkup: &[Checkup, R], json: Bool, out: &![StringBuilder, T]): Index is
+        var findings: Buffer[Finding] := allocateEmpty();
+        let service: Bool := isService(checkup->kind);
+        let app: Span[Nat8, R] := asSpan(&(checkup->app));
+        let account: String := ownerOf(checkup);
+        var owner: Option[Nat32] := None();
+        if service then
+            case lookupAccount(asSpan(&account)) of
+                when AccountFound(numbers as n: AccountNumbers) do
+                    owner := Some(value => n.user);
+                    note(&!findings, true, "account", asSpan(&account), makeEmpty(), makeEmpty());
+                when NoAccount do
+                    note(&!findings, false, "account", asSpan(&account), fromLiteral("no such account"), lineOf(system, true, superuser, accountWords(system, asSpan(&account))));
+                when LookupFailed do
+                    note(&!findings, false, "account", asSpan(&account), fromLiteral("the password database could not be read"), makeEmpty());
+            end case;
+        else
+            owner := Some(value => runningUser());
+        end if;
+        var i: Index := 0;
+        while i < bufferLength(&(checkup->items)) do
+            let item: &[Item, R] := nthRef(&(checkup->items), i);
+            checkPath(&!findings, system, service, superuser, app, asSpan(&account), owner, item->what, asSpan(&(item->path)));
+            i := i + 1;
+        end while;
+        destroyString(account);
+        var j: Index := 0;
+        while j < bufferLength(&(checkup->files)) do
+            let file: &[FileItem, R] := nthRef(&(checkup->files), j);
+            let path: Span[Nat8, R] := asSpan(&(file->path));
+            case statusOf(path) of
+                when FileMissing do
+                    note(&!findings, false, "file", path, fromLiteral("not there; init writes it"), makeEmpty());
+                when FileUnreadable do
+                    note(&!findings, false, "file", path, fromLiteral("cannot be looked at"), makeEmpty());
+                when FileFound(status as s: FileStatus) do
+                    if sameKind(s.kind, kindRegular) then
+                        note(&!findings, true, "file", path, makeEmpty(), makeEmpty());
+                    else
+                        note(&!findings, false, "file", path, fromLiteral("not a regular file"), makeEmpty());
+                    end if;
+            end case;
+            j := j + 1;
+        end while;
+        var k: Index := 0;
+        while k < bufferLength(&(checkup->results)) do
+            let result: &[Finding, R] := nthRef(&(checkup->results), k);
+            note(&!findings, result->good, result->name, asSpan(&(result->path)), fromSpan(asSpan(&(result->reason))), fromSpan(asSpan(&(result->fix))));
+            k := k + 1;
+        end while;
+        return writeFindings(&~out, findings, json);
+    end;
+
+    -- The findings as lines or as JSON into out; how many are missing.
+    generic [T: Region]
+    function writeFindings(out: &![StringBuilder, T], findings: Buffer[Finding], json: Bool): Index is
+        var missing: Index := 0;
+        var rest: Buffer[Finding] := findings;
+        var writer: JsonWriter := makeJsonWriter();
+        beginArray(&!writer);
+        while bufferLength(&rest) > 0 do
+            let { good: Bool, name: Span[Nat8, Static], path: String, reason: String, fix: String } := removeFirst(&!rest);
+            if not good then
+                missing := missing + 1;
+            end if;
+            if json then
+                beginObject(&!writer);
+                writeName(&!writer, "what");
+                writeJsonString(&!writer, name);
+                writeName(&!writer, "path");
+                writeJsonString(&!writer, asSpan(&path));
+                writeName(&!writer, "ok");
+                writeBool(&!writer, good);
+                writeName(&!writer, "reason");
+                writeJsonString(&!writer, asSpan(&reason));
+                writeName(&!writer, "fix");
+                writeJsonString(&!writer, asSpan(&fix));
+                endObject(&!writer);
+            else
+                if good then
+                    writeString(&~out, "ok       ");
+                else
+                    writeString(&~out, "missing  ");
+                end if;
+                writeColumn(&~out, name);
+                writeString(&~out, asSpan(&path));
+                if not good then
+                    writeString(&~out, ": ");
+                    writeString(&~out, asSpan(&reason));
+                    if spanLength(asSpan(&fix)) > 0 then
+                        writeString(&~out, "; fix: ");
+                        writeString(&~out, asSpan(&fix));
+                    end if;
+                end if;
+                writeByte(&~out, '\n');
+            end if;
+            destroyString(path);
+            destroyString(reason);
+            destroyString(fix);
+        end while;
+        destroyEmptyBuffer(rest);
+        endArray(&!writer);
+        case finishJson(writer) of
+            when Some(value as text: String) do
+                if json then
+                    writeString(&~out, asSpan(&text));
+                    writeByte(&~out, '\n');
+                end if;
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        return missing;
+    end;
+
+    -- name padded with blanks to nine columns, and one blank at least.
+    generic [T: Region]
+    function writeColumn(out: &![StringBuilder, T], name: Span[Nat8, Static]): Unit is
+        writeString(&~out, name);
+        writeByte(&~out, ' ');
+        var n: Index := spanLength(name) + 1;
+        while n < 9 do
+            writeByte(&~out, ' ');
+            n := n + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Init
+    ---
+
+    generic [S: Region, A: Region]
+    function servicePath(system: Span[Nat8, S], app: Span[Nat8, A]): String is
+        var out: StringBuilder := makeStringBuilder();
+        if equal(system, "openbsd") then
+            writeString(&!out, "/etc/rc.d/");
+            writeString(&!out, app);
+        else if equal(system, "freebsd") then
+            writeString(&!out, "/usr/local/etc/rc.d/");
+            writeString(&!out, app);
+        else if equal(system, "macos") then
+            writeString(&!out, "/Library/LaunchDaemons/");
+            writeString(&!out, app);
+            writeString(&!out, ".plist");
+        else
+            writeString(&!out, "/etc/systemd/system/");
+            writeString(&!out, app);
+            writeString(&!out, ".service");
+        end if;
+        return finalize(out);
+    end;
+
+    -- A line of a service file whose value the shell or systemd reads:
+    -- name, the value quoted for the shell when shell is true, a line feed.
+    generic [R: Region, V: Region]
+    function writeSetting(out: &![StringBuilder, R], name: Span[Nat8, Static], value: Span[Nat8, V], shell: Bool): Unit is
+        writeString(&~out, name);
+        if shell then
+            writeQuoted(&~out, value);
+        else
+            writeString(&~out, value);
+        end if;
+        writeByte(&~out, '\n');
+        return nil;
+    end;
+
+    generic [S: Region, R: Region, B: Region]
+    function serviceFile(system: Span[Nat8, S], checkup: &[Checkup, R], binary: Span[Nat8, B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let app: Span[Nat8, R] := asSpan(&(checkup->app));
+        let account: String := accountName(app);
+        if equal(system, "openbsd") then
+            writeString(&!out, "#!/bin/ksh\n\n");
+            writeSetting(&!out, "daemon=", binary, true);
+            writeSetting(&!out, "daemon_user=", asSpan(&account), true);
+            writeString(&!out, "\n. /etc/rc.d/rc.subr\n\nrc_bg=YES\nrc_reload=NO\n\nrc_cmd $1\n");
+        else if equal(system, "freebsd") then
+            writeString(&!out, "#!/bin/sh\n\n# PROVIDE: ");
+            writeVariable(&!out, app);
+            writeString(&!out, "\n# REQUIRE: LOGIN\n# KEYWORD: shutdown\n\n. /etc/rc.subr\n\nname=");
+            writeVariable(&!out, app);
+            writeString(&!out, "\nrcvar=");
+            writeVariable(&!out, app);
+            writeString(&!out, "_enable\n");
+            writeSetting(&!out, "command=", "/usr/sbin/daemon", false);
+            var arguments: StringBuilder := makeStringBuilder();
+            writeString(&!arguments, "-f -u ");
+            writeQuoted(&!arguments, asSpan(&account));
+            writeByte(&!arguments, ' ');
+            writeQuoted(&!arguments, binary);
+            let text: String := finalize(arguments);
+            writeString(&!out, "command_args=\"");
+            writeString(&!out, asSpan(&text));
+            writeString(&!out, "\"\n\nload_rc_config $name\n: ${");
+            destroyString(text);
+            writeVariable(&!out, app);
+            writeString(&!out, "_enable:=NO}\n\nrun_rc_command \"$1\"\n");
+        else if equal(system, "macos") then
+            writeString(&!out, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+            writeString(&!out, "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
+            writeString(&!out, "<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>");
+            writeXml(&!out, app);
+            writeString(&!out, "</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>");
+            writeXml(&!out, binary);
+            writeString(&!out, "</string>\n\t</array>\n\t<key>UserName</key>\n\t<string>");
+            writeXml(&!out, asSpan(&account));
+            writeString(&!out, "</string>\n\t<key>GroupName</key>\n\t<string>");
+            writeXml(&!out, asSpan(&account));
+            writeString(&!out, "</string>\n\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<true/>\n</dict>\n</plist>\n");
+        else
+            writeString(&!out, "[Unit]\nDescription=");
+            writeString(&!out, app);
+            writeString(&!out, "\nAfter=network.target\n\n[Service]\n");
+            writeSetting(&!out, "User=", asSpan(&account), false);
+            writeSetting(&!out, "Group=", asSpan(&account), false);
+            writeSetting(&!out, "ExecStart=", binary, false);
+            writeWritable(&!out, checkup);
+            writeString(&!out, "Restart=on-failure\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\n");
+            writeString(&!out, "PrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\n");
+            writeString(&!out, "ProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\n");
+            writeString(&!out, "RestrictRealtime=yes\nRestrictNamespaces=yes\nCapabilityBoundingSet=\n\n[Install]\nWantedBy=multi-user.target\n");
+        end if;
+        destroyString(account);
+        return finalize(out);
+    end;
+
+    -- Text inside an element of a property list: the three characters
+    -- that XML reads as markup written as entities.
+    generic [T: Region, V: Region]
+    function writeXml(out: &![StringBuilder, T], text: Span[Nat8, V]): Unit is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if byte = '&' then
+                writeString(&~out, "&amp;");
+            else if byte = '<' then
+                writeString(&~out, "&lt;");
+            else if byte = '>' then
+                writeString(&~out, "&gt;");
+            else
+                writeByte(&~out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- ReadWritePaths with the directories of the checkup, the only places
+    -- a unit under ProtectSystem=strict may write; no line without one.
+    generic [T: Region, R: Region]
+    function writeWritable(out: &![StringBuilder, T], checkup: &[Checkup, R]): Unit is
+        var first: Bool := true;
+        var i: Index := 0;
+        while i < bufferLength(&(checkup->items)) do
+            let item: &[Item, R] := nthRef(&(checkup->items), i);
+            if sameKind(wantedKind(item->what), kindDirectory) then
+                if first then
+                    writeString(&~out, "ReadWritePaths=");
+                    first := false;
+                else
+                    writeByte(&~out, ' ');
+                end if;
+                writeString(&~out, asSpan(&(item->path)));
+            end if;
+            i := i + 1;
+        end while;
+        if not first then
+            writeByte(&~out, '\n');
+        end if;
+        return nil;
+    end;
+
+    generic [A: Region]
+    function accountName(app: Span[Nat8, A]): String is
+        case serviceAccount(app) of
+            when Some(value as name: String) do
+                return name;
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    -- What init would do on system for checkup, in order: the account, the
+    -- paths that are not there, a service file that is not there, and the
+    -- service enabled at boot.
+    generic [S: Region, R: Region, B: Region]
+    function planSteps(system: Span[Nat8, S], checkup: &[Checkup, R], binary: Span[Nat8, B]): Buffer[Step] is
+        var steps: Buffer[Step] := allocateEmpty();
+        let service: Bool := isService(checkup->kind);
+        let app: Span[Nat8, R] := asSpan(&(checkup->app));
+        let account: String := accountName(app);
+        if service then
+            case lookupAccount(asSpan(&account)) of
+                when AccountFound(numbers as n: AccountNumbers) do
+                    skip;
+                when NoAccount do
+                    insertBack(&!steps, RunStep(name => "account", path => fromSpan(asSpan(&account)), words => accountWords(system, asSpan(&account))));
+                when LookupFailed do
+                    insertBack(&!steps, RunStep(name => "account", path => fromSpan(asSpan(&account)), words => accountWords(system, asSpan(&account))));
+            end case;
+        end if;
+        var i: Index := 0;
+        while i < bufferLength(&(checkup->items)) do
+            let item: &[Item, R] := nthRef(&(checkup->items), i);
+            let path: Span[Nat8, R] := asSpan(&(item->path));
+            if not isSocket(item->what) then
+                case statusOf(path) of
+                    when FileMissing do
+                        insertBack(&!steps, RunStep(name => whatName(item->what), path => fromSpan(path), words => createWords(service, asSpan(&account), item->what, path)));
+                    when FileUnreadable do
+                        skip;
+                    when FileFound(status as s: FileStatus) do
+                        skip;
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        var j: Index := 0;
+        while j < bufferLength(&(checkup->files)) do
+            let item: &[FileItem, R] := nthRef(&(checkup->files), j);
+            let path: Span[Nat8, R] := asSpan(&(item->path));
+            case statusOf(path) of
+                when FileMissing do
+                    let parent: String := parentOf(path);
+                    if spanLength(asSpan(&parent)) > 0 then
+                        case statusOf(asSpan(&parent)) of
+                            when FileMissing do
+                                var w: Buffer[String] := allocateEmpty();
+                                word(&!w, "/usr/bin/install");
+                                word(&!w, "-d");
+                                word(&!w, "-m");
+                                word(&!w, "0755");
+                                wordOf(&!w, asSpan(&parent));
+                                insertBack(&!steps, RunStep(name => "directory", path => fromSpan(asSpan(&parent)), words => w));
+                            when FileUnreadable do
+                                skip;
+                            when FileFound(status as s: FileStatus) do
+                                skip;
+                        end case;
+                    end if;
+                    destroyString(parent);
+                    insertBack(&!steps, WriteStep(name => "file", path => fromSpan(path), text => fromSpan(asSpan(&(item->text))), mode => item->mode));
+                when FileUnreadable do
+                    skip;
+                when FileFound(status as s: FileStatus) do
+                    skip;
+            end case;
+            j := j + 1;
+        end while;
+        let file: String := servicePath(system, app);
+        if service and (spanLength(asSpan(&file)) > 0) then
+            case statusOf(asSpan(&file)) of
+                when FileMissing do
+                    var mode: Nat32 := 420;
+                    if not (equal(system, "linux") or equal(system, "macos")) then
+                        mode := 365;
+                    end if;
+                    insertBack(&!steps, WriteStep(name => "service", path => fromSpan(asSpan(&file)), text => serviceFile(system, checkup, binary), mode => mode));
+                when FileUnreadable do
+                    skip;
+                when FileFound(status as s: FileStatus) do
+                    skip;
+            end case;
+            insertBack(&!steps, RunStep(name => "enable", path => fromSpan(asSpan(&file)), words => enableWords(system, app)));
+        end if;
+        destroyString(file);
+        destroyString(account);
+        return steps;
+    end;
+
+    -- Runs words without a shell and waits for it: true when it exited
+    -- with 0.  The output and the errors are read to their ends, output
+    -- first; the commands init runs write little.
+    function runWords(words: Buffer[String]): Bool is
+        var rest: Buffer[String] := words;
+        let program: String := removeFirst(&!rest);
+        var command: ProcessCommand := makeProcessCommand(asSpan(&program));
+        destroyString(program);
+        while bufferLength(&rest) > 0 do
+            let argument: String := removeFirst(&!rest);
+            command := addArgument(command, asSpan(&argument));
+            destroyString(argument);
+        end while;
+        destroyEmptyBuffer(rest);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closedInput: Bool := closeFile(input);
+                var o: FileDescriptor := output;
+                var e: FileDescriptor := errors;
+                discardText(readAll(&!o));
+                discardText(readAll(&!e));
+                let closedOutput: Bool := closeFile(o);
+                let closedErrors: Bool := closeFile(e);
+                let status: ProcessStatus := waitProcess(process);
+                return exitedNormally(status) and (exitCode(status) = 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function discardText(text: Option[String]): Unit is
+        case text of
+            when Some(value as t: String) do
+                destroyString(t);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Writes text into a new file at path with mode; false when the name
+    -- is taken or a write failed.
+    generic [P: Region, T: Region]
+    function writeNew(path: Span[Nat8, P], text: Span[Nat8, T], mode: Nat32): Bool is
+        case createNewFile(path, mode) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, text);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [B: Region, R: Region, T: Region]
+    function runInit(checkup: &[Checkup, R], binary: Span[Nat8, B], dryRun: Bool, out: &![StringBuilder, T]): Index is
+        return runInitOn(systemName(), isSuperuser(), checkup, binary, dryRun, &~out);
+    end;
+
+    generic [S: Region, B: Region, R: Region, T: Region]
+    function runInitOn(system: Span[Nat8, S], superuser: Bool, checkup: &[Checkup, R], binary: Span[Nat8, B], dryRun: Bool, out: &![StringBuilder, T]): Index is
+        let service: Bool := isService(checkup->kind);
+        var steps: Buffer[Step] := planSteps(system, checkup, binary);
+        let count: Index := bufferLength(&steps);
+        -- Without the superuser a service is not touched at all: what init
+        -- would do is listed, and the command that does it.
+        let doing: Bool := (not dryRun) and (superuser or (not service));
+        var left: Index := 0;
+        var failed: Bool := false;
+        while bufferLength(&steps) > 0 do
+            let step: Step := removeFirst(&!steps);
+            case step of
+                when RunStep(name as name: Span[Nat8, Static], path as path: String, words as words: Buffer[String]) do
+                    if doing and (not failed) then
+                        let line: String := commandLine(system, false, true, &words);
+                        if runWords(words) then
+                            writeString(&~out, "made     ");
+                        else
+                            writeString(&~out, "failed   ");
+                            failed := true;
+                            left := left + 1;
+                        end if;
+                        writeColumn(&~out, name);
+                        writeString(&~out, asSpan(&line));
+                        destroyString(line);
+                    else
+                        writeString(&~out, "would    ");
+                        writeColumn(&~out, name);
+                        let line: String := lineOf(system, false, true, words);
+                        writeString(&~out, asSpan(&line));
+                        destroyString(line);
+                        left := left + 1;
+                    end if;
+                    writeByte(&~out, '\n');
+                    destroyString(path);
+                when WriteStep(name as name: Span[Nat8, Static], path as path: String, text as text: String, mode as mode: Nat32) do
+                    if doing and (not failed) then
+                        if writeNew(asSpan(&path), asSpan(&text), mode) then
+                            writeString(&~out, "made     ");
+                        else
+                            writeString(&~out, "failed   ");
+                            failed := true;
+                            left := left + 1;
+                        end if;
+                    else
+                        writeString(&~out, "would    ");
+                        left := left + 1;
+                    end if;
+                    writeColumn(&~out, name);
+                    writeString(&~out, "write ");
+                    writeQuoted(&~out, asSpan(&path));
+                    writeString(&~out, " mode ");
+                    writeMode(&~out, mode);
+                    writeByte(&~out, '\n');
+                    destroyString(path);
+                    destroyString(text);
+            end case;
+        end while;
+        destroyEmptyBuffer(steps);
+        if count = 0 then
+            writeString(&~out, "nothing to do\n");
+        else if (not doing) and (not dryRun) then
+            if equal(system, "openbsd") then
+                writeString(&~out, "init needs the superuser; run: doas ");
+            else
+                writeString(&~out, "init needs the superuser; run: sudo ");
+            end if;
+            writeQuoted(&~out, binary);
+            writeString(&~out, " init\n");
+        end if;
+        let block: String := hiawathaBlock(checkup);
+        if service and (spanLength(asSpan(&block)) > 0) then
+            writeString(&~out, "for hiawatha.conf:\n");
+            writeString(&~out, asSpan(&block));
+        end if;
+        destroyString(block);
+        return left;
+    end;
+
+    generic [R: Region]
+    function hiawathaBlock(checkup: &[Checkup, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        var found: Bool := false;
+        while (i < bufferLength(&(checkup->items))) and (not found) do
+            let item: &[Item, R] := nthRef(&(checkup->items), i);
+            if isSocket(item->what) then
+                found := true;
+                let app: Span[Nat8, R] := asSpan(&(checkup->app));
+                writeString(&!out, "FastCGIserver {\n    FastCGIid = ");
+                writeString(&!out, app);
+                writeString(&!out, "\n    ConnectTo = ");
+                writeString(&!out, asSpan(&(item->path)));
+                writeString(&!out, "\n    SessionTimeout = 30\n}\nUrlToolkit {\n    ToolkitID = ");
+                writeString(&!out, app);
+                writeString(&!out, "\n    Match .* UseFastCGI ");
+                writeString(&!out, app);
+                writeString(&!out, "\n}\n# and in the VirtualHost of the site:\n#     UseToolkit = ");
+                writeString(&!out, app);
+                writeByte(&!out, '\n');
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+end module body.

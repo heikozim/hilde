@@ -1,0 +1,191 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Keys made by libcrypto are written as COSE keys from the coordinates
+-- of their DER, and publicKeyFromCose must give that DER back byte for
+-- byte; a signature then verifies under it.  Keys with a wrong alg, an
+-- unknown curve or kind, a compressed point, a short coordinate, bytes
+-- after the map and bytes that are no CBOR give None.
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    hexToBytes,
+    substring,
+    equal
+);
+import Standard.X509 (
+    PrivateKey,
+    KeyKind,
+    EcP256,
+    Ed25519Key,
+    Rsa2048,
+    generateKey,
+    publicKeyDer,
+    signMessage,
+    verifyMessage,
+    destroyPrivateKey
+);
+import Standard.Cose (
+    publicKeyFromCose
+);
+
+module body Standard.Cose.Test is
+    function hex(text: Span[Nat8, Static]): String is
+        case hexToBytes(text) of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                abort("not hexadecimal");
+        end case;
+    end;
+
+    function made(kind: KeyKind): PrivateKey is
+        case generateKey(kind) of
+            when Some(value as key: PrivateKey) do
+                return key;
+            when None do
+                abort("no key was made");
+        end case;
+    end;
+
+    generic [R: Region]
+    function derOf(key: &[PrivateKey, R]): String is
+        case publicKeyDer(key) of
+            when Some(value as der: String) do
+                return der;
+            when None do
+                abort("no public key");
+        end case;
+    end;
+
+    -- head, then the bytes of der from start to stop, then middle, then
+    -- the bytes from start2 to stop2.
+    generic [R: Region]
+    function cose(head: Span[Nat8, Static], der: &[String, R], start: Index, stop: Index, middle: Span[Nat8, Static], start2: Index, stop2: Index): String is
+        let data: Span[Nat8, R] := asSpan(der);
+        let first: String := hex(head);
+        let second: String := hex(middle);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&first));
+        writeString(&!out, substring(data, start, stop));
+        writeString(&!out, asSpan(&second));
+        writeString(&!out, substring(data, start2, stop2));
+        destroyString(first);
+        destroyString(second);
+        return finalize(out);
+    end;
+
+    -- publicKeyFromCose gives der back for the COSE key key.
+    generic [R: Region, S: Region]
+    function givesBack(key: &[String, R], der: &[String, S], message: Span[Nat8, Static]): Unit is
+        case publicKeyFromCose(asSpan(key)) of
+            when Some(value as back: String) do
+                assertTrue(equal(asSpan(&back), asSpan(der)), message);
+                destroyString(back);
+            when None do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function refused(text: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let key: String := hex(text);
+        case publicKeyFromCose(asSpan(&key)) of
+            when Some(value as back: String) do
+                destroyString(back);
+                assertFailure(message);
+            when None do
+                assertTrue(true, message);
+        end case;
+        destroyString(key);
+        return nil;
+    end;
+
+    -- The DER of P-256 ends with 04, x and y of 32 bytes each.
+    function testEc2RoundTrip(): Unit is
+        let key: PrivateKey := made(EcP256());
+        let der: String := derOf(&key);
+        let size: Index := length(&der);
+        let x: Index := size - 64;
+        let cosed: String := cose("a5010203262001215820", &der, x, x + 32, "225820", x + 32, size);
+        givesBack(&cosed, &der, "a P-256 key comes back as its DER");
+        case publicKeyFromCose(asSpan(&cosed)) of
+            when Some(value as back: String) do
+                case signMessage(&key, "signed") of
+                    when Some(value as signature: String) do
+                        assertTrue(verifyMessage(asSpan(&back), "signed", asSpan(&signature)), "a signature verifies under the key");
+                        assertTrue(not verifyMessage(asSpan(&back), "other", asSpan(&signature)), "and not for another message");
+                        destroyString(signature);
+                    when None do
+                        assertFailure("a signature is made");
+                end case;
+                destroyString(back);
+            when None do
+                assertFailure("the key is read");
+        end case;
+        destroyString(cosed);
+        destroyString(der);
+        destroyPrivateKey(key);
+        return nil;
+    end;
+
+    -- The DER of Ed25519 ends with the 32 bytes of x.
+    function testOkpRoundTrip(): Unit is
+        let key: PrivateKey := made(Ed25519Key());
+        let der: String := derOf(&key);
+        let size: Index := length(&der);
+        let cosed: String := cose("a4010103272006215820", &der, size - 32, size, "", size, size);
+        givesBack(&cosed, &der, "an Ed25519 key comes back as its DER");
+        destroyString(cosed);
+        destroyString(der);
+        destroyPrivateKey(key);
+        return nil;
+    end;
+
+    -- The DER of RSA 2048 with e 65537 holds n of 256 bytes from 33 on,
+    -- after the 00 that keeps it positive, and e as 010001 at its end.
+    function testRsaRoundTrip(): Unit is
+        let key: PrivateKey := made(Rsa2048());
+        let der: String := derOf(&key);
+        let size: Index := length(&der);
+        assertTrue(size = 294, "an RSA 2048 key has 294 bytes of DER");
+        let cosed: String := cose("a401030339010020590100", &der, 33, 289, "2143", size - 3, size);
+        givesBack(&cosed, &der, "an RSA key comes back as its DER");
+        destroyString(cosed);
+        destroyString(der);
+        destroyPrivateKey(key);
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        refused("a501020338222001215820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f225820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", "a P-256 key with alg -35");
+        refused("a5010203262004215820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f225820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", "curve 4");
+        refused("a5010203262001215820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f22f5", "a compressed point");
+        refused("a501020326200121581f0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f225820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", "an x of 31 bytes");
+        refused("a201040326", "kty 4");
+        refused("a10102", "a key of kty 2 without its parameters");
+        refused("a5010203262001215820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f225820202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f00", "a byte after the map");
+        refused("ff", "bytes that are no CBOR");
+        refused("", "nothing");
+        return nil;
+    end;
+end module body.

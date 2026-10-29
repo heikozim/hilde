@@ -1,0 +1,389 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The files and frame payloads of a Sperli checkpoint: rank files, signed COMMIT files and their place on disk.
+
+- A rank file holds a header of 80 bytes and the state; the header names the job, epoch, rank, size and the SHA-256 of the state.
+- A COMMIT file lists the SHA-256 of every rank file and is signed with Standard.CompositeSig; without a valid signature an epoch does not count.
+- Every file is written to a temporary name, synced and renamed, so a reader finds a whole file or none.
+- The path of a file is the directory, the job as hexadecimal digits, the epoch and the rank.
+- A state goes in and out through the type class Checkpointable.
+- Every refusal is a code of Standard.SperliError.
+
+    let file: Option[String] := rankFile(job, 1, 0, 2, asSpan(&state));
+    let verdict: Int32 := checkCommit(asSpan(&commit), publicKey, job, 1, 2);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String,
+    length
+);
+import Standard.CompositeSig (
+    CompositeKey
+);
+
+module Standard.SperliCkpt is
+    """
+    The bytes of the header of a rank file: 80.
+    """
+    function fileHeaderBytes(): Index
+        ensures result = 80;
+
+    """
+    The bytes of a SHA-256 digest: 32.
+    """
+    function digestBytes(): Index
+        ensures result = 32;
+
+    """
+    The most bytes a state may have in version 1: 268435456.
+    """
+    function maxStateBytes(): Index
+        ensures result = 268435456;
+
+    """
+    The most bytes of a rank file one CKPT_DATA frame carries: 1048576.
+    """
+    function chunkBytes(): Index
+        ensures result = 1048576;
+
+    """
+    The context of the signature of a COMMIT file.
+    """
+    function commitContext(): Span[Nat8, Static]
+        ensures spanLength(result) = 15;
+
+    """
+    A type whose values a checkpoint can write and read back.  A type that
+    holds an open send or receive, a connection or a file has no instance,
+    so a program that tries to checkpoint it does not compile.
+    """
+    typeclass Checkpointable(T: Type) is
+        """
+        The bytes of the value.
+        No contract: the length of the bytes is the choice of the type.
+        """
+        generic [R: Region]
+        method encodeState(value: &[T, R]): String;
+
+        """
+        The value the bytes hold; None when they hold none.
+        No contract: an Option result, which an ensures cannot look into.
+        """
+        generic [B: Region]
+        method decodeState(bytes: Span[Nat8, B]): Option[T];
+    end;
+
+    instance Checkpointable(String);
+
+    ---
+    --- Rank files
+    ---
+
+    """
+    The rank file of rank for epoch in job (16 bytes): the header, then
+    payload.  None when the SHA-256 could not be made.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [J: Region, P: Region]
+    function rankFile(job: Span[Nat8, J], epoch: Nat64, rank: Nat32, size: Nat32, payload: Span[Nat8, P]): Option[String]
+        requires (spanLength(job) = 16) and (epoch >= 1)
+        requires ((size >= 1) and (size <= 4096)) and (rank < size)
+        requires spanLength(payload) <= 268435456;
+
+    """
+    0 when file is a rank file of job, epoch, rank and size whose payload
+    hashes to the digest in its header; badCheckpointFile for another
+    magic, version, job, epoch, rank or size or a length that is not the
+    header and the payload length; digestMismatch when the payload does not
+    hash to the digest.
+    No contract: every file is allowed, a wrong one is an answer.
+    """
+    generic [F: Region, J: Region]
+    function checkRankFile(file: Span[Nat8, F], job: Span[Nat8, J], epoch: Nat64, rank: Nat32, size: Nat32): Int32
+        requires spanLength(job) = 16;
+
+    """
+    The payload of a rank file that checkRankFile accepted.
+    """
+    generic [F: Region]
+    function rankFilePayload(file: Span[Nat8, F]): String
+        requires spanLength(file) >= 80
+        ensures (length(&result) + 80) = spanLength(file);
+
+    """
+    The SHA-256 of bytes, 32 bytes.  None when the library fails.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [B: Region]
+    function digestOf(bytes: Span[Nat8, B]): Option[String];
+
+    ---
+    --- COMMIT files
+    ---
+
+    """
+    The part of a COMMIT file that is signed: the header and the digests of
+    the rank files of epoch in job, 32 bytes for each rank in order.
+    """
+    generic [J: Region, D: Region]
+    function commitBody(job: Span[Nat8, J], epoch: Nat64, digests: Span[Nat8, D]): String
+        requires (spanLength(job) = 16) and (epoch >= 1)
+        requires ((spanLength(digests) >= 32) and (spanLength(digests) <= 131072)) and (((spanLength(digests) / 32) * 32) = spanLength(digests))
+        ensures length(&result) = (36 + spanLength(digests));
+
+    """
+    The COMMIT file of content signed with key: the content, the length of the
+    signature and the signature.  None when signing failed.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [K: Region, B: Region]
+    function signCommit(key: &[CompositeKey, K], content: Span[Nat8, B]): Option[String]
+        requires spanLength(content) >= 68;
+
+    """
+    0 when commit is a COMMIT file of job and epoch for size ranks with a
+    signature that publicKey verifies.  badCommit for a cut or malformed
+    file, another job or epoch or a signature that fails; sizeMismatch for
+    a signed file of another size.
+    No contract: every file is allowed, a wrong one is an answer.
+    """
+    generic [C: Region, K: Region, J: Region]
+    function checkCommit(commit: Span[Nat8, C], publicKey: Span[Nat8, K], job: Span[Nat8, J], epoch: Nat64, size: Nat32): Int32
+        requires spanLength(job) = 16;
+
+    """
+    The epoch a COMMIT file names; 0 when it is too short to name one.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [C: Region]
+    function commitEpoch(commit: Span[Nat8, C]): Nat64;
+
+    """
+    The digest of the rank file of rank in a COMMIT file that checkCommit
+    accepted; the empty string when the file has no such rank.
+    No contract: the empty string is the answer for a rank the file lacks.
+    """
+    generic [C: Region]
+    function commitDigest(commit: Span[Nat8, C], rank: Nat32): String
+        requires rank < 4096;
+
+    ---
+    --- Frame payloads
+    ---
+
+    """
+    The payload of CKPT_BEGIN: the format version 1 and size.
+    """
+    function beginPayload(size: Nat32): String
+        requires (size >= 1) and (size <= 4096)
+        ensures length(&result) = 8;
+
+    """
+    Whether payload is a CKPT_BEGIN payload of version 1 for size ranks.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [P: Region]
+    function beginIs(payload: Span[Nat8, P], size: Nat32): Bool;
+
+    """
+    The payload of CKPT_DATA: the kind (0 buddy copy, 1 fetch request, 2
+    fetch reply, 3 fetch refused, 4 nothing to fetch), the rank whose file
+    it is, the offset of chunk in the file and the length of the file.
+    """
+    generic [C: Region]
+    function dataPayload(kind: Nat8, owner: Nat32, offset: Nat64, total: Nat64, chunk: Span[Nat8, C]): String
+        requires (kind <= 4) and (spanLength(chunk) <= 1048576)
+        ensures length(&result) = (24 + spanLength(chunk));
+
+    """
+    Whether payload holds the 24 bytes before the chunk of a CKPT_DATA
+    payload, with a kind below 5, and no chunk when the kind is 1, 3 or 4.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [P: Region]
+    function dataIs(payload: Span[Nat8, P]): Bool;
+
+    """
+    The kind of a CKPT_DATA payload that dataIs accepted.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [P: Region]
+    function dataKindOf(payload: Span[Nat8, P]): Nat8
+        requires spanLength(payload) >= 24;
+
+    """
+    The rank whose file a CKPT_DATA payload carries.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [P: Region]
+    function dataOwner(payload: Span[Nat8, P]): Nat32
+        requires spanLength(payload) >= 24;
+
+    """
+    The offset of the chunk of a CKPT_DATA payload.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [P: Region]
+    function dataOffset(payload: Span[Nat8, P]): Nat64
+        requires spanLength(payload) >= 24;
+
+    """
+    The length of the whole file a CKPT_DATA payload speaks of.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [P: Region]
+    function dataTotal(payload: Span[Nat8, P]): Nat64
+        requires spanLength(payload) >= 24;
+
+    """
+    The chunk of a CKPT_DATA payload.
+    """
+    generic [P: Region]
+    function dataChunk(payload: Span[Nat8, P]): String
+        requires spanLength(payload) >= 24
+        ensures (length(&result) + 24) = spanLength(payload);
+
+    """
+    The payload of RESUME: size, the status (0 request or ready, 1 file
+    fetched from the buddy, 2 failed, 3 offer), the SHA-256 of the COMMIT
+    file (32 zero bytes for none) and, for status 0 from rank 0 and for 3,
+    the COMMIT file.
+    """
+    generic [D: Region, C: Region]
+    function resumePayload(size: Nat32, status: Nat32, fingerprint: Span[Nat8, D], commit: Span[Nat8, C]): String
+        requires ((size >= 1) and (size <= 4096)) and ((status <= 3) and (spanLength(fingerprint) = 32))
+        ensures length(&result) = (40 + spanLength(commit));
+
+    """
+    Whether payload holds the 40 bytes of a RESUME payload.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [P: Region]
+    function resumeIs(payload: Span[Nat8, P]): Bool;
+
+    """
+    The size a RESUME payload names.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [P: Region]
+    function resumeSize(payload: Span[Nat8, P]): Nat32
+        requires spanLength(payload) >= 40;
+
+    """
+    The status of a RESUME payload.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [P: Region]
+    function resumeStatus(payload: Span[Nat8, P]): Nat32
+        requires spanLength(payload) >= 40;
+
+    """
+    The COMMIT file after the 40 bytes of a RESUME payload.
+    """
+    generic [P: Region]
+    function resumeCommit(payload: Span[Nat8, P]): String
+        requires spanLength(payload) >= 40
+        ensures (length(&result) + 40) = spanLength(payload);
+
+    ---
+    --- Places on disk
+    ---
+
+    """
+    The directory of a job: directory, a slash and the job (16 bytes) as 32
+    hexadecimal digits.
+    """
+    generic [D: Region, J: Region]
+    function jobDirectory(directory: Span[Nat8, D], job: Span[Nat8, J]): String
+        requires (spanLength(directory) > 0) and (spanLength(job) = 16)
+        ensures length(&result) = (spanLength(directory) + 33);
+
+    """
+    The directory of an epoch: the directory of the job, a slash and the
+    epoch in decimal.
+    """
+    generic [D: Region, J: Region]
+    function epochDirectory(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64): String
+        requires (spanLength(directory) > 0) and (spanLength(job) = 16)
+        ensures length(&result) >= (spanLength(directory) + 35);
+
+    """
+    The path of the rank file of rank in an epoch; with buddy true the copy
+    the buddy of the rank keeps, named rank-N.ckpt.buddy.
+    """
+    generic [D: Region, J: Region]
+    function rankPath(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64, rank: Nat32, buddy: Bool): String
+        requires (spanLength(directory) > 0) and (spanLength(job) = 16)
+        ensures length(&result) >= (spanLength(directory) + 47);
+
+    """
+    The path of the COMMIT file of an epoch.
+    """
+    generic [D: Region, J: Region]
+    function commitPath(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64): String
+        requires (spanLength(directory) > 0) and (spanLength(job) = 16)
+        ensures length(&result) >= (spanLength(directory) + 42);
+
+    """
+    Makes the directories of the job and of the epoch, each for its owner
+    only; true when both are there.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [D: Region, J: Region]
+    function prepareEpoch(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64): Bool
+        requires (spanLength(directory) > 0) and (spanLength(job) = 16);
+
+    """
+    Writes bytes to path for its owner only: to a temporary name, synced,
+    then renamed over path.  true when the file is in place.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [P: Region, B: Region]
+    function storeFile(path: Span[Nat8, P], bytes: Span[Nat8, B]): Bool
+        requires spanLength(path) > 0;
+
+    """
+    The bytes of the ordinary file at path, at most most of them.  None for
+    a file that is missing, is no ordinary file (a link is not followed),
+    is larger than most, or cannot be read.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [P: Region]
+    function loadFile(path: Span[Nat8, P], most: Index): Option[String]
+        requires spanLength(path) > 0;
+
+    """
+    Removes the COMMIT file of an epoch if there is one.
+    No contract: its effect is on the file system, which a condition cannot read.
+    """
+    generic [D: Region, J: Region]
+    function removeCommit(directory: Span[Nat8, D], job: Span[Nat8, J], epoch: Nat64): Unit
+        requires (spanLength(directory) > 0) and (spanLength(job) = 16);
+
+    """
+    The COMMIT file of the highest epoch under directory whose file checkCommit
+    accepts for job and size ranks.  When none fits: Left sizeMismatch when an
+    otherwise valid file was of another size, else Left badCommit when a file
+    failed, else Left resumeRefused.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [D: Region, J: Region, K: Region]
+    function bestCommit(directory: Span[Nat8, D], job: Span[Nat8, J], publicKey: Span[Nat8, K], size: Nat32): Either[Int32, String]
+        requires (spanLength(directory) > 0) and (spanLength(job) = 16);
+
+    """
+    Deletes every epoch directory of the job that is older than the epoch
+    before keep, committed or not.  Keep, the epoch before it and later
+    epochs stay.  Names that are no epoch are left alone.
+    No contract: its effect is on the file system, which a condition cannot read.
+    """
+    generic [D: Region, J: Region]
+    function pruneEpochs(directory: Span[Nat8, D], job: Span[Nat8, J], keep: Nat64): Unit
+        requires (spanLength(directory) > 0) and (spanLength(job) = 16);
+end module.

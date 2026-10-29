@@ -1,0 +1,135 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Arena (
+    Arena,
+    arenaSpan
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join
+);
+import Standard.TaskArena (
+    WithArena,
+    spawnWithArena
+);
+
+module body Example.LearnTasks is
+    -- The part of the work one task does: the numbers from first to last.
+    record Range: Free is
+        first: Nat64;
+        last: Nat64;
+    end;
+
+    -- The sum of the squares of first to last.  It runs in a task of its
+    -- own and shares nothing: its argument is copied in, its result is
+    -- handed back by join.
+    function sumSquares(range: Range): Nat64 is
+        let { first: Nat64, last: Nat64 } := range;
+        var sum: Nat64 := 0;
+        var i: Nat64 := first;
+        while i <= last do
+            sum := sum + (i * i);
+            i := i + 1;
+        end while;
+        return sum;
+    end;
+
+    -- A task started in scope, or nothing when none could be started.
+    generic [R: Region]
+    function start(scope: &![Scope, R], first: Nat64, last: Nat64): Option[Task[Nat64]] is
+        case spawn(scope, sumSquares, Range(first => first, last => last)) of
+            when Right(right as task: Task[Nat64]) do
+                let started: Option[Task[Nat64]] := Some(value => task);
+                return started;
+            when Left(left as back: Range) do
+                let none: Option[Task[Nat64]] := None();
+                return none;
+        end case;
+    end;
+
+    -- The result of a task, waiting for it to end.  A task that was never
+    -- started is the end of this programme: abort does not return.
+    function finish(task: Option[Task[Nat64]]): Nat64 is
+        case task of
+            when Some(value as running: Task[Nat64]) do
+                return join(running);
+            when None do
+                abort("no task could be started");
+                let zero: Nat64 := 0;
+                return zero;
+        end case;
+    end;
+
+    -- A task with an arena of its own: it takes room for 100 numbers from
+    -- the arena, writes the squares of 1 to 100 into it and adds them up.
+    -- The arena goes back with the result and ends with the task.
+    function squaresInArena(input: WithArena[Nat64]): WithArena[Nat64] is
+        let { value as count: Nat64, arena: Arena } := input;
+        var a: Arena := arena;
+        var sum: Nat64 := 0;
+        borrow r: &![Arena, R] := &!a do
+            let got: Option[Span![Nat64, R]] := arenaSpan(r, 100);
+            case got of
+                when Some(value as room: Span![Nat64, R]) do
+                    var sp: Span![Nat64, R] := room;
+                    var n: Nat64 := 1;
+                    for k from 0 to 99 do
+                        sp[k] := n * n;
+                        n := n + 1;
+                    end for;
+                    for k from 0 to 99 do
+                        sum := sum + sp[k];
+                    end for;
+                when None do
+                    sum := count;
+            end case;
+        end borrow;
+        return WithArena(value => sum, arena => a);
+    end;
+
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                -- Four tasks, started one after the other; they may run at
+                -- the same time and finish in any order.  join waits for
+                -- each in a fixed order, so the lines below always come
+                -- out the same.
+                let a: Option[Task[Nat64]] := start(&!scope, 1, 250);
+                let b: Option[Task[Nat64]] := start(&!scope, 251, 500);
+                let c: Option[Task[Nat64]] := start(&!scope, 501, 750);
+                let d: Option[Task[Nat64]] := start(&!scope, 751, 1000);
+                let sa: Nat64 := finish(a);
+                let sb: Nat64 := finish(b);
+                let sc: Nat64 := finish(c);
+                let sd: Nat64 := finish(d);
+                printLn(sa);
+                printLn(sb);
+                printLn(sc);
+                printLn(sd);
+                printLn(((sa + sb) + sc) + sd);
+                let room: ByteSize := 4096;
+                let marker: Nat64 := 0;
+                case spawnWithArena(&!scope, squaresInArena, marker, room) of
+                    when Right(right as task: Task[Nat64]) do
+                        printLn(join(task));
+                    when Left(left as back: Nat64) do
+                        printLn(back);
+                end case;
+                -- The scope ends here; every task started in it has ended.
+                closeScope(scope);
+            when None do
+                printLn("no scope for tasks");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

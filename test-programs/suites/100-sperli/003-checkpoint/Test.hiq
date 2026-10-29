@@ -1,0 +1,486 @@
+-- Checkpoint and resume of Standard.Sperli across processes: the
+-- programme starts itself as the ranks of jobs on localhost with TLS 1.3
+-- and a checkpoint directory.  In the first incarnation every rank writes
+-- two checkpoints and then one rank is lost; the launcher starts the job
+-- again and every rank resumes.  One job loses a rank whose own file is
+-- gone and gets it from the buddy; one has a changed SHA-256 in the file
+-- and in the buddy copy; one a COMMIT file whose signature is changed, so
+-- that the epoch before counts; one has no valid COMMIT file at all.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    insertBack,
+    removeLast,
+    destroyEmpty
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    nthByte,
+    asSpan,
+    length as textLength
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    formatNat
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFile,
+    removeDirectory
+);
+import Standard.Arguments (
+    processArguments
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal
+);
+import Standard.IO.Terminal (
+    StandardInput,
+    acquireInput,
+    releaseInput,
+    readLine
+);
+import Standard.SperliLaunch (
+    RunOptions,
+    parseRunArguments,
+    runJob
+);
+import Standard.SperliError (
+    restartStatus
+);
+import Standard.SperliCkpt (
+    rankPath,
+    commitPath,
+    jobDirectory,
+    loadFile,
+    storeFile,
+    pruneEpochs
+);
+import Standard.Sperli (
+    Job,
+    Comm,
+    readJobText,
+    jobId,
+    jobIncarnation,
+    init,
+    rank,
+    size,
+    barrier,
+    finish,
+    useCheckpoints,
+    checkpoint,
+    checkpointEpoch,
+    resume
+);
+
+module body Test is
+    ---
+    --- The launcher
+    ---
+
+    function checkpointDirectory(): Span[Nat8, Static] is
+        return "sperli-ckpt-suite";
+    end;
+
+    function words(ranks: Span[Nat8, Static], mode: Span[Nat8, Static]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        insertBack(&!out, fromLiteral("-n"));
+        insertBack(&!out, fromLiteral(ranks));
+        insertBack(&!out, fromLiteral("--hosts"));
+        insertBack(&!out, fromLiteral("sperli-hosts.txt"));
+        insertBack(&!out, fromLiteral("--checkpoint-dir"));
+        insertBack(&!out, fromLiteral(checkpointDirectory()));
+        insertBack(&!out, fromLiteral("--restart-max"));
+        insertBack(&!out, fromLiteral("2"));
+        insertBack(&!out, fromLiteral("/proc/self/exe"));
+        insertBack(&!out, fromLiteral(mode));
+        return out;
+    end;
+
+    function destroyWords(list: Buffer[String]): Unit is
+        var rest: Buffer[String] := list;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- Three ranks and one more host for a rank that is lost.
+    function writeHosts(): Bool is
+        case openWrite("sperli-hosts.txt") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, "localhost\nlocalhost\nlocalhost\nlocalhost\n");
+                return closeFile(file) and written;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function launch(ranks: Span[Nat8, Static], mode: Span[Nat8, Static]): Int32 is
+        let list: Buffer[String] := words(ranks, mode);
+        case parseRunArguments(&list) of
+            when Right(right as options: RunOptions) do
+                destroyWords(list);
+                return runJob(options);
+            when Left(left as code: Int32) do
+                destroyWords(list);
+                return code;
+        end case;
+    end;
+
+    function job(ranks: Span[Nat8, Static], mode: Span[Nat8, Static]): Bool is
+        print("job ");
+        print(mode);
+        print(" of ");
+        printLn(ranks);
+        let status: Int32 := launch(ranks, mode);
+        print("launcher status ");
+        printLn(status);
+        return status = 0;
+    end;
+
+    function launcher(): ExitCode is
+        if not writeHosts() then
+            printLn("no host file");
+            return ExitFailure();
+        end if;
+        var good: Bool := job("3", "kill");
+        good := job("2", "badsha") and good;
+        good := job("2", "badsig") and good;
+        good := job("2", "nosig") and good;
+        let removed: Bool := removeFile("sperli-hosts.txt");
+        if good then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+
+    ---
+    --- The ranks
+    ---
+
+    function widen(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The state of rank at step: a text that tells both.
+    function stateOf(me: Nat32, step: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "state of rank ");
+        let number: String := formatNat(widen(me));
+        writeString(&!out, asSpan(&number));
+        destroyString(number);
+        writeString(&!out, " at step ");
+        let at: String := formatNat(widen(step));
+        writeString(&!out, asSpan(&at));
+        destroyString(at);
+        return finalize(out);
+    end;
+
+    -- Writes the state of step as a checkpoint; true when it was committed.
+    generic [R: Region]
+    function writeStep(comm: &![Comm, R], me: Nat32, step: Nat32): Bool is
+        let state: String := stateOf(me, step);
+        let code: Int32 := checkpoint(&~comm, &state);
+        destroyString(state);
+        return code = 0;
+    end;
+
+    -- The file at path with the byte at place changed by one bit.
+    generic [P: Region]
+    function damage(path: Span[Nat8, P], place: Index): Bool is
+        case loadFile(path, 1000000) of
+            when None do
+                return false;
+            when Some(value as bytes: String) do
+                if place >= textLength(&bytes) then
+                    destroyString(bytes);
+                    return false;
+                end if;
+                var out: StringBuilder := makeStringBuilder();
+                var i: Index := 0;
+                while i < textLength(&bytes) do
+                    if i = place then
+                        writeByte(&!out, bitwiseXor(nthByte(&bytes, i), 1));
+                    else
+                        writeByte(&!out, nthByte(&bytes, i));
+                    end if;
+                    i := i + 1;
+                end while;
+                destroyString(bytes);
+                let changed: String := finalize(out);
+                let stored: Bool := storeFile(path, asSpan(&changed));
+                destroyString(changed);
+                return stored;
+        end case;
+    end;
+
+    -- What rank 0 does to the files of epoch 2 (and 1) before it is lost.
+    generic [M: Region, I: Region]
+    function spoilFiles(mode: &[String, M], id: &[String, I]): Bool is
+        var good: Bool := true;
+        if equal(asSpan(mode), "badsha") then
+            let file: String := rankPath(checkpointDirectory(), asSpan(id), 2, 0, false);
+            let copy: String := rankPath(checkpointDirectory(), asSpan(id), 2, 0, true);
+            good := damage(asSpan(&file), 90) and good;
+            good := damage(asSpan(&copy), 90) and good;
+            destroyString(copy);
+            destroyString(file);
+        end if;
+        if equal(asSpan(mode), "badsig") or equal(asSpan(mode), "nosig") then
+            let second: String := commitPath(checkpointDirectory(), asSpan(id), 2);
+            good := damage(asSpan(&second), 200) and good;
+            destroyString(second);
+        end if;
+        if equal(asSpan(mode), "nosig") then
+            let first: String := commitPath(checkpointDirectory(), asSpan(id), 1);
+            good := damage(asSpan(&first), 200) and good;
+            destroyString(first);
+        end if;
+        return good;
+    end;
+
+    -- The first incarnation: two checkpoints, then the rank that the mode
+    -- names is lost and the others find out.  Gives the exit status.
+    generic [I: Region]
+    function firstRun(opened: Comm, mode: String, id: &[String, I]): ExitCode is
+        var comm: Comm := opened;
+        let me: Nat32 := rank(&comm);
+        useCheckpoints(&!comm, checkpointDirectory());
+        var good: Bool := writeStep(&!comm, me, 1);
+        good := writeStep(&!comm, me, 2) and good;
+        good := (checkpointEpoch(&!comm) = 2) and good;
+        print("rank ");
+        print(me);
+        print(" wrote two checkpoints ");
+        printLn(good);
+        if barrier(&!comm) /= 0 then
+            good := false;
+        end if;
+        var lost: Nat32 := 1;
+        if (equal(asSpan(&mode), "badsha") or equal(asSpan(&mode), "badsig")) or equal(asSpan(&mode), "nosig") then
+            lost := 0;
+        end if;
+        if me = lost then
+            if equal(asSpan(&mode), "kill") then
+                let own: String := rankPath(checkpointDirectory(), asSpan(id), 2, me, false);
+                let gone: Bool := removeFile(asSpan(&own));
+                destroyString(own);
+                print("rank 1 lost its file and the job ");
+                printLn(gone);
+            else
+                let spoiled: Bool := spoilFiles(&mode, id);
+                print("rank 0 changed the files ");
+                printLn(spoiled);
+            end if;
+            destroyString(mode);
+            finish(comm);
+            return ExitStatus(status => 9);
+        end if;
+        destroyString(mode);
+        let peer: Int32 := barrier(&!comm);
+        print("rank ");
+        print(me);
+        if peer = 0 then
+            printLn(" the others did not leave");
+        else
+            printLn(" lost a peer");
+        end if;
+        finish(comm);
+        return ExitStatus(status => 75);
+    end;
+
+    generic [I: Region]
+    function cleanUp(id: &[String, I]): Unit is
+        pruneEpochs(checkpointDirectory(), asSpan(id), 1000000);
+        let jobPath: String := jobDirectory(checkpointDirectory(), asSpan(id));
+        let removed: Bool := removeDirectory(asSpan(&jobPath));
+        destroyString(jobPath);
+        let top: Bool := removeDirectory(checkpointDirectory());
+        return nil;
+    end;
+
+    generic [R: Region, M: Region, I: Region]
+    function afterResume(comm: &![Comm, R], mode: &[String, M], id: &[String, I], me: Nat32, state: String): Bool is
+        var good: Bool := true;
+        let epoch: Nat64 := checkpointEpoch(&~comm);
+        var step: Nat32 := 2;
+        if equal(asSpan(mode), "badsig") then
+            step := 1;
+        end if;
+        let wanted: String := stateOf(me, step);
+        good := equal(asSpan(&state), asSpan(&wanted)) and good;
+        destroyString(wanted);
+        print("rank ");
+        print(me);
+        print(" resumed epoch ");
+        print(epoch);
+        print(" with its own state ");
+        printLn(good);
+        destroyString(state);
+        if equal(asSpan(mode), "kill") and (me = 1) then
+            let own: String := rankPath(checkpointDirectory(), asSpan(id), 2, me, false);
+            case loadFile(asSpan(&own), 1000000) of
+                when Some(value as bytes: String) do
+                    destroyString(bytes);
+                    printLn("rank 1 has its file again");
+                when None do
+                    printLn("rank 1 has no file");
+                    good := false;
+            end case;
+            destroyString(own);
+        end if;
+        good := writeStep(&~comm, me, 3) and good;
+        good := (barrier(&~comm) = 0) and good;
+        if me = 0 then
+            let first: String := commitPath(checkpointDirectory(), asSpan(id), 1);
+            let second: String := commitPath(checkpointDirectory(), asSpan(id), 2);
+            var oldGone: Bool := true;
+            case loadFile(asSpan(&first), 1000000) of
+                when Some(value as bytes: String) do
+                    destroyString(bytes);
+                    oldGone := false;
+                when None do
+                    skip;
+            end case;
+            var lastKept: Bool := false;
+            case loadFile(asSpan(&second), 1000000) of
+                when Some(value as bytes: String) do
+                    destroyString(bytes);
+                    lastKept := true;
+                when None do
+                    skip;
+            end case;
+            destroyString(second);
+            destroyString(first);
+            if equal(asSpan(mode), "kill") then
+                print("only the last two epochs are kept ");
+                printLn(oldGone and lastKept);
+                good := oldGone and lastKept and good;
+            end if;
+        end if;
+        good := (barrier(&~comm) = 0) and good;
+        if me = 0 then
+            cleanUp(id);
+        end if;
+        return good;
+    end;
+
+    -- The second incarnation: every rank resumes.  A resume that is
+    -- refused is reported by its code at rank 0.
+    generic [I: Region]
+    function secondRun(opened: Comm, mode: String, id: &[String, I]): ExitCode is
+        var comm: Comm := opened;
+        let me: Nat32 := rank(&comm);
+        useCheckpoints(&!comm, checkpointDirectory());
+        if equal(asSpan(&mode), "kill") and (me = 1) then
+            let own: String := rankPath(checkpointDirectory(), asSpan(id), 2, me, false);
+            case loadFile(asSpan(&own), 1000000) of
+                when Some(value as bytes: String) do
+                    destroyString(bytes);
+                    printLn("rank 1 has its file");
+                when None do
+                    printLn("rank 1 has no file");
+            end case;
+            destroyString(own);
+        end if;
+        let back: Either[Int32, String] := resume(&!comm);
+        var good: Bool := true;
+        case back of
+            when Right(right as state: String) do
+                good := afterResume(&!comm, &mode, id, me, state);
+            when Left(left as code: Int32) do
+                if me = 0 then
+                    print("rank 0 resume refused with H");
+                    printLn(code);
+                    cleanUp(id);
+                else
+                    printLn("the others resume refused");
+                end if;
+                good := (not equal(asSpan(&mode), "kill")) and (not equal(asSpan(&mode), "badsig"));
+        end case;
+        destroyString(mode);
+        finish(comm);
+        if good then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+
+    function rankMain(line: String, mode: String): ExitCode is
+        case readJobText(asSpan(&line)) of
+            when Left(left as why: Int32) do
+                destroyString(line);
+                destroyString(mode);
+                print("the job was refused with ");
+                printLn(why);
+                return ExitStatus(status => 4);
+            when Right(right as given: Job) do
+                destroyString(line);
+                let id: String := jobId(&given);
+                let incarnation: Nat32 := jobIncarnation(&given);
+                case init(given) of
+                    when Left(left as why: Int32) do
+                        destroyString(id);
+                        destroyString(mode);
+                        print("init failed with ");
+                        printLn(why);
+                        return ExitStatus(status => 5);
+                    when Right(right as comm: Comm) do
+                        var status: ExitCode := ExitSuccess();
+                        if incarnation = 1 then
+                            status := firstRun(comm, mode, &id);
+                        else
+                            status := secondRun(comm, mode, &id);
+                        end if;
+                        destroyString(id);
+                        return status;
+                end case;
+        end case;
+    end;
+
+    function readJobLine(root: RootCapability): String is
+        var mutRoot: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!mutRoot);
+        var input: StandardInput := acquireInput(&!terminal);
+        let line: String := readLine(&!input);
+        releaseInput(input);
+        releaseTerminal(terminal);
+        surrenderRoot(mutRoot);
+        return line;
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var arguments: Buffer[String] := processArguments();
+        if length(&arguments) = 0 then
+            destroyEmpty(arguments);
+            surrenderRoot(root);
+            return launcher();
+        end if;
+        let mode: String := removeLast(&!arguments);
+        destroyWords(arguments);
+        return rankMain(readJobLine(root), mode);
+    end;
+end module body.

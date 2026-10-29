@@ -1,0 +1,611 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.CompositeSig (
+    CompositeKey,
+    sign,
+    verify,
+    openSshLabel,
+    signatureBytes
+);
+import Standard.Text (
+    substring
+);
+import Standard.File (
+    environmentValue
+);
+import Standard.SperliError (
+    refusedHost,
+    tokenExpired,
+    tokenForeignJob,
+    tokenWrongRank,
+    tokenBadSignature,
+    oversizedFrame,
+    staleIncarnation,
+    badFrame,
+    badHello
+);
+
+module body Standard.SperliWire is
+    constant byteMask: Nat64 := 255;
+    constant byteBase: Nat64 := 256;
+    constant tokenHead: Index := 46;
+
+    function headerBytes(): Index is
+        return 52;
+    end;
+
+    function maxPayload(): Index is
+        return 16777216;
+    end;
+
+    function helloKind(): Nat8 is
+        return 1;
+    end;
+
+    function dataKind(): Nat8 is
+        return 2;
+    end;
+
+    function heartbeatKind(): Nat8 is
+        return 4;
+    end;
+
+    function abortKind(): Nat8 is
+        return 5;
+    end;
+
+    function ckptBeginKind(): Nat8 is
+        return 6;
+    end;
+
+    function ckptDataKind(): Nat8 is
+        return 7;
+    end;
+
+    function ckptAckKind(): Nat8 is
+        return 8;
+    end;
+
+    function ckptCommitKind(): Nat8 is
+        return 9;
+    end;
+
+    function resumeKind(): Nat8 is
+        return 10;
+    end;
+
+    function byeKind(): Nat8 is
+        return 11;
+    end;
+
+    function tokenContext(): Span[Nat8, Static] is
+        return "SPERLI-JOIN-1";
+    end;
+
+    function wide(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliWire: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function wide32(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.SperliWire: a Nat32 did not fit a Nat64");
+        end case;
+    end;
+
+    function narrow(value: Nat64): Index is
+        case toIndex(value) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.SperliWire: a length did not fit an Index");
+        end case;
+    end;
+
+    function narrow32(value: Nat64): Nat32 is
+        case toNat32(value) of
+            when Some(value as at: Nat32) do
+                return at;
+            when None do
+                abort("Standard.SperliWire: a number did not fit a Nat32");
+        end case;
+    end;
+
+    function lowByte(value: Nat64): Nat8 is
+        case toNat8(bitwiseAnd(value, byteMask)) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                abort("Standard.SperliWire: a byte did not fit a Nat8");
+        end case;
+    end;
+
+    function byteValue(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.SperliWire: a byte did not fit a Nat64");
+        end case;
+    end;
+
+    -- value in width bytes, least significant first.
+    generic [R: Region]
+    function putNumber(out: &![StringBuilder, R], value: Nat64, width: Index): Unit is
+        var rest: Nat64 := value;
+        var i: Index := 0;
+        while i < width do
+            writeByte(&~out, lowByte(rest));
+            rest := rest / byteBase;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- width bytes of bytes from at on, least significant first.  The caller
+    -- has checked that they are there.
+    generic [B: Region]
+    function takeNumber(bytes: Span[Nat8, B], at: Index, width: Index): Nat64 is
+        var value: Nat64 := 0;
+        var i: Index := width;
+        while i > 0 do
+            i := i - 1;
+            value := modularAdd(modularMultiply(value, byteBase), byteValue(bytes[at + i]));
+        end while;
+        return value;
+    end;
+
+    generic [J: Region]
+    function frameHeader(kind: Nat8, payloadLength: Index, job: Span[Nat8, J], incarnation: Nat32, epoch: Nat64, source: Nat32, target: Nat32, tag: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        putNumber(&!out, wide(payloadLength), 4);
+        writeByte(&!out, kind);
+        writeByte(&!out, 0);
+        putNumber(&!out, 0, 2);
+        writeString(&!out, job);
+        putNumber(&!out, wide32(incarnation), 4);
+        putNumber(&!out, 0, 4);
+        putNumber(&!out, epoch, 8);
+        putNumber(&!out, wide32(source), 4);
+        putNumber(&!out, wide32(target), 4);
+        putNumber(&!out, wide32(tag), 4);
+        return finalize(out);
+    end;
+
+    generic [H: Region]
+    function headerLength(header: Span[Nat8, H]): Index is
+        return narrow(takeNumber(header, 0, 4));
+    end;
+
+    generic [H: Region]
+    function headerKind(header: Span[Nat8, H]): Nat8 is
+        return header[4];
+    end;
+
+    generic [H: Region]
+    function headerTag(header: Span[Nat8, H]): Nat32 is
+        return narrow32(takeNumber(header, 48, 4));
+    end;
+
+    generic [H: Region, J: Region]
+    function sameJob(header: Span[Nat8, H], job: Span[Nat8, J]): Bool is
+        var i: Index := 0;
+        while i < 16 do
+            if header[8 + i] /= job[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [H: Region, J: Region]
+    function checkHeader(header: Span[Nat8, H], job: Span[Nat8, J], incarnation: Nat32, own: Nat32, peer: Nat32): Int32 is
+        if headerLength(header) > maxPayload() then
+            return oversizedFrame();
+        end if;
+        let kind: Nat8 := header[4];
+        if (kind < 1) or (kind > 11) then
+            return badFrame();
+        end if;
+        if header[5] /= 0 then
+            return badFrame();
+        end if;
+        if takeNumber(header, 6, 2) /= 0 then
+            return badFrame();
+        end if;
+        if takeNumber(header, 28, 4) /= 0 then
+            return badFrame();
+        end if;
+        if not sameJob(header, job) then
+            return badFrame();
+        end if;
+        if takeNumber(header, 40, 4) /= wide32(peer) then
+            return badFrame();
+        end if;
+        if takeNumber(header, 44, 4) /= wide32(own) then
+            return badFrame();
+        end if;
+        let theirs: Nat64 := takeNumber(header, 24, 4);
+        if theirs < wide32(incarnation) then
+            return staleIncarnation();
+        end if;
+        if theirs > wide32(incarnation) then
+            return badFrame();
+        end if;
+        -- A tag above the largest user tag is reserved, and only a data
+        -- frame has a tag at all.  A collective frame holds its header.
+        if (kind = 2) and (takeNumber(header, 48, 4) > 2147483647) then
+            return badFrame();
+        end if;
+        if (kind = 3) and ((takeNumber(header, 48, 4) /= 0) or (takeNumber(header, 0, 4) < 16)) then
+            return badFrame();
+        end if;
+        -- A checkpoint frame has an epoch and no tag, except that resume
+        -- may name epoch 0 for none; no other frame has an epoch.
+        let epoch: Nat64 := takeNumber(header, 32, 8);
+        if (kind >= 6) and (kind <= 10) then
+            if (takeNumber(header, 48, 4) /= 0) or ((epoch = 0) and (kind /= 10)) then
+                return badFrame();
+            end if;
+        else
+            if epoch /= 0 then
+                return badFrame();
+            end if;
+        end if;
+        return 0;
+    end;
+
+    generic [T: Region]
+    function helloPayload(language: Nat8, services: Nat32, token: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        putNumber(&!out, 1, 2);
+        writeByte(&!out, language);
+        writeByte(&!out, 0);
+        putNumber(&!out, wide32(services), 4);
+        putNumber(&!out, 0, 4);
+        putNumber(&!out, wide(spanLength(token)), 4);
+        writeString(&!out, token);
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function checkHello(payload: Span[Nat8, P]): Int32 is
+        if spanLength(payload) < 16 then
+            return badHello();
+        end if;
+        if takeNumber(payload, 0, 2) /= 1 then
+            return badHello();
+        end if;
+        if (payload[3] /= 0) or (takeNumber(payload, 8, 4) /= 0) then
+            return badHello();
+        end if;
+        if bitwiseAnd(takeNumber(payload, 4, 4), 1) = 0 then
+            return badHello();
+        end if;
+        if takeNumber(payload, 12, 4) /= wide(spanLength(payload) - 16) then
+            return badHello();
+        end if;
+        return 0;
+    end;
+
+    generic [P: Region]
+    function helloToken(payload: Span[Nat8, P]): String is
+        if checkHello(payload) /= 0 then
+            return fromSpan("");
+        end if;
+        return fromSpan(spanPart(payload, 16, spanLength(payload) - 16));
+    end;
+
+    generic [T: Region]
+    function abortPayload(reason: Nat32, text: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        putNumber(&!out, wide32(reason), 4);
+        if spanLength(text) > 1024 then
+            writeString(&!out, spanPart(text, 0, 1024));
+        else
+            writeString(&!out, text);
+        end if;
+        return finalize(out);
+    end;
+
+    generic [P: Region]
+    function abortReason(payload: Span[Nat8, P]): Nat32 is
+        if spanLength(payload) < 4 then
+            return 0;
+        end if;
+        return narrow32(takeNumber(payload, 0, 4));
+    end;
+
+    ---
+    --- Join tokens
+    ---
+
+    -- The signed message of a token: magic, version, job, rank, size,
+    -- incarnation, expiry and host.
+    generic [J: Region, H: Region]
+    function tokenMessage(job: Span[Nat8, J], rank: Nat32, size: Nat32, incarnation: Nat32, expiry: Nat64, host: Span[Nat8, H]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "SPJT");
+        putNumber(&!out, 1, 2);
+        putNumber(&!out, 0, 2);
+        writeString(&!out, job);
+        putNumber(&!out, wide32(rank), 4);
+        putNumber(&!out, wide32(size), 4);
+        putNumber(&!out, wide32(incarnation), 4);
+        putNumber(&!out, expiry, 8);
+        putNumber(&!out, wide(spanLength(host)), 2);
+        writeString(&!out, host);
+        return finalize(out);
+    end;
+
+    generic [R: Region, J: Region, H: Region]
+    function signJoinToken(key: &[CompositeKey, R], job: Span[Nat8, J], rank: Nat32, size: Nat32, incarnation: Nat32, expiry: Nat64, host: Span[Nat8, H]): Option[String] is
+        let message: String := tokenMessage(job, rank, size, incarnation, expiry, host);
+        case sign(key, openSshLabel(), asSpan(&message), tokenContext()) of
+            when Some(value as signature: String) do
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, asSpan(&message));
+                putNumber(&!out, wide(length(&signature)), 2);
+                writeString(&!out, asSpan(&signature));
+                destroyString(signature);
+                destroyString(message);
+                let token: Option[String] := Some(value => finalize(out));
+                return token;
+            when None do
+                destroyString(message);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [T: Region, K: Region, J: Region, H: Region]
+    function verifyJoinToken(token: Span[Nat8, T], publicKey: Span[Nat8, K], job: Span[Nat8, J], rank: Nat32, size: Nat32, incarnation: Nat32, host: Span[Nat8, H], now: Nat64): Int32 is
+        if spanLength(token) < (tokenHead + 2) then
+            return tokenBadSignature();
+        end if;
+        let hostLength: Index := narrow(takeNumber(token, 44, 2));
+        let messageLength: Index := tokenHead + hostLength;
+        if (hostLength = 0) or ((spanLength(token) - 2) < messageLength) then
+            return tokenBadSignature();
+        end if;
+        if (takeNumber(token, 4, 2) /= 1) or (token[0] /= 83) or (token[1] /= 80) or (token[2] /= 74) or (token[3] /= 84) then
+            return tokenBadSignature();
+        end if;
+        let signatureLength: Index := narrow(takeNumber(token, messageLength, 2));
+        if (signatureLength /= signatureBytes()) or (spanLength(token) /= ((messageLength + 2) + signatureLength)) then
+            return tokenBadSignature();
+        end if;
+        let message: Span[Nat8, T] := spanPart(token, 0, messageLength);
+        let signature: Span[Nat8, T] := spanPart(token, messageLength + 2, signatureLength);
+        if not verify(publicKey, openSshLabel(), message, tokenContext(), signature) then
+            return tokenBadSignature();
+        end if;
+        var i: Index := 0;
+        while i < 16 do
+            if token[8 + i] /= job[i] then
+                return tokenForeignJob();
+            end if;
+            i := i + 1;
+        end while;
+        if (takeNumber(token, 24, 4) /= wide32(rank)) or (takeNumber(token, 28, 4) /= wide32(size)) or (takeNumber(token, 32, 4) /= wide32(incarnation)) then
+            return tokenWrongRank();
+        end if;
+        if hostLength /= spanLength(host) then
+            return tokenWrongRank();
+        end if;
+        var k: Index := 0;
+        while k < hostLength do
+            if token[tokenHead + k] /= host[k] then
+                return tokenWrongRank();
+            end if;
+            k := k + 1;
+        end while;
+        if takeNumber(token, 36, 8) <= now then
+            return tokenExpired();
+        end if;
+        return 0;
+    end;
+
+    ---
+    --- Hosts, names, subjects
+    ---
+
+    function lower(byte: Nat8): Nat8 is
+        if (byte >= 65) and (byte <= 90) then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    -- Whether the tail of host, from at on, spells name, in any letter case.
+    generic [H: Region, N: Region]
+    function tailIs(host: Span[Nat8, H], at: Index, name: Span[Nat8, N]): Bool is
+        if (spanLength(host) - at) /= spanLength(name) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(name) do
+            if lower(host[at + i]) /= lower(name[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether host is name, or a name below it: name behind a dot, then
+    -- anything that starts at a dot.
+    generic [H: Region, N: Region]
+    function namesHost(host: Span[Nat8, H], name: Span[Nat8, N]): Bool is
+        let n: Index := spanLength(name);
+        if spanLength(host) < n then
+            return false;
+        end if;
+        if tailIs(host, 0, name) then
+            return true;
+        end if;
+        if spanLength(host) > n then
+            if host[n] = 46 then
+                var i: Index := 0;
+                while i < n do
+                    if lower(host[i]) /= lower(name[i]) then
+                        return false;
+                    end if;
+                    i := i + 1;
+                end while;
+                return true;
+            end if;
+        end if;
+        if spanLength(host) > (n + 1) then
+            return tailIs(host, spanLength(host) - n, name) and (host[(spanLength(host) - n) - 1] = 46);
+        end if;
+        return false;
+    end;
+
+    function refusedHostsVariable(): Span[Nat8, Static] is
+        return "SPERLI_REFUSED_HOSTS";
+    end;
+
+    -- Whether byte ends a name of a list: a comma, a blank, a tab, a
+    -- carriage return or a line feed.
+    function separates(byte: Nat8): Bool is
+        return ((((byte = 44) or (byte = 32)) or (byte = 9)) or (byte = 13)) or (byte = 10);
+    end;
+
+    generic [H: Region, L: Region]
+    function hostListed(host: Span[Nat8, H], names: Span[Nat8, L]): Bool is
+        if spanLength(host) = 0 then
+            return false;
+        end if;
+        var start: Index := 0;
+        var at: Index := 0;
+        while at <= spanLength(names) do
+            var ends: Bool := true;
+            if at < spanLength(names) then
+                ends := separates(names[at]);
+            end if;
+            if ends then
+                if at > start then
+                    if namesHost(host, substring(names, start, at)) then
+                        return true;
+                    end if;
+                end if;
+                start := at + 1;
+            end if;
+            at := at + 1;
+        end while;
+        return false;
+    end;
+
+    -- The two names refused on every host are reserved by RFC 6761 and
+    -- name no machine.  The operator's hosts come from the environment, so
+    -- the source names none of them.
+    generic [H: Region]
+    function hostRefused(host: Span[Nat8, H]): Bool is
+        if namesHost(host, "host-a.invalid") or namesHost(host, "host-b.invalid") then
+            return true;
+        end if;
+        case environmentValue(refusedHostsVariable()) of
+            when Some(value as names: String) do
+                let found: Bool := hostListed(host, asSpan(&names));
+                destroyString(names);
+                return found;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [B: Region]
+    function hexOf(bytes: Span[Nat8, B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(bytes) do
+            writeByte(&!out, digit(bytes[i] / 16));
+            writeByte(&!out, digit(bytes[i] - ((bytes[i] / 16) * 16)));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function digit(value: Nat8): Nat8 is
+        if value < 10 then
+            return value + 48;
+        end if;
+        return value + 87;
+    end;
+
+    -- value in decimal.
+    generic [R: Region]
+    function putDecimal(out: &![StringBuilder, R], value: Nat32): Unit is
+        var divisor: Nat64 := 1;
+        let whole: Nat64 := wide32(value);
+        while (whole / divisor) >= 10 do
+            divisor := divisor * 10;
+        end while;
+        while divisor > 0 do
+            writeByte(&~out, lowByte((whole / divisor) - ((whole / (divisor * 10)) * 10)) + 48);
+            divisor := divisor / 10;
+        end while;
+        return nil;
+    end;
+
+    generic [J: Region]
+    function certificateName(job: Span[Nat8, J], rank: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "sperli-");
+        let hex: String := hexOf(job);
+        writeString(&!out, asSpan(&hex));
+        destroyString(hex);
+        writeString(&!out, "-");
+        putDecimal(&!out, rank);
+        return finalize(out);
+    end;
+
+    generic [S: Region, J: Region]
+    function subjectIs(subject: Span[Nat8, S], job: Span[Nat8, J], rank: Nat32): Bool is
+        let name: String := certificateName(job, rank);
+        let want: Index := length(&name) + 4;
+        var same: Bool := spanLength(subject) = want;
+        if same then
+            same := (subject[0] = 47) and (subject[1] = 67) and (subject[2] = 78) and (subject[3] = 61);
+        end if;
+        var i: Index := 0;
+        while same and (i < length(&name)) do
+            let expected: Nat8 := nthByte(&name, i);
+            if subject[4 + i] /= expected then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        destroyString(name);
+        return same;
+    end;
+end module body.

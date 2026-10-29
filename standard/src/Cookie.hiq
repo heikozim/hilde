@@ -1,0 +1,318 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The byte classes are those of RFC 6265 section 4.1.1:
+-- a name is a token, a value is cookie octets, possibly in double quotes.
+-- Reading is lenient about the spaces a browser puts between pairs and
+-- strict about the bytes of the name and value it returns.
+import Standard.String (
+    String,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+
+module body Standard.Cookie is
+    constant byteSpace: Nat8 := 32;
+    constant byteTab: Nat8 := 9;
+    constant byteQuote: Nat8 := 34;
+    constant byteSemicolon: Nat8 := 59;
+    constant byteEquals: Nat8 := 61;
+    constant byteSlash: Nat8 := 47;
+    constant ten: Nat32 := 10;
+
+    function nothing(): Option[String] is
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    record CookieOptions: Free is
+        maxAgeSeconds: Option[Nat32];
+        secure: Bool;
+        httpOnly: Bool;
+        sameSite: SameSite;
+    end;
+
+    function strictOptions(): CookieOptions is
+        let none: Option[Nat32] := None();
+        let options: CookieOptions := CookieOptions(
+            maxAgeSeconds => none,
+            secure => true,
+            httpOnly => true,
+            sameSite => SameSiteStrict()
+        );
+        return options;
+    end;
+
+    ---
+    --- Byte classes
+    ---
+
+    function isTokenByte(byte: Nat8): Bool is
+        if (byte >= '0') and (byte <= '9') then
+            return true;
+        end if;
+        if (byte >= 'a') and (byte <= 'z') then
+            return true;
+        end if;
+        if (byte >= 'A') and (byte <= 'Z') then
+            return true;
+        end if;
+        -- The fifteen symbols of a token: ! # $ % & and the single quote,
+        -- * + - . ^ _ and the grave accent, | and ~.
+        let symbols: Span[Nat8, Static] := "!#$%&\'*+-.^_`|~";
+        var i: Index := 0;
+        while i < spanLength(symbols) do
+            if byte = symbols[i] then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- A cookie octet: printable ASCII but space, double quote, comma,
+    -- semicolon and backslash.
+    function isCookieOctet(byte: Nat8): Bool is
+        if (byte < 33) or (byte > 126) then
+            return false;
+        end if;
+        return ((byte /= 34) and (byte /= 44)) and ((byte /= 59) and (byte /= 92));
+    end;
+
+    generic [R: Region]
+    function isCookieName(name: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(name);
+        if size = 0 then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if not isTokenByte(name[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function isCookieValue(value: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(value);
+        var i: Index := 0;
+        while i < size do
+            if not isCookieOctet(value[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    ---
+    --- Reading a Cookie header
+    ---
+
+    generic [R: Region, S: Region]
+    function sameAt(text: Span[Nat8, R], at: Index, size: Index, other: Span[Nat8, S]): Bool is
+        if size /= spanLength(other) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if text[at + i] /= other[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function cookieValue(header: Span[Nat8, R], name: Span[Nat8, S]): Option[String] is
+        if not isCookieName(name) then
+            return nothing();
+        end if;
+        let size: Index := spanLength(header);
+        var at: Index := 0;
+        while at < size do
+            -- The spaces and semicolons between pairs.
+            while (at < size) and (((header[at] = byteSpace) or (header[at] = byteTab)) or (header[at] = byteSemicolon)) do
+                at := at + 1;
+            end while;
+            let nameAt: Index := at;
+            while (at < size) and ((header[at] /= byteEquals) and (header[at] /= byteSemicolon)) do
+                at := at + 1;
+            end while;
+            if (at < size) and (header[at] = byteEquals) then
+                var nameEnd: Index := at;
+                while (nameEnd > nameAt) and ((header[nameEnd - 1] = byteSpace) or (header[nameEnd - 1] = byteTab)) do
+                    nameEnd := nameEnd - 1;
+                end while;
+                at := at + 1;
+                var valueAt: Index := at;
+                while (valueAt < size) and ((header[valueAt] = byteSpace) or (header[valueAt] = byteTab)) do
+                    valueAt := valueAt + 1;
+                end while;
+                at := valueAt;
+                while (at < size) and (header[at] /= byteSemicolon) do
+                    at := at + 1;
+                end while;
+                var valueEnd: Index := at;
+                while (valueEnd > valueAt) and ((header[valueEnd - 1] = byteSpace) or (header[valueEnd - 1] = byteTab)) do
+                    valueEnd := valueEnd - 1;
+                end while;
+                if sameAt(header, nameAt, nameEnd - nameAt, name) then
+                    if ((valueEnd - valueAt) >= 2) and ((header[valueAt] = byteQuote) and (header[valueEnd - 1] = byteQuote)) then
+                        valueAt := valueAt + 1;
+                        valueEnd := valueEnd - 1;
+                    end if;
+                    var out: StringBuilder := makeStringBuilder();
+                    var good: Bool := true;
+                    var i: Index := valueAt;
+                    while i < valueEnd do
+                        if not isCookieOctet(header[i]) then
+                            good := false;
+                        end if;
+                        writeByte(&!out, header[i]);
+                        i := i + 1;
+                    end while;
+                    let found: String := finalize(out);
+                    if good then
+                        let some: Option[String] := Some(value => found);
+                        return some;
+                    else
+                        destroyString(found);
+                        return nothing();
+                    end if;
+                end if;
+            end if;
+        end while;
+        return nothing();
+    end;
+
+    ---
+    --- Writing a Set-Cookie header
+    ---
+
+    -- A path attribute: a slash first, then printable ASCII without a
+    -- space or a semicolon.
+    generic [R: Region]
+    function isPath(path: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(path);
+        if (size = 0) or (path[0] /= byteSlash) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := path[i];
+            if ((byte < 33) or (byte > 126)) or (byte = byteSemicolon) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [B: Region]
+    function writeDecimal(out: &![StringBuilder, B], number: Nat32): Unit is
+        if number >= ten then
+            writeDecimal(&~out, number / ten);
+        end if;
+        case toNat8(number - ((number / ten) * ten)) of
+            when Some(value as digit: Nat8) do
+                writeByte(&~out, digit + 48);
+            when None do
+                abort("Standard.Cookie: a digit did not fit a Nat8");
+        end case;
+        return nil;
+    end;
+
+    function isSameSiteNone(sameSite: SameSite): Bool is
+        case sameSite of
+            when SameSiteNone do
+                return true;
+            when SameSiteStrict do
+                return false;
+            when SameSiteLax do
+                return false;
+        end case;
+    end;
+
+    generic [B: Region]
+    function writeAttributes(out: &![StringBuilder, B], options: CookieOptions, removing: Bool): Unit is
+        if removing then
+            writeString(&~out, "; Max-Age=0");
+        else
+            case options.maxAgeSeconds of
+                when Some(value as seconds: Nat32) do
+                    writeString(&~out, "; Max-Age=");
+                    writeDecimal(&~out, seconds);
+                when None do
+                    skip;
+            end case;
+        end if;
+        if options.secure then
+            writeString(&~out, "; Secure");
+        end if;
+        if options.httpOnly then
+            writeString(&~out, "; HttpOnly");
+        end if;
+        case options.sameSite of
+            when SameSiteStrict do
+                writeString(&~out, "; SameSite=Strict");
+            when SameSiteLax do
+                writeString(&~out, "; SameSite=Lax");
+            when SameSiteNone do
+                writeString(&~out, "; SameSite=None");
+        end case;
+        return nil;
+    end;
+
+    generic [N: Region, V: Region, P: Region]
+    function setCookie(name: Span[Nat8, N], value: Span[Nat8, V], path: Span[Nat8, P], options: CookieOptions): Option[String] is
+        if ((not isCookieName(name)) or (not isCookieValue(value))) or (not isPath(path)) then
+            return nothing();
+        end if;
+        if isSameSiteNone(options.sameSite) and (not options.secure) then
+            return nothing();
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, name);
+        writeByte(&!out, byteEquals);
+        writeString(&!out, value);
+        writeString(&!out, "; Path=");
+        writeString(&!out, path);
+        writeAttributes(&!out, options, false);
+        let some: Option[String] := Some(value => finalize(out));
+        return some;
+    end;
+
+    generic [N: Region, P: Region]
+    function deleteCookie(name: Span[Nat8, N], path: Span[Nat8, P], options: CookieOptions): Option[String] is
+        if (not isCookieName(name)) or (not isPath(path)) then
+            return nothing();
+        end if;
+        if isSameSiteNone(options.sameSite) and (not options.secure) then
+            return nothing();
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, name);
+        writeByte(&!out, byteEquals);
+        writeString(&!out, "; Path=");
+        writeString(&!out, path);
+        writeAttributes(&!out, options, true);
+        let some: Option[String] := Some(value => finalize(out));
+        return some;
+    end;
+end module body.

@@ -1,0 +1,115 @@
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    Sender,
+    Receiver,
+    Channel,
+    openChannel,
+    send,
+    receive,
+    closeSender,
+    closeReceiver
+);
+
+module body Test is
+    -- Send 1 to 3000, then close.
+    function produce(sender: Sender[Int64]): Unit is
+        var out: Sender[Int64] := sender;
+        var k: Int64 := 1;
+        while k <= 3000 do
+            case send(&!out, k) of
+                when Some(value as returned: Int64) do
+                    printLn(-returned);
+                when None do
+                    skip;
+            end case;
+            k := k + 1;
+        end while;
+        closeSender(out);
+        return nil;
+    end;
+
+    -- Receive to the end of the stream and give back the sum: 4501500.
+    function consume(receiver: Receiver[Int64]): Int64 is
+        var input: Receiver[Int64] := receiver;
+        var sum: Int64 := 0;
+        var more: Bool := true;
+        while more do
+            case receive(&!input) of
+                when Some(value as got: Int64) do
+                    sum := sum + got;
+                when None do
+                    more := false;
+            end case;
+        end while;
+        closeReceiver(input);
+        return sum;
+    end;
+
+    -- left pairs of a producer and a consumer, every pair started before
+    -- any is joined, so that all of them run at once on however many
+    -- workers the system has (no env.txt: the runtime's own choice).  The
+    -- capacities differ -- rendezvous, one, three -- so that every way a
+    -- send and a receive can meet happens across threads.
+    generic [R: Region]
+    function pairs(scope: &![Scope, R], left: Int32): Int64 is
+        if left = 0 then
+            return 0;
+        end if;
+        let rendezvous: Index := 0;
+        let one: Index := 1;
+        var capacity: Index := 3;
+        if left > 5 then
+            capacity := rendezvous;
+        else
+            if left > 2 then
+                capacity := one;
+            end if;
+        end if;
+        let made: Option[Channel[Int64]] := openChannel(capacity);
+        case made of
+            when Some(value as ends: Channel[Int64]) do
+                let { sender: Sender[Int64], receiver: Receiver[Int64] } := ends;
+                let makeWork: Fn[Sender[Int64], Unit] := produce;
+                let takeWork: Fn[Receiver[Int64], Int64] := consume;
+                case spawn(&~scope, makeWork, sender) of
+                    when Right(right as producer: Task[Unit]) do
+                        case spawn(&~scope, takeWork, receiver) of
+                            when Right(right as consumer: Task[Int64]) do
+                                let rest: Int64 := pairs(&~scope, left - 1);
+                                let mine: Int64 := join(consumer);
+                                join(producer);
+                                return rest + mine;
+                            when Left(left as unused: Receiver[Int64]) do
+                                let rest: Int64 := consume(unused);
+                                let failed: Int64 := -1;
+                                join(producer);
+                                return failed - rest;
+                        end case;
+                    when Left(left as unused: Sender[Int64]) do
+                        closeSender(unused);
+                        closeReceiver(receiver);
+                        return -1;
+                end case;
+            when None do
+                return -2;
+        end case;
+    end;
+
+    -- Eight pairs: 8 * 4501500 = 36012000.
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                printLn(pairs(&!scope, 8));
+                closeScope(scope);
+            when None do
+                printLn(-2);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

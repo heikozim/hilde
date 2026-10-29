@@ -1,0 +1,259 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nthRef,
+    insertBack,
+    removeFirst,
+    removeLast,
+    destroyEmpty
+);
+import Standard.Text (
+    equal
+);
+import Standard.Order (
+    Ordering,
+    LessThan,
+    Equal,
+    GreaterThan,
+    compare
+);
+import Standard.Semver (
+    Version,
+    sameMajor,
+    formatVersion
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf,
+    destroyProblem
+);
+import Pkg.Manifest (
+    Manifest,
+    Requirement,
+    readManifest,
+    destroyManifest
+);
+import Pkg.Sum (
+    SumEntry,
+    readSum,
+    findEntry,
+    destroyEntries
+);
+import Pkg.Tree (
+    treeSum
+);
+import Pkg.Targets (
+    Reach,
+    reachTargets,
+    targetProblems,
+    packageDirs,
+    destroyReach
+);
+import Pkg.Files (
+    readText,
+    isThere,
+    isDirectory,
+    joinPath,
+    directoryNames
+);
+
+module body Pkg.Verify is
+    function destroyVerified(verified: Verified): Unit is
+        let { checked: Index, problems: Buffer[Problem] } := verified;
+        var rest: Buffer[Problem] := problems;
+        while bufferLength(&rest) > 0 do
+            destroyProblem(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [A: Region, B: Region, C: Region]
+    function said(a: Span[Nat8, A], b: Span[Nat8, B], c: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        writeString(&!out, c);
+        return finalize(out);
+    end;
+
+    -- Whether the version of the sum line serves the requirement: the same
+    -- major and not older.
+    function serves(have: Version, need: Version): Bool is
+        if not sameMajor(have, need) then
+            return false;
+        end if;
+        case compare(&have, &need) of
+            when LessThan do
+                return false;
+            when Equal do
+                return true;
+            when GreaterThan do
+                return true;
+        end case;
+    end;
+
+    generic [M: Region, E: Region, B: Region]
+    function checkRequirements(manifest: &[Manifest, M], entries: &[Buffer[SumEntry], E], out: &![Buffer[Problem], B]): Unit is
+        let needs: &[Buffer[Requirement], M] := &(manifest->needs);
+        var i: Index := 0;
+        while i < bufferLength(needs) do
+            let r: &[Requirement, M] := nthRef(needs, i);
+            case findEntry(entries, asSpan(&(r->prefix))) of
+                when Some(value as at: Index) do
+                    let e: &[SumEntry, E] := nthRef(entries, at);
+                    if not serves(e->version, r->version) then
+                        let v: String := formatVersion(r->version);
+                        insertBack(&~out, problemOf(1514, said(asSpan(&(r->prefix)), " needs ", asSpan(&v)), said("hilde.sum names an older version or another major; run hilde get", "", "")));
+                        destroyString(v);
+                    end if;
+                when None do
+                    insertBack(&~out, problemOf(1514, said(asSpan(&(r->prefix)), " is required in hilde.toml but has no line in hilde.sum", ""), fromLiteral("run hilde get")));
+            end case;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Each tree of hilde.sum against vendor/; the number held.
+    generic [R: Region, E: Region, B: Region]
+    function checkTrees(root: Span[Nat8, R], entries: &[Buffer[SumEntry], E], out: &![Buffer[Problem], B]): Index is
+        let vendor: String := joinPath(root, "vendor");
+        var checked: Index := 0;
+        var i: Index := 0;
+        while i < bufferLength(entries) do
+            let e: &[SumEntry, E] := nthRef(entries, i);
+            let tree: String := joinPath(asSpan(&vendor), asSpan(&(e->prefix)));
+            if not isDirectory(asSpan(&tree)) then
+                insertBack(&~out, problemOf(1515, said("vendor/ has no tree ", asSpan(&(e->prefix)), ", which hilde.sum names"), fromLiteral("run hilde get to fetch it again")));
+            else
+                case treeSum(asSpan(&tree)) of
+                    when Right(right as sum: String) do
+                        if not equal(asSpan(&sum), asSpan(&(e->sum))) then
+                            insertBack(&~out, problemOf(1515, said("the tree vendor/", asSpan(&(e->prefix)), " is not the one hilde.sum names: a file in it was changed"), fromLiteral("undo the change, or run hilde get to fetch the tree again")));
+                        end if;
+                        destroyString(sum);
+                        checked := checked + 1;
+                    when Left(left as p: Problem) do
+                        insertBack(&~out, p);
+                end case;
+            end if;
+            destroyString(tree);
+            i := i + 1;
+        end while;
+        -- No tree in vendor/ that hilde.sum does not name.
+        if isDirectory(asSpan(&vendor)) then
+            case directoryNames(asSpan(&vendor)) of
+                when Some(value as names: Buffer[String]) do
+                    strays(&names, entries, &~out);
+                    destroyArguments(names);
+                when None do
+                    insertBack(&~out, problemOf(1518, fromLiteral("vendor/ cannot be read"), fromLiteral("check that it may be read")));
+            end case;
+        end if;
+        destroyString(vendor);
+        return checked;
+    end;
+
+    generic [N: Region, E: Region, B: Region]
+    function strays(names: &[Buffer[String], N], entries: &[Buffer[SumEntry], E], out: &![Buffer[Problem], B]): Unit is
+        var j: Index := 0;
+        while j < bufferLength(names) do
+            let name: Span[Nat8, N] := asSpan(nthRef(names, j));
+            case findEntry(entries, name) of
+                when Some(value as at: Index) do
+                    skip;
+                when None do
+                    insertBack(&~out, problemOf(1515, said("vendor/", name, " is not named in hilde.sum"), fromLiteral("remove it, or require it in hilde.toml and run hilde get")));
+            end case;
+            j := j + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, L: Region, M: Region]
+    function verifyWith(root: Span[Nat8, R], library: Span[Nat8, L], manifest: &[Manifest, M], out: Buffer[Problem]): Verified is
+        var problems: Buffer[Problem] := out;
+        let sumPath: String := joinPath(root, "hilde.sum");
+        var checked: Index := 0;
+        case readText(asSpan(&sumPath)) of
+            when Some(value as text: String) do
+                case readSum(asSpan(&text)) of
+                    when Right(right as entries: Buffer[SumEntry]) do
+                        checkRequirements(manifest, &entries, &!problems);
+                        checked := checkTrees(root, &entries, &!problems);
+                        destroyEntries(entries);
+                    when Left(left as p: Problem) do
+                        insertBack(&!problems, p);
+                end case;
+                destroyString(text);
+            when None do
+                -- No hilde.sum: right only for a package that needs nothing.
+                if bufferLength(&(manifest->needs)) > 0 then
+                    insertBack(&!problems, problemOf(1514, fromLiteral("hilde.sum is missing, and hilde.toml requires packages"), fromLiteral("run hilde get")));
+                end if;
+        end case;
+        destroyString(sumPath);
+        if bufferLength(&(manifest->targets)) > 0 then
+            let dirs: Buffer[String] := packageDirs(root, library);
+            let reach: Reach := reachTargets(&dirs);
+            destroyArguments(dirs);
+            var found: Buffer[Problem] := targetProblems(&(manifest->targets), &reach);
+            destroyReach(reach);
+            while bufferLength(&found) > 0 do
+                insertBack(&!problems, removeFirst(&!found));
+            end while;
+            destroyEmpty(found);
+        end if;
+        return Verified(checked => checked, problems => problems);
+    end;
+
+    generic [R: Region, L: Region]
+    function verifyPackage(root: Span[Nat8, R], library: Span[Nat8, L]): Verified is
+        var problems: Buffer[Problem] := allocateEmpty();
+        let tomlPath: String := joinPath(root, "hilde.toml");
+        let text: Option[String] := readText(asSpan(&tomlPath));
+        destroyString(tomlPath);
+        case text of
+            when Some(value as toml: String) do
+                let read: Either[Problem, Manifest] := readManifest(asSpan(&toml));
+                destroyString(toml);
+                case read of
+                    when Right(right as manifest: Manifest) do
+                        let verified: Verified := verifyWith(root, library, &manifest, problems);
+                        destroyManifest(manifest);
+                        return verified;
+                    when Left(left as p: Problem) do
+                        insertBack(&!problems, p);
+                        return Verified(checked => 0, problems => problems);
+                end case;
+            when None do
+                insertBack(&!problems, problemOf(1501, said("no hilde.toml in ", root, ""), fromLiteral("run the command in the directory of the package, or make one with hilde new Name")));
+                return Verified(checked => 0, problems => problems);
+        end case;
+    end;
+end module body.

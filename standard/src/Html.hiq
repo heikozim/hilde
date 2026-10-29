@@ -1,0 +1,1264 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  A document keeps every name and every decoded text in one
+-- buffer of bytes, the pool, and its tokens and attributes as records of
+-- where they stand in it, so a document of many tokens is three values and
+-- not one string per token.  A policy is two words of 64 bits: which of the
+-- elements the module knows it keeps, and which of the attributes it knows.
+-- An element or attribute the module does not know cannot be allowed.
+-- sanitize writes nothing it took over from the input as it stood: every
+-- tag is written anew from the table of known names, every text and value
+-- escaped, so a difference between this tokenizer and a browser's can drop
+-- content but cannot let markup through.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromByteBuffer
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    insertBack,
+    removeLast,
+    length as bufferLength,
+    lengthMut as bufferLengthMut,
+    nth,
+    nthMut
+);
+import Standard.Text (
+    substring
+);
+
+module body Standard.Html is
+    constant noIndex: Index := 0;
+    constant zeroNat: Nat64 := 0;
+    constant oneNat: Nat64 := 1;
+    constant twoNat: Nat64 := 2;
+    constant replacement: Nat64 := 65533;
+    constant mostDepth: Index := 100;
+    constant mostAttributes: Index := 64;
+
+    record TokenRecord: Free is
+        kind: TokenKind;
+        textAt: Index;
+        textLength: Index;
+        selfClosing: Bool;
+        firstAttribute: Index;
+        attributeTotal: Index;
+    end;
+
+    record AttributeRecord: Free is
+        nameAt: Index;
+        nameLength: Index;
+        valueAt: Index;
+        valueLength: Index;
+    end;
+
+    record Document: Linear is
+        pool: String;
+        tokens: Buffer[TokenRecord];
+        attributes: Buffer[AttributeRecord];
+    end;
+
+    record Policy: Free is
+        elements: Nat64;
+        attributes: Nat64;
+        links: Bool;
+    end;
+
+    ---
+    --- Bytes and numbers
+    ---
+
+    function isSpace(byte: Nat8): Bool is
+        return ((byte = 32) or (byte = 9)) or ((byte = 10) or ((byte = 12) or (byte = 13)));
+    end;
+
+    function isLetter(byte: Nat8): Bool is
+        return ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'));
+    end;
+
+    function lower(byte: Nat8): Nat8 is
+        if (byte >= 'A') and (byte <= 'Z') then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    function natOf(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    function byteOf(wide: Nat64): Nat8 is
+        case toNat8(wide) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                abort("Standard.Html: a byte did not fit a Nat8");
+                let zero: Nat8 := 0;
+                return zero;
+        end case;
+    end;
+
+    function indexOfInt(number: Int32): Index is
+        case toIndex(number) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                return noIndex;
+        end case;
+    end;
+
+    function natOfInt(number: Int32): Nat64 is
+        case toNat64(number) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    -- The number 2 to the power of bit, for bit up to 63.
+    function bitValue(bit: Index): Nat64 is
+        var result: Nat64 := 1;
+        var i: Index := 0;
+        while i < bit do
+            result := result * twoNat;
+            i := i + 1;
+        end while;
+        return result;
+    end;
+
+    function hasBit(mask: Nat64, bit: Index): Bool is
+        let shifted: Nat64 := mask / bitValue(bit);
+        return (shifted - ((shifted / twoNat) * twoNat)) = oneNat;
+    end;
+
+    function withBit(mask: Nat64, bit: Index): Nat64 is
+        if hasBit(mask, bit) then
+            return mask;
+        end if;
+        return mask + bitValue(bit);
+    end;
+
+    generic [R: Region, S: Region]
+    function sameSpans(left: Span[Nat8, R], right: Span[Nat8, S]): Bool is
+        if spanLength(left) /= spanLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(left) do
+            if left[i] /= right[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether text holds word from at on, ignoring the case of text; word
+    -- is in small letters.
+    generic [R: Region, S: Region]
+    function startsWithAt(text: Span[Nat8, R], at: Index, word: Span[Nat8, S]): Bool is
+        if (at + spanLength(word)) > spanLength(text) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if lower(text[at + i]) /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    ---
+    --- Tables of names
+    ---
+
+    -- The elements a policy can allow, at most 64, numbered from 1 in this
+    -- order.
+    function elementTable(): Span[Nat8, Static] is
+        let table: Span[Nat8, Static] := "a abbr b bdi bdo blockquote br caption cite code col colgroup dd del dfn div dl dt em figcaption figure h1 h2 h3 h4 h5 h6 hr i img ins kbd li mark ol p pre q s samp small span strong sub sup table tbody td tfoot th thead time tr u ul var wbr";
+        return table;
+    end;
+
+    -- The attributes a policy can allow, at most 64.
+    function attributeTable(): Span[Nat8, Static] is
+        let table: Span[Nat8, Static] := "href src alt title class lang dir width height colspan rowspan start reversed cite datetime";
+        return table;
+    end;
+
+    -- The elements whose content is dropped with them: code, foreign
+    -- markup, frames and forms.
+    function dropTable(): Span[Nat8, Static] is
+        let table: Span[Nat8, Static] := "script style iframe object embed template noscript noembed noframes xmp textarea title svg math select applet frame frameset plaintext head";
+        return table;
+    end;
+
+    -- The number of name in table, counting from 1, or 0 when it is not
+    -- there.
+    generic [R: Region]
+    function wordNumber(table: Span[Nat8, Static], name: Span[Nat8, R]): Index is
+        let size: Index := spanLength(table);
+        var start: Index := 0;
+        var number: Index := 1;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (table[i] = ' ') then
+                if sameSpans(substring(table, start, i), name) then
+                    return number;
+                end if;
+                number := number + 1;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return noIndex;
+    end;
+
+    -- Word number of table, counting from 1; empty when there is none.
+    function wordAt(table: Span[Nat8, Static], number: Index): Span[Nat8, Static] is
+        let size: Index := spanLength(table);
+        var start: Index := 0;
+        var count: Index := 1;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (table[i] = ' ') then
+                if count = number then
+                    return substring(table, start, i);
+                end if;
+                count := count + 1;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return substring(table, noIndex, noIndex);
+    end;
+
+    generic [R: Region]
+    function isVoid(name: Span[Nat8, R]): Bool is
+        return wordNumber("br col hr img wbr", name) > 0;
+    end;
+
+    -- Whether attribute, a name of the attribute table, belongs on element.
+    generic [A: Region, E: Region]
+    function belongs(attribute: Span[Nat8, A], element: Span[Nat8, E]): Bool is
+        if wordNumber("title class lang dir", attribute) > 0 then
+            return true;
+        end if;
+        if sameSpans(attribute, "href") then
+            return sameSpans(element, "a");
+        end if;
+        if wordNumber("src alt width height", attribute) > 0 then
+            return sameSpans(element, "img");
+        end if;
+        if wordNumber("colspan rowspan", attribute) > 0 then
+            return wordNumber("td th", element) > 0;
+        end if;
+        if wordNumber("start reversed", attribute) > 0 then
+            return sameSpans(element, "ol");
+        end if;
+        if sameSpans(attribute, "cite") then
+            return wordNumber("blockquote q del ins", element) > 0;
+        end if;
+        if sameSpans(attribute, "datetime") then
+            return wordNumber("time del ins", element) > 0;
+        end if;
+        return false;
+    end;
+
+    ---
+    --- Character references
+    ---
+
+    -- A character reference: the code point and the bytes it takes, 0 when
+    -- there is none.
+    record Reference: Free is
+        codePoint: Nat64;
+        taken: Index;
+    end;
+
+    function noReference(): Reference is
+        return Reference(codePoint => zeroNat, taken => noIndex);
+    end;
+
+    -- A named reference of size letters at at, with or without its
+    -- semicolon.
+    generic [R: Region]
+    function named(text: Span[Nat8, R], at: Index, stop: Index, size: Int32, codePoint: Int32): Reference is
+        var taken: Index := indexOfInt(size) + 1;
+        if ((at + taken) < stop) and (text[at + taken] = ';') then
+            taken := taken + 1;
+        end if;
+        return Reference(codePoint => natOfInt(codePoint), taken => taken);
+    end;
+
+    generic [R: Region]
+    function numericAt(text: Span[Nat8, R], at: Index, stop: Index): Reference is
+        var i: Index := at + 2;
+        var hex: Bool := false;
+        if (i < stop) and ((text[i] = 'x') or (text[i] = 'X')) then
+            hex := true;
+            i := i + 1;
+        end if;
+        let first: Index := i;
+        var value: Nat64 := 0;
+        var going: Bool := true;
+        while going and (i < stop) do
+            let byte: Nat8 := text[i];
+            var digit: Nat64 := 99;
+            if (byte >= '0') and (byte <= '9') then
+                digit := natOf(byte - '0');
+            else if hex and ((byte >= 'a') and (byte <= 'f')) then
+                digit := natOf(byte - 'a') + 10;
+            else if hex and ((byte >= 'A') and (byte <= 'F')) then
+                digit := natOf(byte - 'A') + 10;
+            end if;
+            if digit = 99 then
+                going := false;
+            else
+                if value < 1114112 then
+                    if hex then
+                        value := (value * 16) + digit;
+                    else
+                        value := (value * 10) + digit;
+                    end if;
+                end if;
+                i := i + 1;
+            end if;
+        end while;
+        if i = first then
+            return noReference();
+        end if;
+        if (i < stop) and (text[i] = ';') then
+            i := i + 1;
+        end if;
+        return Reference(codePoint => value, taken => i - at);
+    end;
+
+    -- The character reference at at, where text holds an ampersand.
+    generic [R: Region]
+    function referenceAt(text: Span[Nat8, R], at: Index, stop: Index): Reference is
+        if (at + 1) >= stop then
+            return noReference();
+        end if;
+        if text[at + 1] = '#' then
+            return numericAt(text, at, stop);
+        end if;
+        if startsWithAt(text, at + 1, "amp") then
+            return named(text, at, stop, 3, 38);
+        end if;
+        if startsWithAt(text, at + 1, "lt") then
+            return named(text, at, stop, 2, 60);
+        end if;
+        if startsWithAt(text, at + 1, "gt") then
+            return named(text, at, stop, 2, 62);
+        end if;
+        if startsWithAt(text, at + 1, "quot") then
+            return named(text, at, stop, 4, 34);
+        end if;
+        if startsWithAt(text, at + 1, "apos;") then
+            return named(text, at, stop, 4, 39);
+        end if;
+        if startsWithAt(text, at + 1, "nbsp") then
+            return named(text, at, stop, 4, 160);
+        end if;
+        return noReference();
+    end;
+
+    ---
+    --- The pool
+    ---
+
+    -- A code point as UTF-8; one that is no character as the replacement
+    -- character.
+    generic [P: Region]
+    function putCodePoint(pool: &![Buffer[Nat8], P], codePoint: Nat64): Unit is
+        var point: Nat64 := codePoint;
+        if ((point = 0) or (point > 1114111)) or ((point >= 55296) and (point <= 57343)) then
+            point := replacement;
+        end if;
+        if point < 128 then
+            insertBack(&~pool, byteOf(point));
+        else if point < 2048 then
+            insertBack(&~pool, byteOf((point / 64) + 192));
+            insertBack(&~pool, byteOf((point - ((point / 64) * 64)) + 128));
+        else if point < 65536 then
+            insertBack(&~pool, byteOf((point / 4096) + 224));
+            insertBack(&~pool, byteOf(((point / 64) - ((point / 4096) * 64)) + 128));
+            insertBack(&~pool, byteOf((point - ((point / 64) * 64)) + 128));
+        else
+            insertBack(&~pool, byteOf((point / 262144) + 240));
+            insertBack(&~pool, byteOf(((point / 4096) - ((point / 262144) * 64)) + 128));
+            insertBack(&~pool, byteOf(((point / 64) - ((point / 4096) * 64)) + 128));
+            insertBack(&~pool, byteOf((point - ((point / 64) * 64)) + 128));
+        end if;
+        return nil;
+    end;
+
+    -- The bytes of text from start up to stop into the pool, with their
+    -- character references decoded when decode is true.
+    generic [R: Region, P: Region]
+    function putText(pool: &![Buffer[Nat8], P], text: Span[Nat8, R], start: Index, stop: Index, decode: Bool): Unit is
+        var i: Index := start;
+        while i < stop do
+            if decode and (text[i] = '&') then
+                let reference: Reference := referenceAt(text, i, stop);
+                if reference.taken > 0 then
+                    putCodePoint(&~pool, reference.codePoint);
+                    i := i + reference.taken;
+                else
+                    insertBack(&~pool, text[i]);
+                    i := i + 1;
+                end if;
+            else
+                insertBack(&~pool, text[i]);
+                i := i + 1;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    -- The bytes of text from start up to stop into the pool in small
+    -- letters.
+    generic [R: Region, P: Region]
+    function putLower(pool: &![Buffer[Nat8], P], text: Span[Nat8, R], start: Index, stop: Index): Unit is
+        var i: Index := start;
+        while i < stop do
+            insertBack(&~pool, lower(text[i]));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Whether the pool holds the same size bytes at first and at second.
+    generic [P: Region]
+    function samePoolBytes(pool: &![Buffer[Nat8], P], first: Index, second: Index, size: Index): Bool is
+        var i: Index := 0;
+        while i < size do
+            let left: Nat8 := nthMut(&~pool, first + i);
+            let right: Nat8 := nthMut(&~pool, second + i);
+            if left /= right then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether the pool holds word at at, size bytes.
+    generic [P: Region]
+    function poolIs(pool: &![Buffer[Nat8], P], at: Index, size: Index, word: Span[Nat8, Static]): Bool is
+        if size /= spanLength(word) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthMut(&~pool, at + i) /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    ---
+    --- Tokens
+    ---
+
+    generic [P: Region, T: Region, A: Region]
+    function addToken(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        kind: TokenKind, textAt: Index, size: Index, selfClosing: Bool, firstAttribute: Index): Unit is
+        let total: Index := bufferLengthMut(&~attributes) - firstAttribute;
+        insertBack(&~tokens, TokenRecord(kind => kind, textAt => textAt, textLength => size, selfClosing => selfClosing,
+            firstAttribute => firstAttribute, attributeTotal => total));
+        return nil;
+    end;
+
+    generic [R: Region, P: Region, T: Region, A: Region]
+    function addText(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        html: Span[Nat8, R], start: Index, stop: Index, decode: Bool): Unit is
+        if stop > start then
+            let at: Index := bufferLengthMut(&~pool);
+            putText(&~pool, html, start, stop, decode);
+            let size: Index := bufferLengthMut(&~pool) - at;
+            let first: Index := bufferLengthMut(&~attributes);
+            addToken(&~pool, &~tokens, &~attributes, TextToken(), at, size, false, first);
+        end if;
+        return nil;
+    end;
+
+    -- The index after a run of bytes from at that stops at a space, a
+    -- slash, an angle bracket or, for an attribute name after its first
+    -- byte, an equals sign.
+    generic [R: Region]
+    function nameEnd(html: Span[Nat8, R], at: Index, attribute: Bool): Index is
+        var i: Index := at;
+        while i < spanLength(html) do
+            let byte: Nat8 := html[i];
+            if (isSpace(byte) or (byte = '/')) or (byte = '>') then
+                return i;
+            end if;
+            if attribute and ((byte = '=') and (i > at)) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    generic [R: Region]
+    function skipSpaces(html: Span[Nat8, R], at: Index): Index is
+        var i: Index := at;
+        while (i < spanLength(html)) and isSpace(html[i]) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- Whether the attribute name at nameAt, size bytes, is already one of
+    -- the attributes from first on.
+    generic [P: Region, A: Region]
+    function seenBefore(pool: &![Buffer[Nat8], P], attributes: &![Buffer[AttributeRecord], A], first: Index, nameAt: Index, size: Index): Bool is
+        let total: Index := bufferLengthMut(&~attributes);
+        var a: Index := first;
+        while a < total do
+            let other: AttributeRecord := nthMut(&~attributes, a);
+            if other.nameLength = size then
+                if samePoolBytes(&~pool, other.nameAt, nameAt, size) then
+                    return true;
+                end if;
+            end if;
+            a := a + 1;
+        end while;
+        return false;
+    end;
+
+    -- The value of an attribute at at, after its equals sign and spaces,
+    -- into the pool.  The index after it, or 0 when the input ended inside
+    -- a quoted value.
+    generic [R: Region, P: Region]
+    function attributeValueAt(pool: &![Buffer[Nat8], P], html: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(html);
+        let quote: Nat8 := html[at];
+        if (quote = '"') or (quote = 39) then
+            var close: Index := at + 1;
+            while (close < size) and (html[close] /= quote) do
+                close := close + 1;
+            end while;
+            if close >= size then
+                return noIndex;
+            end if;
+            putText(&~pool, html, at + 1, close, true);
+            return close + 1;
+        end if;
+        var close: Index := at;
+        while (close < size) and ((not isSpace(html[close])) and (html[close] /= '>')) do
+            close := close + 1;
+        end while;
+        putText(&~pool, html, at, close, true);
+        return close;
+    end;
+
+    -- A start tag at at, where html holds an angle bracket and a letter.
+    -- The index after it, or 0 when the input ended inside the tag, which
+    -- then is no tag.
+    generic [R: Region, P: Region, T: Region, A: Region]
+    function startTag(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        html: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(html);
+        let nameStop: Index := nameEnd(html, at + 1, false);
+        let textAt: Index := bufferLengthMut(&~pool);
+        putLower(&~pool, html, at + 1, nameStop);
+        let nameSize: Index := nameStop - (at + 1);
+        let first: Index := bufferLengthMut(&~attributes);
+        var selfClosing: Bool := false;
+        var i: Index := nameStop;
+        while i < size do
+            i := skipSpaces(html, i);
+            if i >= size then
+                return noIndex;
+            end if;
+            if html[i] = '>' then
+                addToken(&~pool, &~tokens, &~attributes, StartTag(), textAt, nameSize, selfClosing, first);
+                return i + 1;
+            end if;
+            if html[i] = '/' then
+                selfClosing := ((i + 1) < size) and (html[i + 1] = '>');
+                i := i + 1;
+            else
+                selfClosing := false;
+                let attributeStop: Index := nameEnd(html, i, true);
+                let nameAt: Index := bufferLengthMut(&~pool);
+                putLower(&~pool, html, i, attributeStop);
+                let attributeSize: Index := attributeStop - i;
+                i := skipSpaces(html, attributeStop);
+                let valueAt: Index := bufferLengthMut(&~pool);
+                if (i < size) and (html[i] = '=') then
+                    i := skipSpaces(html, i + 1);
+                    if i >= size then
+                        return noIndex;
+                    end if;
+                    i := attributeValueAt(&~pool, html, i);
+                    if i = 0 then
+                        return noIndex;
+                    end if;
+                end if;
+                let valueSize: Index := bufferLengthMut(&~pool) - valueAt;
+                -- The test for a name seen before costs one comparison for
+                -- each attribute kept, so their number is held down.
+                let kept: Index := bufferLengthMut(&~attributes) - first;
+                if kept >= mostAttributes then
+                    skip;
+                else if not seenBefore(&~pool, &~attributes, first, nameAt, attributeSize) then
+                    insertBack(&~attributes, AttributeRecord(nameAt => nameAt, nameLength => attributeSize,
+                        valueAt => valueAt, valueLength => valueSize));
+                end if;
+            end if;
+        end while;
+        return noIndex;
+    end;
+
+    -- An end tag at at, where html holds an angle bracket, a slash and a
+    -- letter.  The index after it, or 0 when the input ended inside it.
+    generic [R: Region, P: Region, T: Region, A: Region]
+    function endTag(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        html: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(html);
+        let nameStop: Index := nameEnd(html, at + 2, false);
+        var close: Index := nameStop;
+        while (close < size) and (html[close] /= '>') do
+            close := close + 1;
+        end while;
+        if close >= size then
+            return noIndex;
+        end if;
+        let textAt: Index := bufferLengthMut(&~pool);
+        putLower(&~pool, html, at + 2, nameStop);
+        let first: Index := bufferLengthMut(&~attributes);
+        addToken(&~pool, &~tokens, &~attributes, EndTag(), textAt, nameStop - (at + 2), false, first);
+        return close + 1;
+    end;
+
+    -- The index of the first close in html from start on, or the end.
+    generic [R: Region]
+    function findFrom(html: Span[Nat8, R], start: Index, close: Span[Nat8, Static]): Index is
+        var i: Index := start;
+        while i < spanLength(html) do
+            if startsWithAt(html, i, close) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(html);
+    end;
+
+    -- The index of the end tag of element name in html from at on, ignoring
+    -- case, or the end of the input.
+    generic [R: Region]
+    function rawTextEnd(html: Span[Nat8, R], at: Index, name: Span[Nat8, Static]): Index is
+        let size: Index := spanLength(html);
+        var i: Index := at;
+        while i < size do
+            if ((html[i] = '<') and ((i + 1) < size)) and (html[i + 1] = '/') then
+                if startsWithAt(html, i + 2, name) then
+                    let after: Index := (i + 2) + spanLength(name);
+                    if after >= size then
+                        return i;
+                    end if;
+                    if (isSpace(html[after]) or (html[after] = '/')) or (html[after] = '>') then
+                        return i;
+                    end if;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return size;
+    end;
+
+    -- After a start tag that ended at at: when its element holds raw text,
+    -- that text as one token and the index of its end tag; at otherwise.
+    -- The slash of a start tag does not change this, as in a browser.
+    generic [R: Region, P: Region, T: Region, A: Region]
+    function rawText(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        html: Span[Nat8, R], at: Index): Index is
+        let last: Index := bufferLengthMut(&~tokens) - 1;
+        let tag: TokenRecord := nthMut(&~tokens, last);
+        var stop: Index := at;
+        if poolIs(&~pool, tag.textAt, tag.textLength, "script") then
+            stop := rawTextEnd(html, at, "script");
+            addText(&~pool, &~tokens, &~attributes, html, at, stop, false);
+        else if poolIs(&~pool, tag.textAt, tag.textLength, "style") then
+            stop := rawTextEnd(html, at, "style");
+            addText(&~pool, &~tokens, &~attributes, html, at, stop, false);
+        else if poolIs(&~pool, tag.textAt, tag.textLength, "textarea") then
+            stop := rawTextEnd(html, at, "textarea");
+            addText(&~pool, &~tokens, &~attributes, html, at, stop, true);
+        else if poolIs(&~pool, tag.textAt, tag.textLength, "title") then
+            stop := rawTextEnd(html, at, "title");
+            addText(&~pool, &~tokens, &~attributes, html, at, stop, true);
+        end if;
+        return stop;
+    end;
+
+    -- A comment, or a doctype or other markup declaration, at at, where html
+    -- holds an angle bracket and an exclamation or question mark.  The
+    -- index after it.
+    generic [R: Region, P: Region, T: Region, A: Region]
+    function declaration(pool: &![Buffer[Nat8], P], tokens: &![Buffer[TokenRecord], T], attributes: &![Buffer[AttributeRecord], A],
+        html: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(html);
+        let textAt: Index := bufferLengthMut(&~pool);
+        let first: Index := bufferLengthMut(&~attributes);
+        if startsWithAt(html, at + 1, "!--") then
+            let close: Index := findFrom(html, at + 4, "-->");
+            putText(&~pool, html, at + 4, close, false);
+            let commentSize: Index := bufferLengthMut(&~pool) - textAt;
+            addToken(&~pool, &~tokens, &~attributes, CommentToken(), textAt, commentSize, false, first);
+            if (close + 3) > size then
+                return size;
+            end if;
+            return close + 3;
+        end if;
+        let close: Index := findFrom(html, at + 2, ">");
+        if startsWithAt(html, at + 1, "!doctype") then
+            let nameAt: Index := skipSpaces(html, at + 9);
+            var k: Index := nameAt;
+            while (k < close) and (not isSpace(html[k])) do
+                k := k + 1;
+            end while;
+            if nameAt < k then
+                putLower(&~pool, html, nameAt, k);
+            end if;
+            let doctypeSize: Index := bufferLengthMut(&~pool) - textAt;
+            addToken(&~pool, &~tokens, &~attributes, DoctypeToken(), textAt, doctypeSize, false, first);
+        else
+            putText(&~pool, html, at + 2, close, false);
+            let otherSize: Index := bufferLengthMut(&~pool) - textAt;
+            addToken(&~pool, &~tokens, &~attributes, CommentToken(), textAt, otherSize, false, first);
+        end if;
+        if (close + 1) > size then
+            return size;
+        end if;
+        return close + 1;
+    end;
+
+    generic [R: Region]
+    function parseHtml(html: Span[Nat8, R]): Document is
+        let size: Index := spanLength(html);
+        var pool: Buffer[Nat8] := allocateEmpty();
+        var tokens: Buffer[TokenRecord] := allocateEmpty();
+        var attributes: Buffer[AttributeRecord] := allocateEmpty();
+        var textStart: Index := 0;
+        var i: Index := 0;
+        while i < size do
+            if (html[i] = '<') and ((i + 1) < size) then
+                let next: Nat8 := html[i + 1];
+                if isLetter(next) then
+                    addText(&!pool, &!tokens, &!attributes, html, textStart, i, true);
+                    let after: Index := startTag(&!pool, &!tokens, &!attributes, html, i);
+                    if after = 0 then
+                        i := size;
+                    else
+                        i := rawText(&!pool, &!tokens, &!attributes, html, after);
+                    end if;
+                    textStart := i;
+                else if ((next = '/') and ((i + 2) < size)) and isLetter(html[i + 2]) then
+                    addText(&!pool, &!tokens, &!attributes, html, textStart, i, true);
+                    let after: Index := endTag(&!pool, &!tokens, &!attributes, html, i);
+                    if after = 0 then
+                        i := size;
+                    else
+                        i := after;
+                    end if;
+                    textStart := i;
+                else if (next = '!') or (next = '?') then
+                    addText(&!pool, &!tokens, &!attributes, html, textStart, i, true);
+                    i := declaration(&!pool, &!tokens, &!attributes, html, i);
+                    textStart := i;
+                else
+                    i := i + 1;
+                end if;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        addText(&!pool, &!tokens, &!attributes, html, textStart, size, true);
+        return Document(pool => fromByteBuffer(pool), tokens => tokens, attributes => attributes);
+    end;
+
+    function destroyDocument(document: Document): Unit is
+        let { pool: String, tokens: Buffer[TokenRecord], attributes: Buffer[AttributeRecord] } := document;
+        destroyString(pool);
+        destroyFree(tokens);
+        destroyFree(attributes);
+        return nil;
+    end;
+
+    ---
+    --- Asking a document
+    ---
+
+    generic [R: Region]
+    function tokenCount(document: &[Document, R]): Index is
+        return bufferLength(&(document->tokens));
+    end;
+
+    generic [R: Region]
+    function tokenKind(document: &[Document, R], n: Index): Option[TokenKind] is
+        if n >= bufferLength(&(document->tokens)) then
+            let none: Option[TokenKind] := None();
+            return none;
+        end if;
+        let token: TokenRecord := nth(&(document->tokens), n);
+        let some: Option[TokenKind] := Some(value => token.kind);
+        return some;
+    end;
+
+    function kindNumber(kind: TokenKind): Index is
+        case kind of
+            when TextToken do
+                return 1;
+            when StartTag do
+                return 2;
+            when EndTag do
+                return 3;
+            when CommentToken do
+                return 4;
+            when DoctypeToken do
+                return 5;
+        end case;
+    end;
+
+    -- The kind of token n as a number, 1 to 5, or 0 when there is none.
+    generic [R: Region]
+    function kindAt(document: &[Document, R], n: Index): Index is
+        case tokenKind(document, n) of
+            when Some(value as found: TokenKind) do
+                return kindNumber(found);
+            when None do
+                return noIndex;
+        end case;
+    end;
+
+    generic [R: Region]
+    function poolSpan(document: &[Document, R], at: Index, size: Index): Span[Nat8, R] is
+        return substring(asSpan(&(document->pool)), at, at + size);
+    end;
+
+    generic [R: Region]
+    function tokenText(document: &[Document, R], n: Index): Span[Nat8, R] is
+        if n >= bufferLength(&(document->tokens)) then
+            return poolSpan(document, noIndex, noIndex);
+        end if;
+        let token: TokenRecord := nth(&(document->tokens), n);
+        return poolSpan(document, token.textAt, token.textLength);
+    end;
+
+    generic [R: Region]
+    function tokenSelfClosing(document: &[Document, R], n: Index): Bool is
+        if n >= bufferLength(&(document->tokens)) then
+            return false;
+        end if;
+        let token: TokenRecord := nth(&(document->tokens), n);
+        return token.selfClosing;
+    end;
+
+    generic [R: Region]
+    function attributeCount(document: &[Document, R], n: Index): Index is
+        if n >= bufferLength(&(document->tokens)) then
+            return noIndex;
+        end if;
+        let token: TokenRecord := nth(&(document->tokens), n);
+        return token.attributeTotal;
+    end;
+
+    -- Where attribute a of token n stands, or None.
+    generic [R: Region]
+    function attributeRecord(document: &[Document, R], n: Index, a: Index): Option[AttributeRecord] is
+        if a >= attributeCount(document, n) then
+            let none: Option[AttributeRecord] := None();
+            return none;
+        end if;
+        let token: TokenRecord := nth(&(document->tokens), n);
+        let some: Option[AttributeRecord] := Some(value => nth(&(document->attributes), token.firstAttribute + a));
+        return some;
+    end;
+
+    generic [R: Region]
+    function attributeName(document: &[Document, R], n: Index, a: Index): Span[Nat8, R] is
+        case attributeRecord(document, n, a) of
+            when Some(value as found: AttributeRecord) do
+                return poolSpan(document, found.nameAt, found.nameLength);
+            when None do
+                return poolSpan(document, noIndex, noIndex);
+        end case;
+    end;
+
+    generic [R: Region]
+    function attributeValue(document: &[Document, R], n: Index, a: Index): Span[Nat8, R] is
+        case attributeRecord(document, n, a) of
+            when Some(value as found: AttributeRecord) do
+                return poolSpan(document, found.valueAt, found.valueLength);
+            when None do
+                return poolSpan(document, noIndex, noIndex);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function attributeOf(document: &[Document, R], n: Index, name: Span[Nat8, S]): Option[String] is
+        var a: Index := 0;
+        while a < attributeCount(document, n) do
+            if sameSpans(attributeName(document, n, a), name) then
+                var out: StringBuilder := makeStringBuilder();
+                writeString(&!out, attributeValue(document, n, a));
+                let some: Option[String] := Some(value => finalize(out));
+                return some;
+            end if;
+            a := a + 1;
+        end while;
+        let none: Option[String] := None();
+        return none;
+    end;
+
+    ---
+    --- Text and escaping
+    ---
+
+    generic [R: Region]
+    function textOf(html: Span[Nat8, R]): String is
+        let document: Document := parseHtml(html);
+        var out: StringBuilder := makeStringBuilder();
+        let count: Index := tokenCount(&document);
+        var n: Index := 0;
+        while n < count do
+            if kindAt(&document, n) = 1 then
+                var hidden: Bool := false;
+                if n > 0 then
+                    if kindAt(&document, n - 1) = 2 then
+                        hidden := wordNumber("script style", tokenText(&document, n - 1)) > 0;
+                    end if;
+                end if;
+                if not hidden then
+                    writeString(&!out, tokenText(&document, n));
+                end if;
+            end if;
+            n := n + 1;
+        end while;
+        destroyDocument(document);
+        return finalize(out);
+    end;
+
+    generic [B: Region, R: Region]
+    function writeEscaped(out: &![StringBuilder, B], text: Span[Nat8, R]): Unit is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if byte = '&' then
+                writeString(&~out, "&amp;");
+            else if byte = '<' then
+                writeString(&~out, "&lt;");
+            else if byte = '>' then
+                writeString(&~out, "&gt;");
+            else if byte = '"' then
+                writeString(&~out, "&quot;");
+            else if byte = 39 then
+                writeString(&~out, "&#39;");
+            else
+                writeByte(&~out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function escapeHtml(text: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeEscaped(&!out, text);
+        return finalize(out);
+    end;
+
+    ---
+    --- Policies
+    ---
+
+    -- The comma separated names of list as a mask, with bit n minus 1 set
+    -- for the name that is word n of table.  None when a name is empty or
+    -- not in the table.
+    generic [L: Region]
+    function maskOf(table: Span[Nat8, Static], list: Span[Nat8, L]): Option[Nat64] is
+        var mask: Nat64 := 0;
+        let size: Index := spanLength(list);
+        if size = 0 then
+            let empty: Option[Nat64] := Some(value => mask);
+            return empty;
+        end if;
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= size do
+            if (i = size) or (list[i] = ',') then
+                let number: Index := wordNumber(table, substring(list, start, i));
+                if number = 0 then
+                    let none: Option[Nat64] := None();
+                    return none;
+                end if;
+                mask := withBit(mask, number - 1);
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        let some: Option[Nat64] := Some(value => mask);
+        return some;
+    end;
+
+    generic [E: Region, A: Region]
+    function makePolicy(elements: Span[Nat8, E], attributes: Span[Nat8, A], links: Bool): Option[Policy] is
+        case maskOf(elementTable(), elements) of
+            when Some(value as elementMask: Nat64) do
+                case maskOf(attributeTable(), attributes) of
+                    when Some(value as attributeMask: Nat64) do
+                        let some: Option[Policy] := Some(value => Policy(elements => elementMask, attributes => attributeMask, links => links));
+                        return some;
+                    when None do
+                        let none: Option[Policy] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Policy] := None();
+                return none;
+        end case;
+    end;
+
+    function basicPolicy(): Policy is
+        case makePolicy("p,br,b,i,em,strong,code,pre,blockquote,ul,ol,li,h1,h2,h3,h4,h5,h6,a", "href,title", true) of
+            when Some(value as policy: Policy) do
+                return policy;
+            when None do
+                abort("Standard.Html: the basic policy names an unknown element");
+        end case;
+    end;
+
+    ---
+    --- Sanitizing
+    ---
+
+    -- Whether value may stand in a URL attribute: without a scheme, or
+    -- with http, https or mailto.  The scheme is what comes before a colon
+    -- that stands before any slash, question mark or number sign, read
+    -- without control bytes and spaces.
+    generic [R: Region]
+    function safeUrl(value: Span[Nat8, R]): Bool is
+        var scheme: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        var found: Bool := false;
+        var going: Bool := true;
+        while going and (i < spanLength(value)) do
+            let byte: Nat8 := value[i];
+            if ((byte = ':') or (byte = '/')) or ((byte = '?') or (byte = '#')) then
+                found := byte = ':';
+                going := false;
+            else if (byte > 32) and (byte /= 127) then
+                writeByte(&!scheme, lower(byte));
+            end if;
+            i := i + 1;
+        end while;
+        let text: String := finalize(scheme);
+        var safe: Bool := true;
+        if found then
+            safe := wordNumber("http https mailto", asSpan(&text)) > 0;
+        end if;
+        destroyString(text);
+        return safe;
+    end;
+
+    -- value without control bytes and spaces, escaped.
+    generic [B: Region, R: Region]
+    function writeUrl(out: &![StringBuilder, B], value: Span[Nat8, R]): Unit is
+        var clean: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(value) do
+            if (value[i] > 32) and (value[i] /= 127) then
+                writeByte(&!clean, value[i]);
+            end if;
+            i := i + 1;
+        end while;
+        let text: String := finalize(clean);
+        writeEscaped(&~out, asSpan(&text));
+        destroyString(text);
+        return nil;
+    end;
+
+    -- The attributes of start tag n that policy keeps on element.
+    generic [R: Region, B: Region]
+    function writeAttributes(out: &![StringBuilder, B], document: &[Document, R], n: Index, policy: Policy, element: Span[Nat8, Static]): Unit is
+        var a: Index := 0;
+        while a < attributeCount(document, n) do
+            let name: Span[Nat8, R] := attributeName(document, n, a);
+            let number: Index := wordNumber(attributeTable(), name);
+            if number > 0 then
+                if hasBit(policy.attributes, number - 1) and belongs(name, element) then
+                    let value: Span[Nat8, R] := attributeValue(document, n, a);
+                    if wordNumber("href src cite", name) > 0 then
+                        if safeUrl(value) then
+                            writeByte(&~out, ' ');
+                            writeString(&~out, name);
+                            writeString(&~out, "=\"");
+                            writeUrl(&~out, value);
+                            writeByte(&~out, '"');
+                        end if;
+                    else
+                        writeByte(&~out, ' ');
+                        writeString(&~out, name);
+                        writeString(&~out, "=\"");
+                        writeEscaped(&~out, value);
+                        writeByte(&~out, '"');
+                    end if;
+                end if;
+            end if;
+            a := a + 1;
+        end while;
+        if policy.links and sameSpans(element, "a") then
+            writeString(&~out, " rel=\"nofollow noopener\"");
+        end if;
+        return nil;
+    end;
+
+    -- Which dropped element sanitize is inside: its number in the table of
+    -- dropped elements, 0 for none, and how deep.
+    record Skip: Free is
+        element: Index;
+        depth: Index;
+    end;
+
+    generic [B: Region]
+    function closeElement(out: &![StringBuilder, B], number: Index): Unit is
+        writeString(&~out, "</");
+        writeString(&~out, wordAt(elementTable(), number));
+        writeByte(&~out, '>');
+        return nil;
+    end;
+
+    -- The end tag of element number: when it is open, everything opened
+    -- after it closed, and it.
+    generic [B: Region, O: Region]
+    function closeUpTo(out: &![StringBuilder, B], open: &![Buffer[Index], O], number: Index): Unit is
+        var at: Index := bufferLengthMut(&~open);
+        var found: Bool := false;
+        while (at > 0) and (not found) do
+            at := at - 1;
+            found := nthMut(&~open, at) = number;
+        end while;
+        if found then
+            while bufferLengthMut(&~open) > at do
+                closeElement(&~out, removeLast(&~open));
+            end while;
+        end if;
+        return nil;
+    end;
+
+    -- Start tag n under policy.
+    generic [R: Region, B: Region, O: Region]
+    function startElement(out: &![StringBuilder, B], open: &![Buffer[Index], O], document: &[Document, R], n: Index, policy: Policy): Skip is
+        let name: Span[Nat8, R] := tokenText(document, n);
+        let dropped: Index := wordNumber(dropTable(), name);
+        if dropped > 0 then
+            return Skip(element => dropped, depth => 1);
+        end if;
+        let number: Index := wordNumber(elementTable(), name);
+        let none: Skip := Skip(element => noIndex, depth => noIndex);
+        if number = 0 then
+            return none;
+        end if;
+        if not hasBit(policy.elements, number - 1) then
+            return none;
+        end if;
+        let void: Bool := isVoid(name);
+        if (not void) and (bufferLengthMut(&~open) >= mostDepth) then
+            return none;
+        end if;
+        let element: Span[Nat8, Static] := wordAt(elementTable(), number);
+        writeByte(&~out, '<');
+        writeString(&~out, element);
+        writeAttributes(&~out, document, n, policy, element);
+        writeByte(&~out, '>');
+        if not void then
+            insertBack(&~open, number);
+        end if;
+        return none;
+    end;
+
+    -- Token n under policy, while inside names the element whose content is dropped.
+    generic [R: Region, B: Region, O: Region]
+    function sanitizeToken(out: &![StringBuilder, B], open: &![Buffer[Index], O], document: &[Document, R], n: Index, policy: Policy, inside: Skip): Skip is
+        let kind: Index := kindAt(document, n);
+        let name: Span[Nat8, R] := tokenText(document, n);
+        if inside.element > 0 then
+            if wordNumber(dropTable(), name) = inside.element then
+                if kind = 2 then
+                    return Skip(element => inside.element, depth => inside.depth + 1);
+                end if;
+                if kind = 3 then
+                    if inside.depth = 1 then
+                        return Skip(element => noIndex, depth => noIndex);
+                    end if;
+                    return Skip(element => inside.element, depth => inside.depth - 1);
+                end if;
+            end if;
+            return inside;
+        end if;
+        if kind = 1 then
+            writeEscaped(&~out, name);
+        else if kind = 2 then
+            return startElement(&~out, &~open, document, n, policy);
+        else if kind = 3 then
+            let number: Index := wordNumber(elementTable(), name);
+            if number > 0 then
+                closeUpTo(&~out, &~open, number);
+            end if;
+        end if;
+        return inside;
+    end;
+
+    generic [R: Region]
+    function sanitize(html: Span[Nat8, R], policy: Policy): String is
+        let document: Document := parseHtml(html);
+        var out: StringBuilder := makeStringBuilder();
+        var open: Buffer[Index] := allocateEmpty();
+        var inside: Skip := Skip(element => noIndex, depth => noIndex);
+        let count: Index := tokenCount(&document);
+        var n: Index := 0;
+        while n < count do
+            inside := sanitizeToken(&!out, &!open, &document, n, policy, inside);
+            n := n + 1;
+        end while;
+        while bufferLengthMut(&!open) > 0 do
+            closeElement(&!out, removeLast(&!open));
+        end while;
+        destroyFree(open);
+        destroyDocument(document);
+        return finalize(out);
+    end;
+end module body.

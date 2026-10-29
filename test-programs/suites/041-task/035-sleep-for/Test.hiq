@@ -1,0 +1,146 @@
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    Sender,
+    Receiver,
+    Channel,
+    openChannel,
+    send,
+    closeSender,
+    closeReceiver,
+    Selected,
+    receiveEither,
+    sleepFor
+);
+
+module body Test is
+    function now(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as t: Nat64) do
+                return t;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    record Delayed: Linear is
+        out: Sender[Int32];
+        milliseconds: Nat32;
+        value: Int32;
+    end;
+
+    -- Waits, then sends its value and closes.
+    function wakeAndSend(job: Delayed): Unit is
+        let { out: Sender[Int32], milliseconds: Nat32, value: Int32 } := job;
+        var sender: Sender[Int32] := out;
+        sleepFor(milliseconds);
+        case send(&!sender, value) of
+            when Some(value as back: Int32) do
+                printLn(back);
+            when None do
+                skip;
+        end case;
+        closeSender(sender);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function twoSleepers(scope: &![Scope, R]): Unit is
+        let two: Index := 2;
+        let made1: Option[Channel[Int32]] := openChannel(two);
+        case made1 of
+            when Some(value as slowEnds: Channel[Int32]) do
+                let made2: Option[Channel[Int32]] := openChannel(two);
+                case made2 of
+                    when Some(value as fastEnds: Channel[Int32]) do
+                        let { sender as slowOut: Sender[Int32], receiver as slowIn: Receiver[Int32] } := slowEnds;
+                        let { sender as fastOut: Sender[Int32], receiver as fastIn: Receiver[Int32] } := fastEnds;
+                        let work: Fn[Delayed, Unit] := wakeAndSend;
+                        let slowTime: Nat32 := 400;
+                        let fastTime: Nat32 := 20;
+                        let slowValue: Int32 := 2;
+                        let fastValue: Int32 := 1;
+                        -- The slow one starts first and ends last.
+                        case spawn(&~scope, work, Delayed(out => slowOut, milliseconds => slowTime, value => slowValue)) of
+                            when Right(right as ts: Task[Unit]) do
+                                case spawn(&~scope, work, Delayed(out => fastOut, milliseconds => fastTime, value => fastValue)) of
+                                    when Right(right as tf: Task[Unit]) do
+                                        var fast: Receiver[Int32] := fastIn;
+                                        var slow: Receiver[Int32] := slowIn;
+                                        -- Whichever sends first is taken first: the
+                                        -- fast one, although it started second.
+                                        var more: Bool := true;
+                                        while more do
+                                            case receiveEither(&!slow, &!fast) of
+                                                when FromFirst(value as v: Int32) do
+                                                    printLn(v);
+                                                when FromSecond(value as v: Int32) do
+                                                    printLn(v);
+                                                when AllClosed do
+                                                    more := false;
+                                            end case;
+                                        end while;
+                                        join(tf);
+                                        join(ts);
+                                        closeReceiver(fast);
+                                        closeReceiver(slow);
+                                    when Left(left as unused: Delayed) do
+                                        let { out as o: Sender[Int32], milliseconds as m: Nat32, value as v: Int32 } := unused;
+                                        closeSender(o);
+                                        join(ts);
+                                        closeReceiver(fastIn);
+                                        closeReceiver(slowIn);
+                                        printLn(-2);
+                                end case;
+                            when Left(left as unused: Delayed) do
+                                let { out as o: Sender[Int32], milliseconds as m: Nat32, value as v: Int32 } := unused;
+                                closeSender(o);
+                                closeSender(fastOut);
+                                closeReceiver(fastIn);
+                                closeReceiver(slowIn);
+                                printLn(-2);
+                        end case;
+                    when None do
+                        let { sender as s: Sender[Int32], receiver as r: Receiver[Int32] } := slowEnds;
+                        closeSender(s);
+                        closeReceiver(r);
+                        printLn(-1);
+                end case;
+            when None do
+                printLn(-1);
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        -- main alone, before any task: it waits, and that is no deadlock.
+        let fifty: Nat32 := 50;
+        let millis: Nat64 := 1000000;
+        let fiftyWide: Nat64 := 50;
+        let before: Nat64 := now();
+        sleepFor(fifty);
+        let later: Nat64 := now();
+        print("slept at least 50 ms: ");
+        printLn((later - before) >= (fiftyWide * millis));
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                twoSleepers(&!scope);
+                closeScope(scope);
+            when None do
+                printLn(-2);
+        end case;
+        -- main alone again, after the tasks.
+        let ten: Nat32 := 10;
+        sleepFor(ten);
+        printLn("no deadlock");
+        return ExitSuccess();
+    end;
+end module body.

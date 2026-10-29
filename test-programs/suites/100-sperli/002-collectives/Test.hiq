@@ -1,0 +1,766 @@
+-- Every collective of Standard.Sperli across processes: the programme
+-- starts itself as the ranks of jobs of one to four ranks on localhost
+-- with TLS 1.3, and each rank runs barrier, bcast, reduce, allreduce,
+-- gather and scatter with every rank as the root, and every reduce
+-- operation on every element type it fits.  A job of three ranks in which
+-- the calls are wrong and one in which the ranks disagree show the codes.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    insertBack,
+    removeLast,
+    destroyEmpty
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    nthByte,
+    asSpan,
+    length as textLength
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal
+);
+import Standard.Bits (
+    float32Bits,
+    float64Bits
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFile
+);
+import Standard.Arguments (
+    processArguments
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal
+);
+import Standard.IO.Terminal (
+    StandardInput,
+    acquireInput,
+    releaseInput,
+    readLine
+);
+import Standard.SperliLaunch (
+    RunOptions,
+    parseRunArguments,
+    runJob
+);
+import Standard.SperliCollective (
+    elementWidth,
+    reductionFits
+);
+import Standard.Sperli (
+    Job,
+    Comm,
+    readJobText,
+    init,
+    rank,
+    size,
+    send,
+    recv,
+    barrier,
+    bcast,
+    reduce,
+    allreduce,
+    gather,
+    scatter,
+    finish
+);
+
+module body Test is
+    ---
+    --- The launcher
+    ---
+
+    function words(ranks: Span[Nat8, Static], hosts: Span[Nat8, Static], mode: Span[Nat8, Static]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        insertBack(&!out, fromLiteral("-n"));
+        insertBack(&!out, fromLiteral(ranks));
+        insertBack(&!out, fromLiteral("--hosts"));
+        insertBack(&!out, fromLiteral(hosts));
+        insertBack(&!out, fromLiteral("/proc/self/exe"));
+        insertBack(&!out, fromLiteral(mode));
+        return out;
+    end;
+
+    function destroyWords(list: Buffer[String]): Unit is
+        var rest: Buffer[String] := list;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function writeHosts(text: Span[Nat8, Static]): Bool is
+        case openWrite("sperli-hosts.txt") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, text);
+                return closeFile(file) and written;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function launch(ranks: Span[Nat8, Static], mode: Span[Nat8, Static]): Int32 is
+        let list: Buffer[String] := words(ranks, "sperli-hosts.txt", mode);
+        case parseRunArguments(&list) of
+            when Right(right as options: RunOptions) do
+                destroyWords(list);
+                return runJob(options);
+            when Left(left as code: Int32) do
+                destroyWords(list);
+                return code;
+        end case;
+    end;
+
+    function hostsOf(ranks: Nat32): Span[Nat8, Static] is
+        if ranks = 1 then
+            return "localhost\n";
+        end if;
+        if ranks = 2 then
+            return "localhost\nlocalhost\n";
+        end if;
+        if ranks = 3 then
+            return "localhost\nlocalhost\nlocalhost\n";
+        end if;
+        return "localhost\nlocalhost\nlocalhost\nlocalhost\n";
+    end;
+
+    function job(ranks: Nat32, count: Span[Nat8, Static], mode: Span[Nat8, Static]): Bool is
+        if not writeHosts(hostsOf(ranks)) then
+            printLn("no host file");
+            return false;
+        end if;
+        print("job ");
+        print(mode);
+        print(" of ");
+        printLn(count);
+        let status: Int32 := launch(count, mode);
+        print("launcher status ");
+        printLn(status);
+        return true;
+    end;
+
+    function launcher(): ExitCode is
+        var good: Bool := job(1, "1", "full");
+        good := good and job(2, "2", "full");
+        good := good and job(3, "3", "full");
+        good := good and job(4, "4", "full");
+        good := good and job(3, "3", "bad");
+        good := good and job(3, "3", "mismatch");
+        let removed: Bool := removeFile("sperli-hosts.txt");
+        if good then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+
+    ---
+    --- Numbers and bytes
+    ---
+
+    function widen(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function widenByte(value: Nat8): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function widenIndex(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function narrow32(value: Nat64): Nat32 is
+        case toNat32(value) of
+            when Some(value as at: Nat32) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function byteOf(value: Nat64): Nat8 is
+        case toNat8(bitwiseAnd(value, 255)) of
+            when Some(value as at: Nat8) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function floatOf64(value: Nat64): Float64 is
+        var out: Float64 := 0.0;
+        var i: Nat64 := 0;
+        while i < value do
+            out := out + 1.0;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    function floatOf32(value: Nat64): Float32 is
+        var out: Float32 := 0.0;
+        var i: Nat64 := 0;
+        while i < value do
+            out := out + 1.0;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- value in width bytes, least significant first.
+    function le(value: Nat64, width: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var rest: Nat64 := value;
+        var i: Index := 0;
+        while i < width do
+            writeByte(&!out, byteOf(rest));
+            rest := rest / 256;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The bytes of the number value as an element of elementType.
+    function elementOf(elementType: Nat8, value: Nat64): String is
+        if elementType = 6 then
+            return le(float64Bits(floatOf64(value)), 8);
+        end if;
+        if elementType = 5 then
+            return le(widen(float32Bits(floatOf32(value))), 4);
+        end if;
+        return le(value, elementWidth(elementType));
+    end;
+
+    generic [R: Region]
+    function firstNumber(text: &[String, R], width: Index): Nat64 is
+        var value: Nat64 := 0;
+        var i: Index := width;
+        while i > 0 do
+            i := i - 1;
+            value := (value * 256) + widenByte(nthByte(text, i));
+        end while;
+        return value;
+    end;
+
+    -- The result of operation over the numbers 1 to count.
+    function expectedOf(operation: Nat8, count: Nat64): Nat64 is
+        if operation = 1 then
+            return (count * (count + 1)) / 2;
+        end if;
+        if operation = 3 then
+            return count;
+        end if;
+        if operation = 7 then
+            return count - ((count / 2) * 2);
+        end if;
+        if (operation = 2) or ((operation = 5) or (operation = 6)) then
+            return 1;
+        end if;
+        var acc: Nat64 := 1;
+        var v: Nat64 := 2;
+        while v <= count do
+            if operation = 4 then
+                acc := acc * v;
+            end if;
+            if operation = 8 then
+                acc := bitwiseAnd(acc, v);
+            end if;
+            if operation = 9 then
+                acc := bitwiseOr(acc, v);
+            end if;
+            if operation = 10 then
+                acc := bitwiseXor(acc, v);
+            end if;
+            v := v + 1;
+        end while;
+        return acc;
+    end;
+
+    -- Whether the first element of result is what operation makes of the
+    -- numbers 1 to ranks, as a number of elementType.
+    generic [R: Region]
+    function matches(elementType: Nat8, operation: Nat8, ranks: Nat64, result: &[String, R]): Bool is
+        let width: Index := elementWidth(elementType);
+        if textLength(result) /= width then
+            return false;
+        end if;
+        let expected: Nat64 := expectedOf(operation, ranks);
+        var wanted: Nat64 := expected;
+        if elementType = 6 then
+            wanted := float64Bits(floatOf64(expected));
+        end if;
+        if elementType = 5 then
+            wanted := widen(float32Bits(floatOf32(expected)));
+        end if;
+        return firstNumber(result, width) = wanted;
+    end;
+
+    -- A string of count bytes that ends in a byte unlike the rest.
+    function filled(count: Index, seed: Nat8): String is
+        var out: String := makeString(count, seed);
+        if count > 0 then
+            storeNth(&!out, count - 1, byteOf(widenByte(seed) + 1));
+        end if;
+        return out;
+    end;
+
+    ---
+    --- The calls of a rank
+    ---
+
+    function report(good: Bool, what: Span[Nat8, Static], first: Nat64, second: Nat64): Bool is
+        if not good then
+            print("FAIL ");
+            print(what);
+            print(" ");
+            print(first);
+            print(" ");
+            printLn(second);
+        end if;
+        return good;
+    end;
+
+    generic [R: Region]
+    function barrierCase(comm: &![Comm, R], me: Nat32, ranks: Nat32): Bool is
+        var good: Bool := true;
+        -- Data sent before the barrier is kept while the barrier is taken.
+        if me /= 0 then
+            good := (send(&~comm, 0, 5, fromLiteral("early")) = 0) and good;
+        end if;
+        good := (barrier(&~comm) = 0) and good;
+        if me = 0 then
+            var other: Nat32 := 1;
+            while other < ranks do
+                case recv(&~comm, other, 5) of
+                    when Right(right as text: String) do
+                        good := equal(asSpan(&text), "early") and good;
+                        destroyString(text);
+                    when Left(left as code: Int32) do
+                        good := false;
+                end case;
+                other := other + 1;
+            end while;
+        end if;
+        good := (barrier(&~comm) = 0) and good;
+        good := (barrier(&~comm) = 0) and good;
+        return report(good, "barrier", widen(me), widen(ranks));
+    end;
+
+    generic [R: Region]
+    function bcastCase(comm: &![Comm, R], me: Nat32, ranks: Nat32, root: Nat32, count: Index): Bool is
+        var good: Bool := true;
+        var mine: String := fromLiteral("ignored");
+        if me = root then
+            destroyString(mine);
+            mine := filled(count, byteOf(widen(root) + 65));
+        end if;
+        case bcast(&~comm, root, mine) of
+            when Right(right as text: String) do
+                let wanted: String := filled(count, byteOf(widen(root) + 65));
+                good := equal(asSpan(&text), asSpan(&wanted));
+                destroyString(wanted);
+                destroyString(text);
+            when Left(left as code: Int32) do
+                good := false;
+        end case;
+        return report(good, "bcast", widen(root), widenIndex(count));
+    end;
+
+    generic [R: Region]
+    function reduceCase(comm: &![Comm, R], me: Nat32, ranks: Nat32, root: Nat32, elementType: Nat8, operation: Nat8): Bool is
+        let count: Nat64 := widen(ranks);
+        var good: Bool := true;
+        case reduce(&~comm, root, elementType, operation, elementOf(elementType, widen(me) + 1)) of
+            when Right(right as text: String) do
+                if me = root then
+                    good := matches(elementType, operation, count, &text);
+                else
+                    good := textLength(&text) = 0;
+                end if;
+                destroyString(text);
+            when Left(left as code: Int32) do
+                good := false;
+        end case;
+        return report(good, "reduce", widenByte(elementType), widenByte(operation));
+    end;
+
+    generic [R: Region]
+    function allreduceCase(comm: &![Comm, R], me: Nat32, ranks: Nat32, elementType: Nat8, operation: Nat8): Bool is
+        let count: Nat64 := widen(ranks);
+        var good: Bool := true;
+        case allreduce(&~comm, elementType, operation, elementOf(elementType, widen(me) + 1)) of
+            when Right(right as text: String) do
+                good := matches(elementType, operation, count, &text);
+                destroyString(text);
+            when Left(left as code: Int32) do
+                good := false;
+        end case;
+        return report(good, "allreduce", widenByte(elementType), widenByte(operation));
+    end;
+
+    -- Every operation on every element type it fits: allreduce on all
+    -- ranks, reduce with a root that changes from case to case.
+    generic [R: Region]
+    function reduceAll(comm: &![Comm, R], me: Nat32, ranks: Nat32): Bool is
+        var good: Bool := true;
+        var elementType: Nat8 := 0;
+        var turn: Nat32 := 0;
+        while elementType <= 6 do
+            var operation: Nat8 := 1;
+            while operation <= 10 do
+                if reductionFits(elementType, operation) then
+                    good := allreduceCase(&~comm, me, ranks, elementType, operation) and good;
+                    let root: Nat32 := narrow32(widen(turn) - ((widen(turn) / widen(ranks)) * widen(ranks)));
+                    good := reduceCase(&~comm, me, ranks, root, elementType, operation) and good;
+                    turn := turn + 1;
+                end if;
+                operation := operation + 1;
+            end while;
+            elementType := elementType + 1;
+        end while;
+        return good;
+    end;
+
+    -- Negative numbers keep their order: -1 to -ranks, as 32-bit and
+    -- 64-bit numbers, the smallest and the largest.
+    generic [R: Region]
+    function signedCase(comm: &![Comm, R], me: Nat32, ranks: Nat32): Bool is
+        let count: Nat64 := widen(ranks);
+        let mine: Nat64 := widen(me) + 1;
+        var good: Bool := true;
+        case allreduce(&~comm, 1, 2, le(4294967296 - mine, 4)) of
+            when Right(right as text: String) do
+                good := (firstNumber(&text, 4) = (4294967296 - count)) and good;
+                destroyString(text);
+            when Left(left as code: Int32) do
+                good := false;
+        end case;
+        case allreduce(&~comm, 1, 3, le(4294967296 - mine, 4)) of
+            when Right(right as text: String) do
+                good := (firstNumber(&text, 4) = 4294967295) and good;
+                destroyString(text);
+            when Left(left as code: Int32) do
+                good := false;
+        end case;
+        case allreduce(&~comm, 2, 2, le(18446744073709551615 - (mine - 1), 8)) of
+            when Right(right as text: String) do
+                good := (firstNumber(&text, 8) = (18446744073709551615 - (count - 1))) and good;
+                destroyString(text);
+            when Left(left as code: Int32) do
+                good := false;
+        end case;
+        return report(good, "signed", count, mine);
+    end;
+
+    -- The block of rank who for the gather rooted at root.
+    function blockOf(who: Nat32, root: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, byteOf(widen(who) + 1));
+        writeByte(&!out, byteOf(widen(root) + 100));
+        writeByte(&!out, byteOf(widen(who) * 7));
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function gatherCase(comm: &![Comm, R], me: Nat32, ranks: Nat32, root: Nat32, empty: Bool): Bool is
+        var good: Bool := true;
+        var block: String := blockOf(me, root);
+        if empty then
+            destroyString(block);
+            block := fromLiteral("");
+        end if;
+        case gather(&~comm, root, block) of
+            when Right(right as text: String) do
+                if me = root then
+                    var wanted: StringBuilder := makeStringBuilder();
+                    var who: Nat32 := 0;
+                    while who < ranks do
+                        if not empty then
+                            let part: String := blockOf(who, root);
+                            writeString(&!wanted, asSpan(&part));
+                            destroyString(part);
+                        end if;
+                        who := who + 1;
+                    end while;
+                    let whole: String := finalize(wanted);
+                    good := equal(asSpan(&text), asSpan(&whole));
+                    destroyString(whole);
+                else
+                    good := textLength(&text) = 0;
+                end if;
+                destroyString(text);
+            when Left(left as code: Int32) do
+                good := false;
+        end case;
+        return report(good, "gather", widen(root), widen(ranks));
+    end;
+
+    -- Five bytes for rank who in the scatter rooted at root.
+    function pieceOf(who: Nat32, root: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        var k: Nat64 := 0;
+        while k < 5 do
+            writeByte(&!out, byteOf((widen(who) * 16) + (widen(root) + k)));
+            k := k + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function scatterCase(comm: &![Comm, R], me: Nat32, ranks: Nat32, root: Nat32, empty: Bool): Bool is
+        var good: Bool := true;
+        var data: String := fromLiteral("junk");
+        if me = root then
+            destroyString(data);
+            var whole: StringBuilder := makeStringBuilder();
+            var who: Nat32 := 0;
+            while (who < ranks) and (not empty) do
+                let part: String := pieceOf(who, root);
+                writeString(&!whole, asSpan(&part));
+                destroyString(part);
+                who := who + 1;
+            end while;
+            data := finalize(whole);
+        end if;
+        case scatter(&~comm, root, data) of
+            when Right(right as text: String) do
+                if empty then
+                    good := textLength(&text) = 0;
+                else
+                    let wanted: String := pieceOf(me, root);
+                    good := equal(asSpan(&text), asSpan(&wanted));
+                    destroyString(wanted);
+                end if;
+                destroyString(text);
+            when Left(left as code: Int32) do
+                good := false;
+        end case;
+        return report(good, "scatter", widen(root), widen(ranks));
+    end;
+
+    -- Data sent to a rank before a collective is kept for its recv.
+    generic [R: Region]
+    function mixedCase(comm: &![Comm, R], me: Nat32, ranks: Nat32): Bool is
+        var good: Bool := true;
+        if me = 0 then
+            var other: Nat32 := 1;
+            while other < ranks do
+                good := (send(&~comm, other, 6, fromLiteral("before")) = 0) and good;
+                other := other + 1;
+            end while;
+        end if;
+        good := bcastCase(&~comm, me, ranks, 0, 3) and good;
+        if me /= 0 then
+            case recv(&~comm, 0, 6) of
+                when Right(right as text: String) do
+                    good := equal(asSpan(&text), "before") and good;
+                    destroyString(text);
+                when Left(left as code: Int32) do
+                    good := false;
+            end case;
+        end if;
+        return report(good, "mixed", widen(me), widen(ranks));
+    end;
+
+    generic [R: Region]
+    function allCases(comm: &![Comm, R], me: Nat32, ranks: Nat32): Bool is
+        var good: Bool := barrierCase(&~comm, me, ranks);
+        good := mixedCase(&~comm, me, ranks) and good;
+        var root: Nat32 := 0;
+        while root < ranks do
+            good := bcastCase(&~comm, me, ranks, root, 0) and good;
+            good := bcastCase(&~comm, me, ranks, root, 5) and good;
+            good := bcastCase(&~comm, me, ranks, root, 70000) and good;
+            good := gatherCase(&~comm, me, ranks, root, false) and good;
+            good := gatherCase(&~comm, me, ranks, root, true) and good;
+            good := scatterCase(&~comm, me, ranks, root, false) and good;
+            good := scatterCase(&~comm, me, ranks, root, true) and good;
+            root := root + 1;
+        end while;
+        good := reduceAll(&~comm, me, ranks) and good;
+        good := signedCase(&~comm, me, ranks) and good;
+        good := (barrier(&~comm) = 0) and good;
+        return good;
+    end;
+
+    function fullMain(opened: Comm): Int32 is
+        var comm: Comm := opened;
+        let me: Nat32 := rank(&comm);
+        let ranks: Nat32 := size(&comm);
+        let good: Bool := allCases(&!comm, me, ranks);
+        print("rank ");
+        print(me);
+        print(" of ");
+        print(ranks);
+        if good then
+            printLn(" every collective as it should be");
+        else
+            printLn(" FAILED");
+        end if;
+        finish(comm);
+        if good then
+            return 0;
+        end if;
+        return 1;
+    end;
+
+    -- Calls with wrong arguments give a code on every rank and leave the
+    -- job working; a scatter whose data is no whole number of blocks ends
+    -- the job for the others.
+    function badMain(opened: Comm): Int32 is
+        var comm: Comm := opened;
+        let ranks: Nat32 := size(&comm);
+        case bcast(&!comm, ranks, fromLiteral("x")) of
+            when Right(right as text: String) do
+                destroyString(text);
+                printLn("bcast with a root outside the job went through");
+            when Left(left as code: Int32) do
+                print("bcast root outside ");
+                printLn(code);
+        end case;
+        case reduce(&!comm, 0, 0, 1, fromLiteral("ab")) of
+            when Right(right as text: String) do
+                destroyString(text);
+                printLn("sum of bytes went through");
+            when Left(left as code: Int32) do
+                print("sum of bytes ");
+                printLn(code);
+        end case;
+        case allreduce(&!comm, 1, 1, fromLiteral("abc")) of
+            when Right(right as text: String) do
+                destroyString(text);
+                printLn("half an element went through");
+            when Left(left as code: Int32) do
+                print("half an element ");
+                printLn(code);
+        end case;
+        print("barrier after the wrong calls ");
+        printLn(barrier(&!comm));
+        case scatter(&!comm, 1, fromLiteral("0123456789")) of
+            when Right(right as text: String) do
+                destroyString(text);
+                printLn("scatter of ten bytes went through");
+            when Left(left as code: Int32) do
+                print("scatter of ten bytes ");
+                printLn(code);
+        end case;
+        finish(comm);
+        return 0;
+    end;
+
+    -- Rank 0 asks for a sum and the others for a maximum.
+    function mismatchMain(opened: Comm): Int32 is
+        var comm: Comm := opened;
+        var operation: Nat8 := 3;
+        if rank(&comm) = 0 then
+            operation := 1;
+        end if;
+        case allreduce(&!comm, 2, operation, le(1, 8)) of
+            when Right(right as text: String) do
+                destroyString(text);
+                printLn("allreduce of different operations went through");
+            when Left(left as code: Int32) do
+                print("allreduce of different operations ");
+                printLn(code);
+        end case;
+        finish(comm);
+        return 0;
+    end;
+
+    function rankMain(line: String, mode: String): Int32 is
+        case readJobText(asSpan(&line)) of
+            when Left(left as why: Int32) do
+                destroyString(line);
+                destroyString(mode);
+                print("the job was refused with ");
+                printLn(why);
+                return 4;
+            when Right(right as given: Job) do
+                destroyString(line);
+                case init(given) of
+                    when Left(left as why: Int32) do
+                        destroyString(mode);
+                        print("init failed with ");
+                        printLn(why);
+                        return 5;
+                    when Right(right as comm: Comm) do
+                        if equal(asSpan(&mode), "bad") then
+                            destroyString(mode);
+                            return badMain(comm);
+                        end if;
+                        if equal(asSpan(&mode), "mismatch") then
+                            destroyString(mode);
+                            return mismatchMain(comm);
+                        end if;
+                        destroyString(mode);
+                        return fullMain(comm);
+                end case;
+        end case;
+    end;
+
+    function readJobLine(root: RootCapability): String is
+        var mutRoot: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!mutRoot);
+        var input: StandardInput := acquireInput(&!terminal);
+        let line: String := readLine(&!input);
+        releaseInput(input);
+        releaseTerminal(terminal);
+        surrenderRoot(mutRoot);
+        return line;
+    end;
+
+    function exitFor(status: Int32): ExitCode is
+        if status = 0 then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var arguments: Buffer[String] := processArguments();
+        if length(&arguments) = 0 then
+            destroyEmpty(arguments);
+            surrenderRoot(root);
+            return launcher();
+        end if;
+        let mode: String := removeLast(&!arguments);
+        destroyWords(arguments);
+        return exitFor(rankMain(readJobLine(root), mode));
+    end;
+end module body.

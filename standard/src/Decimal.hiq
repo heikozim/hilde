@@ -1,0 +1,382 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module of arithmetic on Nat64 and Nat8; it binds no C.  The
+-- language traps on an overflow, so every step that could leave its range
+-- is checked before it is taken, and a number that would not fit is None.
+import Standard.String (
+    String
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+
+module body Standard.Decimal is
+    -- A Decimal is made in one place only, the function made below, and every function of this module that makes
+    -- a number checks the limit itself: the magnitude is at most limit, the scale at most mostScale, and a zero is
+    -- never negative.  A function that cannot keep them answers None.  So the record states no invariant.
+    record Decimal: Free is
+        negative: Bool;
+        magnitude: Nat64;
+        scale: Nat8;
+    end;
+
+    constant mostScale: Nat8 := 18;
+
+    -- The largest magnitude: 18 nines.  Two of them add up to less than
+    -- the largest Nat64, so a sum is checked after it is taken.
+    constant limit: Nat64 := 999'999'999'999'999'999;
+
+    -- A number, never minus zero.
+    function made(negative: Bool, magnitude: Nat64, scale: Nat8): Decimal is
+        return Decimal(negative => negative and (magnitude /= 0), magnitude => magnitude, scale => scale);
+    end;
+
+    -- Ten to the power of exponent, for exponents up to 19.
+    function powerOfTen(exponent: Nat8): Nat64 is
+        var result: Nat64 := 1;
+        var i: Nat8 := 0;
+        while i < exponent do
+            result := result * 10;
+            i := i + 1;
+        end while;
+        return result;
+    end;
+
+    -- magnitude times ten to the power of by, when it stays within limit.
+    function scaleUp(magnitude: Nat64, by: Nat8): Option[Nat64] is
+        if by > mostScale then
+            if magnitude = 0 then
+                return Some(value => magnitude);
+            end if;
+            return None();
+        end if;
+        let factor: Nat64 := powerOfTen(by);
+        if magnitude > (limit / factor) then
+            return None();
+        end if;
+        return Some(value => magnitude * factor);
+    end;
+
+    -- magnitude times ten, times times, when it stays within a Nat64.
+    function timesTen(magnitude: Nat64, times: Nat8): Option[Nat64] is
+        var result: Nat64 := magnitude;
+        var i: Nat8 := 0;
+        while i < times do
+            if result > (maximum_nat64 / 10) then
+                return None();
+            end if;
+            result := result * 10;
+            i := i + 1;
+        end while;
+        return Some(value => result);
+    end;
+
+    function larger(left: Nat8, right: Nat8): Nat8 is
+        if left > right then
+            return left;
+        end if;
+        return right;
+    end;
+
+    function digitValue(byte: Nat8): Nat64 is
+        case toNat64(byte - '0') of
+            when Some(value as digit: Nat64) do
+                return digit;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function digitByte(digit: Nat64): Nat8 is
+        case toNat8(digit) of
+            when Some(value as small: Nat8) do
+                return small + '0';
+            when None do
+                return '0';
+        end case;
+    end;
+
+    ---
+    --- Making and reading
+    ---
+
+    function makeDecimal(units: Int64, scale: Nat8): Option[Decimal] is
+        if scale > mostScale then
+            return None();
+        end if;
+        let negative: Bool := units < 0;
+        var magnitude: Nat64 := 0;
+        if negative then
+            let m: Nat64 := toNat64(-(units + 1))?;
+            magnitude := m + 1;
+        else
+            let m: Nat64 := toNat64(units)?;
+            magnitude := m;
+        end if;
+        if magnitude > limit then
+            return None();
+        end if;
+        return Some(value => made(negative, magnitude, scale));
+    end;
+
+    generic [R: Region]
+    function parseDecimal(text: Span[Nat8, R]): Option[Decimal] is
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        var negative: Bool := false;
+        if (size > 0) and (text[0] = '-') then
+            negative := true;
+            i := i + 1;
+        end if;
+        var magnitude: Nat64 := 0;
+        var digits: Index := 0;
+        var scale: Nat8 := 0;
+        var afterPoint: Bool := false;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if (byte >= '0') and (byte <= '9') then
+                let digit: Nat64 := digitValue(byte);
+                if magnitude > ((limit - digit) / 10) then
+                    return None();
+                end if;
+                magnitude := (magnitude * 10) + digit;
+                digits := digits + 1;
+                if afterPoint then
+                    if scale = mostScale then
+                        return None();
+                    end if;
+                    scale := scale + 1;
+                end if;
+            else if ((byte = '.') and (not afterPoint)) and (digits > 0) then
+                afterPoint := true;
+            else
+                return None();
+            end if;
+            i := i + 1;
+        end while;
+        if digits = 0 then
+            return None();
+        end if;
+        if afterPoint and (scale = 0) then
+            return None();
+        end if;
+        return Some(value => made(negative, magnitude, scale));
+    end;
+
+    function digitCount(magnitude: Nat64): Nat8 is
+        var count: Nat8 := 1;
+        var rest: Nat64 := magnitude / 10;
+        while rest > 0 do
+            count := count + 1;
+            rest := rest / 10;
+        end while;
+        return count;
+    end;
+
+    function decimalToString(value: Decimal): String is
+        var builder: StringBuilder := makeStringBuilder();
+        if value.negative then
+            writeByte(&!builder, '-');
+        end if;
+        let width: Nat8 := larger(digitCount(value.magnitude), value.scale + 1);
+        var k: Nat8 := 0;
+        while k < width do
+            let position: Nat8 := (width - 1) - k;
+            if (value.scale > 0) and (position = (value.scale - 1)) then
+                writeByte(&!builder, '.');
+            end if;
+            let shifted: Nat64 := value.magnitude / powerOfTen(position);
+            writeByte(&!builder, digitByte(shifted - ((shifted / 10) * 10)));
+            k := k + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    function decimalUnits(value: Decimal): Int64 is
+        case toInt64(value.magnitude) of
+            when Some(value as units: Int64) do
+                if value.negative then
+                    return -units;
+                end if;
+                return units;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function decimalScale(value: Decimal): Nat8 is
+        return value.scale;
+    end;
+
+    ---
+    --- Arithmetic
+    ---
+
+    -- Two magnitudes at one scale, with their signs, added.
+    function combine(leftNegative: Bool, left: Nat64, rightNegative: Bool, right: Nat64, scale: Nat8): Option[Decimal] is
+        if leftNegative = rightNegative then
+            let sum: Nat64 := left + right;
+            if sum > limit then
+                return None();
+            end if;
+            return Some(value => made(leftNegative, sum, scale));
+        end if;
+        if left >= right then
+            return Some(value => made(leftNegative, left - right, scale));
+        end if;
+        return Some(value => made(rightNegative, right - left, scale));
+    end;
+
+    function addDecimal(left: Decimal, right: Decimal): Option[Decimal] is
+        let scale: Nat8 := larger(left.scale, right.scale);
+        let a: Nat64 := scaleUp(left.magnitude, scale - left.scale)?;
+        let b: Nat64 := scaleUp(right.magnitude, scale - right.scale)?;
+        return combine(left.negative, a, right.negative, b, scale);
+    end;
+
+    function subtractDecimal(left: Decimal, right: Decimal): Option[Decimal] is
+        return addDecimal(left, made(not right.negative, right.magnitude, right.scale));
+    end;
+
+    function multiplyDecimal(left: Decimal, right: Decimal): Option[Decimal] is
+        let scale: Nat8 := left.scale + right.scale;
+        if scale > mostScale then
+            return None();
+        end if;
+        if (right.magnitude /= 0) and (left.magnitude > (limit / right.magnitude)) then
+            return None();
+        end if;
+        return Some(value => made(left.negative /= right.negative, left.magnitude * right.magnitude, scale));
+    end;
+
+    -- quotient rounded half away from zero: one more when what is left is
+    -- at least half of the divisor.
+    function roundedQuotient(numerator: Nat64, denominator: Nat64): Nat64 is
+        let quotient: Nat64 := numerator / denominator;
+        let rest: Nat64 := numerator - (quotient * denominator);
+        if rest >= (denominator - rest) then
+            return quotient + 1;
+        end if;
+        return quotient;
+    end;
+
+    -- numerator times ten to the power of shift, divided by denominator,
+    -- rounded half away from zero; None when it passes limit.  Digit by
+    -- digit, so that no step needs more room than a Nat64 has: what is left
+    -- is always below the denominator, which is at most limit, and ten
+    -- times that still fits.
+    function scaledQuotient(numerator: Nat64, shift: Nat8, denominator: Nat64): Option[Nat64] is
+        var quotient: Nat64 := numerator / denominator;
+        var rest: Nat64 := numerator - (quotient * denominator);
+        if quotient > limit then
+            return None();
+        end if;
+        var i: Nat8 := 0;
+        while i < shift do
+            let widened: Nat64 := rest * 10;
+            let digit: Nat64 := widened / denominator;
+            if quotient > ((limit - digit) / 10) then
+                return None();
+            end if;
+            quotient := (quotient * 10) + digit;
+            rest := widened - (digit * denominator);
+            i := i + 1;
+        end while;
+        if rest >= (denominator - rest) then
+            if quotient = limit then
+                return None();
+            end if;
+            quotient := quotient + 1;
+        end if;
+        return Some(value => quotient);
+    end;
+
+    function divideDecimal(left: Decimal, right: Decimal, scale: Nat8): Option[Decimal] is
+        if (right.magnitude = 0) or (scale > mostScale) then
+            return None();
+        end if;
+        let negative: Bool := left.negative /= right.negative;
+        let up: Nat8 := scale + right.scale;
+        var quotient: Nat64 := 0;
+        if up >= left.scale then
+            let exact: Nat64 := scaledQuotient(left.magnitude, up - left.scale, right.magnitude)?;
+            quotient := exact;
+        else
+            -- A denominator beyond a Nat64 is more than twice the
+            -- numerator, so the quotient rounds to zero, which it is.
+            case timesTen(right.magnitude, left.scale - up) of
+                when Some(value as denominator: Nat64) do
+                    quotient := roundedQuotient(left.magnitude, denominator);
+                when None do
+                    skip;
+            end case;
+        end if;
+        if quotient > limit then
+            return None();
+        end if;
+        return Some(value => made(negative, quotient, scale));
+    end;
+
+    function roundDecimal(value: Decimal, scale: Nat8): Option[Decimal] is
+        if scale > mostScale then
+            return None();
+        end if;
+        if scale >= value.scale then
+            let magnitude: Nat64 := scaleUp(value.magnitude, scale - value.scale)?;
+            return Some(value => made(value.negative, magnitude, scale));
+        end if;
+        let divisor: Nat64 := powerOfTen(value.scale - scale);
+        return Some(value => made(value.negative, roundedQuotient(value.magnitude, divisor), scale));
+    end;
+
+    ---
+    --- Comparing
+    ---
+
+    -- Whether the magnitude of left is smaller than that of right, at the
+    -- larger scale.  Only the one with the smaller scale is scaled up, and
+    -- when it does not fit it is the larger one.
+    function magnitudeLess(left: Decimal, right: Decimal): Bool is
+        let scale: Nat8 := larger(left.scale, right.scale);
+        case scaleUp(left.magnitude, scale - left.scale) of
+            when Some(value as a: Nat64) do
+                case scaleUp(right.magnitude, scale - right.scale) of
+                    when Some(value as b: Nat64) do
+                        return a < b;
+                    when None do
+                        return true;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function equalDecimal(left: Decimal, right: Decimal): Bool is
+        if left.negative /= right.negative then
+            return false;
+        end if;
+        return (not magnitudeLess(left, right)) and (not magnitudeLess(right, left));
+    end;
+
+    function lessDecimal(left: Decimal, right: Decimal): Bool is
+        if left.negative and (not right.negative) then
+            return true;
+        end if;
+        if (not left.negative) and right.negative then
+            return false;
+        end if;
+        if left.negative then
+            return magnitudeLess(right, left);
+        end if;
+        return magnitudeLess(left, right);
+    end;
+end module body.

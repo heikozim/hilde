@@ -1,0 +1,384 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  Every path is put together from a base directory per
+-- kind and the app name; the bases differ by system and by kind of app.
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal
+);
+import Standard.File (
+    environmentValue
+);
+import Standard.Platform (
+    systemName
+);
+
+module body Standard.Paths is
+    constant appLimit: Index := 31;
+
+    generic [A: Region]
+    function isAppName(app: Span[Nat8, A]): Bool is
+        let size: Index := spanLength(app);
+        if (size = 0) or (size > appLimit) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := app[i];
+            let small: Bool := (byte >= 'a') and (byte <= 'z');
+            let digit: Bool := (byte >= '0') and (byte <= '9');
+            if not small then
+                if i = 0 then
+                    return false;
+                end if;
+                if (not digit) and (byte /= '-') then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [A: Region]
+    function serviceAccount(app: Span[Nat8, A]): Option[String] is
+        if not isAppName(app) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var b: StringBuilder := makeStringBuilder();
+        writeByte(&!b, '_');
+        writeString(&!b, app);
+        let some: Option[String] := Some(value => finalize(b));
+        return some;
+    end;
+
+    generic [A: Region]
+    function variableName(app: Span[Nat8, A], what: PathKind): Option[String] is
+        var tail: Span[Nat8, Static] := "";
+        case what of
+            when EnvFile do
+                tail := "_ENV";
+            when PepperFile do
+                tail := "_PEPPER";
+            when ConfigFile do
+                tail := "_CONFIG";
+            when SocketFile do
+                tail := "_SOCKET";
+            when DataDirectory do
+                skip;
+            when CacheDirectory do
+                skip;
+            when LogDirectory do
+                skip;
+            when RuntimeDirectory do
+                skip;
+        end case;
+        if (spanLength(tail) = 0) or (not isAppName(app)) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var b: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(app) do
+            let byte: Nat8 := app[i];
+            if (byte >= 'a') and (byte <= 'z') then
+                writeByte(&!b, byte - 32);
+            else
+                if byte = '-' then
+                    writeByte(&!b, '_');
+                else
+                    writeByte(&!b, byte);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        writeString(&!b, tail);
+        let some: Option[String] := Some(value => finalize(b));
+        return some;
+    end;
+
+    function pathMode(what: PathKind): Nat32 is
+        case what of
+            when EnvFile do
+                return 384;
+            when PepperFile do
+                return 384;
+            when ConfigFile do
+                return 416;
+            when SocketFile do
+                return 432;
+            when DataDirectory do
+                return 488;
+            when CacheDirectory do
+                return 488;
+            when LogDirectory do
+                return 488;
+            when RuntimeDirectory do
+                return 488;
+        end case;
+    end;
+
+    -- The base directories of one app on one system, without a slash at
+    -- the end.  secretDirectory says whether the env file of the app lies
+    -- in a directory secret of its own, as a service's does.
+    record Bases: Linear is
+        config: String;
+        data: String;
+        cache: String;
+        log: String;
+        run: String;
+        secretDirectory: Bool;
+    end;
+
+    function destroyBases(bases: Bases): Unit is
+        let { config: String, data: String, cache: String, log: String, run: String, secretDirectory: Bool } := bases;
+        destroyString(config);
+        destroyString(data);
+        destroyString(cache);
+        destroyString(log);
+        destroyString(run);
+        return nil;
+    end;
+
+    function serviceBases(config: Span[Nat8, Static], data: Span[Nat8, Static], cache: Span[Nat8, Static], log: Span[Nat8, Static], run: Span[Nat8, Static]): Bases is
+        return Bases(config => fromSpan(config), data => fromSpan(data), cache => fromSpan(cache),
+            log => fromSpan(log), run => fromSpan(run), secretDirectory => true);
+    end;
+
+    generic [S: Region]
+    function serviceBasesOn(system: Span[Nat8, S]): Bases is
+        if equal(system, "openbsd") then
+            return serviceBases("/etc", "/var", "/var/cache", "/var/log", "/var/run");
+        end if;
+        if equal(system, "freebsd") then
+            return serviceBases("/usr/local/etc", "/var/db", "/var/cache", "/var/log", "/var/run");
+        end if;
+        if equal(system, "macos") then
+            return serviceBases("/usr/local/etc", "/usr/local/var", "/usr/local/var/cache", "/usr/local/var/log", "/usr/local/var/run");
+        end if;
+        return serviceBases("/etc", "/var/lib", "/var/cache", "/var/log", "/run");
+    end;
+
+    generic [R: Region]
+    function absolute(text: &[String, R]): Bool is
+        return (length(text) > 0) and (nthByte(text, 0) = '/');
+    end;
+
+    -- The value of variable when it holds an absolute path, else home and
+    -- suffix.
+    generic [V: Region, H: Region, X: Region]
+    function userBase(variable: Span[Nat8, V], home: Span[Nat8, H], suffix: Span[Nat8, X]): String is
+        case environmentValue(variable) of
+            when Some(value as set: String) do
+                if absolute(&set) then
+                    return set;
+                end if;
+                destroyString(set);
+            when None do
+                skip;
+        end case;
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, home);
+        writeString(&!b, suffix);
+        return finalize(b);
+    end;
+
+    generic [H: Region, X: Region]
+    function homeAnd(home: Span[Nat8, H], suffix: Span[Nat8, X]): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, home);
+        writeString(&!b, suffix);
+        return finalize(b);
+    end;
+
+    generic [S: Region, H: Region]
+    function userBasesOn(system: Span[Nat8, S], home: Span[Nat8, H]): Bases is
+        if equal(system, "macos") then
+            return Bases(config => homeAnd(home, "/Library/Application Support"),
+                data => homeAnd(home, "/Library/Application Support"),
+                cache => homeAnd(home, "/Library/Caches"),
+                log => homeAnd(home, "/Library/Logs"),
+                run => homeAnd(home, "/Library/Caches"),
+                secretDirectory => false);
+        end if;
+        let cache: String := userBase("XDG_CACHE_HOME", home, "/.cache");
+        var run: String := fromSpan(asSpan(&cache));
+        case environmentValue("XDG_RUNTIME_DIR") of
+            when Some(value as set: String) do
+                if absolute(&set) then
+                    destroyString(run);
+                    run := set;
+                else
+                    destroyString(set);
+                end if;
+            when None do
+                skip;
+        end case;
+        return Bases(config => userBase("XDG_CONFIG_HOME", home, "/.config"),
+            data => userBase("XDG_DATA_HOME", home, "/.local/share"),
+            cache => cache,
+            log => userBase("XDG_STATE_HOME", home, "/.local/state"),
+            run => run,
+            secretDirectory => false);
+    end;
+
+    -- base/app, then what follows for the kind.
+    generic [R: Region, A: Region]
+    function assemble(bases: &[Bases, R], app: Span[Nat8, A], what: PathKind): String is
+        var b: StringBuilder := makeStringBuilder();
+        case what of
+            when ConfigFile do
+                writeString(&!b, asSpan(&(bases->config)));
+            when EnvFile do
+                writeString(&!b, asSpan(&(bases->config)));
+            when PepperFile do
+                writeString(&!b, asSpan(&(bases->data)));
+            when DataDirectory do
+                writeString(&!b, asSpan(&(bases->data)));
+            when CacheDirectory do
+                writeString(&!b, asSpan(&(bases->cache)));
+            when LogDirectory do
+                writeString(&!b, asSpan(&(bases->log)));
+            when RuntimeDirectory do
+                writeString(&!b, asSpan(&(bases->run)));
+            when SocketFile do
+                writeString(&!b, asSpan(&(bases->run)));
+        end case;
+        writeByte(&!b, '/');
+        writeString(&!b, app);
+        case what of
+            when ConfigFile do
+                writeByte(&!b, '/');
+                writeString(&!b, app);
+                writeString(&!b, ".yaml");
+            when EnvFile do
+                if bases->secretDirectory then
+                    writeString(&!b, "/secret");
+                end if;
+                writeString(&!b, "/.");
+                writeString(&!b, app);
+                writeString(&!b, ".env");
+            when PepperFile do
+                writeString(&!b, "/.");
+                writeString(&!b, app);
+                writeString(&!b, ".pepper");
+            when SocketFile do
+                writeByte(&!b, '/');
+                writeString(&!b, app);
+                writeString(&!b, ".sock");
+            when DataDirectory do
+                skip;
+            when CacheDirectory do
+                skip;
+            when LogDirectory do
+                skip;
+            when RuntimeDirectory do
+                skip;
+        end case;
+        return finalize(b);
+    end;
+
+    generic [S: Region, A: Region]
+    function defaultPathOn(system: Span[Nat8, S], app: Span[Nat8, A], kind: AppKind, what: PathKind): Option[String] is
+        if not isAppName(app) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case kind of
+            when Service do
+                let bases: Bases := serviceBasesOn(system);
+                let path: String := assemble(&bases, app, what);
+                destroyBases(bases);
+                let some: Option[String] := Some(value => path);
+                return some;
+            when UserTool do
+                case environmentValue("HOME") of
+                    when Some(value as home: String) do
+                        if not absolute(&home) then
+                            destroyString(home);
+                            let none: Option[String] := None();
+                            return none;
+                        end if;
+                        let bases: Bases := userBasesOn(system, asSpan(&home));
+                        let path: String := assemble(&bases, app, what);
+                        destroyBases(bases);
+                        destroyString(home);
+                        let some: Option[String] := Some(value => path);
+                        return some;
+                    when None do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+        end case;
+    end;
+
+    generic [A: Region]
+    function defaultPath(app: Span[Nat8, A], kind: AppKind, what: PathKind): Option[String] is
+        return defaultPathOn(systemName(), app, kind, what);
+    end;
+
+    generic [A: Region, F: Region, C: Region]
+    function choosePath(app: Span[Nat8, A], kind: AppKind, what: PathKind, flag: Option[Span[Nat8, F]], configured: Option[Span[Nat8, C]]): Option[String] is
+        if not isAppName(app) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        case flag of
+            when Some(value as given: Span[Nat8, F]) do
+                if spanLength(given) > 0 then
+                    let some: Option[String] := Some(value => fromSpan(given));
+                    return some;
+                end if;
+            when None do
+                skip;
+        end case;
+        case variableName(app, what) of
+            when Some(value as name: String) do
+                let set: Option[String] := environmentValue(asSpan(&name));
+                destroyString(name);
+                case set of
+                    when Some(value as text: String) do
+                        if length(&text) > 0 then
+                            let some: Option[String] := Some(value => text);
+                            return some;
+                        end if;
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+            when None do
+                skip;
+        end case;
+        case configured of
+            when Some(value as given: Span[Nat8, C]) do
+                if spanLength(given) > 0 then
+                    let some: Option[String] := Some(value => fromSpan(given));
+                    return some;
+                end if;
+            when None do
+                skip;
+        end case;
+        return defaultPath(app, kind, what);
+    end;
+end module body.

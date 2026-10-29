@@ -1,0 +1,1 @@
+Test that two connections that run the same migrations at the same time apply each of them once: migrate reads the version again under BEGIN IMMEDIATE, so the second one skips what the first ran after it had read the version.  Two tasks on a database file, 100 rounds, a fresh file each; each round must leave one row.

@@ -1,0 +1,325 @@
+-- The same exercise against SQLite, SQLCipher and PostgreSQL through
+-- Standard.Database: the migration, the config table with its upsert,
+-- every type of value there and back, a question mark inside a string
+-- literal that stays one, a unique violation classified, a transaction
+-- rolled back and one committed, and a reading connection that reads.  The
+-- output of the three is the same apart from the name of the backend.
+import Standard.String (
+    String,
+    destroyString,
+    makeString,
+    storeNth,
+    asSpan,
+    length
+);
+import Standard.SqlCipher (
+    Key,
+    makeKey
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile
+);
+import Standard.Database (
+    Database,
+    Writing,
+    Reading,
+    DbError,
+    Values,
+    Cursor,
+    Transaction,
+    describe,
+    isUniqueViolation,
+    isConstraintViolation,
+    isBusy,
+    closeDatabase,
+    migrate,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    withInt64,
+    withFloat64,
+    withBool,
+    withTimestamp,
+    withText,
+    withBytes,
+    withNull,
+    start,
+    execute,
+    advance,
+    isNullColumn,
+    columnInt64,
+    columnFloat64,
+    columnBool,
+    columnTimestamp,
+    columnText,
+    columnBytes,
+    finish,
+    createConfigTable,
+    setConfig,
+    getConfig
+);
+import Standard.Database.Sqlite (
+    openSqlite,
+    openSqliteReader,
+    openSqlCipher,
+    openSqlCipherReader
+);
+import DbTest (
+    openTestPostgres,
+    openTestPostgresReader
+);
+
+module body Test is
+    constant migrations: Span[Nat8, Static] := "126\nCREATE TABLE people (id int8 PRIMARY KEY, name text NOT NULL UNIQUE, height float8, alive bool, born timestamptz, photo bytea)";
+
+    function report(error: DbError): Unit is
+        print("error: ");
+        printLn(describe(error));
+        return nil;
+    end;
+
+    function written(label: Span[Nat8, Static], result: Either[DbError, Nat64]): Unit is
+        print(label);
+        print(": ");
+        case result of
+            when Left(left as error: DbError) do
+                print(describe(error));
+                print(", unique ");
+                print(isUniqueViolation(error));
+                print(", constraint ");
+                print(isConstraintViolation(error));
+                print(", busy ");
+                printLn(isBusy(error));
+            when Right(right as count: Nat64) do
+                print("rows ");
+                printLn(count);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function countPeople(db: &![Database[Writing], R]): Unit is
+        var rows: Cursor := start(&~db, "SELECT count(*) FROM people WHERE name <> 'who?' AND id > ?", withInt64(noValues(), 0));
+        while advance(&!rows) do
+            print("people: ");
+            printLn(columnInt64(&rows, 0));
+        end while;
+        ended(finish(&~db, rows));
+        return nil;
+    end;
+
+    function ended(failure: Option[DbError]): Unit is
+        case failure of
+            when Some(value as error: DbError) do
+                report(error);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [S: Region]
+    function printBytes(bytes: Span[Nat8, S]): Unit is
+        var i: Index := 0;
+        while i < spanLength(bytes) do
+            print(" ");
+            print(bytes[i]);
+            i := i + 1;
+        end while;
+        printLn("");
+        return nil;
+    end;
+
+    function printConfig(label: Span[Nat8, Static], result: Either[DbError, Option[String]]): Unit is
+        print(label);
+        print(": ");
+        case result of
+            when Left(left as error: DbError) do
+                report(error);
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as text: String) do
+                        printLn(asSpan(&text));
+                        destroyString(text);
+                    when None do
+                        printLn("none");
+                end case;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Database[Writing], R]): Unit is
+        case migrate(&~db, migrations) of
+            when Left(left as error: DbError) do
+                report(error);
+            when Right(right as applied: Index) do
+                print("migrations: ");
+                printLn(applied);
+        end case;
+        case createConfigTable(&~db) of
+            when Left(left as error: DbError) do
+                report(error);
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        case setConfig(&~db, "mode", "fast") of
+            when Left(left as error: DbError) do
+                report(error);
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        case setConfig(&~db, "mode", "slow") of
+            when Left(left as error: DbError) do
+                report(error);
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        printConfig("config mode", getConfig(&~db, "mode"));
+        printConfig("config missing", getConfig(&~db, "missing"));
+        var photo: String := makeString(3, 0);
+        storeNth(&!photo, 1, 128);
+        storeNth(&!photo, 2, 255);
+        let first: Values := withBytes(withTimestamp(withBool(withFloat64(withText(withInt64(noValues(), 1), "Ada"), 1.5), true), 1700000000000001), asSpan(&photo));
+        written("insert Ada", execute(&~db, "INSERT INTO people (id, name, height, alive, born, photo) VALUES (?, ?, ?, ?, ?, ?)", first));
+        destroyString(photo);
+        let second: Values := withNull(withNull(withNull(withNull(withText(withInt64(noValues(), 2), "Bob' OR '1'='1")))));
+        written("insert Bob", execute(&~db, "INSERT INTO people (id, name, height, alive, born, photo) VALUES (?, ?, ?, ?, ?, ?)", second));
+        written("insert Ada again", execute(&~db, "INSERT INTO people (id, name) VALUES (?, ?)", withText(withInt64(noValues(), 3), "Ada")));
+        countPeople(&~db);
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                report(error);
+            when Right(right as transaction: Transaction) do
+                written("insert in a transaction", execute(&~db, "INSERT INTO people (id, name) VALUES (?, ?)", withText(withInt64(noValues(), 4), "Cy")));
+                rollback(&~db, transaction);
+                printLn("rolled back");
+        end case;
+        countPeople(&~db);
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                report(error);
+            when Right(right as transaction: Transaction) do
+                written("insert in a transaction", execute(&~db, "INSERT INTO people (id, name) VALUES (?, ?)", withText(withInt64(noValues(), 5), "Di")));
+                case commit(&~db, transaction) of
+                    when Left(left as error: DbError) do
+                        report(error);
+                    when Right(right as done: Unit) do
+                        printLn("committed");
+                end case;
+        end case;
+        countPeople(&~db);
+        var rows: Cursor := start(&~db, "SELECT id, name, height, alive, born, photo FROM people WHERE id = ? OR id = ? ORDER BY id", withInt64(withInt64(noValues(), 1), 2));
+        while advance(&!rows) do
+            print(columnInt64(&rows, 0));
+            print(" ");
+            print(columnText(&rows, 1));
+            if isNullColumn(&rows, 2) then
+                printLn(" and nothing else");
+            else
+                print(" ");
+                print(columnFloat64(&rows, 2));
+                print(" ");
+                print(columnBool(&rows, 3));
+                print(" ");
+                print(columnTimestamp(&rows, 4));
+                print(" photo");
+                printBytes(columnBytes(&rows, 5));
+            end if;
+        end while;
+        ended(finish(&~db, rows));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function readBack(db: &![Database[Reading], R]): Unit is
+        var rows: Cursor := start(&~db, "SELECT name FROM people ORDER BY id", noValues());
+        print("reader:");
+        while advance(&!rows) do
+            print(" ");
+            print(columnText(&rows, 0));
+        end while;
+        printLn("");
+        ended(finish(&~db, rows));
+        return nil;
+    end;
+
+    function writer(label: Span[Nat8, Static], opened: Either[DbError, Database[Writing]]): Unit is
+        printLn(label);
+        case opened of
+            when Left(left as error: DbError) do
+                report(error);
+            when Right(right as db: Database[Writing]) do
+                var open: Database[Writing] := db;
+                exercise(&!open);
+                closeDatabase(open);
+        end case;
+        return nil;
+    end;
+
+    function reader(opened: Either[DbError, Database[Reading]]): Unit is
+        case opened of
+            when Left(left as error: DbError) do
+                report(error);
+            when Right(right as db: Database[Reading]) do
+                var open: Database[Reading] := db;
+                readBack(&!open);
+                closeDatabase(open);
+        end case;
+        return nil;
+    end;
+
+    -- Whether the file at path begins with the header of a plain SQLite
+    -- database: the SQLite backend writes one, SQLCipher with a key does
+    -- not.
+    function plainHeader(path: Span[Nat8, Static]): Unit is
+        let header: Span[Nat8, Static] := "SQLite format 3";
+        print(path);
+        case openRead(path) of
+            when None do
+                printLn(": cannot be opened");
+            when Some(value as file: FileDescriptor) do
+                var open: FileDescriptor := file;
+                case readAll(&!open) of
+                    when None do
+                        printLn(": cannot be read");
+                    when Some(value as bytes: String) do
+                        var same: Bool := length(&bytes) >= spanLength(header);
+                        var i: Index := 0;
+                        while same and (i < spanLength(header)) do
+                            if byteAt(&bytes, i) /= header[i] then
+                                same := false;
+                            end if;
+                            i := i + 1;
+                        end while;
+                        print(": plain SQLite header ");
+                        printLn(same);
+                        destroyString(bytes);
+                end case;
+                let closed: Bool := closeFile(open);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function byteAt(text: &[String, R], i: Index): Nat8 is
+        let bytes: Span[Nat8, R] := asSpan(text);
+        return bytes[i];
+    end;
+
+    function main(): ExitCode is
+        writer("== sqlite", openSqlite("plain.db"));
+        reader(openSqliteReader("plain.db"));
+        writer("== sqlcipher", openSqlCipher("cipher.db", makeKey("correct horse battery staple")));
+        reader(openSqlCipherReader("cipher.db", makeKey("correct horse battery staple")));
+        writer("== postgres", openTestPostgres());
+        reader(openTestPostgresReader());
+        plainHeader("plain.db");
+        plainHeader("cipher.db");
+        return ExitSuccess();
+    end;
+end module body.

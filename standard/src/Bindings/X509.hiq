@@ -1,0 +1,1389 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Each call into libcrypto is an @embed against the headers of the system,
+-- so a prototype that changes is a compile error and not a wrong call.  An
+-- out parameter of C lives in one slot of memory allocated here and read
+-- back with load.  Bytes come out of libcrypto through a memory BIO or a
+-- buffer of the size libcrypto names first, and are copied into a String
+-- before the C memory is given back.  A password callback is never asked:
+-- the PEM readers get an empty password, so an encrypted key is refused
+-- instead of a prompt on a terminal.  After a failure the error queue of
+-- the thread is emptied, so that it does not reach another library.  The
+-- functions that Bindings.C.Libcrypto imports are called through it and not
+-- in an @embed: where that module is part of a programme, the compiler
+-- renames their prototypes in the system's headers.  No ML-DSA key is made
+-- or used for signing here: Standard.X509 takes those from Standard.MlDsa.
+-- A key libcrypto reads from a certificate request may still be one, and
+-- is recognised by name through a function LibreSSL does not have; it is
+-- looked up with dlsym when the programme runs, so that this module
+-- compiles against either library.
+pragma Unsafe_Module;
+pragma Foreign_Library(Name => "crypto");
+pragma Foreign_Header(Name => "openssl/evp.h");
+pragma Foreign_Header(Name => "openssl/pem.h");
+pragma Foreign_Header(Name => "openssl/x509.h");
+pragma Foreign_Header(Name => "openssl/x509v3.h");
+pragma Foreign_Header(Name => "openssl/bn.h");
+pragma Foreign_Header(Name => "openssl/err.h");
+pragma Foreign_Header(Name => "dlfcn.h");
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullCheck,
+    allocateBuffer,
+    store,
+    load,
+    positiveOffset,
+    deallocate
+);
+import Standard.String (
+    String,
+    makeEmpty,
+    makeString,
+    storeNth,
+    destroyString,
+    length,
+    asSpan
+);
+import Bindings.C.Libcrypto (
+    EVP_PKEY_free,
+    EVP_PKEY_CTX_free,
+    EVP_MD_CTX_new,
+    EVP_MD_CTX_free,
+    EVP_DigestSignInit,
+    EVP_DigestSign,
+    EVP_DigestVerifyInit,
+    EVP_DigestVerify,
+    EVP_sha256,
+    EVP_sha384,
+    EVP_sha512
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+
+module body Bindings.X509 is
+    record RequestParts: Linear is
+        key: Address[Unit];
+        commonName: String;
+        names: String;
+    end;
+
+    function kindP256(): Int32 is
+        return 1;
+    end;
+
+    function kindP384(): Int32 is
+        return 2;
+    end;
+
+    function kindEd25519(): Int32 is
+        return 3;
+    end;
+
+    -- RSA of 2048, 3072 and 4096 bits, P-521, and ML-DSA-44, -65 and -87.
+    function kindRsa2048(): Int32 is
+        return 4;
+    end;
+
+    function kindRsa3072(): Int32 is
+        return 5;
+    end;
+
+    function kindRsa4096(): Int32 is
+        return 6;
+    end;
+
+    function kindP521(): Int32 is
+        return 7;
+    end;
+
+    function kindMlDsa44(): Int32 is
+        return 8;
+    end;
+
+    function kindMlDsa65(): Int32 is
+        return 9;
+    end;
+
+    function kindMlDsa87(): Int32 is
+        return 10;
+    end;
+
+    function isRsaKind(kind: Int32): Bool is
+        return (kind >= kindRsa2048()) and (kind <= kindRsa4096());
+    end;
+
+    function rsaBits(kind: Int32): Int32 is
+        if kind = kindRsa2048() then
+            return 2048;
+        end if;
+        if kind = kindRsa3072() then
+            return 3072;
+        end if;
+        -- The requires leaves kindRsa4096 alone here.
+        return 4096;
+    end;
+
+    function mlDsaName(kind: Int32): Span[Nat8, Static] is
+        if kind = kindMlDsa44() then
+            return "ML-DSA-44";
+        end if;
+        if kind = kindMlDsa65() then
+            return "ML-DSA-65";
+        end if;
+        return "ML-DSA-87";
+    end;
+
+    -- A function of libcrypto by name, or null where it has none.
+    function symbol(name: Span[Nat8, Static]): Address[Unit] is
+        let text: Pointer[Nat8] := cString(name);
+        let found: Address[Unit] := @embed(Address[Unit], "dlsym(dlopen(NULL, RTLD_NOW), (const char*) ($1))", text);
+        deallocate(text);
+        return found;
+    end;
+
+    ---
+    --- Memory
+    ---
+
+    function isNull(address: Address[Unit]): Bool is
+        return @embed(Bool, "(($1) == NULL)", address);
+    end;
+
+    function nullAddress(): Address[Unit] is
+        return @embed(Address[Unit], "NULL");
+    end;
+
+    function noContext(): Address[Address[Unit]] is
+        return @embed(Address[Address[Unit]], "NULL");
+    end;
+
+    function noBytes(): Address[Nat8] is
+        return @embed(Address[Nat8], "NULL");
+    end;
+
+    function indexAddress(slot: Pointer[Index]): Address[Index] is
+        return @embed(Address[Index], "$1", slot);
+    end;
+
+    generic [R: Region]
+    function bytesOf(bytes: Span[Nat8, R]): Address[Nat8] is
+        return @embed(Address[Nat8], "((hilde_nat8_t*) (($1).data))", bytes);
+    end;
+
+    function cleared(): Unit is
+        @embed(Unit, "ERR_clear_error()");
+        return nil;
+    end;
+
+    -- One slot for a pointer that C writes, holding null.
+    function pointerSlot(): Pointer[Address[Unit]] is
+        let address: Address[Address[Unit]] := allocateBuffer(1);
+        case nullCheck(address) of
+            when Some(value as slot: Pointer[Address[Unit]]) do
+                store(slot, nullAddress());
+                return slot;
+            when None do
+                abort("Standard.X509: out of memory");
+        end case;
+    end;
+
+    function indexSlot(): Pointer[Index] is
+        let address: Address[Index] := allocateBuffer(1);
+        case nullCheck(address) of
+            when Some(value as slot: Pointer[Index]) do
+                let zero: Index := 0;
+                store(slot, zero);
+                return slot;
+            when None do
+                abort("Standard.X509: out of memory");
+        end case;
+    end;
+
+    function intSlots(count: Index): Pointer[Int32] is
+        let address: Address[Int32] := allocateBuffer(count);
+        case nullCheck(address) of
+            when Some(value as slots: Pointer[Int32]) do
+                var i: Index := 0;
+                while i < count do
+                    let zero: Int32 := 0;
+                    store(positiveOffset(slots, i), zero);
+                    i := i + 1;
+                end while;
+                return slots;
+            when None do
+                abort("Standard.X509: out of memory");
+        end case;
+    end;
+
+    -- size bytes of C memory at data, as a String.
+    function copyOut(data: Address[Unit], size: Index): String is
+        var out: String := makeString(size, 0);
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!out, i, @embed(Nat8, "((const unsigned char*) ($1))[$2]", data, i));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- A copy of text with a zero byte after it, for a C string.  Its
+    -- address, to be given to deallocate.
+    generic [R: Region]
+    function cString(text: Span[Nat8, R]): Pointer[Nat8] is
+        let size: Index := spanLength(text);
+        let room: Address[Nat8] := allocateBuffer(size + 1);
+        case nullCheck(room) of
+            when Some(value as buffer: Pointer[Nat8]) do
+                var i: Index := 0;
+                while i < size do
+                    store(positiveOffset(buffer, i), text[i]);
+                    i := i + 1;
+                end while;
+                let terminator: Nat8 := 0;
+                store(positiveOffset(buffer, size), terminator);
+                return buffer;
+            when None do
+                abort("Standard.X509: out of memory");
+        end case;
+    end;
+
+    -- A memory BIO that reads the bytes of span; the bytes must outlive it.
+    generic [R: Region]
+    function readingBio(bytes: Span[Nat8, R]): Address[Unit] is
+        return @embed(Address[Unit], "BIO_new_mem_buf((const void*) (($1).data), (int) ($2))", bytes, spanLength(bytes));
+    end;
+
+    function writingBio(): Address[Unit] is
+        return @embed(Address[Unit], "BIO_new(BIO_s_mem())");
+    end;
+
+    -- What a writing BIO holds, and the BIO freed.
+    function drained(bio: Address[Unit]): Option[String] is
+        let pending: Index := @embed(Index, "(size_t) BIO_ctrl_pending((BIO*) ($1))", bio);
+        let room: Address[Nat8] := allocateBuffer(pending + 1);
+        case nullCheck(room) of
+            when Some(value as buffer: Pointer[Nat8]) do
+                let got: Int32 := @embed(Int32, "BIO_read((BIO*) ($1), (void*) ($2), (int) ($3))", bio, buffer, pending);
+                var out: Option[String] := None();
+                if (pending > 0) and (got > 0) then
+                    case toIndex(got) of
+                        when Some(value as size: Index) do
+                            let previous: Option[String] := out;
+                            dropOption(previous);
+                            out := Some(value => copyOut(@embed(Address[Unit], "(void*) ($1)", buffer), size));
+                        when None do
+                            skip;
+                    end case;
+                end if;
+                deallocate(buffer);
+                @embed(Unit, "BIO_free((BIO*) ($1))", bio);
+                return out;
+            when None do
+                @embed(Unit, "BIO_free((BIO*) ($1))", bio);
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function dropOption(value: Option[String]): Unit is
+        case value of
+            when Some(value as text: String) do
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function freeBio(bio: Address[Unit]): Unit is
+        @embed(Unit, "BIO_free((BIO*) ($1))", bio);
+        return nil;
+    end;
+
+    ---
+    --- Keys
+    ---
+
+    function generateKey(kind: Int32): Address[Unit] is
+        var context: Address[Unit] := nullAddress();
+        if kind = kindEd25519() then
+            context := @embed(Address[Unit], "EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL)");
+        else if ((kind = kindP256()) or (kind = kindP384())) or (kind = kindP521()) then
+            context := @embed(Address[Unit], "EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL)");
+        else if isRsaKind(kind) then
+            context := @embed(Address[Unit], "EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL)");
+        end if;
+        if isNull(context) then
+            cleared();
+            return nullAddress();
+        end if;
+        var good: Bool := @embed(Int32, "EVP_PKEY_keygen_init((EVP_PKEY_CTX*) ($1))", context) = 1;
+        if good and (kind = kindP256()) then
+            good := @embed(Int32, "EVP_PKEY_CTX_set_ec_paramgen_curve_nid((EVP_PKEY_CTX*) ($1), NID_X9_62_prime256v1)", context) = 1;
+        else if good and (kind = kindP384()) then
+            good := @embed(Int32, "EVP_PKEY_CTX_set_ec_paramgen_curve_nid((EVP_PKEY_CTX*) ($1), NID_secp384r1)", context) = 1;
+        else if good and (kind = kindP521()) then
+            good := @embed(Int32, "EVP_PKEY_CTX_set_ec_paramgen_curve_nid((EVP_PKEY_CTX*) ($1), NID_secp521r1)", context) = 1;
+        else if good and isRsaKind(kind) then
+            good := @embed(Int32, "EVP_PKEY_CTX_set_rsa_keygen_bits((EVP_PKEY_CTX*) ($1), $2)", context, rsaBits(kind)) > 0;
+        end if;
+        let slot: Pointer[Address[Unit]] := pointerSlot();
+        if good then
+            good := @embed(Int32, "EVP_PKEY_keygen((EVP_PKEY_CTX*) ($1), (EVP_PKEY**) ($2))", context, slot) = 1;
+        end if;
+        let key: Address[Unit] := load(slot);
+        deallocate(slot);
+        EVP_PKEY_CTX_free(context);
+        if not good then
+            freeKey(key);
+            cleared();
+            return nullAddress();
+        end if;
+        return key;
+    end;
+
+    function keyKind(key: Address[Unit]): Int32 is
+        if @embed(Int32, "EVP_PKEY_base_id((const EVP_PKEY*) ($1))", key) = @embed(Int32, "EVP_PKEY_ED25519") then
+            return kindEd25519();
+        end if;
+        if @embed(Int32, "EVP_PKEY_base_id((const EVP_PKEY*) ($1))", key) = @embed(Int32, "EVP_PKEY_RSA") then
+            let size: Int32 := @embed(Int32, "EVP_PKEY_bits((const EVP_PKEY*) ($1))", key);
+            if size = 2048 then
+                return kindRsa2048();
+            end if;
+            if size = 3072 then
+                return kindRsa3072();
+            end if;
+            if size = 4096 then
+                return kindRsa4096();
+            end if;
+            return 0;
+        end if;
+        let named: Int32 := mlDsaKindOf(key);
+        if named /= 0 then
+            return named;
+        end if;
+        if @embed(Int32, "EVP_PKEY_base_id((const EVP_PKEY*) ($1))", key) = @embed(Int32, "EVP_PKEY_EC") then
+            let bits: Int32 := @embed(Int32, "EVP_PKEY_bits((const EVP_PKEY*) ($1))", key);
+            if bits = 256 then
+                return kindP256();
+            end if;
+            if bits = 384 then
+                return kindP384();
+            end if;
+            if bits = 521 then
+                return kindP521();
+            end if;
+        end if;
+        return 0;
+    end;
+
+    -- The kind of an ML-DSA key by the name libcrypto gives its type, or 0.
+    function mlDsaKindOf(key: Address[Unit]): Int32 is
+        let isA: Address[Unit] := symbol("EVP_PKEY_is_a");
+        if isNull(isA) then
+            return 0;
+        end if;
+        var kind: Int32 := kindMlDsa44();
+        while kind <= kindMlDsa87() do
+            let name: Pointer[Nat8] := cString(mlDsaName(kind));
+            let same: Bool := @embed(Int32, "((int (*)(const void*, const char*)) hilde_fnptr_from_object($1))((const void*) ($2), (const char*) ($3))", isA, key, name) = 1;
+            deallocate(name);
+            if same then
+                return kind;
+            end if;
+            kind := kind + 1;
+        end while;
+        return 0;
+    end;
+
+    -- The digest a key of kind signs with: SHA-256 for P-256 and RSA
+    -- (RS256), SHA-384 for P-384, SHA-512 for P-521, or none for Ed25519 and
+    -- ML-DSA, which take the message itself.
+    function digestFor(kind: Int32): Address[Unit] is
+        if (kind = kindP256()) or isRsaKind(kind) then
+            return EVP_sha256();
+        end if;
+        if kind = kindP384() then
+            return EVP_sha384();
+        end if;
+        if kind = kindP521() then
+            return EVP_sha512();
+        end if;
+        return nullAddress();
+    end;
+
+    function keyToPem(key: Address[Unit]): Option[String] is
+        let bio: Address[Unit] := writingBio();
+        if isNull(bio) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if @embed(Int32, "PEM_write_bio_PrivateKey((BIO*) ($1), (EVP_PKEY*) ($2), NULL, NULL, 0, NULL, NULL)", bio, key) /= 1 then
+            freeBio(bio);
+            cleared();
+            let none: Option[String] := None();
+            return none;
+        end if;
+        return drained(bio);
+    end;
+
+    generic [R: Region]
+    function keyFromPem(pem: Span[Nat8, R]): Address[Unit] is
+        let bio: Address[Unit] := readingBio(pem);
+        if isNull(bio) then
+            return nullAddress();
+        end if;
+        let key: Address[Unit] := @embed(Address[Unit], "PEM_read_bio_PrivateKey((BIO*) ($1), NULL, NULL, (void*) \"\")", bio);
+        freeBio(bio);
+        if isNull(key) then
+            cleared();
+        end if;
+        return key;
+    end;
+
+    function publicKeyDer(key: Address[Unit]): Option[String] is
+        let size: Int32 := @embed(Int32, "i2d_PUBKEY((EVP_PKEY*) ($1), NULL)", key);
+        return derOut(key, size, false);
+    end;
+
+    -- The DER of the public key (request false) or of a certificate or a
+    -- request, size bytes, written by i2d into memory of its own.
+    function derOut(object: Address[Unit], size: Int32, certificate: Bool): Option[String] is
+        case toIndex(size) of
+            when Some(value as count: Index) do
+                if count = 0 then
+                    cleared();
+                    let none: Option[String] := None();
+                    return none;
+                end if;
+                let room: Address[Nat8] := allocateBuffer(count);
+                case nullCheck(room) of
+                    when Some(value as buffer: Pointer[Nat8]) do
+                        let slot: Pointer[Address[Unit]] := pointerSlot();
+                        store(slot, @embed(Address[Unit], "(void*) ($1)", buffer));
+                        var written: Int32 := 0;
+                        if certificate then
+                            written := @embed(Int32, "i2d_X509((X509*) ($1), (unsigned char**) ($2))", object, slot);
+                        else
+                            written := @embed(Int32, "i2d_PUBKEY((EVP_PKEY*) ($1), (unsigned char**) ($2))", object, slot);
+                        end if;
+                        deallocate(slot);
+                        var out: Option[String] := None();
+                        if written = size then
+                            let previous: Option[String] := out;
+                            dropOption(previous);
+                            out := Some(value => copyOut(@embed(Address[Unit], "(void*) ($1)", buffer), count));
+                        else
+                            cleared();
+                        end if;
+                        deallocate(buffer);
+                        return out;
+                    when None do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                cleared();
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function sign(key: Address[Unit], message: Span[Nat8, R]): Option[String] is
+        let kind: Int32 := keyKind(key);
+        if kind = 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let context: Address[Unit] := EVP_MD_CTX_new();
+        if isNull(context) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let digest: Address[Unit] := digestFor(kind);
+        let size: Pointer[Index] := indexSlot();
+        var good: Bool := EVP_DigestSignInit(context, noContext(), digest, nullAddress(), key) = 1;
+        if good then
+            good := EVP_DigestSign(context, noBytes(), indexAddress(size), bytesOf(message), spanLength(message)) = 1;
+        end if;
+        var out: Option[String] := None();
+        if good then
+            let most: Index := load(size);
+            let room: Address[Nat8] := allocateBuffer(most + 1);
+            case nullCheck(room) of
+                when Some(value as buffer: Pointer[Nat8]) do
+                    if EVP_DigestSign(context, @embed(Address[Nat8], "$1", buffer), indexAddress(size), bytesOf(message), spanLength(message)) = 1 then
+                        let previous: Option[String] := out;
+                        dropOption(previous);
+                        out := Some(value => copyOut(@embed(Address[Unit], "(void*) ($1)", buffer), load(size)));
+                    end if;
+                    deallocate(buffer);
+                when None do
+                    skip;
+            end case;
+        end if;
+        deallocate(size);
+        EVP_MD_CTX_free(context);
+        cleared();
+        return out;
+    end;
+
+    -- The public key of a DER SubjectPublicKeyInfo, or null.
+    generic [R: Region]
+    function publicKeyOf(der: Span[Nat8, R]): Address[Unit] is
+        let slot: Pointer[Address[Unit]] := pointerSlot();
+        store(slot, @embed(Address[Unit], "(void*) (($1).data)", der));
+        let key: Address[Unit] := @embed(Address[Unit], "d2i_PUBKEY(NULL, (const unsigned char**) ($1), (long) ($2))", slot, spanLength(der));
+        deallocate(slot);
+        return key;
+    end;
+
+    generic [P: Region, M: Region, S: Region]
+    function verify(publicDer: Span[Nat8, P], message: Span[Nat8, M], signature: Span[Nat8, S]): Bool is
+        let key: Address[Unit] := publicKeyOf(publicDer);
+        if isNull(key) then
+            cleared();
+            return false;
+        end if;
+        let kind: Int32 := keyKind(key);
+        let context: Address[Unit] := EVP_MD_CTX_new();
+        var good: Bool := (kind /= 0) and (not isNull(context));
+        if good then
+            good := EVP_DigestVerifyInit(context, noContext(), digestFor(kind), nullAddress(), key) = 1;
+        end if;
+        if good then
+            good := EVP_DigestVerify(context, bytesOf(signature), spanLength(signature), bytesOf(message), spanLength(message)) = 1;
+        end if;
+        if not isNull(context) then
+            EVP_MD_CTX_free(context);
+        end if;
+        freeKey(key);
+        cleared();
+        return good;
+    end;
+
+    generic [P: Region]
+    function kindOfPublicDer(publicDer: Span[Nat8, P]): Int32 is
+        let key: Address[Unit] := publicKeyOf(publicDer);
+        if isNull(key) then
+            cleared();
+            return 0;
+        end if;
+        let kind: Int32 := keyKind(key);
+        freeKey(key);
+        return kind;
+    end;
+
+    function freeKey(key: Address[Unit]): Unit is
+        EVP_PKEY_free(key);
+        return nil;
+    end;
+
+    ---
+    --- Certificates
+    ---
+
+    generic [R: Region]
+    function certificateFromPem(pem: Span[Nat8, R]): Address[Unit] is
+        let bio: Address[Unit] := readingBio(pem);
+        if isNull(bio) then
+            return nullAddress();
+        end if;
+        let certificate: Address[Unit] := @embed(Address[Unit], "PEM_read_bio_X509((BIO*) ($1), NULL, NULL, (void*) \"\")", bio);
+        freeBio(bio);
+        if isNull(certificate) then
+            cleared();
+        end if;
+        return certificate;
+    end;
+
+    generic [R: Region]
+    function certificateFromDer(der: Span[Nat8, R]): Address[Unit] is
+        let slot: Pointer[Address[Unit]] := pointerSlot();
+        store(slot, @embed(Address[Unit], "(void*) (($1).data)", der));
+        let certificate: Address[Unit] := @embed(Address[Unit], "d2i_X509(NULL, (const unsigned char**) ($1), (long) ($2))", slot, spanLength(der));
+        deallocate(slot);
+        if isNull(certificate) then
+            cleared();
+        end if;
+        return certificate;
+    end;
+
+    function certificateToPem(certificate: Address[Unit]): Option[String] is
+        let bio: Address[Unit] := writingBio();
+        if isNull(bio) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        if @embed(Int32, "PEM_write_bio_X509((BIO*) ($1), (X509*) ($2))", bio, certificate) /= 1 then
+            freeBio(bio);
+            cleared();
+            let none: Option[String] := None();
+            return none;
+        end if;
+        return drained(bio);
+    end;
+
+    function certificateToDer(certificate: Address[Unit]): Option[String] is
+        let size: Int32 := @embed(Int32, "i2d_X509((X509*) ($1), NULL)", certificate);
+        return derOut(certificate, size, true);
+    end;
+
+    -- The UTF-8 bytes of an ASN1_STRING, or None.
+    function utf8Of(text: Address[Unit]): Option[String] is
+        let slot: Pointer[Address[Unit]] := pointerSlot();
+        let size: Int32 := @embed(Int32, "ASN1_STRING_to_UTF8((unsigned char**) ($1), (const ASN1_STRING*) ($2))", slot, text);
+        let bytes: Address[Unit] := load(slot);
+        deallocate(slot);
+        case toIndex(size) of
+            when Some(value as count: Index) do
+                let out: String := copyOut(bytes, count);
+                @embed(Unit, "OPENSSL_free($1)", bytes);
+                let some: Option[String] := Some(value => out);
+                return some;
+            when None do
+                cleared();
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- The common name of an X509_NAME, or None.
+    function nameCommonName(name: Address[Unit]): Option[String] is
+        let at: Int32 := @embed(Int32, "X509_NAME_get_index_by_NID((const X509_NAME*) ($1), NID_commonName, -1)", name);
+        if at < 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let entry: Address[Unit] := @embed(Address[Unit], "(void*) X509_NAME_get_entry((const X509_NAME*) ($1), $2)", name, at);
+        return utf8Of(@embed(Address[Unit], "(void*) X509_NAME_ENTRY_get_data((const X509_NAME_ENTRY*) ($1))", entry));
+    end;
+
+    function commonNameRaw(certificate: Address[Unit], issuer: Bool): Option[String] is
+        if issuer then
+            return nameCommonName(@embed(Address[Unit], "(void*) X509_get_issuer_name((const X509*) ($1))", certificate));
+        end if;
+        return nameCommonName(@embed(Address[Unit], "(void*) X509_get_subject_name((const X509*) ($1))", certificate));
+    end;
+
+    -- The DNS names of a GENERAL_NAMES stack, separated by commas, written
+    -- to out.
+    generic [B: Region]
+    function writeDnsNames(names: Address[Unit], out: &![StringBuilder, B]): Unit is
+        if isNull(names) then
+            return nil;
+        end if;
+        let count: Int32 := @embed(Int32, "sk_GENERAL_NAME_num((const GENERAL_NAMES*) ($1))", names);
+        var i: Int32 := 0;
+        var first: Bool := true;
+        while i < count do
+            let entry: Address[Unit] := @embed(Address[Unit], "(void*) sk_GENERAL_NAME_value((const GENERAL_NAMES*) ($1), $2)", names, i);
+            if @embed(Bool, "(((GENERAL_NAME*) ($1))->type == GEN_DNS)", entry) then
+                case utf8Of(@embed(Address[Unit], "(void*) (((GENERAL_NAME*) ($1))->d.dNSName)", entry)) of
+                    when Some(value as name: String) do
+                        if not first then
+                            writeByte(&~out, ',');
+                        end if;
+                        writeString(&~out, asSpan(&name));
+                        destroyString(name);
+                        first := false;
+                    when None do
+                        skip;
+                end case;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    function dnsNames(certificate: Address[Unit]): String is
+        let names: Address[Unit] := @embed(Address[Unit], "X509_get_ext_d2i((const X509*) ($1), NID_subject_alt_name, NULL, NULL)", certificate);
+        var out: StringBuilder := makeStringBuilder();
+        writeDnsNames(names, &!out);
+        if not isNull(names) then
+            @embed(Unit, "GENERAL_NAMES_free((GENERAL_NAMES*) ($1))", names);
+        end if;
+        cleared();
+        return finalize(out);
+    end;
+
+    function validity(certificate: Address[Unit], last: Bool): Option[Int64] is
+        var time: Address[Unit] := @embed(Address[Unit], "(void*) X509_get0_notBefore((const X509*) ($1))", certificate);
+        if last then
+            time := @embed(Address[Unit], "(void*) X509_get0_notAfter((const X509*) ($1))", certificate);
+        end if;
+        let epoch: Address[Unit] := @embed(Address[Unit], "(void*) ASN1_TIME_set(NULL, 0)");
+        if isNull(epoch) then
+            let none: Option[Int64] := None();
+            return none;
+        end if;
+        let slots: Pointer[Int32] := intSlots(2);
+        let good: Bool := @embed(Int32, "ASN1_TIME_diff((int*) ($1), (int*) ($2), (const ASN1_TIME*) ($3), (const ASN1_TIME*) ($4))", slots, positiveOffset(slots, 1), epoch, time) = 1;
+        let days: Int32 := load(slots);
+        let seconds: Int32 := load(positiveOffset(slots, 1));
+        deallocate(slots);
+        @embed(Unit, "ASN1_TIME_free((ASN1_TIME*) ($1))", epoch);
+        if not good then
+            cleared();
+            let none: Option[Int64] := None();
+            return none;
+        end if;
+        case toInt64(days) of
+            when Some(value as wideDays: Int64) do
+                case toInt64(seconds) of
+                    when Some(value as wideSeconds: Int64) do
+                        let day: Int64 := 86400;
+                        let some: Option[Int64] := Some(value => (wideDays * day) + wideSeconds);
+                        return some;
+                    when None do
+                        let none: Option[Int64] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Int64] := None();
+                return none;
+        end case;
+    end;
+
+    function serialHex(certificate: Address[Unit]): Option[String] is
+        let number: Address[Unit] := @embed(Address[Unit], "(void*) ASN1_INTEGER_to_BN(X509_get0_serialNumber((const X509*) ($1)), NULL)", certificate);
+        if isNull(number) then
+            cleared();
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let hex: Address[Unit] := @embed(Address[Unit], "(void*) BN_bn2hex((const BIGNUM*) ($1))", number);
+        @embed(Unit, "BN_free((BIGNUM*) ($1))", number);
+        if isNull(hex) then
+            cleared();
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let out: String := copyOut(hex, @embed(Index, "strlen((const char*) ($1))", hex));
+        @embed(Unit, "OPENSSL_free($1)", hex);
+        let some: Option[String] := Some(value => out);
+        return some;
+    end;
+
+    function fingerprint(certificate: Address[Unit]): Option[String] is
+        let room: Address[Nat8] := allocateBuffer(64);
+        case nullCheck(room) of
+            when Some(value as buffer: Pointer[Nat8]) do
+                let size: Pointer[Int32] := intSlots(1);
+                let good: Bool := @embed(Int32, "X509_digest((const X509*) ($1), (const EVP_MD*) ($2), (unsigned char*) ($3), (unsigned int*) ($4))", certificate, EVP_sha256(), buffer, size) = 1;
+                var out: Option[String] := None();
+                if good and (load(size) = 32) then
+                    let previous: Option[String] := out;
+                    dropOption(previous);
+                    out := Some(value => copyOut(@embed(Address[Unit], "(void*) ($1)", buffer), 32));
+                end if;
+                deallocate(size);
+                deallocate(buffer);
+                return out;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    function matchesKey(certificate: Address[Unit], key: Address[Unit]): Bool is
+        let matches: Bool := @embed(Int32, "X509_check_private_key((const X509*) ($1), (const EVP_PKEY*) ($2))", certificate, key) = 1;
+        cleared();
+        return matches;
+    end;
+
+    function isAuthority(certificate: Address[Unit]): Bool is
+        -- X509_check_ca answers 1 for basicConstraints with the CA flag set,
+        -- and 3, 4 or 5 for a version 1 root, keyCertSign alone and the
+        -- Netscape type.  Only the first makes a CA here.
+        return @embed(Int32, "X509_check_ca((X509*) ($1))", certificate) = 1;
+    end;
+
+    function freeCertificate(certificate: Address[Unit]): Unit is
+        @embed(Unit, "X509_free((X509*) ($1))", certificate);
+        return nil;
+    end;
+
+    ---
+    --- Making certificates and requests
+    ---
+
+    -- An extension made from its value in the syntax of the configuration
+    -- of OpenSSL and added to the certificate.  The value is text of this
+    -- module or names the caller checked.
+    function addExtension(certificate: Address[Unit], context: Address[Unit], nid: Int32, value: Span[Nat8, Static]): Bool is
+        let text: Pointer[Nat8] := cString(value);
+        let added: Bool := addExtensionText(certificate, context, nid, text);
+        deallocate(text);
+        return added;
+    end;
+
+    function addExtensionText(certificate: Address[Unit], context: Address[Unit], nid: Int32, text: Pointer[Nat8]): Bool is
+        let extension: Address[Unit] := @embed(Address[Unit], "(void*) X509V3_EXT_conf_nid(NULL, (X509V3_CTX*) ($1), $2, (const char*) ($3))", context, nid, text);
+        if isNull(extension) then
+            cleared();
+            return false;
+        end if;
+        let added: Bool := @embed(Int32, "X509_add_ext((X509*) ($1), (X509_EXTENSION*) ($2), -1)", certificate, extension) = 1;
+        @embed(Unit, "X509_EXTENSION_free((X509_EXTENSION*) ($1))", extension);
+        return added;
+    end;
+
+    -- "DNS:" before each of the comma-separated names, as a C string.
+    generic [N: Region]
+    function altNames(names: Span[Nat8, N]): Pointer[Nat8] is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "DNS:");
+        var i: Index := 0;
+        while i < spanLength(names) do
+            writeByte(&!out, names[i]);
+            if names[i] = ',' then
+                writeString(&!out, "DNS:");
+            end if;
+            i := i + 1;
+        end while;
+        let text: String := finalize(out);
+        let pointer: Pointer[Nat8] := cString(asSpan(&text));
+        destroyString(text);
+        return pointer;
+    end;
+
+    -- The digest for a signature by key in a certificate or a request.
+    function signingDigest(key: Address[Unit]): Address[Unit] is
+        return digestFor(keyKind(key));
+    end;
+
+    generic [C: Region, N: Region]
+    function makeCertificate(subjectKey: Address[Unit], issuer: Address[Unit], signerKey: Address[Unit],
+        commonName: Span[Nat8, C], names: Span[Nat8, N], days: Int32, authority: Bool): Address[Unit] is
+        let certificate: Address[Unit] := @embed(Address[Unit], "(void*) X509_new()");
+        if isNull(certificate) then
+            return nullAddress();
+        end if;
+        var good: Bool := @embed(Int32, "X509_set_version((X509*) ($1), 2)", certificate) = 1;
+        -- A serial number of 127 random bits, as RFC 5280 asks: positive,
+        -- at most 20 bytes, and not to be guessed.
+        let serial: Address[Unit] := @embed(Address[Unit], "(void*) BN_new()");
+        good := good and (not isNull(serial));
+        if good then
+            good := @embed(Int32, "BN_rand((BIGNUM*) ($1), 127, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY)", serial) = 1;
+        end if;
+        if good then
+            good := not isNull(@embed(Address[Unit], "(void*) BN_to_ASN1_INTEGER((const BIGNUM*) ($1), X509_get_serialNumber((X509*) ($2)))", serial, certificate));
+        end if;
+        @embed(Unit, "BN_free((BIGNUM*) ($1))", serial);
+        -- The clock is read once and both ends are counted from that one
+        -- second, so that the certificate is valid for exactly days days;
+        -- two reads give one second more when the clock ticks between them.
+        let issued: Int64 := @embed(Int64, "(int64_t) time(NULL)");
+        good := good and (issued >= 0);
+        if good then
+            good := not isNull(@embed(Address[Unit], "(void*) X509_time_adj_ex(X509_getm_notBefore((X509*) ($1)), 0, 0, &(time_t){ (time_t) ($2) })", certificate, issued));
+        end if;
+        if good then
+            good := not isNull(@embed(Address[Unit], "(void*) X509_time_adj_ex(X509_getm_notAfter((X509*) ($1)), (int) ($2), 0, &(time_t){ (time_t) ($3) })", certificate, days, issued));
+        end if;
+        if good then
+            good := @embed(Int32, "X509_set_pubkey((X509*) ($1), (EVP_PKEY*) ($2))", certificate, subjectKey) = 1;
+        end if;
+        if good then
+            good := @embed(Int32, "X509_NAME_add_entry_by_txt(X509_get_subject_name((X509*) ($1)), \"CN\", MBSTRING_UTF8, (const unsigned char*) (($2).data), (int) ($3), -1, 0)", certificate, commonName, spanLength(commonName)) = 1;
+        end if;
+        var signer: Address[Unit] := issuer;
+        if isNull(issuer) then
+            signer := certificate;
+        end if;
+        if good then
+            good := @embed(Int32, "X509_set_issuer_name((X509*) ($1), X509_get_subject_name((const X509*) ($2)))", certificate, signer) = 1;
+        end if;
+        let room: Address[Nat8] := allocateBuffer(@embed(Index, "sizeof(X509V3_CTX)"));
+        case nullCheck(room) of
+            when Some(value as context: Pointer[Nat8]) do
+                let ctx: Address[Unit] := @embed(Address[Unit], "(void*) ($1)", context);
+                @embed(Unit, "X509V3_set_ctx((X509V3_CTX*) ($1), (X509*) ($2), (X509*) ($3), NULL, NULL, 0)", ctx, signer, certificate);
+                if good then
+                    if authority then
+                        good := addExtension(certificate, ctx, @embed(Int32, "NID_basic_constraints"), "critical,CA:TRUE");
+                    else
+                        good := addExtension(certificate, ctx, @embed(Int32, "NID_basic_constraints"), "critical,CA:FALSE");
+                    end if;
+                end if;
+                if good then
+                    if authority then
+                        good := addExtension(certificate, ctx, @embed(Int32, "NID_key_usage"), "critical,keyCertSign,cRLSign,digitalSignature");
+                    else
+                        good := addExtension(certificate, ctx, @embed(Int32, "NID_key_usage"), "critical,digitalSignature");
+                    end if;
+                end if;
+                if good and (not authority) then
+                    good := addExtension(certificate, ctx, @embed(Int32, "NID_ext_key_usage"), "serverAuth,clientAuth");
+                end if;
+                if good then
+                    good := addExtension(certificate, ctx, @embed(Int32, "NID_subject_key_identifier"), "hash");
+                end if;
+                if good and (not isNull(issuer)) then
+                    good := addExtension(certificate, ctx, @embed(Int32, "NID_authority_key_identifier"), "keyid:always");
+                end if;
+                if good and (spanLength(names) > 0) then
+                    let text: Pointer[Nat8] := altNames(names);
+                    good := addExtensionText(certificate, ctx, @embed(Int32, "NID_subject_alt_name"), text);
+                    deallocate(text);
+                end if;
+                deallocate(context);
+            when None do
+                good := false;
+        end case;
+        if good then
+            good := @embed(Int32, "X509_sign((X509*) ($1), (EVP_PKEY*) ($2), (const EVP_MD*) ($3))", certificate, signerKey, signingDigest(signerKey)) > 0;
+        end if;
+        if not good then
+            freeCertificate(certificate);
+            cleared();
+            return nullAddress();
+        end if;
+        return certificate;
+    end;
+
+    generic [C: Region, N: Region]
+    function makeRequest(key: Address[Unit], commonName: Span[Nat8, C], names: Span[Nat8, N]): Option[String] is
+        let request: Address[Unit] := @embed(Address[Unit], "(void*) X509_REQ_new()");
+        if isNull(request) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var good: Bool := @embed(Int32, "X509_REQ_set_version((X509_REQ*) ($1), 0)", request) = 1;
+        if good then
+            good := @embed(Int32, "X509_REQ_set_pubkey((X509_REQ*) ($1), (EVP_PKEY*) ($2))", request, key) = 1;
+        end if;
+        if good and (spanLength(commonName) > 0) then
+            good := @embed(Int32, "X509_NAME_add_entry_by_txt(X509_REQ_get_subject_name((X509_REQ*) ($1)), \"CN\", MBSTRING_UTF8, (const unsigned char*) (($2).data), (int) ($3), -1, 0)", request, commonName, spanLength(commonName)) = 1;
+        end if;
+        if good and (spanLength(names) > 0) then
+            let text: Pointer[Nat8] := altNames(names);
+            let extension: Address[Unit] := @embed(Address[Unit], "(void*) X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name, (const char*) ($1))", text);
+            deallocate(text);
+            let stack: Address[Unit] := @embed(Address[Unit], "(void*) sk_X509_EXTENSION_new_null()");
+            good := (not isNull(extension)) and (not isNull(stack));
+            if good then
+                good := @embed(Int32, "sk_X509_EXTENSION_push((STACK_OF(X509_EXTENSION)*) ($1), (X509_EXTENSION*) ($2))", stack, extension) > 0;
+            end if;
+            if good then
+                -- OpenSSL 3 takes the stack as const and LibreSSL does not;
+                -- a stack that is not const is taken by both without a
+                -- warning.
+                good := @embed(Int32, "X509_REQ_add_extensions((X509_REQ*) ($1), (STACK_OF(X509_EXTENSION)*) ($2))", request, stack) = 1;
+                @embed(Unit, "sk_X509_EXTENSION_pop_free((STACK_OF(X509_EXTENSION)*) ($1), X509_EXTENSION_free)", stack);
+            else
+                if not isNull(extension) then
+                    @embed(Unit, "X509_EXTENSION_free((X509_EXTENSION*) ($1))", extension);
+                end if;
+                if not isNull(stack) then
+                    @embed(Unit, "sk_X509_EXTENSION_free((STACK_OF(X509_EXTENSION)*) ($1))", stack);
+                end if;
+            end if;
+        end if;
+        if good then
+            good := @embed(Int32, "X509_REQ_sign((X509_REQ*) ($1), (EVP_PKEY*) ($2), (const EVP_MD*) ($3))", request, key, signingDigest(key)) > 0;
+        end if;
+        var out: Option[String] := None();
+        if good then
+            let size: Int32 := @embed(Int32, "i2d_X509_REQ((X509_REQ*) ($1), NULL)", request);
+            -- A length of zero or below is a failure of the library.
+            case toIndex(size) of
+                when Some(value as count: Index) do
+                    let room: Address[Nat8] := allocateBuffer(count + 1);
+                    case nullCheck(room) of
+                        when Some(value as buffer: Pointer[Nat8]) do
+                            let slot: Pointer[Address[Unit]] := pointerSlot();
+                            store(slot, @embed(Address[Unit], "(void*) ($1)", buffer));
+                            if (size > 0) and (@embed(Int32, "i2d_X509_REQ((X509_REQ*) ($1), (unsigned char**) ($2))", request, slot) = size) then
+                                let previous: Option[String] := out;
+                                dropOption(previous);
+                                out := Some(value => copyOut(@embed(Address[Unit], "(void*) ($1)", buffer), count));
+                            end if;
+                            deallocate(slot);
+                            deallocate(buffer);
+                        when None do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+        end if;
+        @embed(Unit, "X509_REQ_free((X509_REQ*) ($1))", request);
+        cleared();
+        return out;
+    end;
+
+    generic [R: Region]
+    function readRequestRaw(der: Span[Nat8, R]): Option[RequestParts] is
+        let slot: Pointer[Address[Unit]] := pointerSlot();
+        store(slot, @embed(Address[Unit], "(void*) (($1).data)", der));
+        let request: Address[Unit] := @embed(Address[Unit], "(void*) d2i_X509_REQ(NULL, (const unsigned char**) ($1), (long) ($2))", slot, spanLength(der));
+        deallocate(slot);
+        if isNull(request) then
+            cleared();
+            let none: Option[RequestParts] := None();
+            return none;
+        end if;
+        let key: Address[Unit] := @embed(Address[Unit], "(void*) X509_REQ_get_pubkey((X509_REQ*) ($1))", request);
+        var good: Bool := not isNull(key);
+        if good then
+            good := @embed(Int32, "X509_REQ_verify((X509_REQ*) ($1), (EVP_PKEY*) ($2))", request, key) = 1;
+        end if;
+        if not good then
+            if not isNull(key) then
+                freeKey(key);
+            end if;
+            @embed(Unit, "X509_REQ_free((X509_REQ*) ($1))", request);
+            cleared();
+            let none: Option[RequestParts] := None();
+            return none;
+        end if;
+        var name: String := makeEmpty();
+        case nameCommonName(@embed(Address[Unit], "(void*) X509_REQ_get_subject_name((const X509_REQ*) ($1))", request)) of
+            when Some(value as found: String) do
+                destroyString(name);
+                name := found;
+            when None do
+                skip;
+        end case;
+        var out: StringBuilder := makeStringBuilder();
+        -- A subject alternative name the library cannot decode makes the
+        -- request unreadable: taking it as no names would issue for the
+        -- common name alone.
+        var unreadable: Bool := false;
+        let extensions: Address[Unit] := @embed(Address[Unit], "(void*) X509_REQ_get_extensions((X509_REQ*) ($1))", request);
+        if not isNull(extensions) then
+            let count: Int32 := @embed(Int32, "sk_X509_EXTENSION_num((const STACK_OF(X509_EXTENSION)*) ($1))", extensions);
+            var i: Int32 := 0;
+            while i < count do
+                let extension: Address[Unit] := @embed(Address[Unit], "(void*) sk_X509_EXTENSION_value((const STACK_OF(X509_EXTENSION)*) ($1), $2)", extensions, i);
+                if @embed(Int32, "OBJ_obj2nid(X509_EXTENSION_get_object((X509_EXTENSION*) ($1)))", extension) = @embed(Int32, "NID_subject_alt_name") then
+                    let names: Address[Unit] := @embed(Address[Unit], "X509V3_EXT_d2i((X509_EXTENSION*) ($1))", extension);
+                    if isNull(names) then
+                        unreadable := true;
+                    else
+                        writeDnsNames(names, &!out);
+                        @embed(Unit, "GENERAL_NAMES_free((GENERAL_NAMES*) ($1))", names);
+                    end if;
+                end if;
+                i := i + 1;
+            end while;
+            @embed(Unit, "sk_X509_EXTENSION_pop_free((STACK_OF(X509_EXTENSION)*) ($1), X509_EXTENSION_free)", extensions);
+        end if;
+        @embed(Unit, "X509_REQ_free((X509_REQ*) ($1))", request);
+        cleared();
+        if unreadable then
+            freeKey(key);
+            destroyString(name);
+            destroyString(finalize(out));
+            let none: Option[RequestParts] := None();
+            return none;
+        end if;
+        let parts: RequestParts := RequestParts(key => key, commonName => name, names => finalize(out));
+        let some: Option[RequestParts] := Some(value => parts);
+        return some;
+    end;
+
+    ---
+    --- Verifying a chain
+    ---
+
+    -- Every certificate of PEM text, pushed onto a new stack, or into a
+    -- a store when trustStore is not null.  The count.
+    generic [R: Region]
+    function readAll(pem: Span[Nat8, R], stack: Address[Unit], trustStore: Address[Unit]): Int32 is
+        let bio: Address[Unit] := readingBio(pem);
+        if isNull(bio) then
+            return 0;
+        end if;
+        var count: Int32 := 0;
+        var going: Bool := true;
+        while going do
+            let certificate: Address[Unit] := @embed(Address[Unit], "(void*) PEM_read_bio_X509((BIO*) ($1), NULL, NULL, (void*) \"\")", bio);
+            if isNull(certificate) then
+                going := false;
+            else
+                if isNull(trustStore) then
+                    if @embed(Int32, "sk_X509_push((STACK_OF(X509)*) ($1), (X509*) ($2))", stack, certificate) > 0 then
+                        count := count + 1;
+                    else
+                        freeCertificate(certificate);
+                    end if;
+                else
+                    if @embed(Int32, "X509_STORE_add_cert((X509_STORE*) ($1), (X509*) ($2))", trustStore, certificate) = 1 then
+                        count := count + 1;
+                    end if;
+                    freeCertificate(certificate);
+                end if;
+            end if;
+        end while;
+        freeBio(bio);
+        cleared();
+        return count;
+    end;
+
+    function plain(text: Span[Nat8, Static]): Option[String] is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, text);
+        let some: Option[String] := Some(value => finalize(out));
+        return some;
+    end;
+
+    generic [C: Region, T: Region, H: Region]
+    function verifyChain(chain: Span[Nat8, C], trusted: Span[Nat8, T], host: Span[Nat8, H], at: Int64): Option[String] is
+        let trustStore: Address[Unit] := @embed(Address[Unit], "(void*) X509_STORE_new()");
+        let untrusted: Address[Unit] := @embed(Address[Unit], "(void*) sk_X509_new_null()");
+        if isNull(trustStore) or isNull(untrusted) then
+            if not isNull(trustStore) then
+                @embed(Unit, "X509_STORE_free((X509_STORE*) ($1))", trustStore);
+            end if;
+            if not isNull(untrusted) then
+                @embed(Unit, "sk_X509_free((STACK_OF(X509)*) ($1))", untrusted);
+            end if;
+            return plain("out of memory");
+        end if;
+        let noStore: Address[Unit] := nullAddress();
+        let anchors: Int32 := readAll(trusted, untrusted, trustStore);
+        let links: Int32 := readAll(chain, untrusted, noStore);
+        var result: Option[String] := None();
+        if anchors = 0 then
+            let previous: Option[String] := result;
+            dropOption(previous);
+            result := plain("no trusted certificate");
+        else if links = 0 then
+            let previous: Option[String] := result;
+            dropOption(previous);
+            result := plain("no certificate to verify");
+        else
+            let leaf: Address[Unit] := @embed(Address[Unit], "(void*) sk_X509_shift((STACK_OF(X509)*) ($1))", untrusted);
+            let context: Address[Unit] := @embed(Address[Unit], "(void*) X509_STORE_CTX_new()");
+            if isNull(context) then
+                let previous: Option[String] := result;
+                dropOption(previous);
+                result := plain("out of memory");
+            else
+                if @embed(Int32, "X509_STORE_CTX_init((X509_STORE_CTX*) ($1), (X509_STORE*) ($2), (X509*) ($3), (STACK_OF(X509)*) ($4))", context, trustStore, leaf, untrusted) /= 1 then
+                    let previous: Option[String] := result;
+                    dropOption(previous);
+                    result := plain("the verification could not start");
+                else
+                    let parameters: Address[Unit] := @embed(Address[Unit], "(void*) X509_STORE_CTX_get0_param((X509_STORE_CTX*) ($1))", context);
+                    @embed(Unit, "X509_VERIFY_PARAM_set_time((X509_VERIFY_PARAM*) ($1), (time_t) ($2))", parameters, at);
+                    var hostSet: Bool := true;
+                    if spanLength(host) > 0 then
+                        hostSet := @embed(Int32, "X509_VERIFY_PARAM_set1_host((X509_VERIFY_PARAM*) ($1), (const char*) (($2).data), (size_t) ($3))", parameters, host, spanLength(host)) = 1;
+                    end if;
+                    if not hostSet then
+                        let previous: Option[String] := result;
+                        dropOption(previous);
+                        result := plain("the host name was refused");
+                    else if @embed(Int32, "X509_verify_cert((X509_STORE_CTX*) ($1))", context) /= 1 then
+                        -- A failure that leaves the error at X509_V_OK would read "ok".
+                        let words: Address[Unit] := @embed(Address[Unit], "(void*) ((X509_STORE_CTX_get_error((X509_STORE_CTX*) ($1)) == X509_V_OK) ? \"the chain could not be verified\" : X509_verify_cert_error_string(X509_STORE_CTX_get_error((X509_STORE_CTX*) ($1))))", context);
+                        let previous: Option[String] := result;
+                        dropOption(previous);
+                        result := Some(value => copyOut(words, @embed(Index, "strlen((const char*) ($1))", words)));
+                    end if;
+                end if;
+                @embed(Unit, "X509_STORE_CTX_free((X509_STORE_CTX*) ($1))", context);
+            end if;
+            freeCertificate(leaf);
+        end if;
+        @embed(Unit, "sk_X509_pop_free((STACK_OF(X509)*) ($1), X509_free)", untrusted);
+        @embed(Unit, "X509_STORE_free((X509_STORE*) ($1))", trustStore);
+        cleared();
+        return result;
+    end;
+    ---
+    --- The interface: handles in linear records
+    ---
+
+    record Key: Linear is
+        handle: Address[Unit];
+    end;
+
+    record Cert: Linear is
+        handle: Address[Unit];
+    end;
+
+    record Parts: Linear is
+        key: Key;
+        commonName: String;
+        names: String;
+    end;
+
+    -- A key of a kind this module has, or None; a key of another kind is
+    -- freed.
+    function wrapKey(handle: Address[Unit]): Option[Key] is
+        if isNull(handle) then
+            let none: Option[Key] := None();
+            return none;
+        end if;
+        if keyKind(handle) = 0 then
+            freeKey(handle);
+            let none: Option[Key] := None();
+            return none;
+        end if;
+        let some: Option[Key] := Some(value => Key(handle => handle));
+        return some;
+    end;
+
+    function wrapCert(handle: Address[Unit]): Option[Cert] is
+        if isNull(handle) then
+            let none: Option[Cert] := None();
+            return none;
+        end if;
+        let some: Option[Cert] := Some(value => Cert(handle => handle));
+        return some;
+    end;
+
+    function newKey(kind: Int32): Option[Key] is
+        return wrapKey(generateKey(kind));
+    end;
+
+    generic [R: Region]
+    function kindOfKey(key: &[Key, R]): Int32 is
+        return keyKind(key->handle);
+    end;
+
+    generic [R: Region]
+    function pemOfKey(key: &[Key, R]): Option[String] is
+        return keyToPem(key->handle);
+    end;
+
+    generic [R: Region]
+    function keyOfPem(pem: Span[Nat8, R]): Option[Key] is
+        return wrapKey(keyFromPem(pem));
+    end;
+
+    generic [R: Region]
+    function publicDerOfKey(key: &[Key, R]): Option[String] is
+        return publicKeyDer(key->handle);
+    end;
+
+    generic [R: Region, M: Region]
+    function signWith(key: &[Key, R], message: Span[Nat8, M]): Option[String] is
+        return sign(key->handle, message);
+    end;
+
+    function dropKey(key: Key): Unit is
+        let { handle: Address[Unit] } := key;
+        freeKey(handle);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function certOfPem(pem: Span[Nat8, R]): Option[Cert] is
+        return wrapCert(certificateFromPem(pem));
+    end;
+
+    generic [R: Region]
+    function certOfDer(der: Span[Nat8, R]): Option[Cert] is
+        return wrapCert(certificateFromDer(der));
+    end;
+
+    generic [R: Region]
+    function pemOfCert(certificate: &[Cert, R]): Option[String] is
+        return certificateToPem(certificate->handle);
+    end;
+
+    generic [R: Region]
+    function derOfCert(certificate: &[Cert, R]): Option[String] is
+        return certificateToDer(certificate->handle);
+    end;
+
+    generic [R: Region]
+    function nameOf(certificate: &[Cert, R], issuer: Bool): Option[String] is
+        return commonNameRaw(certificate->handle, issuer);
+    end;
+
+    generic [R: Region]
+    function namesOf(certificate: &[Cert, R]): String is
+        return dnsNames(certificate->handle);
+    end;
+
+    generic [R: Region]
+    function timeOf(certificate: &[Cert, R], last: Bool): Option[Int64] is
+        return validity(certificate->handle, last);
+    end;
+
+    generic [R: Region]
+    function serialOf(certificate: &[Cert, R]): Option[String] is
+        return serialHex(certificate->handle);
+    end;
+
+    generic [R: Region]
+    function fingerprintOf(certificate: &[Cert, R]): Option[String] is
+        return fingerprint(certificate->handle);
+    end;
+
+    generic [R: Region, K: Region]
+    function keyMatches(certificate: &[Cert, R], key: &[Key, K]): Bool is
+        return matchesKey(certificate->handle, key->handle);
+    end;
+
+    generic [R: Region]
+    function authorityOf(certificate: &[Cert, R]): Bool is
+        return isAuthority(certificate->handle);
+    end;
+
+    function dropCert(certificate: Cert): Unit is
+        let { handle: Address[Unit] } := certificate;
+        freeCertificate(handle);
+        return nil;
+    end;
+
+    generic [K: Region, C: Region, N: Region]
+    function selfSignedCert(key: &[Key, K], commonName: Span[Nat8, C], names: Span[Nat8, N], days: Int32, authority: Bool): Option[Cert] is
+        return wrapCert(makeCertificate(key->handle, nullAddress(), key->handle, commonName, names, days, authority));
+    end;
+
+    generic [A: Region, K: Region, S: Region, C: Region, N: Region]
+    function issuedCert(issuer: &[Cert, A], signer: &[Key, K], subject: &[Key, S],
+        commonName: Span[Nat8, C], names: Span[Nat8, N], days: Int32, authority: Bool): Option[Cert] is
+        return wrapCert(makeCertificate(subject->handle, issuer->handle, signer->handle, commonName, names, days, authority));
+    end;
+
+    generic [K: Region, C: Region, N: Region]
+    function requestFor(key: &[Key, K], commonName: Span[Nat8, C], names: Span[Nat8, N]): Option[String] is
+        return makeRequest(key->handle, commonName, names);
+    end;
+
+    generic [R: Region]
+    function readRequest(der: Span[Nat8, R]): Option[Parts] is
+        case readRequestRaw(der) of
+            when Some(value as raw: RequestParts) do
+                let { key: Address[Unit], commonName: String, names: String } := raw;
+                case wrapKey(key) of
+                    when Some(value as wrapped: Key) do
+                        let some: Option[Parts] := Some(value => Parts(key => wrapped, commonName => commonName, names => names));
+                        return some;
+                    when None do
+                        destroyString(commonName);
+                        destroyString(names);
+                        let none: Option[Parts] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Parts] := None();
+                return none;
+        end case;
+    end;
+end module body.

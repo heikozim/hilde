@@ -1,0 +1,1 @@
+Test that readSecret answers NoTerminal at once where the process has no terminal, and that readSecretFromInput reads a line of standard input without its line feed, holds 1024 bytes, refuses 1025 as too long, and an empty line as empty.

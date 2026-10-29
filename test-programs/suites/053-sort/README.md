@@ -1,0 +1,1 @@
+Standard.Sort: a buffer of Strings sorted by their bytes, searched for a word that is there and one that is not, and a buffer of a record of the test's own with an order of its own, sorted stably (001); a record with no order does not compile (002).

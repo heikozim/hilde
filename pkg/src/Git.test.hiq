@@ -1,0 +1,225 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length as bufferLength,
+    nth,
+    destroyFree
+);
+import Standard.Text (
+    equal,
+    contains
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    createDirectory,
+    kindOf,
+    kindRegular,
+    sameKind
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Standard.Semver (
+    Version,
+    makeVersion
+);
+import Pkg.Report (
+    Problem,
+    destroyProblem
+);
+import Pkg.Process (
+    Ran,
+    findProgram,
+    runProgram,
+    destroyRan
+);
+import Pkg.Git (
+    listTags,
+    cloneTag
+);
+import Pkg.Tree (
+    removeTree
+);
+
+module body Pkg.Git.Test is
+    generic [B: Region]
+    function add(words: &![Buffer[String], B], word: Span[Nat8, Static]): Unit is
+        insertBack(&~words, fromLiteral(word));
+        return nil;
+    end;
+
+    -- Runs git in the test repository with a name and a mail set, and
+    -- says whether it ended with 0.
+    generic [G: Region]
+    function git(path: Span[Nat8, G], a: Span[Nat8, Static], b: Span[Nat8, Static], c: Span[Nat8, Static]): Bool is
+        var words: Buffer[String] := allocateEmpty();
+        add(&!words, "-C");
+        add(&!words, "_git-test-repo");
+        add(&!words, "-c");
+        add(&!words, "user.name=test");
+        add(&!words, "-c");
+        add(&!words, "user.email=test@example.org");
+        add(&!words, a);
+        if spanLength(b) > 0 then
+            add(&!words, b);
+        end if;
+        if spanLength(c) > 0 then
+            add(&!words, c);
+        end if;
+        let ran: Either[Problem, Ran] := runProgram(path, &words);
+        destroyArguments(words);
+        case ran of
+            when Right(right as r: Ran) do
+                let good: Bool := r.exitCode = 0;
+                destroyRan(r);
+                return good;
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                return false;
+        end case;
+    end;
+
+    function write(path: Span[Nat8, Static], content: Span[Nat8, Static]): Unit is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                assertTrue(writeAll(&!file, content), "a file written");
+                assertTrue(closeFile(file), "a file closed");
+            when None do
+                assertFailure("a file could not be made");
+        end case;
+        return nil;
+    end;
+
+    function cleared(path: Span[Nat8, Static]): Unit is
+        case removeTree(path) of
+            when Right(right as done: Unit) do
+                skip;
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure("a tree was not removed");
+        end case;
+        return nil;
+    end;
+
+    function testRun(): Unit is
+        case findProgram("sh") of
+            when Some(value as sh: String) do
+                var words: Buffer[String] := allocateEmpty();
+                add(&!words, "-c");
+                add(&!words, "echo out; echo err 1>&2; exit 3");
+                case runProgram(asSpan(&sh), &words) of
+                    when Right(right as r: Ran) do
+                        let { exitCode: Int32, output: String, errors: String } := r;
+                        assertTrue(exitCode = 3, "the exit code of the child");
+                        assertTrue(equal(asSpan(&output), "out\n"), "its output");
+                        assertTrue(equal(asSpan(&errors), "err\n"), "its errors");
+                        destroyString(output);
+                        destroyString(errors);
+                    when Left(left as p: Problem) do
+                        destroyProblem(p);
+                        assertFailure("sh did not run");
+                end case;
+                destroyArguments(words);
+                destroyString(sh);
+            when None do
+                assertFailure("sh is not on PATH");
+        end case;
+        case findProgram("no-such-programme-here") of
+            when Some(value as p: String) do
+                destroyString(p);
+                assertFailure("a programme that is nowhere was found");
+            when None do
+                assertSuccess("a programme that is nowhere is None");
+        end case;
+        return nil;
+    end;
+
+    function testTags(): Unit is
+        case findProgram("git") of
+            when Some(value as found: String) do
+                tagsWith(asSpan(&found));
+                destroyString(found);
+            when None do
+                assertFailure("git is not on PATH");
+        end case;
+        return nil;
+    end;
+
+    generic [G: Region]
+    function tagsWith(gitPath: Span[Nat8, G]): Unit is
+        cleared("_git-test-repo");
+        cleared("_git-test-clone");
+        assertTrue(createDirectory("_git-test-repo"), "the repository made");
+        assertTrue(git(gitPath, "init", "-q", ""), "git init");
+        write("_git-test-repo/a.txt", "one\n");
+        assertTrue(git(gitPath, "add", "a.txt", ""), "git add");
+        assertTrue(git(gitPath, "commit", "-q", "-m1"), "git commit");
+        assertTrue(git(gitPath, "tag", "v1.0.0", ""), "tag v1.0.0");
+        assertTrue(git(gitPath, "tag", "release", ""), "a tag that is no version");
+        write("_git-test-repo/a.txt", "two\n");
+        assertTrue(git(gitPath, "commit", "-q", "-am2"), "second commit");
+        assertTrue(git(gitPath, "tag", "v1.2.0", ""), "tag v1.2.0");
+        case listTags(gitPath, "_git-test-repo") of
+            when Right(right as tags: Buffer[Version]) do
+                assertTrue(bufferLength(&tags) = 2, "two version tags, the other ignored");
+                let first: Version := nth(&tags, 0);
+                let second: Version := nth(&tags, 1);
+                assertTrue((first.minor = 0) and (second.minor = 2), "sorted from the oldest");
+                destroyFree(tags);
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure("the tags were not listed");
+        end case;
+        case cloneTag(gitPath, "_git-test-repo", makeVersion(1, 0, 0), "_git-test-clone") of
+            when Right(right as done: Unit) do
+                assertTrue(sameKind(kindOf("_git-test-clone/a.txt"), kindRegular), "the clone has the file");
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                assertFailure("v1.0.0 was not cloned");
+        end case;
+        case cloneTag(gitPath, "_git-test-repo", makeVersion(1, 1, 0), "_git-test-other") of
+            when Right(right as done: Unit) do
+                assertFailure("a tag that is not there was cloned");
+            when Left(left as p: Problem) do
+                let { code: Int64, message: String, suggestion: String } := p;
+                assertTrue(code = 1509, "a missing tag is H1509");
+                assertTrue(contains(asSpan(&suggestion), "v1.0.0, v1.2.0"), "the nearest tags are named");
+                destroyString(message);
+                destroyString(suggestion);
+        end case;
+        case listTags(gitPath, "_git-test-none") of
+            when Right(right as tags: Buffer[Version]) do
+                destroyFree(tags);
+                assertFailure("a repository that is not there has tags");
+            when Left(left as p: Problem) do
+                assertTrue(p.code = 1508, "a repository that is not there is H1508");
+                destroyProblem(p);
+        end case;
+        cleared("_git-test-repo");
+        cleared("_git-test-clone");
+        return nil;
+    end;
+end module body.

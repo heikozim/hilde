@@ -1,0 +1,129 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Binds libargon2 through the declarations of Bindings.C.Argon2.  It hands
+-- addresses to C, so it is an unsafe module; Standard.Password is the safe
+-- module built on it.  What goes in is a span the caller holds, what comes
+-- out is a String of its own; the buffer the library writes the tag into is
+-- wiped before it is freed.  The fields of argon2_context are set by name,
+-- from the argon2.h of the machine that compiles the program, which
+-- Bindings.C.Argon2 names as its header.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    allocateBuffer
+);
+import Standard.String (
+    String,
+    makeString,
+    storeNth
+);
+import Bindings.C.Argon2 (
+    argon2id_ctx
+);
+
+module body Bindings.Argon2 is
+    -- The largest length the library takes, as it counts lengths in a
+    -- uint32_t.
+    constant largest: Index := 4294967295;
+
+    -- The first byte of a span, never null (an empty span points at an
+    -- empty string).
+    generic [R: Region]
+    function bytesOf(value: Span[Nat8, R]): Address[Nat8] is
+        if spanLength(value) = 0 then
+            return @embed(Address[Nat8], "(hilde_nat8_t*)\"\"");
+        end if;
+        return @embed(Address[Nat8], "(hilde_nat8_t*)($1).data", value);
+    end;
+
+    function untyped(address: Address[Nat8]): Address[Unit] is
+        return @embed(Address[Unit], "(hilde_unit_t*)($1)", address);
+    end;
+
+    -- The size bytes at address, as a String.
+    function copied(address: Address[Nat8], size: Index): String is
+        var out: String := makeString(size, 0);
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!out, i, @embed(Nat8, "($1)[$2]", address, i));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The tag in out when result is the library's success, wiped and freed
+    -- either way.
+    function tagOf(result: Int32, out: Address[Nat8], length: Index): Option[String] is
+        if result = 0 then
+            let tag: String := copied(out, length);
+            @embed(Unit, "hilde_wipe($1, $2)", out, length);
+            @embed(Unit, "hilde_free($1)", out);
+            let some: Option[String] := Some(value => tag);
+            return some;
+        else
+            @embed(Unit, "hilde_wipe($1, $2)", out, length);
+            @embed(Unit, "hilde_free($1)", out);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    generic [P: Region, S: Region]
+    function argon2id(password: Span[Nat8, P], salt: Span[Nat8, S], passes: Nat32, memory: Nat32, lanes: Nat32, length: Index): Option[String] is
+        if ((spanLength(password) >= largest) or (spanLength(salt) >= largest)) or (length >= largest) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        -- The context form with an empty secret and no associated data is
+        -- the same hash, and it takes the working memory of the runtime.
+        return argon2idKeyed(password, salt, "", "", passes, memory, lanes, length);
+    end;
+
+    generic [P: Region, S: Region, K: Region, A: Region]
+    function argon2idKeyed(password: Span[Nat8, P], salt: Span[Nat8, S], secret: Span[Nat8, K], data: Span[Nat8, A], passes: Nat32, memory: Nat32, lanes: Nat32, length: Index): Option[String] is
+        if ((spanLength(password) >= largest) or (spanLength(salt) >= largest)) or (((spanLength(secret) >= largest) or (spanLength(data) >= largest)) or (length >= largest)) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let out: Address[Nat8] := allocateBuffer(length + 1);
+        let context: Address[Nat8] := allocateBuffer(@embed(Index, "sizeof(argon2_context)"));
+        if @embed(Bool, "($1) == NULL || ($2) == NULL", context, out) then
+            @embed(Unit, "hilde_free($1)", out);
+            @embed(Unit, "hilde_free($1)", context);
+            let none: Option[String] := None();
+            return none;
+        end if;
+        -- Every field not set below is zero: the default flags.  The
+        -- working memory comes from the runtime, which keeps two blocks of
+        -- it for the next hash.
+        @embed(Unit, "memset($1, 0, sizeof(argon2_context))", context);
+        @embed(Unit, "((argon2_context*)($1))->out = (uint8_t*)($2)", context, out);
+        @embed(Unit, "((argon2_context*)($1))->outlen = (uint32_t)($2)", context, length);
+        @embed(Unit, "((argon2_context*)($1))->pwd = (uint8_t*)($2)", context, bytesOf(password));
+        @embed(Unit, "((argon2_context*)($1))->pwdlen = (uint32_t)($2)", context, spanLength(password));
+        @embed(Unit, "((argon2_context*)($1))->salt = (uint8_t*)($2)", context, bytesOf(salt));
+        @embed(Unit, "((argon2_context*)($1))->saltlen = (uint32_t)($2)", context, spanLength(salt));
+        @embed(Unit, "((argon2_context*)($1))->secret = (uint8_t*)($2)", context, bytesOf(secret));
+        @embed(Unit, "((argon2_context*)($1))->secretlen = (uint32_t)($2)", context, spanLength(secret));
+        @embed(Unit, "((argon2_context*)($1))->ad = (uint8_t*)($2)", context, bytesOf(data));
+        @embed(Unit, "((argon2_context*)($1))->adlen = (uint32_t)($2)", context, spanLength(data));
+        @embed(Unit, "((argon2_context*)($1))->t_cost = $2", context, passes);
+        @embed(Unit, "((argon2_context*)($1))->m_cost = $2", context, memory);
+        @embed(Unit, "((argon2_context*)($1))->lanes = $2", context, lanes);
+        @embed(Unit, "((argon2_context*)($1))->threads = $2", context, lanes);
+        @embed(Unit, "((argon2_context*)($1))->version = ARGON2_VERSION_13", context);
+        @embed(Unit, "((argon2_context*)($1))->allocate_cbk = hilde_argon2_allocate", context);
+        @embed(Unit, "((argon2_context*)($1))->free_cbk = hilde_argon2_free", context);
+        let result: Int32 := argon2id_ctx(untyped(context));
+        @embed(Unit, "hilde_wipe($1, sizeof(argon2_context))", context);
+        @embed(Unit, "hilde_free($1)", context);
+        return tagOf(result, out, length);
+    end;
+end module body.

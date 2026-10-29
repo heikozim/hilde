@@ -1,0 +1,653 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module, written in Hilde; the image data is compressed and
+-- decompressed with the DEFLATE of Standard.Gzip.  decodePng reads the
+-- chunks twice: the first pass checks every chunk, its length, its CRC
+-- and its order, and reads the header,
+-- so that nothing is allocated for a file that is refused and the size of
+-- the image is known and limited before any data is decompressed; the
+-- second pass only joins the data of the IDAT chunks.  The data must
+-- decompress to exactly the bytes the header says, a filter byte and a row
+-- for every row.
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Gzip (
+    GzipFailure,
+    crc32,
+    deflateRaw,
+    inflateRaw
+);
+
+module body Standard.Png is
+    constant mostSide: Index := 16384;
+    constant zeroNat: Nat64 := 0;
+    constant noIndex: Index := 0;
+
+    record Image: Linear is
+        width: Index;
+        height: Index;
+        color: PngColor;
+        pixels: String;
+        invariant length(&pixels) = ((width * height) * bytesPerPixel(color));
+    end;
+
+    ---
+    --- Numbers
+    ---
+
+    function natOf(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    function natOfIndex(at: Index): Nat64 is
+        case toNat64(at) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                abort("Standard.Png: an index did not fit a Nat64");
+        end case;
+    end;
+
+    function natOf32(word: Nat32): Nat64 is
+        case toNat64(word) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    function indexOfNat(wide: Nat64): Index is
+        case toIndex(wide) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.Png: a number did not fit an Index");
+        end case;
+    end;
+
+    function remainder(number: Nat64, by: Nat64): Nat64 is
+        return number - ((number / by) * by);
+    end;
+
+    function byteOf(wide: Nat64): Nat8 is
+        case toNat8(remainder(wide, 256)) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                abort("Standard.Png: a byte did not fit a Nat8");
+                let zero: Nat8 := 0;
+                return zero;
+        end case;
+    end;
+
+    function intOf(byte: Nat8): Int64 is
+        case toInt64(byte) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function distance(left: Int64, right: Int64): Int64 is
+        if left >= right then
+            return left - right;
+        end if;
+        return right - left;
+    end;
+
+    -- The number of four bytes at at, the first the most significant.
+    generic [R: Region]
+    function bigEndian(data: Span[Nat8, R], at: Index): Nat64 is
+        let high: Nat64 := (natOf(data[at]) * 16777216) + (natOf(data[at + 1]) * 65536);
+        return high + ((natOf(data[at + 2]) * 256) + natOf(data[at + 3]));
+    end;
+
+    generic [B: Region]
+    function writeBigEndian(out: &![StringBuilder, B], number: Nat64): Unit is
+        writeByte(&~out, byteOf(number / 16777216));
+        writeByte(&~out, byteOf(number / 65536));
+        writeByte(&~out, byteOf(number / 256));
+        writeByte(&~out, byteOf(number));
+        return nil;
+    end;
+
+    -- The checksum of zlib, RFC 1950.
+    generic [R: Region]
+    function adler32(data: Span[Nat8, R]): Nat64 is
+        var a: Nat64 := 1;
+        var b: Nat64 := 0;
+        var i: Index := 0;
+        while i < spanLength(data) do
+            a := remainder(a + natOf(data[i]), 65521);
+            b := remainder(b + a, 65521);
+            i := i + 1;
+        end while;
+        return (b * 65536) + a;
+    end;
+
+    ---
+    --- Images
+    ---
+
+    function bytesPerPixel(color: PngColor): Index is
+        case color of
+            when Gray do
+                return 1;
+            when Rgb do
+                return 3;
+            when Rgba do
+                return 4;
+        end case;
+    end;
+
+    function colorType(color: PngColor): Nat8 is
+        case color of
+            when Gray do
+                return 0;
+            when Rgb do
+                return 2;
+            when Rgba do
+                return 6;
+        end case;
+    end;
+
+    function sidesFit(width: Index, height: Index): Bool is
+        return ((width > 0) and (height > 0)) and ((width <= mostSide) and (height <= mostSide));
+    end;
+
+    function makeImage(width: Index, height: Index, color: PngColor, pixels: String): Either[String, Image] is
+        if sidesFit(width, height) and (length(&pixels) = ((width * height) * bytesPerPixel(color))) then
+            let made: Either[String, Image] := Right(right => Image(width => width, height => height, color => color, pixels => pixels));
+            return made;
+        else
+            let refused: Either[String, Image] := Left(left => pixels);
+            return refused;
+        end if;
+    end;
+
+    generic [P: Region]
+    function filledImage(width: Index, height: Index, color: PngColor, pixel: Span[Nat8, P]): Option[Image] is
+        let size: Index := bytesPerPixel(color);
+        if (not sidesFit(width, height)) or (spanLength(pixel) /= size) then
+            let none: Option[Image] := None();
+            return none;
+        end if;
+        var pixels: String := makeString((width * height) * size, 0);
+        var i: Index := 0;
+        while i < length(&pixels) do
+            storeNth(&!pixels, i, pixel[i - ((i / size) * size)]);
+            i := i + 1;
+        end while;
+        let some: Option[Image] := Some(value => Image(width => width, height => height, color => color, pixels => pixels));
+        return some;
+    end;
+
+    generic [R: Region]
+    function imageWidth(image: &[Image, R]): Index is
+        return image->width;
+    end;
+
+    generic [R: Region]
+    function imageHeight(image: &[Image, R]): Index is
+        return image->height;
+    end;
+
+    generic [R: Region]
+    function imageColor(image: &[Image, R]): PngColor is
+        return image->color;
+    end;
+
+    generic [R: Region]
+    function imagePixels(image: &[Image, R]): Span[Nat8, R] is
+        return asSpan(&(image->pixels));
+    end;
+
+    generic [R: Region, P: Region]
+    function storeBytes(pixels: &![String, R], at: Index, pixel: Span[Nat8, P]): Unit is
+        var i: Index := 0;
+        while i < spanLength(pixel) do
+            storeNth(&~pixels, at + i, pixel[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The pixel bytes, through the write reference the image is held by.  A
+    -- function passes &~image, so that it keeps image for the invariant.
+    generic [R: Region]
+    function pixelsMut(image: &![Image, R]): &![String, R] is
+        return &!(image->pixels);
+    end;
+
+    generic [R: Region, P: Region]
+    function setPixel(image: &![Image, R], x: Index, y: Index, pixel: Span[Nat8, P]): Bool is
+        let size: Index := bytesPerPixel(image->color);
+        if ((x >= image->width) or (y >= image->height)) or (spanLength(pixel) /= size) then
+            return false;
+        end if;
+        let at: Index := ((y * image->width) + x) * size;
+        storeBytes(pixelsMut(&~image), at, pixel);
+        return true;
+    end;
+
+    function destroyImage(image: Image): Unit is
+        let { width: Index, height: Index, color: PngColor, pixels: String } := image;
+        destroyString(pixels);
+        return nil;
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    -- A chunk: its length, its type and data, and the CRC of both.
+    generic [B: Region, D: Region]
+    function writeChunk(out: &![StringBuilder, B], kind: Span[Nat8, Static], data: Span[Nat8, D]): Unit is
+        var both: StringBuilder := makeStringBuilder();
+        writeString(&!both, kind);
+        writeString(&!both, data);
+        let whole: String := finalize(both);
+        writeBigEndian(&~out, natOfIndex(spanLength(data)));
+        writeString(&~out, asSpan(&whole));
+        writeBigEndian(&~out, natOf32(crc32(asSpan(&whole))));
+        destroyString(whole);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function encodePng(image: &[Image, R]): String is
+        let width: Index := image->width;
+        let height: Index := image->height;
+        let stride: Index := width * bytesPerPixel(image->color);
+        let pixels: Span[Nat8, R] := asSpan(&(image->pixels));
+        var raw: StringBuilder := makeStringBuilder();
+        var y: Index := 0;
+        while y < height do
+            writeByte(&!raw, 0);
+            writeString(&!raw, substring(pixels, y * stride, (y + 1) * stride));
+            y := y + 1;
+        end while;
+        let rows: String := finalize(raw);
+        let compressed: String := deflateRaw(asSpan(&rows));
+        var zlib: StringBuilder := makeStringBuilder();
+        writeByte(&!zlib, 120);
+        writeByte(&!zlib, 1);
+        writeString(&!zlib, asSpan(&compressed));
+        writeBigEndian(&!zlib, adler32(asSpan(&rows)));
+        destroyString(compressed);
+        destroyString(rows);
+        let data: String := finalize(zlib);
+        var header: StringBuilder := makeStringBuilder();
+        writeBigEndian(&!header, natOfIndex(width));
+        writeBigEndian(&!header, natOfIndex(height));
+        writeByte(&!header, 8);
+        writeByte(&!header, colorType(image->color));
+        writeByte(&!header, 0);
+        writeByte(&!header, 0);
+        writeByte(&!header, 0);
+        let head: String := finalize(header);
+        var out: StringBuilder := makeStringBuilder();
+        writeSignature(&!out);
+        writeChunk(&!out, "IHDR", asSpan(&head));
+        writeChunk(&!out, "IDAT", asSpan(&data));
+        writeChunk(&!out, "IEND", "");
+        destroyString(head);
+        destroyString(data);
+        return finalize(out);
+    end;
+
+    -- The eight bytes every PNG begins with.
+    function signatureByte(at: Index): Nat8 is
+        let bytes: Span[Nat8, Static] := "?PNG??? ";
+        if at = 0 then
+            return 137;
+        else if at = 4 then
+            return 13;
+        else if at = 5 then
+            return 10;
+        else if at = 6 then
+            return 26;
+        else if at = 7 then
+            return 10;
+        end if;
+        return bytes[at];
+    end;
+
+    generic [B: Region]
+    function writeSignature(out: &![StringBuilder, B]): Unit is
+        var i: Index := 0;
+        while i < 8 do
+            writeByte(&~out, signatureByte(i));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    -- What the first pass learnt: the header, and how many bytes the data
+    -- of the IDAT chunks has.
+    record Header: Free is
+        width: Index;
+        height: Index;
+        color: PngColor;
+        dataBytes: Index;
+    end;
+
+    function refuse(error: PngError): Either[PngError, Header] is
+        let refused: Either[PngError, Header] := Left(left => error);
+        return refused;
+    end;
+
+    generic [R: Region]
+    function isType(data: Span[Nat8, R], at: Index, kind: Span[Nat8, Static]): Bool is
+        var i: Index := 0;
+        while i < 4 do
+            if data[at + i] /= kind[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The header of IHDR, whose data starts at at, or why it is refused.
+    generic [R: Region]
+    function readHeader(data: Span[Nat8, R], at: Index, maxPixels: Index): Either[PngError, Header] is
+        let wide: Nat64 := bigEndian(data, at);
+        let high: Nat64 := bigEndian(data, at + 4);
+        let most: Nat64 := natOfIndex(mostSide);
+        if ((wide = 0) or (high = 0)) or ((wide > most) or (high > most)) then
+            return refuse(BadData());
+        end if;
+        let width: Index := indexOfNat(wide);
+        let height: Index := indexOfNat(high);
+        if (width * height) > maxPixels then
+            return refuse(TooLarge());
+        end if;
+        let depth: Nat8 := data[at + 8];
+        let kind: Nat8 := data[at + 9];
+        if ((data[at + 10] /= 0) or (data[at + 11] /= 0)) or (data[at + 12] > 1) then
+            return refuse(BadData());
+        end if;
+        if (depth /= 8) or (data[at + 12] = 1) then
+            return refuse(Unsupported());
+        end if;
+        var color: PngColor := Gray();
+        if kind = 0 then
+            color := Gray();
+        else if kind = 2 then
+            color := Rgb();
+        else if kind = 6 then
+            color := Rgba();
+        else if (kind = 3) or (kind = 4) then
+            return refuse(Unsupported());
+        else
+            return refuse(BadData());
+        end if;
+        let header: Either[PngError, Header] := Right(right => Header(width => width, height => height, color => color, dataBytes => noIndex));
+        return header;
+    end;
+
+    -- The first pass: every chunk checked, the header read and the data
+    -- of the IDAT chunks counted.
+    generic [R: Region]
+    function scan(data: Span[Nat8, R], maxPixels: Index): Either[PngError, Header] is
+        let size: Index := spanLength(data);
+        if size < 8 then
+            return refuse(NotPng());
+        end if;
+        var i: Index := 0;
+        while i < 8 do
+            if data[i] /= signatureByte(i) then
+                return refuse(NotPng());
+            end if;
+            i := i + 1;
+        end while;
+        var at: Index := 8;
+        var found: Bool := false;
+        var header: Header := Header(width => noIndex, height => noIndex, color => Gray(), dataBytes => noIndex);
+        -- 0 before the first IDAT, 1 in the run of IDATs, 2 after it.
+        var phase: Index := 0;
+        var ended: Bool := false;
+        while not ended do
+            if (size - at) < 12 then
+                return refuse(BadData());
+            end if;
+            let long: Nat64 := bigEndian(data, at);
+            if long > natOfIndex((size - at) - 12) then
+                return refuse(BadData());
+            end if;
+            let chunkSize: Index := indexOfNat(long);
+            let start: Index := at + 8;
+            let stop: Index := start + chunkSize;
+            if natOf32(crc32(substring(data, at + 4, stop))) /= bigEndian(data, stop) then
+                return refuse(BadChecksum());
+            end if;
+            let isHeader: Bool := isType(data, at + 4, "IHDR");
+            if found = isHeader then
+                return refuse(BadData());
+            end if;
+            if isHeader then
+                if chunkSize /= 13 then
+                    return refuse(BadData());
+                end if;
+                case readHeader(data, start, maxPixels) of
+                    when Right(right as read: Header) do
+                        header := read;
+                        found := true;
+                    when Left(left as error: PngError) do
+                        return refuse(error);
+                end case;
+            else if isType(data, at + 4, "IDAT") then
+                if phase = 2 then
+                    return refuse(BadData());
+                end if;
+                phase := 1 : Index;
+                header := Header(width => header.width, height => header.height, color => header.color, dataBytes => header.dataBytes + chunkSize);
+            else if isType(data, at + 4, "IEND") then
+                ended := true;
+            else
+                if phase = 1 then
+                    phase := 2 : Index;
+                end if;
+                if (data[at + 4] >= 'A') and (data[at + 4] <= 'Z') then
+                    return refuse(Unsupported());
+                end if;
+            end if;
+            at := stop + 4;
+        end while;
+        if phase = 0 then
+            return refuse(BadData());
+        end if;
+        let scanned: Either[PngError, Header] := Right(right => header);
+        return scanned;
+    end;
+
+    -- The second pass: the data of the IDAT chunks of a file the first
+    -- pass took, joined.
+    generic [R: Region]
+    function joinData(data: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var at: Index := 8;
+        var going: Bool := true;
+        while going do
+            let chunkSize: Index := indexOfNat(bigEndian(data, at));
+            if isType(data, at + 4, "IDAT") then
+                writeString(&!out, substring(data, at + 8, (at + 8) + chunkSize));
+            end if;
+            going := not isType(data, at + 4, "IEND");
+            at := (at + 12) + chunkSize;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The filtered rows out of the zlib stream z, which must give exactly
+    -- expected bytes.
+    generic [R: Region]
+    function unpack(z: Span[Nat8, R], expected: Index): Either[PngError, String] is
+        let size: Index := spanLength(z);
+        if size < 6 then
+            let short: Either[PngError, String] := Left(left => BadData());
+            return short;
+        end if;
+        let first: Nat64 := natOf(z[0]);
+        let check: Nat64 := (first * 256) + natOf(z[1]);
+        let preset: Bool := remainder(natOf(z[1]) / 32, 2) = 1;
+        if ((remainder(first, 16) /= 8) or (remainder(check, 31) /= 0)) or preset then
+            let wrong: Either[PngError, String] := Left(left => BadData());
+            return wrong;
+        end if;
+        case inflateRaw(substring(z, 2, size - 4), expected) of
+            when Right(right as rows: String) do
+                let complete: Bool := length(&rows) = expected;
+                let summed: Bool := adler32(asSpan(&rows)) = bigEndian(z, size - 4);
+                if complete and summed then
+                    let fine: Either[PngError, String] := Right(right => rows);
+                    return fine;
+                else
+                    destroyString(rows);
+                    if complete then
+                        let wrongSum: Either[PngError, String] := Left(left => BadChecksum());
+                        return wrongSum;
+                    end if;
+                    let wrongSize: Either[PngError, String] := Left(left => BadData());
+                    return wrongSize;
+                end if;
+            when Left(left as failure: GzipFailure) do
+                let broken: Either[PngError, String] := Left(left => BadData());
+                return broken;
+        end case;
+    end;
+
+    -- The predictor of Paeth: of a, b and c the one nearest to a + b - c.
+    function paeth(a: Nat8, b: Nat8, c: Nat8): Nat8 is
+        let p: Int64 := (intOf(a) + intOf(b)) - intOf(c);
+        let pa: Int64 := distance(p, intOf(a));
+        let pb: Int64 := distance(p, intOf(b));
+        let pc: Int64 := distance(p, intOf(c));
+        if (pa <= pb) and (pa <= pc) then
+            return a;
+        end if;
+        if pb <= pc then
+            return b;
+        end if;
+        return c;
+    end;
+
+    -- The pixels of the filtered rows, or None when a row has a filter
+    -- that is not one of the five.
+    generic [R: Region]
+    function unfilter(rows: Span[Nat8, R], height: Index, stride: Index, pixelBytes: Index): Option[String] is
+        var pixels: String := makeString(height * stride, 0);
+        var failed: Bool := false;
+        var y: Index := 0;
+        while (y < height) and (not failed) do
+            let filter: Nat8 := rows[y * (stride + 1)];
+            if filter > 4 then
+                failed := true;
+            end if;
+            var x: Index := 0;
+            while (x < stride) and (not failed) do
+                let raw: Nat8 := rows[((y * (stride + 1)) + 1) + x];
+                let here: Index := (y * stride) + x;
+                var a: Nat8 := 0;
+                var b: Nat8 := 0;
+                var c: Nat8 := 0;
+                if x >= pixelBytes then
+                    a := nthByte(&pixels, here - pixelBytes);
+                end if;
+                if y > 0 then
+                    b := nthByte(&pixels, here - stride);
+                    if x >= pixelBytes then
+                        c := nthByte(&pixels, (here - stride) - pixelBytes);
+                    end if;
+                end if;
+                var predicted: Nat64 := 0;
+                if filter = 1 then
+                    predicted := natOf(a);
+                else if filter = 2 then
+                    predicted := natOf(b);
+                else if filter = 3 then
+                    predicted := (natOf(a) + natOf(b)) / 2;
+                else if filter = 4 then
+                    predicted := natOf(paeth(a, b, c));
+                end if;
+                storeNth(&!pixels, here, byteOf(natOf(raw) + predicted));
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        if failed then
+            destroyString(pixels);
+            let none: Option[String] := None();
+            return none;
+        else
+            let some: Option[String] := Some(value => pixels);
+            return some;
+        end if;
+    end;
+
+    generic [R: Region]
+    function decodePng(data: Span[Nat8, R], maxPixels: Index): Either[PngError, Image] is
+        case scan(data, maxPixels) of
+            when Right(right as header: Header) do
+                let pixelBytes: Index := bytesPerPixel(header.color);
+                let stride: Index := header.width * pixelBytes;
+                let z: String := joinData(data);
+                let unpacked: Either[PngError, String] := unpack(asSpan(&z), header.height * (stride + 1));
+                destroyString(z);
+                case unpacked of
+                    when Right(right as rows: String) do
+                        let pixels: Option[String] := unfilter(asSpan(&rows), header.height, stride, pixelBytes);
+                        destroyString(rows);
+                        case pixels of
+                            when Some(value as image: String) do
+                                let decoded: Either[PngError, Image] := Right(right => Image(width => header.width, height => header.height, color => header.color, pixels => image));
+                                return decoded;
+                            when None do
+                                let bad: Either[PngError, Image] := Left(left => BadData());
+                                return bad;
+                        end case;
+                    when Left(left as error: PngError) do
+                        let failed: Either[PngError, Image] := Left(left => error);
+                        return failed;
+                end case;
+            when Left(left as error: PngError) do
+                let refused: Either[PngError, Image] := Left(left => error);
+                return refused;
+        end case;
+    end;
+end module body.

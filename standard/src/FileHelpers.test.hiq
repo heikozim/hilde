@@ -1,0 +1,428 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Each test works in a directory of its own, made at its start and
+-- removed at its end.  The overwrite is shown through a second descriptor
+-- that keeps the removed file's bytes readable: removing alone would pass
+-- the other tests of secureDelete as well.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Failure (
+    Failure,
+    FailureKind,
+    Unclassified,
+    NotFound,
+    NoPermission,
+    Invalid,
+    kindOf,
+    destroyFailure
+);
+import Standard.File (
+    FileDescriptor,
+    FileStatus,
+    FileFound,
+    FileMissing,
+    FileUnreadable,
+    kindRegular,
+    kindSymlink,
+    sameKind,
+    statusOf,
+    openRead,
+    openWrite,
+    readAll,
+    readExactly,
+    writeAll,
+    closeFile,
+    setFileMode,
+    removeFile,
+    createDirectory,
+    removeDirectory,
+    createSymlink,
+    linkTarget
+);
+import Standard.FileHelpers (
+    copyFile,
+    copyDirectory,
+    directorySize,
+    unusedName,
+    secureDelete,
+    formatSize
+);
+
+module body Standard.FileHelpers.Test is
+    ---
+    --- Helpers
+    ---
+
+    function inside(dir: Span[Nat8, Static], name: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, dir);
+        writeString(&!out, "/");
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function sameAs(left: &[String, R], right: Span[Nat8, Static]): Bool is
+        let size: Index := length(left);
+        if size /= spanLength(right) then
+            return false;
+        end if;
+        var same: Bool := true;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if nthByte(left, i) /= right[i] then
+                    same := false;
+                end if;
+            end for;
+        end if;
+        return same;
+    end;
+
+    -- Writes content to a new file at path with mode.
+    generic [R: Region]
+    function put(path: &[String, R], content: Span[Nat8, Static], mode: Nat32): Bool is
+        case openWrite(asSpan(path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, content);
+                let moded: Bool := setFileMode(&!file, mode);
+                let closed: Bool := closeFile(file);
+                return (written and moded) and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function holds(path: &[String, R], expected: Span[Nat8, Static]): Bool is
+        case openRead(asSpan(path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let content: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case content of
+                    when Some(value as text: String) do
+                        let same: Bool := sameAs(&text, expected);
+                        destroyString(text);
+                        return same and closed;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function modeOf(path: &[String, R]): Nat32 is
+        case statusOf(asSpan(path)) of
+            when FileFound(status: FileStatus) do
+                return status.mode;
+            when FileMissing do
+                return 4096;
+            when FileUnreadable do
+                return 4096;
+        end case;
+    end;
+
+    generic [R: Region]
+    function isLink(path: &[String, R]): Bool is
+        case statusOf(asSpan(path)) of
+            when FileFound(status: FileStatus) do
+                return sameKind(status.kind, kindSymlink);
+            when FileMissing do
+                return false;
+            when FileUnreadable do
+                return false;
+        end case;
+    end;
+
+    function number(kind: FailureKind): Int32 is
+        case kind of
+            when Unclassified do
+                return 0;
+            when NotFound do
+                return 1;
+            when NoPermission do
+                return 2;
+            when Invalid do
+                return 3;
+        end case;
+    end;
+
+    -- 0 for Right, else 10 plus the number of the failure's kind.
+    function unitNumber(result: Either[Failure, Unit]): Int32 is
+        case result of
+            when Right(right: Unit) do
+                return 0;
+            when Left(left as why: Failure) do
+                let kind: Int32 := number(kindOf(&why));
+                destroyFailure(why);
+                return kind + 10;
+        end case;
+    end;
+
+    -- The size, or 10 plus the failure's kind as a Nat64 above any size here.
+    function sizeNumber(result: Either[Failure, Nat64]): Nat64 is
+        case result of
+            when Right(right as size: Nat64) do
+                return size;
+            when Left(left as why: Failure) do
+                let kind: Int32 := number(kindOf(&why));
+                destroyFailure(why);
+                case toNat64(kind) of
+                    when Some(value as k: Nat64) do
+                        return (1000000 : Nat64) + k;
+                    when None do
+                        return 2000000;
+                end case;
+        end case;
+    end;
+
+    function boolNumber(result: Either[Failure, Bool]): Int32 is
+        case result of
+            when Right(right as value: Bool) do
+                if value then
+                    return 1;
+                end if;
+                return 0;
+            when Left(left as why: Failure) do
+                let kind: Int32 := number(kindOf(&why));
+                destroyFailure(why);
+                return kind + 10;
+        end case;
+    end;
+
+    function nameIs(result: Option[String], expected: Span[Nat8, Static]): Bool is
+        case result of
+            when Some(value as name: String) do
+                let same: Bool := sameAs(&name, expected);
+                destroyString(name);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function sizeIs(size: Nat64, expected: Span[Nat8, Static]): Bool is
+        let text: String := formatSize(size);
+        let same: Bool := sameAs(&text, expected);
+        destroyString(text);
+        return same;
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    function testCopyFile(): Unit is
+        let dir: Span[Nat8, Static] := "filehelpers-test-1.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let source: String := inside(dir, "source.txt");
+        let target: String := inside(dir, "target.txt");
+        let missing: String := inside(dir, "missing.txt");
+        assertTrue(put(&source, "hello, clone", 416), "the source was written");
+        assertTrue(unitNumber(copyFile(asSpan(&source), asSpan(&target))) = 0, "the file is copied");
+        assertTrue(holds(&target, "hello, clone"), "the copy has the content");
+        assertTrue(modeOf(&target) = 416, "the copy has the source's mode 0640");
+        assertTrue(unitNumber(copyFile(asSpan(&source), asSpan(&target))) = 13, "a target that exists is refused as invalid");
+        assertTrue(holds(&target, "hello, clone"), "the refused copy left the target alone");
+        assertTrue(unitNumber(copyFile(asSpan(&missing), asSpan(&missing))) = 11, "a missing source is not found");
+        let link: String := inside(dir, "link");
+        assertTrue(createSymlink("source.txt", asSpan(&link)), "a link was made");
+        let viaLink: String := inside(dir, "via-link.txt");
+        assertTrue(unitNumber(copyFile(asSpan(&link), asSpan(&viaLink))) = 13, "a link is not followed as a source");
+        assertTrue(removeFile(asSpan(&link)), "the link was removed");
+        assertTrue(removeFile(asSpan(&source)), "the source was removed");
+        assertTrue(removeFile(asSpan(&target)), "the copy was removed");
+        destroyString(viaLink);
+        destroyString(link);
+        destroyString(missing);
+        destroyString(target);
+        destroyString(source);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testUnusedName(): Unit is
+        let dir: Span[Nat8, Static] := "filehelpers-test-2.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        assertTrue(nameIs(unusedName(dir, "report.txt", false), "report-1.txt"), "the first free name of a file");
+        let one: String := inside(dir, "report-1.txt");
+        let two: String := inside(dir, "report-2.txt");
+        assertTrue(put(&one, "", 384), "report-1.txt was made");
+        assertTrue(nameIs(unusedName(dir, "report.txt", false), "report-2.txt"), "a taken name is skipped");
+        assertTrue(put(&two, "", 384), "report-2.txt was made");
+        assertTrue(nameIs(unusedName(dir, "report.txt", false), "report-3.txt"), "two taken names are skipped");
+        assertTrue(nameIs(unusedName(dir, "docs", true), "docs-1"), "a directory's name gets its number at the end");
+        let docs: String := inside(dir, "docs-1");
+        assertTrue(createDirectory(asSpan(&docs)), "docs-1 was made");
+        assertTrue(nameIs(unusedName(dir, "docs", true), "docs-2"), "a taken directory name is skipped");
+        assertTrue(nameIs(unusedName(dir, "Makefile", false), "Makefile-1"), "a name without a dot gets its number at the end");
+        assertTrue(nameIs(unusedName(dir, ".bashrc", false), ".bashrc-1"), "a leading dot is not an extension");
+        assertTrue(nameIs(unusedName(dir, "archive.tar.gz", false), "archive.tar-1.gz"), "the number goes before the last dot");
+        assertTrue(nameIs(unusedName(dir, "v1.0.txt", true), "v1.0.txt-1"), "a directory's dot is part of its name");
+        case unusedName(dir, "a/b", false) of
+            when Some(value as name: String) do
+                destroyString(name);
+                assertTrue(false, "a name with a slash is refused");
+            when None do
+                assertTrue(true, "a name with a slash is refused");
+        end case;
+        assertTrue(removeDirectory(asSpan(&docs)), "docs-1 was removed");
+        assertTrue(removeFile(asSpan(&one)), "report-1.txt was removed");
+        assertTrue(removeFile(asSpan(&two)), "report-2.txt was removed");
+        destroyString(docs);
+        destroyString(two);
+        destroyString(one);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testDirectorySizeAndCopy(): Unit is
+        let dir: Span[Nat8, Static] := "filehelpers-test-3.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let tree: String := inside(dir, "tree");
+        let sub: String := inside(dir, "tree/sub");
+        let empty: String := inside(dir, "tree/empty");
+        let a: String := inside(dir, "tree/a.txt");
+        let b: String := inside(dir, "tree/sub/b.txt");
+        let link: String := inside(dir, "tree/link");
+        assertTrue(createDirectory(asSpan(&tree)), "tree was made");
+        assertTrue(createDirectory(asSpan(&sub)), "tree/sub was made");
+        assertTrue(createDirectory(asSpan(&empty)), "tree/empty was made");
+        assertTrue(put(&a, "alpha", 420), "a.txt was written");
+        assertTrue(put(&b, "bravo charlie", 384), "sub/b.txt was written");
+        assertTrue(createSymlink("a.txt", asSpan(&link)), "a link was made");
+        assertTrue(sizeNumber(directorySize(asSpan(&tree))) = 18, "the tree holds 18 bytes, the link none");
+        assertTrue(sizeNumber(directorySize(asSpan(&empty))) = 0, "an empty directory holds none");
+        let nowhere: String := inside(dir, "nowhere");
+        assertTrue(sizeNumber(directorySize(asSpan(&nowhere))) = 1000001, "a missing directory is not found");
+        assertTrue(sizeNumber(directorySize(asSpan(&a))) = 1000003, "a file is not a directory");
+        let copy: String := inside(dir, "copy");
+        assertTrue(unitNumber(copyDirectory(asSpan(&tree), asSpan(&copy))) = 0, "the tree is copied");
+        let copyA: String := inside(dir, "copy/a.txt");
+        let copyB: String := inside(dir, "copy/sub/b.txt");
+        let copySub: String := inside(dir, "copy/sub");
+        let copyEmpty: String := inside(dir, "copy/empty");
+        let copyLink: String := inside(dir, "copy/link");
+        assertTrue(holds(&copyA, "alpha"), "a.txt was copied");
+        assertTrue(holds(&copyB, "bravo charlie"), "sub/b.txt was copied");
+        assertTrue(modeOf(&copyB) = 384, "sub/b.txt kept mode 0600");
+        assertTrue(modeOf(&copySub) = modeOf(&sub), "sub kept its mode");
+        assertTrue(isLink(&copyLink), "the link was copied as a link");
+        case linkTarget(asSpan(&copyLink)) of
+            when Some(value as target: String) do
+                assertTrue(sameAs(&target, "a.txt"), "the copied link points where the link did");
+                destroyString(target);
+            when None do
+                assertTrue(false, "the copied link points where the link did");
+        end case;
+        assertTrue(sizeNumber(directorySize(asSpan(&copy))) = 18, "the copy holds the same 18 bytes");
+        assertTrue(unitNumber(copyDirectory(asSpan(&tree), asSpan(&copy))) = 13, "a target that exists is refused");
+        assertTrue(unitNumber(copyDirectory(asSpan(&nowhere), asSpan(&nowhere))) = 11, "a missing source is not found");
+        assertTrue(removeFile(asSpan(&copyLink)), "the copied link was removed");
+        assertTrue(removeFile(asSpan(&copyA)), "the copied a.txt was removed");
+        assertTrue(removeFile(asSpan(&copyB)), "the copied b.txt was removed");
+        assertTrue(removeDirectory(asSpan(&copySub)), "the copied sub was removed");
+        assertTrue(removeDirectory(asSpan(&copyEmpty)), "the copied empty was removed");
+        assertTrue(removeDirectory(asSpan(&copy)), "the copy was removed");
+        assertTrue(removeFile(asSpan(&link)), "the link was removed");
+        assertTrue(removeFile(asSpan(&a)), "a.txt was removed");
+        assertTrue(removeFile(asSpan(&b)), "b.txt was removed");
+        assertTrue(removeDirectory(asSpan(&sub)), "sub was removed");
+        assertTrue(removeDirectory(asSpan(&empty)), "empty was removed");
+        assertTrue(removeDirectory(asSpan(&tree)), "tree was removed");
+        destroyString(copyLink);
+        destroyString(copyEmpty);
+        destroyString(copySub);
+        destroyString(copyB);
+        destroyString(copyA);
+        destroyString(copy);
+        destroyString(nowhere);
+        destroyString(link);
+        destroyString(b);
+        destroyString(a);
+        destroyString(empty);
+        destroyString(sub);
+        destroyString(tree);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testSecureDelete(): Unit is
+        let dir: Span[Nat8, Static] := "filehelpers-test-4.dir";
+        assertTrue(createDirectory(dir), "the test directory was made");
+        let path: String := inside(dir, "witness.tmp");
+        let secret: Span[Nat8, Static] := "SENSITIVESENSITIVESENSITIVESENSITIVESENSITIVESENSITIVESENSITIVESENSITIVE";
+        assertTrue(put(&path, secret, 384), "the witness was written");
+        case openRead(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                var witness: FileDescriptor := opened;
+                assertTrue(boolNumber(secureDelete(asSpan(&path))) = 1, "the file is overwritten and removed");
+                case statusOf(asSpan(&path)) of
+                    when FileFound(status: FileStatus) do
+                        assertTrue(false, "the name is gone");
+                    when FileMissing do
+                        assertTrue(true, "the name is gone");
+                    when FileUnreadable do
+                        assertTrue(false, "the name is gone");
+                end case;
+                case readExactly(&!witness, spanLength(secret)) of
+                    when Some(value as bytes: String) do
+                        assertTrue(not sameAs(&bytes, secret), "the bytes behind the name were overwritten");
+                        destroyString(bytes);
+                    when None do
+                        assertTrue(false, "the bytes behind the name were overwritten");
+                end case;
+                let closed: Bool := closeFile(witness);
+            when None do
+                assertTrue(false, "the witness was opened");
+        end case;
+        assertTrue(boolNumber(secureDelete(asSpan(&path))) = 0, "a missing file is nothing to remove");
+        assertTrue(boolNumber(secureDelete(dir)) = 13, "a directory is refused");
+        destroyString(path);
+        assertTrue(removeDirectory(dir), "the test directory was removed");
+        return nil;
+    end;
+
+    function testFormatSize(): Unit is
+        assertTrue(sizeIs(0, "0"), "0");
+        assertTrue(sizeIs(500, "500"), "500");
+        assertTrue(sizeIs(1023, "1023"), "1023");
+        assertTrue(sizeIs(1024, "1.0K"), "1024");
+        assertTrue(sizeIs(1536, "1.5K"), "1536");
+        assertTrue(sizeIs(1048576, "1.0M"), "1 MiB");
+        assertTrue(sizeIs(1572864, "1.5M"), "1.5 MiB");
+        assertTrue(sizeIs(1073741824, "1.0G"), "1 GiB");
+        assertTrue(sizeIs(2147483648, "2.0G"), "2 GiB");
+        assertTrue(sizeIs(2684354560, "2.5G"), "2.5 GiB");
+        assertTrue(sizeIs(1280, "1.2K"), "1.25 K goes to the even tenth, down");
+        assertTrue(sizeIs(1792, "1.8K"), "1.75 K goes to the even tenth, up");
+        assertTrue(sizeIs(1075, "1.0K"), "1075 is nearer 1.0 K");
+        assertTrue(sizeIs(1076, "1.1K"), "1076 is nearer 1.1 K");
+        assertTrue(sizeIs(1048575, "1024.0K"), "one byte below 1 MiB rounds to 1024.0 K");
+        assertTrue(sizeIs(1099511627776, "1024.0G"), "1 TiB is 1024.0 G");
+        assertTrue(sizeIs(5764607523034234880, "5368709120.0G"), "5 EiB");
+        return nil;
+    end;
+end module body.

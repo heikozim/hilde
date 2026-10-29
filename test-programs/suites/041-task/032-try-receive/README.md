@@ -1,0 +1,1 @@
+tryReceive, which does not wait: empty while the sender may still send, the value once one is there, closed when the sender has closed; on a channel of capacity 0 empty, since no sender waits to hand over a value, and closed after the close.

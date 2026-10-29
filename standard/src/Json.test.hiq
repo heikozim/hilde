@@ -1,0 +1,819 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Tests for Standard.Json.  The cases of reading and walking: a string and
+-- a number found by name, a nested name, a missing one, an array and its
+-- elements, an array of
+-- objects, an index into nested arrays, a walk that must answer None
+-- rather than stop, and a value of another kind than asked for.  The
+-- refusals come from RFC 8259, the pointers from RFC 6901, the rest from
+-- what hostile input does.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString as appendText,
+    finalize
+);
+import Standard.Text (
+    constantTimeEqual
+);
+import Standard.Json (
+    JsonFault,
+    CutShort,
+    ByteOutOfPlace,
+    BadNumber,
+    BadEscape,
+    ControlInString,
+    NotUtf8,
+    LoneSurrogate,
+    NestedTooDeep,
+    DuplicateName,
+    TextAfterValue,
+    JsonError,
+    JsonKind,
+    Json,
+    JsonCursor,
+    JsonWriter,
+    mostDepth,
+    readJson,
+    destroyJson,
+    kindAt,
+    stringAt,
+    numberAt,
+    integerAt,
+    boolAt,
+    isNullAt,
+    countAt,
+    nameAt,
+    valueTextAt,
+    firstChildAt,
+    firstChildOf,
+    nextChild,
+    childKind,
+    childName,
+    childString,
+    childNumber,
+    childInteger,
+    childBool,
+    childIsNull,
+    childCount,
+    childText,
+    makeJsonWriter,
+    makePrettyJsonWriter,
+    beginObject,
+    endObject,
+    beginArray,
+    endArray,
+    writeName,
+    writeString,
+    writeInteger,
+    writeNumber,
+    writeBool,
+    writeNull,
+    finishJson
+);
+
+module body Standard.Json.Test is
+    ---
+    --- Helpers
+    ---
+
+    -- Whether the text is read.
+    generic [R: Region]
+    function reads(text: Span[Nat8, R]): Bool is
+        case readJson(text) of
+            when Left(left: JsonError) do
+                return false;
+            when Right(right as document: Json) do
+                destroyJson(document);
+                return true;
+        end case;
+    end;
+
+    function faultNumber(fault: JsonFault): Nat8 is
+        case fault of
+            when CutShort do
+                return 1;
+            when ByteOutOfPlace do
+                return 2;
+            when BadNumber do
+                return 3;
+            when BadEscape do
+                return 4;
+            when ControlInString do
+                return 5;
+            when NotUtf8 do
+                return 6;
+            when LoneSurrogate do
+                return 7;
+            when NestedTooDeep do
+                return 8;
+            when DuplicateName do
+                return 9;
+            when TextAfterValue do
+                return 10;
+        end case;
+    end;
+
+    -- Whether the text is refused with this fault at this place.
+    generic [R: Region]
+    function refusedWith(text: Span[Nat8, R], fault: JsonFault, offset: Index): Bool is
+        case readJson(text) of
+            when Left(left as error: JsonError) do
+                return (faultNumber(error.fault) = faultNumber(fault)) and (error.offset = offset);
+            when Right(right as document: Json) do
+                destroyJson(document);
+                return false;
+        end case;
+    end;
+
+    -- Whether the string found is the expected one; None is never it.
+    generic [S: Region]
+    function isText(found: Option[String], want: Span[Nat8, S]): Bool is
+        case found of
+            when Some(value as text: String) do
+                let same: Bool := constantTimeEqual(asSpan(&text), want);
+                destroyString(text);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNone(found: Option[String]): Bool is
+        case found of
+            when Some(value as text: String) do
+                destroyString(text);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function isInteger(found: Option[Int64], want: Int64): Bool is
+        case found of
+            when Some(value as number: Int64) do
+                return number = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNoInteger(found: Option[Int64]): Bool is
+        case found of
+            when Some(value as number: Int64) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function isCount(found: Option[Index], want: Index): Bool is
+        case found of
+            when Some(value as count: Index) do
+                return count = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNoCursor(found: Option[JsonCursor]): Bool is
+        case found of
+            when Some(value: JsonCursor) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function isBool(found: Option[Bool], want: Bool): Bool is
+        case found of
+            when Some(value as b: Bool) do
+                return b = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function kindNumber(found: Option[JsonKind]): Nat8 is
+        case found of
+            when Some(value as kind: JsonKind) do
+                case kind of
+                    when JsonNull do
+                        return 1;
+                    when JsonBoolean do
+                        return 2;
+                    when JsonNumber do
+                        return 3;
+                    when JsonString do
+                        return 4;
+                    when JsonArray do
+                        return 5;
+                    when JsonObject do
+                        return 6;
+                end case;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The finished text of a writer is the expected one.
+    generic [S: Region]
+    function writes(writer: JsonWriter, want: Span[Nat8, S]): Bool is
+        return isText(finishJson(writer), want);
+    end;
+
+    -- A finished writer gives None.
+    function refusesToFinish(writer: JsonWriter): Bool is
+        return isNone(finishJson(writer));
+    end;
+
+    -- count times open, then count times close.
+    function nested(count: Index, open: Nat8, close: Nat8): String is
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < count do
+            writeByte(&!builder, open);
+            i := i + 1;
+        end while;
+        var j: Index := 0;
+        while j < count do
+            writeByte(&!builder, close);
+            j := j + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    ---
+    --- Reading and walking
+    ---
+
+    function testFindByName(): Unit is
+        case readJson("{\"hello\":\"world\",\"num\":123}") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                assertTrue(isText(stringAt(&document, "/hello"), "world"), "a string by name");
+                assertTrue(isInteger(integerAt(&document, "/num"), 123), "a number by name");
+                assertTrue(isText(numberAt(&document, "/num"), "123"), "the number as its text");
+                assertTrue(kindNumber(kindAt(&document, "")) = 6, "the whole document is an object");
+                assertTrue(isCount(countAt(&document, ""), 2), "two members");
+                assertTrue(isText(nameAt(&document, "", 1), "num"), "the second name");
+                assertTrue(isNone(nameAt(&document, "", 2)), "no third name");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    function testNestedAndMissing(): Unit is
+        case readJson("{\"outer\":{\"inner\":\"deep\"},\"a\":\"b\"}") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                assertTrue(isText(stringAt(&document, "/outer/inner"), "deep"), "a nested name");
+                assertTrue(isNone(stringAt(&document, "/missing")), "a missing name");
+                assertTrue(isNone(stringAt(&document, "/outer/missing")), "a missing nested name");
+                assertTrue(isText(valueTextAt(&document, "/outer"), "{\"inner\":\"deep\"}"), "the text of a value");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    function testNumbersAsText(): Unit is
+        case readJson("{\"pi\":3.14,\"big\":1e400,\"neg\":-0}") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                assertTrue(isText(numberAt(&document, "/pi"), "3.14"), "a fraction kept as written");
+                assertTrue(isNoInteger(integerAt(&document, "/pi")), "a fraction is no integer");
+                assertTrue(isText(numberAt(&document, "/big"), "1e400"), "a number beyond Float64 kept as written");
+                assertTrue(isNoInteger(integerAt(&document, "/big")), "an exponent is no integer");
+                assertTrue(isInteger(integerAt(&document, "/neg"), 0), "minus zero is zero");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    function testArrays(): Unit is
+        case readJson("{\"items\":[1,2,3],\"people\":[{\"name\":\"a\"},{\"name\":\"b\"}],\"data\":[[\"a\",\"b\"],[\"c\",\"d\"]]}") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                assertTrue(isCount(countAt(&document, "/items"), 3), "three items");
+                assertTrue(isInteger(integerAt(&document, "/items/2"), 3), "the last item");
+                assertTrue(isText(stringAt(&document, "/people/0/name"), "a"), "a name in an array of objects");
+                assertTrue(isText(stringAt(&document, "/people/1/name"), "b"), "the second one");
+                assertTrue(isText(stringAt(&document, "/data/1/0"), "c"), "an index into nested arrays");
+                assertTrue(kindNumber(kindAt(&document, "/items")) = 5, "an array");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    -- A walk that cannot go on answers None and does not stop the
+    -- programme: an index too large, a negative or non-numeric one, a
+    -- leading zero, a missing name, a step into a scalar.
+    function testWalkThatCannotGoOn(): Unit is
+        case readJson("{\"a\": {\"b\": [\"hello\", \"world\"]}, \"n\": 5}") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                assertTrue(isNone(stringAt(&document, "/a/b/99")), "an index too large");
+                assertTrue(isNone(stringAt(&document, "/a/b/-1")), "a negative index");
+                assertTrue(isNone(stringAt(&document, "/a/b/1.0")), "an index that is not a whole number");
+                assertTrue(isNone(stringAt(&document, "/a/b/01")), "an index with a leading zero");
+                assertTrue(isNone(stringAt(&document, "/a/3")), "an index into an object");
+                assertTrue(isNone(stringAt(&document, "/missing/x")), "a missing name");
+                assertTrue(isNone(stringAt(&document, "/n/deeper")), "a step into a number");
+                assertTrue(isNone(stringAt(&document, "a")), "a pointer without its slash");
+                assertTrue(isNone(stringAt(&document, "/a~2")), "a tilde that is not an escape");
+                assertTrue(isText(stringAt(&document, "/a/b/1"), "world"), "and the walk still works");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    -- A value of another kind than asked for is None: a boolean is not a
+    -- string, a string is not a number.
+    function testKinds(): Unit is
+        case readJson("{\"ok\":true,\"no\":false,\"nothing\":null,\"s\":\"5\"}") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                assertTrue(isNone(stringAt(&document, "/ok")), "true is not a string");
+                case boolAt(&document, "/ok") of
+                    when Some(value as flag: Bool) do
+                        assertTrue(flag, "true is true");
+                    when None do
+                        assertTrue(false, "true is a boolean");
+                end case;
+                case boolAt(&document, "/no") of
+                    when Some(value as flag: Bool) do
+                        assertTrue(not flag, "false is false");
+                    when None do
+                        assertTrue(false, "false is a boolean");
+                end case;
+                assertTrue(isNullAt(&document, "/nothing"), "null");
+                assertTrue(not isNullAt(&document, "/ok"), "true is not null");
+                assertTrue(not isNullAt(&document, "/missing"), "a missing name is not null");
+                assertTrue(isNoInteger(integerAt(&document, "/s")), "a string is not a number");
+                assertTrue(isNone(numberAt(&document, "/s")), "nor its text");
+                assertTrue(kindNumber(kindAt(&document, "/nothing")) = 1, "the kind of null");
+                assertTrue(kindNumber(kindAt(&document, "/missing")) = 0, "no kind for a missing name");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    -- RFC 6901 section 5: the empty name, a slash and a tilde in names.
+    function testPointerEscapes(): Unit is
+        case readJson("{\"\": 0, \"a/b\": 1, \"m~n\": 8, \" \": 7}") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                assertTrue(isInteger(integerAt(&document, "/"), 0), "the empty name");
+                assertTrue(isInteger(integerAt(&document, "/a~1b"), 1), "a slash in a name");
+                assertTrue(isInteger(integerAt(&document, "/m~0n"), 8), "a tilde in a name");
+                assertTrue(isInteger(integerAt(&document, "/ "), 7), "a space in a name");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    -- Escapes read: a quote, a backslash, a slash, a line end, the letter
+    -- e with acute accent in one escape, and a face beyond the first plane
+    -- in a surrogate pair, each as its UTF-8 bytes.
+    function testEscapesRead(): Unit is
+        case readJson("[\"a\\\"b\\\\c\\/d\\ne\", \"\\u00e9\", \"\\ud83d\\ude00\", \"\\u0041\"]") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                assertTrue(isText(stringAt(&document, "/0"), "a\"b\\c/d\ne"), "the simple escapes");
+                case stringAt(&document, "/1") of
+                    when Some(value as accent: String) do
+                        assertTrue(length(&accent) = 2, "an accented letter is two bytes");
+                        destroyString(accent);
+                    when None do
+                        assertTrue(false, "the escape is read");
+                end case;
+                case stringAt(&document, "/2") of
+                    when Some(value as face: String) do
+                        assertTrue(length(&face) = 4, "a surrogate pair is four bytes");
+                        destroyString(face);
+                    when None do
+                        assertTrue(false, "the pair is read");
+                end case;
+                assertTrue(isText(stringAt(&document, "/3"), "A"), "an escaped capital");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Refusals, RFC 8259
+    ---
+
+    function testRefusedTexts(): Unit is
+        assertTrue(refusedWith("not json", ByteOutOfPlace(), 1), "not json, read as a misspelt null");
+        assertTrue(refusedWith("", CutShort(), 0), "an empty text");
+        assertTrue(refusedWith("   ", CutShort(), 3), "white space alone");
+        assertTrue(refusedWith("[", CutShort(), 1), "an open array");
+        assertTrue(refusedWith("{\"a\"", CutShort(), 4), "a name without its colon");
+        assertTrue(refusedWith("\"abc", CutShort(), 4), "a string without its end");
+        assertTrue(refusedWith("[1,2,]", ByteOutOfPlace(), 5), "a comma before a bracket");
+        assertTrue(refusedWith("{\"a\":1,}", ByteOutOfPlace(), 7), "a comma before a brace");
+        assertTrue(refusedWith("[1}", ByteOutOfPlace(), 2), "a brace closing an array");
+        assertTrue(refusedWith("{1:2}", ByteOutOfPlace(), 1), "a name that is not a string");
+        assertTrue(refusedWith("[1 2]", ByteOutOfPlace(), 3), "two values without a comma");
+        assertTrue(refusedWith("[NaN]", ByteOutOfPlace(), 1), "NaN");
+        assertTrue(refusedWith("[.5]", ByteOutOfPlace(), 1), "a point first");
+        assertTrue(refusedWith("tru", CutShort(), 3), "a word cut short");
+        assertTrue(refusedWith("trUe", ByteOutOfPlace(), 2), "a word misspelt");
+        assertTrue(refusedWith("[1] x", TextAfterValue(), 4), "text after the value");
+        assertTrue(refusedWith("{} {}", TextAfterValue(), 3), "two values");
+        return nil;
+    end;
+
+    function testRefusedNumbers(): Unit is
+        assertTrue(refusedWith("01", BadNumber(), 1), "a leading zero");
+        assertTrue(refusedWith("-", CutShort(), 1), "a minus alone");
+        assertTrue(refusedWith("-a", BadNumber(), 1), "a minus before a letter");
+        assertTrue(refusedWith("1.", BadNumber(), 2), "a point without digits");
+        assertTrue(refusedWith("1e", BadNumber(), 2), "an exponent without digits");
+        assertTrue(refusedWith("1e+", BadNumber(), 3), "a signed exponent without digits");
+        assertTrue(refusedWith("+1", ByteOutOfPlace(), 0), "a plus first");
+        assertTrue(reads("0"), "zero");
+        assertTrue(reads("-0.0e-0"), "every part once");
+        assertTrue(reads("1E+2"), "a capital exponent");
+        return nil;
+    end;
+
+    function testRefusedStrings(): Unit is
+        let control: Span[Nat8, Static] := "\"a\tb\"";
+        assertTrue(refusedWith(control, ControlInString(), 2), "a tab in a string");
+        assertTrue(refusedWith("\"a\\xb\"", BadEscape(), 2), "an escape that is none");
+        assertTrue(refusedWith("\"\\u12g4\"", BadEscape(), 1), "a u escape with a letter that is no digit");
+        assertTrue(refusedWith("\"\\u12\"", BadEscape(), 1), "a u escape with two digits");
+        assertTrue(refusedWith("\"\\u12", CutShort(), 5), "a u escape the text ends inside");
+        -- A quote and a backslash, written as bytes: the lexer does not end
+        -- a string literal after an escaped backslash.
+        var ending: StringBuilder := makeStringBuilder();
+        writeByte(&!ending, 34);
+        writeByte(&!ending, 92);
+        let cut: String := finalize(ending);
+        assertTrue(refusedWith(asSpan(&cut), CutShort(), 2), "a backslash at the end");
+        destroyString(cut);
+        assertTrue(refusedWith("\"\\ud800\"", LoneSurrogate(), 1), "a high surrogate alone");
+        assertTrue(refusedWith("\"\\udc00\"", LoneSurrogate(), 1), "a low surrogate alone");
+        assertTrue(refusedWith("\"\\ud800\\u0041\"", LoneSurrogate(), 1), "a high surrogate before a letter");
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, 34);
+        writeByte(&!builder, 97);
+        writeByte(&!builder, 255);
+        writeByte(&!builder, 34);
+        let broken: String := finalize(builder);
+        assertTrue(refusedWith(asSpan(&broken), NotUtf8(), 2), "a byte that is not UTF-8");
+        destroyString(broken);
+        return nil;
+    end;
+
+    -- A name twice in one object is refused, also when an escape hides it;
+    -- the same name in two objects is not.
+    function testDuplicateNames(): Unit is
+        assertTrue(refusedWith("{\"a\":1,\"a\":2}", DuplicateName(), 12), "a name twice");
+        assertTrue(refusedWith("{\"a\":1,\"\\u0061\":2}", DuplicateName(), 17), "a name twice, once escaped");
+        assertTrue(refusedWith("[{\"x\":{\"b\":1,\"c\":2,\"b\":3}}]", DuplicateName(), 24), "a name twice in an inner object");
+        assertTrue(reads("{\"a\":{\"a\":1},\"b\":{\"a\":2}}"), "one name in several objects");
+        assertTrue(reads("[{\"a\":1},{\"a\":2}]"), "one name in objects side by side");
+        return nil;
+    end;
+
+    -- Nesting up to mostDepth is read, one more is refused, and ten
+    -- thousand levels are refused as quickly, without a stack that grows.
+    function testDepth(): Unit is
+        assertTrue(mostDepth = 128, "the limit");
+        let deepest: String := nested(128, 91, 93);
+        assertTrue(reads(asSpan(&deepest)), "128 arrays deep");
+        destroyString(deepest);
+        let tooDeep: String := nested(129, 91, 93);
+        assertTrue(refusedWith(asSpan(&tooDeep), NestedTooDeep(), 128), "129 arrays deep");
+        destroyString(tooDeep);
+        let hostile: String := nested(10000, 91, 93);
+        assertTrue(refusedWith(asSpan(&hostile), NestedTooDeep(), 128), "ten thousand arrays deep");
+        destroyString(hostile);
+        return nil;
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    function testWriteCompact(): Unit is
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "name");
+        writeString(&!writer, "test");
+        writeName(&!writer, "count");
+        writeInteger(&!writer, 42);
+        writeName(&!writer, "list");
+        beginArray(&!writer);
+        writeBool(&!writer, true);
+        writeNull(&!writer);
+        writeNumber(&!writer, "-1.5e3");
+        endArray(&!writer);
+        writeName(&!writer, "empty");
+        beginObject(&!writer);
+        endObject(&!writer);
+        endObject(&!writer);
+        assertTrue(writes(writer, "{\"name\":\"test\",\"count\":42,\"list\":[true,null,-1.5e3],\"empty\":{}}"), "the compact form");
+        return nil;
+    end;
+
+    -- The pretty form: two spaces a level, a space after a
+    -- colon, and empty containers on one line.
+    function testWritePretty(): Unit is
+        var writer: JsonWriter := makePrettyJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "name");
+        writeString(&!writer, "test");
+        writeName(&!writer, "list");
+        beginArray(&!writer);
+        writeInteger(&!writer, 1);
+        writeInteger(&!writer, 2);
+        endArray(&!writer);
+        writeName(&!writer, "none");
+        beginArray(&!writer);
+        endArray(&!writer);
+        endObject(&!writer);
+        assertTrue(writes(writer, "{\n  \"name\": \"test\",\n  \"list\": [\n    1,\n    2\n  ],\n  \"none\": []\n}"), "the pretty form");
+        return nil;
+    end;
+
+    -- What is written is read back: names, strings with every byte that
+    -- needs an escape, the edges of Int64.
+    function testRoundTrip(): Unit is
+        var builder: StringBuilder := makeStringBuilder();
+        appendText(&!builder, "q\"b\\n");
+        writeByte(&!builder, 10);
+        writeByte(&!builder, 1);
+        writeByte(&!builder, 31);
+        writeByte(&!builder, 127);
+        let awkward: String := finalize(builder);
+        var writer: JsonWriter := makeJsonWriter();
+        beginObject(&!writer);
+        writeName(&!writer, "awkward");
+        writeString(&!writer, asSpan(&awkward));
+        writeName(&!writer, "most");
+        writeInteger(&!writer, 9223372036854775807);
+        writeName(&!writer, "least");
+        writeInteger(&!writer, -9223372036854775808);
+        endObject(&!writer);
+        case finishJson(writer) of
+            when Some(value as text: String) do
+                case readJson(asSpan(&text)) of
+                    when Left(left: JsonError) do
+                        assertTrue(false, "what is written is read");
+                    when Right(right as document: Json) do
+                        assertTrue(isText(stringAt(&document, "/awkward"), asSpan(&awkward)), "the string comes back byte for byte");
+                        assertTrue(isInteger(integerAt(&document, "/most"), 9223372036854775807), "the largest Int64");
+                        assertTrue(isInteger(integerAt(&document, "/least"), -9223372036854775808), "the smallest Int64");
+                        destroyJson(document);
+                end case;
+                destroyString(text);
+            when None do
+                assertTrue(false, "the writer finishes");
+        end case;
+        destroyString(awkward);
+        return nil;
+    end;
+
+    function testIntegerBounds(): Unit is
+        case readJson("[9223372036854775807, 9223372036854775808, -9223372036854775808, -9223372036854775809, 12345678901234567890123]") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                assertTrue(isInteger(integerAt(&document, "/0"), 9223372036854775807), "the largest Int64");
+                assertTrue(isNoInteger(integerAt(&document, "/1")), "one more");
+                assertTrue(isInteger(integerAt(&document, "/2"), -9223372036854775808), "the smallest Int64");
+                assertTrue(isNoInteger(integerAt(&document, "/3")), "one less");
+                assertTrue(isNoInteger(integerAt(&document, "/4")), "far beyond");
+                assertTrue(isText(numberAt(&document, "/4"), "12345678901234567890123"), "kept as text");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    -- Calls out of order spoil a writer, and so does a text that would be
+    -- refused.
+    function testWriterRefuses(): Unit is
+        var noName: JsonWriter := makeJsonWriter();
+        beginObject(&!noName);
+        writeInteger(&!noName, 1);
+        endObject(&!noName);
+        assertTrue(refusesToFinish(noName), "a value in an object without its name");
+        var nameInArray: JsonWriter := makeJsonWriter();
+        beginArray(&!nameInArray);
+        writeName(&!nameInArray, "a");
+        endArray(&!nameInArray);
+        assertTrue(refusesToFinish(nameInArray), "a name in an array");
+        var noValue: JsonWriter := makeJsonWriter();
+        beginObject(&!noValue);
+        writeName(&!noValue, "a");
+        endObject(&!noValue);
+        assertTrue(refusesToFinish(noValue), "a name without its value");
+        var wrongEnd: JsonWriter := makeJsonWriter();
+        beginArray(&!wrongEnd);
+        endObject(&!wrongEnd);
+        assertTrue(refusesToFinish(wrongEnd), "an array closed as an object");
+        var open: JsonWriter := makeJsonWriter();
+        beginArray(&!open);
+        assertTrue(refusesToFinish(open), "an array left open");
+        var nothing: JsonWriter := makeJsonWriter();
+        assertTrue(refusesToFinish(nothing), "nothing written");
+        var two: JsonWriter := makeJsonWriter();
+        writeNull(&!two);
+        writeNull(&!two);
+        assertTrue(refusesToFinish(two), "two values");
+        var badNumber: JsonWriter := makeJsonWriter();
+        writeNumber(&!badNumber, "1.");
+        assertTrue(refusesToFinish(badNumber), "a number that is none");
+        var twice: JsonWriter := makeJsonWriter();
+        beginObject(&!twice);
+        writeName(&!twice, "a");
+        writeNull(&!twice);
+        writeName(&!twice, "a");
+        writeNull(&!twice);
+        endObject(&!twice);
+        assertTrue(refusesToFinish(twice), "a name twice");
+        var builder: StringBuilder := makeStringBuilder();
+        writeByte(&!builder, 255);
+        let notUtf8: String := finalize(builder);
+        var broken: JsonWriter := makeJsonWriter();
+        writeString(&!broken, asSpan(&notUtf8));
+        assertTrue(refusesToFinish(broken), "a string that is not UTF-8");
+        destroyString(notUtf8);
+        var deep: JsonWriter := makeJsonWriter();
+        var i: Index := 0;
+        while i < 129 do
+            beginArray(&!deep);
+            i := i + 1;
+        end while;
+        var k: Index := 0;
+        while k < 129 do
+            endArray(&!deep);
+            k := k + 1;
+        end while;
+        assertTrue(refusesToFinish(deep), "129 arrays deep");
+        var scalar: JsonWriter := makeJsonWriter();
+        writeString(&!scalar, "alone");
+        assertTrue(writes(scalar, "\"alone\""), "a string alone is a document");
+        return nil;
+    end;
+
+    ---
+    --- Cursors
+    ---
+
+    -- The elements of an array walked with a cursor, their sum and their
+    -- count, and the containers and values a cursor cannot start in.
+    function testCursorWalksAnArray(): Unit is
+        case readJson("{\"xs\":[10, 20 ,30],\"e\":[],\"n\":5}") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                var sum: Int64 := 0;
+                var count: Index := 0;
+                var at: Option[JsonCursor] := firstChildAt(&document, "/xs");
+                var walking: Bool := true;
+                while walking do
+                    case at of
+                        when Some(value as cursor: JsonCursor) do
+                            case childInteger(&document, cursor) of
+                                when Some(value as number: Int64) do
+                                    sum := sum + number;
+                                when None do
+                                    assertTrue(false, "every element is an integer");
+                            end case;
+                            assertTrue(isNone(childName(&document, cursor)), "an element has no name");
+                            count := count + 1;
+                            at := nextChild(&document, cursor);
+                        when None do
+                            walking := false;
+                    end case;
+                end while;
+                assertTrue(sum = 60, "the elements add up to 60");
+                assertTrue(count = 3, "three elements were walked");
+                assertTrue(isNoCursor(firstChildAt(&document, "/e")), "an empty array has no first child");
+                assertTrue(isNoCursor(firstChildAt(&document, "/n")), "a number has no child");
+                assertTrue(isNoCursor(firstChildAt(&document, "/missing")), "a missing name has no child");
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    -- The members of an object with their names, a container inside it
+    -- walked from its cursor, and the readers of every kind at a cursor.
+    function testCursorWalksAnObject(): Unit is
+        case readJson("{\"o\" : {\"a\":1, \"b\\u0021\" : [true,null,\"s\",2.5,{}]}}") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the text is read");
+            when Right(right as document: Json) do
+                case firstChildAt(&document, "/o") of
+                    when Some(value as first: JsonCursor) do
+                        assertTrue(isText(childName(&document, first), "a"), "the first name");
+                        assertTrue(isInteger(childInteger(&document, first), 1), "its value");
+                        assertTrue(isText(childText(&document, first), "1"), "its text");
+                        case nextChild(&document, first) of
+                            when Some(value as second: JsonCursor) do
+                                assertTrue(isText(childName(&document, second), "b!"), "the second name, its escape read");
+                                assertTrue(kindNumber(childKind(&document, second)) = 5, "its value is an array");
+                                assertTrue(isCount(childCount(&document, second), 5), "which holds five");
+                                assertTrue(isNoCursor(nextChild(&document, second)), "no third member");
+                                case firstChildOf(&document, second) of
+                                    when Some(value as one: JsonCursor) do
+                                        assertTrue(isBool(childBool(&document, one), true), "true");
+                                        case nextChild(&document, one) of
+                                            when Some(value as two: JsonCursor) do
+                                                assertTrue(childIsNull(&document, two), "null");
+                                                assertTrue(isNone(childString(&document, two)), "null is no string");
+                                                case nextChild(&document, two) of
+                                                    when Some(value as three: JsonCursor) do
+                                                        assertTrue(isText(childString(&document, three), "s"), "a string");
+                                                        case nextChild(&document, three) of
+                                                            when Some(value as four: JsonCursor) do
+                                                                assertTrue(isText(childNumber(&document, four), "2.5"), "a number as written");
+                                                                assertTrue(isNoInteger(childInteger(&document, four)), "2.5 is no integer");
+                                                                case nextChild(&document, four) of
+                                                                    when Some(value as five: JsonCursor) do
+                                                                        assertTrue(isNoCursor(firstChildOf(&document, five)), "an empty object has no first child");
+                                                                        assertTrue(isNoCursor(nextChild(&document, five)), "five is the last");
+                                                                    when None do
+                                                                        assertTrue(false, "a fifth element");
+                                                                end case;
+                                                            when None do
+                                                                assertTrue(false, "a fourth element");
+                                                        end case;
+                                                    when None do
+                                                        assertTrue(false, "a third element");
+                                                end case;
+                                            when None do
+                                                assertTrue(false, "a second element");
+                                        end case;
+                                    when None do
+                                        assertTrue(false, "the array has a first child");
+                                end case;
+                            when None do
+                                assertTrue(false, "a second member");
+                        end case;
+                    when None do
+                        assertTrue(false, "the object has a first member");
+                end case;
+                destroyJson(document);
+        end case;
+        return nil;
+    end;
+
+    -- A cursor of one document is refused by another, even one with the
+    -- same text: every reader answers None, and childIsNull false.
+    function testCursorOfAnotherDocument(): Unit is
+        case readJson("[null,1]") of
+            when Left(left: JsonError) do
+                assertTrue(false, "the first text is read");
+            when Right(right as one: Json) do
+                case readJson("[null,1]") of
+                    when Left(left: JsonError) do
+                        assertTrue(false, "the second text is read");
+                    when Right(right as other: Json) do
+                        case firstChildAt(&one, "") of
+                            when Some(value as cursor: JsonCursor) do
+                                assertTrue(childIsNull(&one, cursor), "null in its own document");
+                                assertTrue(not childIsNull(&other, cursor), "not in the other one");
+                                assertTrue(kindNumber(childKind(&other, cursor)) = 0, "no kind there");
+                                assertTrue(isNoCursor(nextChild(&other, cursor)), "no next child there");
+                                assertTrue(isNoCursor(firstChildOf(&other, cursor)), "no first child there");
+                                assertTrue(isNone(childText(&other, cursor)), "no text there");
+                            when None do
+                                assertTrue(false, "the array has a first child");
+                        end case;
+                        destroyJson(other);
+                end case;
+                destroyJson(one);
+        end case;
+        return nil;
+    end;
+end module body.

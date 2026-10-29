@@ -1,0 +1,191 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A chain of failures is a list: each failure holds its cause in a box,
+-- and the functions that read a chain walk it by reference, from the
+-- outermost failure to the first cause.
+import Standard.String (
+    String,
+    fromSpan,
+    makeEmpty,
+    destroyString,
+    length,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Box (
+    Box,
+    makeBox,
+    unbox,
+    unboxReadRef
+);
+
+module body Standard.Failure is
+    record Failure: Linear is
+        op: String;
+        kind: FailureKind;
+        message: String;
+        cause: Option[Box[Failure]];
+    end;
+
+    function isUnclassified(kind: FailureKind): Bool is
+        case kind of
+            when Unclassified do
+                return true;
+            when NotFound do
+                return false;
+            when NoPermission do
+                return false;
+            when Invalid do
+                return false;
+        end case;
+    end;
+
+    function kindNumber(kind: FailureKind): Nat8 is
+        case kind of
+            when Unclassified do
+                return 0;
+            when NotFound do
+                return 1;
+            when NoPermission do
+                return 2;
+            when Invalid do
+                return 3;
+        end case;
+    end;
+
+    generic [O: Region, M: Region]
+    function makeFailure(op: Span[Nat8, O], kind: FailureKind, message: Span[Nat8, M]): Failure is
+        let none: Option[Box[Failure]] := None();
+        return Failure(op => fromSpan(op), kind => kind, message => fromSpan(message), cause => none);
+    end;
+
+    generic [R: Region]
+    function wrapFailureAs(op: Span[Nat8, R], kind: FailureKind, cause: Failure): Failure is
+        case makeBox(cause) of
+            when Right(right as boxed: Box[Failure]) do
+                let some: Option[Box[Failure]] := Some(value => boxed);
+                return Failure(op => fromSpan(op), kind => kind, message => makeEmpty(), cause => some);
+            when Left(left as kept: Failure) do
+                destroyFailure(kept);
+                abort("Standard.Failure: no memory left to keep a failure");
+        end case;
+    end;
+
+    generic [R: Region]
+    function wrapFailure(op: Span[Nat8, R], cause: Failure): Failure is
+        return wrapFailureAs(op, Unclassified(), cause);
+    end;
+
+    generic [R: Region]
+    function kindOf(failure: &[Failure, R]): FailureKind is
+        let own: FailureKind := failure->kind;
+        if not isUnclassified(own) then
+            return own;
+        end if;
+        case &(failure->cause) of
+            when Some(value as boxed: &[Box[Failure], R]) do
+                return kindOf(unboxReadRef(boxed));
+            when None do
+                return Unclassified();
+        end case;
+    end;
+
+    generic [R: Region]
+    function hasKind(failure: &[Failure, R], kind: FailureKind): Bool is
+        if kindNumber(failure->kind) = kindNumber(kind) then
+            return true;
+        end if;
+        case &(failure->cause) of
+            when Some(value as boxed: &[Box[Failure], R]) do
+                return hasKind(unboxReadRef(boxed), kind);
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function operationOf(failure: &[Failure, R]): Span[Nat8, R] is
+        return asSpan(&(failure->op));
+    end;
+
+    generic [R: Region]
+    function messageOf(failure: &[Failure, R]): Span[Nat8, R] is
+        case &(failure->cause) of
+            when Some(value as boxed: &[Box[Failure], R]) do
+                return messageOf(unboxReadRef(boxed));
+            when None do
+                return asSpan(&(failure->message));
+        end case;
+    end;
+
+    generic [R: Region]
+    function chainLength(failure: &[Failure, R]): Index is
+        case &(failure->cause) of
+            when Some(value as boxed: &[Box[Failure], R]) do
+                return chainLength(unboxReadRef(boxed)) + 1;
+            when None do
+                return 1;
+        end case;
+    end;
+
+    -- Writes the operations of the chain from failure on, each followed by
+    -- a colon and a space, then the message of its first cause.
+    generic [R: Region, S: Region]
+    function describeInto(failure: &[Failure, R], out: &![StringBuilder, S]): Unit is
+        if length(&(failure->op)) > 0 then
+            writeString(&~out, asSpan(&(failure->op)));
+            writeString(&~out, ": ");
+        end if;
+        case &(failure->cause) of
+            when Some(value as boxed: &[Box[Failure], R]) do
+                describeInto(unboxReadRef(boxed), out);
+            when None do
+                writeString(out, asSpan(&(failure->message)));
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function describeFailure(failure: &[Failure, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        describeInto(failure, &!out);
+        return finalize(out);
+    end;
+
+    function httpStatus(kind: FailureKind): Nat16 is
+        case kind of
+            when Unclassified do
+                return 500;
+            when NotFound do
+                return 404;
+            when NoPermission do
+                return 403;
+            when Invalid do
+                return 400;
+        end case;
+    end;
+
+    function destroyFailure(failure: Failure): Unit is
+        let { op: String, kind: FailureKind, message: String, cause: Option[Box[Failure]] } := failure;
+        destroyString(op);
+        destroyString(message);
+        case cause of
+            when Some(value as boxed: Box[Failure]) do
+                destroyFailure(unbox(boxed));
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+end module body.

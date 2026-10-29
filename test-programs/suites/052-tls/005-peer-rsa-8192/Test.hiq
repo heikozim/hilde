@@ -1,0 +1,236 @@
+-- Standard.Tls and Standard.X509 with a peer whose key is larger than the
+-- largest key Standard.X509 makes, RSA of 4096 bits: the server started as
+-- a child (scripts/tls/server.py --rsa 8192) presents a certificate on RSA
+-- of 8192 bits.  The client verifies it in the handshake, sends a line and
+-- reads the answer, and Standard.X509 reads the same certificate.  Neither
+-- refuses it.  The server prints the size of the key openssl reads back.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readExactly,
+    readAll,
+    openRead,
+    closeFile
+);
+import Standard.X509 (
+    Certificate,
+    certificateFromPem,
+    subjectName,
+    dnsNamesOf,
+    destroyCertificate
+);
+import Standard.Tls (
+    Client,
+    connect,
+    send,
+    receive,
+    closeClient
+);
+
+module body Test is
+    -- A file of the tree, from HILDE_TREE.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        let tail: String := fromLiteral(rest);
+        writeString(&!out, asSpan(&tail));
+        destroyString(tail);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    function serverCommand(): Command is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/tls/server.py");
+        let option: String := fromLiteral("--rsa");
+        let bits: String := fromLiteral("8192");
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script));
+        let withBits: Command := addArgument(addArgument(command, asSpan(&option)), asSpan(&bits));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        destroyString(option);
+        destroyString(bits);
+        return withBits;
+    end;
+
+    -- Read until the answer holds a newline, or the server has closed.
+    generic [R: Region]
+    function answer(client: &![Client, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var going: Bool := true;
+        while going do
+            case receive(&~client, 1024) of
+                when Right(right as got: String) do
+                    let size: Index := length(&got);
+                    if size = 0 then
+                        going := false;
+                    else if nthByte(&got, size - 1) = 10 then
+                        going := false;
+                    end if;
+                    writeString(&!out, asSpan(&got));
+                    destroyString(got);
+                when Left(left as message: String) do
+                    printLn("receive failed");
+                    destroyString(message);
+                    going := false;
+            end case;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function talk(port: &[String, R]): Unit is
+        case connect("localhost", getSpan(port, 0, 4), "server-cert.pem") of
+            when Right(right as opened: Client) do
+                printLn("connected, the certificate verified");
+                var client: Client := opened;
+                let line: String := fromLiteral("hello over TLS\n");
+                case send(&!client, asSpan(&line)) of
+                    when Right(right as sent: Unit) do
+                        printLn("sent");
+                    when Left(left as message: String) do
+                        printLn("send failed");
+                        destroyString(message);
+                end case;
+                destroyString(line);
+                let reply: String := answer(&!client);
+                print("received: ");
+                printText(&reply);
+                destroyString(reply);
+                closeClient(client);
+            when Left(left as message: String) do
+                print("connect failed: ");
+                printText(&message);
+                printLn("");
+                destroyString(message);
+        end case;
+        return nil;
+    end;
+
+    -- The certificate the server presented, read by Standard.X509.
+    function readCertificate(): Unit is
+        case openRead("server-cert.pem") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                case readAll(&!file) of
+                    when Some(value as pem: String) do
+                        case certificateFromPem(asSpan(&pem)) of
+                            when Some(value as read: Certificate) do
+                                printLn("Standard.X509 read the certificate");
+                                print("subject: ");
+                                case subjectName(&read) of
+                                    when Some(value as name: String) do
+                                        printText(&name);
+                                        destroyString(name);
+                                    when None do
+                                        print("(none)");
+                                end case;
+                                printLn("");
+                                let names: String := dnsNamesOf(&read);
+                                print("dns names: ");
+                                printText(&names);
+                                printLn("");
+                                destroyString(names);
+                                destroyCertificate(read);
+                            when None do
+                                printLn("Standard.X509 refused the certificate");
+                        end case;
+                        destroyString(pem);
+                    when None do
+                        printLn("server-cert.pem could not be read");
+                end case;
+                let closed: Bool := closeFile(file);
+            when None do
+                printLn("server-cert.pem could not be opened");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case spawnProcess(serverCommand()) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                var out: FileDescriptor := output;
+                var err: FileDescriptor := errors;
+                case readExactly(&!out, 6) of
+                    when Some(value as port: String) do
+                        talk(&port);
+                        destroyString(port);
+                    when None do
+                        printLn("the server printed no port");
+                end case;
+                let closedInput: Bool := closeFile(input);
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        printText(&text);
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's output failed)");
+                end case;
+                case readAll(&!err) of
+                    when Some(value as text: String) do
+                        if length(&text) > 0 then
+                            printLn("-- the server's error stream:");
+                            printText(&text);
+                        end if;
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's errors failed)");
+                end case;
+                let closedOut: Bool := closeFile(out);
+                let closedErr: Bool := closeFile(err);
+                let status: ProcessStatus := waitProcess(process);
+                print("server exited normally: ");
+                print(exitedNormally(status));
+                print(", code ");
+                printLn(exitCode(status));
+                readCertificate();
+            when None do
+                printLn("the server could not be started");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

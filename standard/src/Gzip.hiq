@@ -1,0 +1,1258 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  Decoding follows the plan of Mark Adler's puff.c, the
+-- reference decoder in zlib's contrib directory: a canonical code is kept
+-- as the number of codes of each length and the symbols in code order,
+-- and a symbol is found bit by bit.  The bit reader and the bit writer
+-- hold their state in a record passed by reference; the language has no
+-- shifts, so a shift is a multiplication or a division by a power of two.
+import Standard.String (
+    String,
+    length as stringLength,
+    asSpan,
+    destroyString,
+    fromByteBuffer
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    initialize,
+    allocateEmpty,
+    destroyFree,
+    length as bufferLength,
+    nth as bufferNth,
+    lengthMut as bufferLengthMut,
+    nthMut as bufferNthMut,
+    storeNth as bufferStore,
+    insertBack,
+    getSpan as bufferSpan
+);
+
+module body Standard.Gzip is
+    constant zeroIndex: Index := 0;
+    constant oneIndex: Index := 1;
+    constant zero32: Nat32 := 0;
+    constant one32: Nat32 := 1;
+    constant two32: Nat32 := 2;
+    constant eight32: Nat32 := 8;
+    constant byteWeight: Nat32 := 128;
+    constant byteSpan: Nat32 := 256;
+    constant zeroI32: Int32 := 0;
+    constant oneI32: Int32 := 1;
+    constant minusOne: Int32 := -1;
+    constant minusTwo: Int32 := -2;
+    constant noPosition: Int64 := -1;
+    constant crcPolynomial: Nat32 := 3988292384;
+    constant allOnes: Nat32 := 4294967295;
+    constant window: Index := 32768;
+    constant hashSize: Index := 32768;
+    constant minMatch: Index := 3;
+    constant maxMatch: Index := 258;
+    constant maxChain: Index := 128;
+    constant storedMost: Index := 65535;
+    constant sizeModulus: Nat64 := 4294967296;
+    constant maxBits: Index := 15;
+    constant lowByte: Nat32 := 255;
+    constant lowWord: Nat32 := 65535;
+    -- Failures inside the module, turned into GzipFailure at the edge.
+    constant ok: Nat8 := 0;
+    constant failTruncated: Nat8 := 1;
+    constant failBad: Nat8 := 2;
+    constant failLarge: Nat8 := 3;
+
+    ---
+    --- Conversions of values the callers have checked
+    ---
+
+    -- The length modulo 4294967296, as the trailer of gzip keeps it.  It is
+    -- taken in Nat64, so that it holds where Index has 32 bits as well as
+    -- where it has 64.
+    function trailerLength(value: Index): Nat32 is
+        case toNat64(value) of
+            when Some(value as wide: Nat64) do
+                case toNat32(rem(wide, sizeModulus)) of
+                    when Some(value as narrow: Nat32) do
+                        return narrow;
+                    when None do
+                        abort("Standard.Gzip: a length modulo 4294967296 did not fit a Nat32");
+                end case;
+            when None do
+                abort("Standard.Gzip: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function natOf(value: Index): Nat32 is
+        case toNat32(value) of
+            when Some(value as narrow: Nat32) do
+                return narrow;
+            when None do
+                abort("Standard.Gzip: a checked Index did not fit a Nat32");
+        end case;
+    end;
+
+    function indexOf(value: Nat32): Index is
+        case toIndex(value) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                abort("Standard.Gzip: a Nat32 did not fit an Index");
+        end case;
+    end;
+
+    function indexOfSigned(value: Int32): Index is
+        case toIndex(value) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                abort("Standard.Gzip: a negative Int32 was used as an Index");
+        end case;
+    end;
+
+    function signedOf(value: Nat32): Int32 is
+        case toInt32(value) of
+            when Some(value as narrow: Int32) do
+                return narrow;
+            when None do
+                abort("Standard.Gzip: a checked Nat32 did not fit an Int32");
+        end case;
+    end;
+
+    function byteOf(value: Nat32): Nat8 is
+        case toNat8(value) of
+            when Some(value as narrow: Nat8) do
+                return narrow;
+            when None do
+                abort("Standard.Gzip: a checked value did not fit a byte");
+        end case;
+    end;
+
+    function wideByte(value: Nat8): Nat32 is
+        case toNat32(value) of
+            when Some(value as wide: Nat32) do
+                return wide;
+            when None do
+                abort("Standard.Gzip: a byte did not fit a Nat32");
+        end case;
+    end;
+
+    function positionOf(value: Index): Int64 is
+        case toInt64(value) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Standard.Gzip: an Index did not fit an Int64");
+        end case;
+    end;
+
+    function indexOfPosition(value: Int64): Index is
+        case toIndex(value) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                abort("Standard.Gzip: a negative position was used as an Index");
+        end case;
+    end;
+
+    -- Two to the power count, for count up to 31.
+    function powerOfTwo(count: Nat32): Nat32 is
+        var value: Nat32 := one32;
+        var i: Nat32 := zero32;
+        while i < count do
+            value := value * two32;
+            i := i + one32;
+        end while;
+        return value;
+    end;
+
+    ---
+    --- CRC-32
+    ---
+
+    function crcTable(): Buffer[Nat32] is
+        var table: Buffer[Nat32] := initialize(indexOf(byteSpan), zero32);
+        var n: Nat32 := zero32;
+        while n < byteSpan do
+            var c: Nat32 := n;
+            var k: Nat32 := zero32;
+            while k < eight32 do
+                if bitwiseAnd(c, one32) = one32 then
+                    c := bitwiseXor(crcPolynomial, c / two32);
+                else
+                    c := c / two32;
+                end if;
+                k := k + one32;
+            end while;
+            bufferStore(&!table, indexOf(n), c);
+            n := n + one32;
+        end while;
+        return table;
+    end;
+
+    -- crc carried on over count bytes of data from start, with table.
+    generic [R: Region, T: Region]
+    function crcRange(table: &[Buffer[Nat32], T], crc: Nat32, data: Span[Nat8, R], start: Index, count: Index): Nat32 is
+        var c: Nat32 := bitwiseXor(crc, allOnes);
+        var i: Index := zeroIndex;
+        while i < count do
+            let slot: Nat32 := bitwiseAnd(bitwiseXor(c, wideByte(data[start + i])), lowByte);
+            c := bitwiseXor(bufferNth(table, indexOf(slot)), c / byteSpan);
+            i := i + 1;
+        end while;
+        return bitwiseXor(c, allOnes);
+    end;
+
+    generic [R: Region]
+    function crc32(data: Span[Nat8, R]): Nat32 is
+        let table: Buffer[Nat32] := crcTable();
+        let crc: Nat32 := crcRange(&table, zero32, data, zeroIndex, spanLength(data));
+        destroyFree(table);
+        return crc;
+    end;
+
+    ---
+    --- Reading bits
+    ---
+
+    -- The next byte of the input is at, cur holds the bits of the byte
+    -- before it that are not read yet, left how many; past is set when a
+    -- read went beyond the end, and the bits read then are 0.
+    record Reader: Free is
+        at: Index;
+        cur: Nat32;
+        left: Nat32;
+        past: Bool;
+    end;
+
+    generic [R: Region, S: Region]
+    function getBit(data: Span[Nat8, S], reader: &![Reader, R]): Nat32 is
+        if reader->left = zero32 then
+            if reader->at < spanLength(data) then
+                reader->cur := wideByte(data[reader->at]);
+                reader->at := reader->at + 1;
+                reader->left := eight32;
+            else
+                reader->past := true;
+                return zero32;
+            end if;
+        end if;
+        let bit: Nat32 := bitwiseAnd(reader->cur, one32);
+        reader->cur := reader->cur / two32;
+        reader->left := reader->left - one32;
+        return bit;
+    end;
+
+    -- count bits, the first read the lowest, as RFC 1951 packs numbers.
+    generic [R: Region, S: Region]
+    function getBits(data: Span[Nat8, S], reader: &![Reader, R], count: Nat32): Nat32 is
+        var value: Nat32 := zero32;
+        var weight: Nat32 := one32;
+        var i: Nat32 := zero32;
+        while i < count do
+            value := value + (getBit(data, &~reader) * weight);
+            weight := weight * two32;
+            i := i + one32;
+        end while;
+        return value;
+    end;
+
+    ---
+    --- Canonical codes
+    ---
+
+    record Huffman: Linear is
+        counts: Buffer[Nat32];
+        symbols: Buffer[Nat32];
+    end;
+
+    -- A code and how complete it is: 0 complete, above 0 incomplete,
+    -- below 0 over-subscribed, as puff's construct answers.
+    record Built: Linear is
+        code: Huffman;
+        left: Int32;
+    end;
+
+    function destroyHuffman(code: Huffman): Unit is
+        let { counts: Buffer[Nat32], symbols: Buffer[Nat32] } := code;
+        destroyFree(counts);
+        destroyFree(symbols);
+        return nil;
+    end;
+
+    function destroyBuilt(built: Built): Unit is
+        let { code: Huffman, left: Int32 } := built;
+        destroyHuffman(code);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function builtLeft(built: &[Built, R]): Int32 is
+        return built->left;
+    end;
+
+    generic [R: Region]
+    function codeOf(built: &[Built, R]): &[Huffman, R] is
+        return &(built->code);
+    end;
+
+    -- The code whose lengths are the count entries of lengths from start.
+    generic [R: Region]
+    function construct(lengths: &[Buffer[Nat32], R], start: Index, count: Index): Built is
+        var counts: Buffer[Nat32] := initialize(maxBits + 1, zero32);
+        var symbol: Index := zeroIndex;
+        while symbol < count do
+            let slot: Index := indexOf(bufferNth(lengths, start + symbol));
+            let counted: Nat32 := bufferNthMut(&!counts, slot) + one32;
+            bufferStore(&!counts, slot, counted);
+            symbol := symbol + 1;
+        end while;
+        var left: Int32 := oneI32;
+        var size: Index := oneIndex;
+        var over: Bool := false;
+        while size <= maxBits do
+            left := left * 2;
+            left := left - signedOf(bufferNthMut(&!counts, size));
+            if left < zeroI32 then
+                over := true;
+            end if;
+            size := size + 1;
+        end while;
+        var offsets: Buffer[Nat32] := initialize(maxBits + 1, zero32);
+        size := oneIndex;
+        while size < maxBits do
+            let next: Nat32 := bufferNthMut(&!offsets, size) + bufferNthMut(&!counts, size);
+            bufferStore(&!offsets, size + 1, next);
+            size := size + 1;
+        end while;
+        var symbols: Buffer[Nat32] := initialize(count + 1, zero32);
+        if not over then
+            symbol := zeroIndex;
+            while symbol < count do
+                let length: Index := indexOf(bufferNth(lengths, start + symbol));
+                if length /= zeroIndex then
+                    let place: Index := indexOf(bufferNthMut(&!offsets, length));
+                    bufferStore(&!symbols, place, natOf(symbol));
+                    let moved: Nat32 := bufferNthMut(&!offsets, length) + one32;
+                    bufferStore(&!offsets, length, moved);
+                end if;
+                symbol := symbol + 1;
+            end while;
+        end if;
+        destroyFree(offsets);
+        if over then
+            left := minusOne;
+        end if;
+        return Built(code => Huffman(counts => counts, symbols => symbols), left => left);
+    end;
+
+    -- The next symbol of code, -1 when no code matches, -2 when the input
+    -- ended.
+    generic [R: Region, S: Region, H: Region]
+    function decode(data: Span[Nat8, S], reader: &![Reader, R], code: &[Huffman, H]): Int32 is
+        var bits: Int32 := zeroI32;
+        var first: Int32 := zeroI32;
+        var index: Int32 := zeroI32;
+        var size: Index := oneIndex;
+        while size <= maxBits do
+            bits := bits + signedOf(getBit(data, &~reader));
+            if reader->past then
+                return minusTwo;
+            end if;
+            let count: Int32 := signedOf(bufferNth(&(code->counts), size));
+            if bits < (first + count) then
+                return signedOf(bufferNth(&(code->symbols), indexOfSigned(index + (bits - first))));
+            end if;
+            index := index + count;
+            first := (first + count) * 2;
+            bits := bits * 2;
+            size := size + 1;
+        end while;
+        return minusOne;
+    end;
+
+    ---
+    --- The tables of lengths and distances
+    ---
+
+    -- The extra bits and the bases of the 29 length codes and the 30
+    -- distance codes of RFC 1951 section 3.2.5, computed from the rule
+    -- that each base is the one before plus the range of its extra bits.
+    record Tables: Linear is
+        lengthExtra: Buffer[Nat32];
+        lengthBase: Buffer[Nat32];
+        distanceExtra: Buffer[Nat32];
+        distanceBase: Buffer[Nat32];
+    end;
+
+    function makeTables(): Tables is
+        let lengthCodes: Index := 29;
+        let distanceCodes: Index := 30;
+        var lengthExtra: Buffer[Nat32] := initialize(lengthCodes, zero32);
+        var lengthBase: Buffer[Nat32] := initialize(lengthCodes, zero32);
+        var i: Index := zeroIndex;
+        let firstLength: Nat32 := 3;
+        bufferStore(&!lengthBase, zeroIndex, firstLength);
+        while i < lengthCodes do
+            if (i >= 8) and (i < 28) then
+                bufferStore(&!lengthExtra, i, natOf((i - 4) / 4));
+            end if;
+            if (i > zeroIndex) and (i < 28) then
+                let before: Nat32 := bufferNthMut(&!lengthBase, i - 1);
+                bufferStore(&!lengthBase, i, before + powerOfTwo(bufferNthMut(&!lengthExtra, i - 1)));
+            end if;
+            i := i + 1;
+        end while;
+        let longest: Nat32 := 258;
+        bufferStore(&!lengthBase, 28, longest);
+        var distanceExtra: Buffer[Nat32] := initialize(distanceCodes, zero32);
+        var distanceBase: Buffer[Nat32] := initialize(distanceCodes, zero32);
+        bufferStore(&!distanceBase, zeroIndex, one32);
+        i := zeroIndex;
+        while i < distanceCodes do
+            if i >= 4 then
+                bufferStore(&!distanceExtra, i, natOf((i - 2) / 2));
+            end if;
+            if i > zeroIndex then
+                let before: Nat32 := bufferNthMut(&!distanceBase, i - 1);
+                bufferStore(&!distanceBase, i, before + powerOfTwo(bufferNthMut(&!distanceExtra, i - 1)));
+            end if;
+            i := i + 1;
+        end while;
+        return Tables(lengthExtra => lengthExtra, lengthBase => lengthBase, distanceExtra => distanceExtra, distanceBase => distanceBase);
+    end;
+
+    function destroyTables(tables: Tables): Unit is
+        let { lengthExtra: Buffer[Nat32], lengthBase: Buffer[Nat32], distanceExtra: Buffer[Nat32], distanceBase: Buffer[Nat32] } := tables;
+        destroyFree(lengthExtra);
+        destroyFree(lengthBase);
+        destroyFree(distanceExtra);
+        destroyFree(distanceBase);
+        return nil;
+    end;
+
+    ---
+    --- Inflating
+    ---
+
+    -- One byte more of output, or false when it would pass the limit.
+    generic [R: Region]
+    function putOut(out: &![Buffer[Nat8], R], limit: Index, byte: Nat8): Bool is
+        if bufferLengthMut(&~out) >= limit then
+            return false;
+        end if;
+        insertBack(&~out, byte);
+        return true;
+    end;
+
+    -- A stored block: its length and the length's complement, then the
+    -- bytes.  The bits left of the current byte are dropped.
+    generic [R: Region, S: Region, O: Region]
+    function stored(data: Span[Nat8, S], reader: &![Reader, R], out: &![Buffer[Nat8], O], limit: Index): Nat8 is
+        reader->left := zero32;
+        let at: Index := reader->at;
+        if (at + 4) > spanLength(data) then
+            return failTruncated;
+        end if;
+        let size: Nat32 := wideByte(data[at]) + (wideByte(data[at + 1]) * byteSpan);
+        let complement: Nat32 := wideByte(data[at + 2]) + (wideByte(data[at + 3]) * byteSpan);
+        if bitwiseXor(size, complement) /= lowWord then
+            return failBad;
+        end if;
+        let count: Index := indexOf(size);
+        if ((at + 4) + count) > spanLength(data) then
+            return failTruncated;
+        end if;
+        var i: Index := zeroIndex;
+        while i < count do
+            if not putOut(&~out, limit, data[(at + 4) + i]) then
+                return failLarge;
+            end if;
+            i := i + 1;
+        end while;
+        reader->at := (at + 4) + count;
+        return ok;
+    end;
+
+    -- The symbols of a block with the codes given, up to its end.  start
+    -- is where this stream's output began: a distance may not reach
+    -- before it.
+    generic [R: Region, S: Region, O: Region, L: Region, D: Region, T: Region]
+    function codes(data: Span[Nat8, S], reader: &![Reader, R], out: &![Buffer[Nat8], O], limit: Index, start: Index, lengthCode: &[Huffman, L], distanceCode: &[Huffman, D], tables: &[Tables, T]): Nat8 is
+        let endOfBlock: Int32 := 256;
+        let firstLengthSymbol: Int32 := 257;
+        let lengthCodes: Int32 := 29;
+        let distanceCodes: Int32 := 30;
+        while true do
+            let symbol: Int32 := decode(data, &~reader, lengthCode);
+            if symbol = minusTwo then
+                return failTruncated;
+            end if;
+            if symbol < zeroI32 then
+                return failBad;
+            end if;
+            if symbol < endOfBlock then
+                if not putOut(&~out, limit, byteOf(natOf(indexOfSigned(symbol)))) then
+                    return failLarge;
+                end if;
+            else
+                if symbol = endOfBlock then
+                    return ok;
+                end if;
+                let lengthIndex: Int32 := symbol - firstLengthSymbol;
+                if lengthIndex >= lengthCodes then
+                    return failBad;
+                end if;
+                let li: Index := indexOfSigned(lengthIndex);
+                let length: Index := indexOf(bufferNth(&(tables->lengthBase), li) + getBits(data, &~reader, bufferNth(&(tables->lengthExtra), li)));
+                let distanceSymbol: Int32 := decode(data, &~reader, distanceCode);
+                if distanceSymbol = minusTwo then
+                    return failTruncated;
+                end if;
+                if (distanceSymbol < zeroI32) or (distanceSymbol >= distanceCodes) then
+                    return failBad;
+                end if;
+                let di: Index := indexOfSigned(distanceSymbol);
+                let distance: Index := indexOf(bufferNth(&(tables->distanceBase), di) + getBits(data, &~reader, bufferNth(&(tables->distanceExtra), di)));
+                if reader->past then
+                    return failTruncated;
+                end if;
+                let made: Index := bufferLengthMut(&~out);
+                if distance > (made - start) then
+                    return failBad;
+                end if;
+                var k: Index := zeroIndex;
+                while k < length do
+                    let size: Index := bufferLengthMut(&~out);
+                    let byte: Nat8 := bufferNthMut(&~out, size - distance);
+                    if not putOut(&~out, limit, byte) then
+                        return failLarge;
+                    end if;
+                    k := k + 1;
+                end while;
+            end if;
+        end while;
+        return failBad;
+    end;
+
+    -- The code lengths of the fixed codes of RFC 1951 section 3.2.6: the
+    -- 288 literal and length symbols, then the 30 distances.
+    function fixedLengths(): Buffer[Nat32] is
+        let seven: Nat32 := 7;
+        let nine: Nat32 := 9;
+        let five: Nat32 := 5;
+        let distanceStart: Index := 288;
+        var lengths: Buffer[Nat32] := initialize(318, eight32);
+        var i: Index := 144;
+        while i < 256 do
+            bufferStore(&!lengths, i, nine);
+            i := i + 1;
+        end while;
+        while i < 280 do
+            bufferStore(&!lengths, i, seven);
+            i := i + 1;
+        end while;
+        i := distanceStart;
+        while i < 318 do
+            bufferStore(&!lengths, i, five);
+            i := i + 1;
+        end while;
+        return lengths;
+    end;
+
+    generic [R: Region, S: Region, O: Region, T: Region]
+    function fixedBlock(data: Span[Nat8, S], reader: &![Reader, R], out: &![Buffer[Nat8], O], limit: Index, start: Index, tables: &[Tables, T]): Nat8 is
+        let lengths: Buffer[Nat32] := fixedLengths();
+        let literals: Built := construct(&lengths, zeroIndex, 288);
+        let distances: Built := construct(&lengths, 288, 30);
+        destroyFree(lengths);
+        let result: Nat8 := codes(data, &~reader, &~out, limit, start, codeOf(&literals), codeOf(&distances), tables);
+        destroyBuilt(literals);
+        destroyBuilt(distances);
+        return result;
+    end;
+
+    -- Whether a built code may be used: complete, or incomplete with one
+    -- code only, which RFC 1951 allows for a block of one symbol.
+    generic [R: Region]
+    function usable(built: &[Built, R], count: Index): Bool is
+        let left: Int32 := built->left;
+        if left < zeroI32 then
+            return false;
+        end if;
+        if left = zeroI32 then
+            return true;
+        end if;
+        let unused: Index := indexOf(bufferNth(&(built->code->counts), zeroIndex));
+        return (count - unused) = 1;
+    end;
+
+    -- The order the code length code's lengths come in, RFC 1951 section
+    -- 3.2.7, one letter each: A for 0, B for 1 and so on.
+    function lengthOrder(): Span[Nat8, Static] is
+        return "QRSAIHJGKFLEMDNCOBP";
+    end;
+
+    generic [R: Region, S: Region, O: Region, T: Region]
+    function dynamicBlock(data: Span[Nat8, S], reader: &![Reader, R], out: &![Buffer[Nat8], O], limit: Index, start: Index, tables: &[Tables, T]): Nat8 is
+        let five: Nat32 := 5;
+        let four: Nat32 := 4;
+        let three: Nat32 := 3;
+        let two: Nat32 := 2;
+        let seven: Nat32 := 7;
+        let literalCount: Index := indexOf(getBits(data, &~reader, five)) + 257;
+        let distanceCount: Index := indexOf(getBits(data, &~reader, five)) + 1;
+        let lengthCodeCount: Index := indexOf(getBits(data, &~reader, four)) + 4;
+        if reader->past then
+            return failTruncated;
+        end if;
+        if (literalCount > 286) or (distanceCount > 30) then
+            return failBad;
+        end if;
+        let order: Span[Nat8, Static] := lengthOrder();
+        var lengths: Buffer[Nat32] := initialize(320, zero32);
+        var i: Index := zeroIndex;
+        while i < lengthCodeCount do
+            let place: Index := indexOf(wideByte(order[i] - 'A'));
+            bufferStore(&!lengths, place, getBits(data, &~reader, three));
+            i := i + 1;
+        end while;
+        var bad: Nat8 := ok;
+        if reader->past then
+            bad := failTruncated;
+        end if;
+        -- The lengths of both codes, read with the code length code.
+        let total: Index := literalCount + distanceCount;
+        if bad = ok then
+            let lengthLengths: Built := construct(&lengths, zeroIndex, 19);
+            if builtLeft(&lengthLengths) /= zeroI32 then
+                bad := failBad;
+            end if;
+            var filled: Index := zeroIndex;
+            while (filled < total) and (bad = ok) do
+                let symbol: Int32 := decode(data, &~reader, codeOf(&lengthLengths));
+                if symbol = minusTwo then
+                    bad := failTruncated;
+                else
+                    if symbol < zeroI32 then
+                        bad := failBad;
+                    else
+                        if symbol < 16 then
+                            bufferStore(&!lengths, filled, natOf(indexOfSigned(symbol)));
+                            filled := filled + 1;
+                        else
+                            var value: Nat32 := zero32;
+                            var repeat: Index := zeroIndex;
+                            if symbol = 16 then
+                                if filled = zeroIndex then
+                                    bad := failBad;
+                                else
+                                    value := bufferNthMut(&!lengths, filled - 1);
+                                    repeat := indexOf(getBits(data, &~reader, two)) + 3;
+                                end if;
+                            else
+                                if symbol = 17 then
+                                    repeat := indexOf(getBits(data, &~reader, three)) + 3;
+                                else
+                                    repeat := indexOf(getBits(data, &~reader, seven)) + 11;
+                                end if;
+                            end if;
+                            if (bad = ok) and ((filled + repeat) > total) then
+                                bad := failBad;
+                            end if;
+                            while (bad = ok) and (repeat > zeroIndex) do
+                                bufferStore(&!lengths, filled, value);
+                                filled := filled + 1;
+                                repeat := repeat - 1;
+                            end while;
+                        end if;
+                    end if;
+                end if;
+            end while;
+            destroyBuilt(lengthLengths);
+        end if;
+        if (bad = ok) and reader->past then
+            bad := failTruncated;
+        end if;
+        if (bad = ok) and (bufferNthMut(&!lengths, 256) = zero32) then
+            -- No code for the end of the block.
+            bad := failBad;
+        end if;
+        var result: Nat8 := bad;
+        if bad = ok then
+            let literals: Built := construct(&lengths, zeroIndex, literalCount);
+            let distances: Built := construct(&lengths, literalCount, distanceCount);
+            if usable(&literals, literalCount) and usable(&distances, distanceCount) then
+                result := codes(data, &~reader, &~out, limit, start, codeOf(&literals), codeOf(&distances), tables);
+            else
+                result := failBad;
+            end if;
+            destroyBuilt(literals);
+            destroyBuilt(distances);
+        end if;
+        destroyFree(lengths);
+        return result;
+    end;
+
+    -- One whole DEFLATE stream from reader's place, into out.
+    generic [R: Region, S: Region, O: Region]
+    function inflateStream(data: Span[Nat8, S], reader: &![Reader, R], out: &![Buffer[Nat8], O], limit: Index): Nat8 is
+        let tables: Tables := makeTables();
+        let start: Index := bufferLengthMut(&~out);
+        let two: Nat32 := 2;
+        var result: Nat8 := ok;
+        var last: Bool := false;
+        while (result = ok) and (not last) do
+            last := (getBit(data, &~reader) = one32);
+            let kind: Nat32 := getBits(data, &~reader, two);
+            if reader->past then
+                result := failTruncated;
+            else
+                if kind = zero32 then
+                    result := stored(data, &~reader, &~out, limit);
+                else
+                    if kind = one32 then
+                        result := fixedBlock(data, &~reader, &~out, limit, start, &tables);
+                    else
+                        if kind = two then
+                            result := dynamicBlock(data, &~reader, &~out, limit, start, &tables);
+                        else
+                            result := failBad;
+                        end if;
+                    end if;
+                end if;
+            end if;
+        end while;
+        destroyTables(tables);
+        return result;
+    end;
+
+    function failureOf(code: Nat8): GzipFailure is
+        if code = failTruncated then
+            return Truncated();
+        end if;
+        if code = failLarge then
+            return TooLarge();
+        end if;
+        return BadData();
+    end;
+
+    function refused(failure: GzipFailure): Either[GzipFailure, String] is
+        let answer: Either[GzipFailure, String] := Left(left => failure);
+        return answer;
+    end;
+
+    generic [R: Region]
+    function inflateRaw(data: Span[Nat8, R], limit: Index): Either[GzipFailure, String] is
+        var reader: Reader := Reader(at => zeroIndex, cur => zero32, left => zero32, past => false);
+        var out: Buffer[Nat8] := allocateEmpty();
+        let result: Nat8 := inflateStream(data, &!reader, &!out, limit);
+        if result /= ok then
+            destroyFree(out);
+            return refused(failureOf(result));
+        else
+            if reader.at /= spanLength(data) then
+                destroyFree(out);
+                return refused(TrailingData());
+            else
+                let text: String := fromByteBuffer(out);
+                return Right(right => text);
+            end if;
+        end if;
+    end;
+
+    ---
+    --- The gzip member
+    ---
+
+    -- The Nat32 of four bytes of data from at, the lowest first.
+    generic [R: Region]
+    function readWord(data: Span[Nat8, R], at: Index): Nat32 is
+        let b0: Nat32 := wideByte(data[at]);
+        let b1: Nat32 := wideByte(data[at + 1]) * byteSpan;
+        let b2: Nat32 := (wideByte(data[at + 2]) * byteSpan) * byteSpan;
+        let b3: Nat32 := ((wideByte(data[at + 3]) * byteSpan) * byteSpan) * byteSpan;
+        return ((b0 + b1) + b2) + b3;
+    end;
+
+    -- The place after a zero-terminated field from at, or the length of
+    -- data when there is no zero byte.
+    generic [R: Region]
+    function afterZero(data: Span[Nat8, R], at: Index): Index is
+        let size: Index := spanLength(data);
+        var i: Index := at;
+        while i < size do
+            if data[i] = 0 then
+                return i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return size;
+    end;
+
+    -- The header of a member from at: where its DEFLATE stream begins, or
+    -- a failure.  ok in the first field means the second holds the place.
+    record Header: Free is
+        failure: Nat8;
+        place: Index;
+        notGzip: Bool;
+        checksum: Bool;
+    end;
+
+    generic [R: Region, T: Region]
+    function readHeader(data: Span[Nat8, R], at: Index, table: &[Buffer[Nat32], T]): Header is
+        let size: Index := spanLength(data);
+        let reservedFlags: Nat8 := 224;
+        let flagCrc: Nat8 := 2;
+        let flagExtra: Nat8 := 4;
+        let flagName: Nat8 := 8;
+        let flagComment: Nat8 := 16;
+        -- Each byte is looked at only once the length has been checked.
+        if (at + 2) > size then
+            return Header(failure => failBad, place => at, notGzip => true, checksum => false);
+        end if;
+        if (data[at] /= 31) or (data[at + 1] /= 139) then
+            return Header(failure => failBad, place => at, notGzip => true, checksum => false);
+        end if;
+        if (at + 10) > size then
+            return Header(failure => failTruncated, place => at, notGzip => false, checksum => false);
+        end if;
+        let flags: Nat8 := data[at + 3];
+        if (data[at + 2] /= 8) or (bitwiseAnd(flags, reservedFlags) /= 0) then
+            return Header(failure => failBad, place => at, notGzip => true, checksum => false);
+        end if;
+        var place: Index := at + 10;
+        if bitwiseAnd(flags, flagExtra) /= 0 then
+            if (place + 2) > size then
+                return Header(failure => failTruncated, place => at, notGzip => false, checksum => false);
+            end if;
+            let extra: Index := indexOf(wideByte(data[place]) + (wideByte(data[place + 1]) * byteSpan));
+            place := (place + 2) + extra;
+        end if;
+        if bitwiseAnd(flags, flagName) /= 0 then
+            place := afterZero(data, place);
+        end if;
+        if bitwiseAnd(flags, flagComment) /= 0 then
+            place := afterZero(data, place);
+        end if;
+        if bitwiseAnd(flags, flagCrc) /= 0 then
+            if (place + 2) > size then
+                return Header(failure => failTruncated, place => at, notGzip => false, checksum => false);
+            end if;
+            let stated: Nat32 := wideByte(data[place]) + (wideByte(data[place + 1]) * byteSpan);
+            let computed: Nat32 := bitwiseAnd(crcRange(table, zero32, data, at, place - at), lowWord);
+            if stated /= computed then
+                return Header(failure => failBad, place => at, notGzip => false, checksum => true);
+            end if;
+            place := place + 2;
+        end if;
+        if place > size then
+            return Header(failure => failTruncated, place => at, notGzip => false, checksum => false);
+        end if;
+        return Header(failure => ok, place => place, notGzip => false, checksum => false);
+    end;
+
+    -- The CRC-32 of the bytes of out from start up to, not including,
+    -- final.
+    generic [O: Region, T: Region]
+    function crcOfBuffer(table: &[Buffer[Nat32], T], out: &[Buffer[Nat8], O], start: Index, final: Index): Nat32 is
+        var c: Nat32 := allOnes;
+        var i: Index := start;
+        while i < final do
+            let slot: Nat32 := bitwiseAnd(bitwiseXor(c, wideByte(bufferNth(out, i))), lowByte);
+            c := bitwiseXor(bufferNth(table, indexOf(slot)), c / byteSpan);
+            i := i + 1;
+        end while;
+        return bitwiseXor(c, allOnes);
+    end;
+
+    generic [R: Region]
+    function gunzip(data: Span[Nat8, R], limit: Index): Either[GzipFailure, String] is
+        let size: Index := spanLength(data);
+        let table: Buffer[Nat32] := crcTable();
+        var out: Buffer[Nat8] := allocateEmpty();
+        var at: Index := zeroIndex;
+        var members: Index := zeroIndex;
+        var failure: Option[GzipFailure] := None();
+        while (at < size) or (members = zeroIndex) do
+            let header: Header := readHeader(data, at, &table);
+            if header.failure /= ok then
+                if header.notGzip then
+                    if members = zeroIndex then
+                        failure := Some(value => NotGzip());
+                    else
+                        failure := Some(value => TrailingData());
+                    end if;
+                else
+                    if header.checksum then
+                        failure := Some(value => BadChecksum());
+                    else
+                        failure := Some(value => failureOf(header.failure));
+                    end if;
+                end if;
+                at := size;
+                members := members + 1;
+            else
+                let start: Index := bufferLengthMut(&!out);
+                var reader: Reader := Reader(at => header.place, cur => zero32, left => zero32, past => false);
+                let result: Nat8 := inflateStream(data, &!reader, &!out, limit);
+                if result /= ok then
+                    failure := Some(value => failureOf(result));
+                    at := size;
+                else
+                    let trailer: Index := reader.at;
+                    if (trailer + 8) > size then
+                        failure := Some(value => Truncated());
+                        at := size;
+                    else
+                        let made: Index := bufferLengthMut(&!out);
+                        var crc: Nat32 := zero32;
+                        if made > start then
+                            crc := crcOfBuffer(&table, &out, start, made);
+                        end if;
+                        let length: Nat32 := trailerLength(made - start);
+                        if (crc /= readWord(data, trailer)) or (length /= readWord(data, trailer + 4)) then
+                            failure := Some(value => BadChecksum());
+                            at := size;
+                        else
+                            at := trailer + 8;
+                        end if;
+                    end if;
+                end if;
+                members := members + 1;
+            end if;
+        end while;
+        destroyFree(table);
+        case failure of
+            when Some(value as failed: GzipFailure) do
+                destroyFree(out);
+                return refused(failed);
+            when None do
+                let text: String := fromByteBuffer(out);
+                return Right(right => text);
+        end case;
+    end;
+
+    ---
+    --- Writing bits
+    ---
+
+    record Writer: Linear is
+        out: StringBuilder;
+        cur: Nat32;
+        weight: Nat32;
+    end;
+
+    function makeWriter(): Writer is
+        return Writer(out => makeStringBuilder(), cur => zero32, weight => one32);
+    end;
+
+    generic [R: Region]
+    function emitByte(writer: &![Writer, R], byte: Nat8): Unit is
+        writeByte(&!(writer->out), byte);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function putBit(writer: &![Writer, R], bit: Nat32): Unit is
+        writer->cur := writer->cur + (bit * writer->weight);
+        if writer->weight = byteWeight then
+            let full: Nat8 := byteOf(writer->cur);
+            writer->cur := zero32;
+            writer->weight := one32;
+            emitByte(&~writer, full);
+        else
+            writer->weight := writer->weight * two32;
+        end if;
+        return nil;
+    end;
+
+    -- count bits of value, the lowest first.
+    generic [R: Region]
+    function putBits(writer: &![Writer, R], value: Nat32, count: Nat32): Unit is
+        var rest: Nat32 := value;
+        var i: Nat32 := zero32;
+        while i < count do
+            putBit(&~writer, rem(rest, two32));
+            rest := rest / two32;
+            i := i + one32;
+        end while;
+        return nil;
+    end;
+
+    -- A code of length bits, the highest first, as Huffman codes go.
+    generic [R: Region]
+    function putCode(writer: &![Writer, R], code: Nat32, length: Nat32): Unit is
+        var mask: Nat32 := powerOfTwo(length - one32);
+        while mask > zero32 do
+            putBit(&~writer, rem(code / mask, two32));
+            mask := mask / two32;
+        end while;
+        return nil;
+    end;
+
+    -- The partial byte written out, padded with zero bits.
+    generic [R: Region]
+    function align(writer: &![Writer, R]): Unit is
+        if writer->weight /= one32 then
+            let full: Nat8 := byteOf(writer->cur);
+            writer->cur := zero32;
+            writer->weight := one32;
+            emitByte(&~writer, full);
+        end if;
+        return nil;
+    end;
+
+    function finishWriter(writer: Writer): String is
+        var open: Writer := writer;
+        align(&!open);
+        let { out: StringBuilder, cur: Nat32, weight: Nat32 } := open;
+        return finalize(out);
+    end;
+
+    -- A literal or length symbol in the fixed code.
+    generic [R: Region]
+    function putSymbol(writer: &![Writer, R], symbol: Nat32): Unit is
+        if symbol <= 143 then
+            putCode(writer, symbol + 48, eight32);
+        else
+            if symbol <= 255 then
+                putCode(writer, (symbol - 144) + 400, 9);
+            else
+                if symbol <= 279 then
+                    putCode(writer, symbol - 256, 7);
+                else
+                    putCode(writer, (symbol - 280) + 192, eight32);
+                end if;
+            end if;
+        end if;
+        return nil;
+    end;
+
+    -- The largest index of bases whose value is not above value.
+    generic [R: Region]
+    function codeFor(bases: &[Buffer[Nat32], R], value: Nat32): Index is
+        var i: Index := bufferLength(bases);
+        while i > zeroIndex do
+            i := i - 1;
+            if bufferNth(bases, i) <= value then
+                return i;
+            end if;
+        end while;
+        return zeroIndex;
+    end;
+
+    generic [R: Region, T: Region]
+    function putMatch(writer: &![Writer, R], tables: &[Tables, T], length: Index, distance: Index): Unit is
+        let five: Nat32 := 5;
+        let lengthValue: Nat32 := natOf(length);
+        let li: Index := codeFor(&(tables->lengthBase), lengthValue);
+        putSymbol(&~writer, natOf(li) + 257);
+        putBits(&~writer, lengthValue - bufferNth(&(tables->lengthBase), li), bufferNth(&(tables->lengthExtra), li));
+        let distanceValue: Nat32 := natOf(distance);
+        let di: Index := codeFor(&(tables->distanceBase), distanceValue);
+        putCode(&~writer, natOf(di), five);
+        putBits(&~writer, distanceValue - bufferNth(&(tables->distanceBase), di), bufferNth(&(tables->distanceExtra), di));
+        return nil;
+    end;
+
+    ---
+    --- Deflating
+    ---
+
+    generic [R: Region]
+    function hashAt(data: Span[Nat8, R], at: Index): Index is
+        let a: Index := indexOf(wideByte(data[at]));
+        let b: Index := indexOf(wideByte(data[at + 1]));
+        let c: Index := indexOf(wideByte(data[at + 2]));
+        return rem(((a * 1024) + (b * 32)) + c, hashSize);
+    end;
+
+    -- How many bytes from candidate equal those from at, at most 258 and
+    -- never past the end.
+    generic [R: Region]
+    function matchLength(data: Span[Nat8, R], candidate: Index, at: Index): Index is
+        let size: Index := spanLength(data);
+        var most: Index := maxMatch;
+        if (size - at) < most then
+            most := size - at;
+        end if;
+        var n: Index := zeroIndex;
+        var going: Bool := true;
+        while going and (n < most) do
+            -- Indexed only below most, whichever way the condition above
+            -- is evaluated.
+            if data[candidate + n] = data[at + n] then
+                n := n + 1;
+            else
+                going := false;
+            end if;
+        end while;
+        return n;
+    end;
+
+    -- Puts at into the chains of its hash.
+    generic [R: Region, H: Region, P: Region]
+    function insertAt(data: Span[Nat8, R], at: Index, head: &![Buffer[Int64], H], previous: &![Buffer[Int64], P]): Unit is
+        if (at + 2) < spanLength(data) then
+            let hash: Index := hashAt(data, at);
+            bufferStore(&~previous, rem(at, window), bufferNthMut(&~head, hash));
+            bufferStore(&~head, hash, positionOf(at));
+        end if;
+        return nil;
+    end;
+
+    -- data as one final block of the fixed code, matches found through
+    -- the hash chains over the window of 32 KiB, greedy.
+    generic [R: Region]
+    function fixedStream(data: Span[Nat8, R]): String is
+        let tables: Tables := makeTables();
+        var writer: Writer := makeWriter();
+        var head: Buffer[Int64] := initialize(hashSize, noPosition);
+        var previous: Buffer[Int64] := initialize(window, noPosition);
+        let size: Index := spanLength(data);
+        let two: Nat32 := 2;
+        putBits(&!writer, one32, one32);
+        putBits(&!writer, one32, two);
+        var at: Index := zeroIndex;
+        while at < size do
+            var bestLength: Index := zeroIndex;
+            var bestDistance: Index := zeroIndex;
+            if (at + 2) < size then
+                var candidate: Int64 := bufferNthMut(&!head, hashAt(data, at));
+                var chain: Index := zeroIndex;
+                let here: Int64 := positionOf(at);
+                let reach: Int64 := positionOf(window);
+                while ((candidate >= 0) and ((here - candidate) <= reach)) and (chain < maxChain) do
+                    let from0: Index := indexOfPosition(candidate);
+                    let length: Index := matchLength(data, from0, at);
+                    if length > bestLength then
+                        bestLength := length;
+                        bestDistance := at - from0;
+                    end if;
+                    if bestLength = maxMatch then
+                        chain := maxChain;
+                    else
+                        candidate := bufferNthMut(&!previous, rem(from0, window));
+                        chain := chain + 1;
+                    end if;
+                end while;
+            end if;
+            if bestLength >= minMatch then
+                putMatch(&!writer, &tables, bestLength, bestDistance);
+                var k: Index := zeroIndex;
+                while k < bestLength do
+                    insertAt(data, at + k, &!head, &!previous);
+                    k := k + 1;
+                end while;
+                at := at + bestLength;
+            else
+                putSymbol(&!writer, wideByte(data[at]));
+                insertAt(data, at, &!head, &!previous);
+                at := at + 1;
+            end if;
+        end while;
+        let endOfBlock: Nat32 := 256;
+        putSymbol(&!writer, endOfBlock);
+        destroyFree(head);
+        destroyFree(previous);
+        destroyTables(tables);
+        return finishWriter(writer);
+    end;
+
+    -- data as stored blocks of at most 65535 bytes.
+    generic [R: Region]
+    function storedStream(data: Span[Nat8, R]): String is
+        var writer: Writer := makeWriter();
+        let size: Index := spanLength(data);
+        var at: Index := zeroIndex;
+        var first: Bool := true;
+        while first or (at < size) do
+            first := false;
+            var count: Index := size - at;
+            if count > storedMost then
+                count := storedMost;
+            end if;
+            var final: Nat32 := zero32;
+            if (at + count) = size then
+                final := one32;
+            end if;
+            putBits(&!writer, final, one32);
+            putBits(&!writer, zero32, 2);
+            align(&!writer);
+            let length: Nat32 := natOf(count);
+            let complement: Nat32 := bitwiseXor(length, lowWord);
+            emitByte(&!writer, byteOf(rem(length, byteSpan)));
+            emitByte(&!writer, byteOf(length / byteSpan));
+            emitByte(&!writer, byteOf(rem(complement, byteSpan)));
+            emitByte(&!writer, byteOf(complement / byteSpan));
+            var i: Index := zeroIndex;
+            while i < count do
+                emitByte(&!writer, data[at + i]);
+                i := i + 1;
+            end while;
+            at := at + count;
+        end while;
+        return finishWriter(writer);
+    end;
+
+    generic [R: Region]
+    function deflateRaw(data: Span[Nat8, R]): String is
+        let coded: String := fixedStream(data);
+        let size: Index := spanLength(data);
+        var blocks: Index := (size + (storedMost - 1)) / storedMost;
+        if blocks = zeroIndex then
+            blocks := oneIndex;
+        end if;
+        if stringLength(&coded) <= (size + (blocks * 5)) then
+            return coded;
+        else
+            destroyString(coded);
+            return storedStream(data);
+        end if;
+    end;
+
+    generic [R: Region]
+    function putWord(out: &![StringBuilder, R], value: Nat32): Unit is
+        var rest: Nat32 := value;
+        var i: Index := zeroIndex;
+        while i < 4 do
+            writeByte(&~out, byteOf(rem(rest, byteSpan)));
+            rest := rest / byteSpan;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function gzip(data: Span[Nat8, R]): String is
+        let packed: String := deflateRaw(data);
+        var out: StringBuilder := makeStringBuilder();
+        -- The magic 31 139, DEFLATE 8, no flags, the time 0, no extra
+        -- flags, and 255 for an operating system not named.
+        writeByte(&!out, 31);
+        writeByte(&!out, 139);
+        writeByte(&!out, 8);
+        var i: Index := zeroIndex;
+        while i < 6 do
+            writeByte(&!out, 0);
+            i := i + 1;
+        end while;
+        writeByte(&!out, 255);
+        writeString(&!out, asSpan(&packed));
+        destroyString(packed);
+        putWord(&!out, crc32(data));
+        putWord(&!out, trailerLength(spanLength(data)));
+        return finalize(out);
+    end;
+end module body.

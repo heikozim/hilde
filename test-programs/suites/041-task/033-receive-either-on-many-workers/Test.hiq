@@ -1,0 +1,132 @@
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    Sender,
+    Receiver,
+    Channel,
+    openChannel,
+    send,
+    closeSender,
+    closeReceiver,
+    Selected,
+    receiveEither
+);
+
+module body Test is
+    -- Send 1 to 2000, then close.
+    function produce(sender: Sender[Int64]): Unit is
+        var out: Sender[Int64] := sender;
+        let last: Int64 := 2000;
+        var k: Int64 := 1;
+        while k <= last do
+            case send(&!out, k) of
+                when Some(value as back: Int64) do
+                    printLn(-back);
+                when None do
+                    skip;
+            end case;
+            k := k + 1;
+        end while;
+        closeSender(out);
+        return nil;
+    end;
+
+    -- The consumer: both channels until both are closed, the sum of each.
+    record Pair: Linear is
+        first: Receiver[Int64];
+        second: Receiver[Int64];
+    end;
+
+    function consume(pair: Pair): Int64 is
+        let { first as r1: Receiver[Int64], second as r2: Receiver[Int64] } := pair;
+        var a: Receiver[Int64] := r1;
+        var b: Receiver[Int64] := r2;
+        var sumA: Int64 := 0;
+        var sumB: Int64 := 0;
+        var more: Bool := true;
+        while more do
+            case receiveEither(&!a, &!b) of
+                when FromFirst(value as v: Int64) do
+                    sumA := sumA + v;
+                when FromSecond(value as v: Int64) do
+                    sumB := sumB + v;
+                when AllClosed do
+                    more := false;
+            end case;
+        end while;
+        closeReceiver(a);
+        closeReceiver(b);
+        let million: Int64 := 1000000;
+        return (sumA * million) + sumB;
+    end;
+
+    -- One round: two producers and a consumer, three tasks, on channels of
+    -- the given capacity; prints the consumer's two sums as one number.
+    generic [R: Region]
+    function round(scope: &![Scope, R], capacity: Index): Unit is
+        let made1: Option[Channel[Int64]] := openChannel(capacity);
+        case made1 of
+            when Some(value as c1: Channel[Int64]) do
+                let made2: Option[Channel[Int64]] := openChannel(capacity);
+                case made2 of
+                    when Some(value as c2: Channel[Int64]) do
+                        let { sender as s1: Sender[Int64], receiver as r1: Receiver[Int64] } := c1;
+                        let { sender as s2: Sender[Int64], receiver as r2: Receiver[Int64] } := c2;
+                        let work: Fn[Sender[Int64], Unit] := produce;
+                        let eat: Fn[Pair, Int64] := consume;
+                        case spawn(&~scope, eat, Pair(first => r1, second => r2)) of
+                            when Right(right as consumer: Task[Int64]) do
+                                case spawn(&~scope, work, s1) of
+                                    when Right(right as p1: Task[Unit]) do
+                                        join(p1);
+                                    when Left(left as unused: Sender[Int64]) do
+                                        closeSender(unused);
+                                        printLn(-2);
+                                end case;
+                                case spawn(&~scope, work, s2) of
+                                    when Right(right as p2: Task[Unit]) do
+                                        join(p2);
+                                    when Left(left as unused: Sender[Int64]) do
+                                        closeSender(unused);
+                                        printLn(-2);
+                                end case;
+                                printLn(join(consumer));
+                            when Left(left as unused: Pair) do
+                                let { first as u1: Receiver[Int64], second as u2: Receiver[Int64] } := unused;
+                                closeSender(s1);
+                                closeSender(s2);
+                                closeReceiver(u1);
+                                closeReceiver(u2);
+                                printLn(-2);
+                        end case;
+                    when None do
+                        let { sender as s1: Sender[Int64], receiver as r1: Receiver[Int64] } := c1;
+                        closeSender(s1);
+                        closeReceiver(r1);
+                        printLn(-1);
+                end case;
+            when None do
+                printLn(-1);
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                round(&!scope, 0);
+                round(&!scope, 1);
+                round(&!scope, 3);
+                round(&!scope, 64);
+                closeScope(scope);
+            when None do
+                printLn(-2);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

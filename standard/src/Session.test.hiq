@@ -1,0 +1,317 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    removeFile
+);
+import Standard.SqlCipher (
+    makeKey
+);
+import Standard.Database (
+    Database,
+    Writing,
+    DbError,
+    Cursor,
+    closeDatabase,
+    start,
+    advance,
+    columnInt64,
+    noValues,
+    withText,
+    finish
+);
+import Standard.Database.Sqlite (
+    openSqlite,
+    openSqlCipher
+);
+import Standard.Session (
+    SessionLimits,
+    SessionError,
+    defaultSessionLimits,
+    prepareSessions,
+    isSessionToken,
+    createSession,
+    loadSession,
+    saveSession,
+    rotateSession,
+    destroySession,
+    purgeSessions
+);
+
+module body Standard.Session.Test is
+    generic [R: Region]
+    function same(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let size: Index := length(text);
+        if size /= spanLength(expected) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(text, i) /= expected[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function removeDatabase(name: Span[Nat8, Static]): Unit is
+        let path: String := fromLiteral(name);
+        let removed: Bool := removeFile(asSpan(&path));
+        destroyString(path);
+        return nil;
+    end;
+
+    -- A fresh database with the table, or an abort.
+    function fresh(name: Span[Nat8, Static]): Database[Writing] is
+        removeDatabase(name);
+        case openSqlite(name) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case prepareSessions(&!db) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as error: SessionError) do
+                        assertFailure("prepareSessions failed");
+                end case;
+                return db;
+            when Left(left as error: DbError) do
+                abort("the test database could not be opened");
+        end case;
+    end;
+
+    function closeAndRemove(db: Database[Writing], name: Span[Nat8, Static]): Unit is
+        closeDatabase(db);
+        removeDatabase(name);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function create(db: &![Database[Writing], R], data: Span[Nat8, Static], now: Int64): String is
+        case createSession(&~db, data, now) of
+            when Right(right as token: String) do
+                return token;
+            when Left(left as error: SessionError) do
+                abort("createSession failed");
+        end case;
+    end;
+
+    -- loadSession of token at now holds expected, or nothing when expected
+    -- is None.
+    generic [R: Region, T: Region]
+    function loads(db: &![Database[Writing], R], token: &[String, T], now: Int64, expected: Option[Span[Nat8, Static]], message: Span[Nat8, Static]): Unit is
+        case loadSession(&~db, asSpan(token), defaultSessionLimits(), now) of
+            when Right(right as found: Option[String]) do
+                case found of
+                    when Some(value as data: String) do
+                        case expected of
+                            when Some(value as wanted: Span[Nat8, Static]) do
+                                assertTrue(same(&data, wanted), message);
+                            when None do
+                                assertFailure(message);
+                        end case;
+                        destroyString(data);
+                    when None do
+                        case expected of
+                            when Some(value as wanted: Span[Nat8, Static]) do
+                                assertFailure(message);
+                            when None do
+                                assertSuccess(message);
+                        end case;
+                end case;
+            when Left(left as error: SessionError) do
+                assertFailure(message);
+        end case;
+        return nil;
+    end;
+
+    function absent(): Option[Span[Nat8, Static]] is
+        let none: Option[Span[Nat8, Static]] := None();
+        return none;
+    end;
+
+    function testTokenForm(): Unit is
+        assertTrue(isSessionToken("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"), "64 hexadecimal digits");
+        assertFalse(isSessionToken("0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"), "capitals");
+        assertFalse(isSessionToken("0123456789abcdef"), "too short");
+        assertFalse(isSessionToken("' OR 1=1 --"), "anything else");
+        return nil;
+    end;
+
+    -- A session is made, loaded, changed, and the database holds no token.
+    function testCreateAndLoad(): Unit is
+        var db: Database[Writing] := fresh("session-a.db");
+        let token: String := create(&!db, "user=7", 1000);
+        assertTrue(isSessionToken(asSpan(&token)), "the token has its form");
+        loads(&!db, &token, 1001, Some(value => "user=7"), "loaded");
+        case saveSession(&!db, asSpan(&token), "user=7;theme=dark", 1002) of
+            when Right(right as saved: Bool) do
+                assertTrue(saved, "saved");
+            when Left(left as error: SessionError) do
+                assertFailure("save failed");
+        end case;
+        loads(&!db, &token, 1003, Some(value => "user=7;theme=dark"), "the new data");
+        -- No row is keyed by the token itself.
+        var cursor: Cursor := start(&!db, "SELECT count(*) FROM hilde_sessions WHERE digest = ?", withText(noValues(), asSpan(&token)));
+        assertTrue(advance(&!cursor), "a count");
+        assertTrue(columnInt64(&cursor, 0) = 0, "the token is not stored");
+        case finish(&!db, cursor) of
+            when Some(value as error: DbError) do
+                assertFailure("the count failed");
+            when None do
+                skip;
+        end case;
+        let other: String := create(&!db, "user=8", 1000);
+        assertFalse(same(&other, ""), "a second token");
+        loads(&!db, &other, 1001, Some(value => "user=8"), "the second session is its own");
+        destroyString(other);
+        destroyString(token);
+        closeAndRemove(db, "session-a.db");
+        return nil;
+    end;
+
+    -- 1800 seconds idle is the limit: one more ends the session.
+    function testIdleLimit(): Unit is
+        var db: Database[Writing] := fresh("session-b.db");
+        let token: String := create(&!db, "x", 0);
+        loads(&!db, &token, 1800, Some(value => "x"), "at the limit");
+        loads(&!db, &token, 3601, absent(), "one second over the limit since the last use");
+        loads(&!db, &token, 3602, absent(), "gone for good");
+        destroyString(token);
+        closeAndRemove(db, "session-b.db");
+        return nil;
+    end;
+
+    -- 43200 seconds in all, however often it is used.
+    function testAbsoluteLimit(): Unit is
+        var db: Database[Writing] := fresh("session-c.db");
+        let token: String := create(&!db, "x", 0);
+        var now: Int64 := 1000;
+        while now <= 43200 do
+            loads(&!db, &token, now, Some(value => "x"), "used within the idle limit");
+            now := now + 1000;
+        end while;
+        loads(&!db, &token, 43201, absent(), "over the absolute limit");
+        destroyString(token);
+        closeAndRemove(db, "session-c.db");
+        return nil;
+    end;
+
+    -- After a rotation the old token opens nothing and the new one the
+    -- same data.
+    function testRotate(): Unit is
+        var db: Database[Writing] := fresh("session-d.db");
+        let token: String := create(&!db, "cart=3", 10);
+        case rotateSession(&!db, asSpan(&token), defaultSessionLimits(), 20) of
+            when Right(right as rotated: Option[String]) do
+                case rotated of
+                    when Some(value as renewed: String) do
+                        assertFalse(same(&renewed, ""), "a new token");
+                        loads(&!db, &renewed, 30, Some(value => "cart=3"), "the data moved");
+                        loads(&!db, &token, 30, absent(), "the old token opens nothing");
+                        destroyString(renewed);
+                    when None do
+                        assertFailure("nothing rotated");
+                end case;
+            when Left(left as error: SessionError) do
+                assertFailure("rotate failed");
+        end case;
+        destroyString(token);
+        closeAndRemove(db, "session-d.db");
+        return nil;
+    end;
+
+    -- The logout removes the row.
+    function testDestroy(): Unit is
+        var db: Database[Writing] := fresh("session-e.db");
+        let token: String := create(&!db, "x", 10);
+        case destroySession(&!db, asSpan(&token)) of
+            when Right(right as done: Unit) do
+                skip;
+            when Left(left as error: SessionError) do
+                assertFailure("destroy failed");
+        end case;
+        loads(&!db, &token, 11, absent(), "logged out");
+        case destroySession(&!db, "not a token") of
+            when Right(right as done: Unit) do
+                assertSuccess("a token that opens nothing is no failure");
+            when Left(left as error: SessionError) do
+                assertFailure("destroy of nothing failed");
+        end case;
+        destroyString(token);
+        closeAndRemove(db, "session-e.db");
+        return nil;
+    end;
+
+    -- Two sessions, one idle too long: purge removes that one.
+    function testPurge(): Unit is
+        var db: Database[Writing] := fresh("session-f.db");
+        let old: String := create(&!db, "old", 0);
+        let young: String := create(&!db, "young", 2000);
+        case purgeSessions(&!db, defaultSessionLimits(), 3000) of
+            when Right(right as removed: Nat64) do
+                assertTrue(removed = 1, "one removed");
+            when Left(left as error: SessionError) do
+                assertFailure("purge failed");
+        end case;
+        loads(&!db, &young, 3001, Some(value => "young"), "the young one stays");
+        destroyString(old);
+        destroyString(young);
+        closeAndRemove(db, "session-f.db");
+        return nil;
+    end;
+
+    function testBadTime(): Unit is
+        var db: Database[Writing] := fresh("session-g.db");
+        case createSession(&!db, "x", -1) of
+            when Right(right as token: String) do
+                destroyString(token);
+                assertFailure("a time below 0 was taken");
+            when Left(left as error: SessionError) do
+                assertSuccess("a time below 0 is refused");
+        end case;
+        closeAndRemove(db, "session-g.db");
+        return nil;
+    end;
+
+    -- The same sessions in an encrypted database, in one programme with
+    -- Standard.Database on SQLCipher.
+    function testSqlCipher(): Unit is
+        removeDatabase("session-cipher.db");
+        case openSqlCipher("session-cipher.db", makeKey("session test key")) of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case prepareSessions(&!db) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as error: SessionError) do
+                        assertFailure("prepareSessions on SQLCipher");
+                end case;
+                let token: String := create(&!db, "user=9", 2000);
+                loads(&!db, &token, 2001, Some(value => "user=9"), "loaded from SQLCipher");
+                destroyString(token);
+                closeAndRemove(db, "session-cipher.db");
+            when Left(left as error: DbError) do
+                assertFailure("SQLCipher opens");
+        end case;
+        return nil;
+    end;
+end module body.

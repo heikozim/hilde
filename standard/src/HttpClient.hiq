@@ -1,0 +1,1502 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The request is written whole, sent through Standard.Tls
+-- over a socket Standard.File connected with a time limit, and the answer
+-- is read in pieces: first the header until the empty line, then the body
+-- by the framing the header names -- a length, chunks, or everything until
+-- the server closes.  Every step of TLS is given what is left of the whole
+-- request, and Standard.Tls keeps that limit for the whole step, so a
+-- server that sends one byte at a time cannot stretch it.
+import Standard.String (
+    String,
+    makeEmpty,
+    fromLiteral,
+    fromSpan,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    destroyFree,
+    length as bufferLength,
+    nth
+);
+import Standard.Text (
+    hexDigitValue,
+    parseNat,
+    substring,
+    trim,
+    toLower
+);
+import Standard.Ip (
+    IpAddress,
+    parseIp,
+    isIpv6,
+    ipToBytes,
+    isPrivateOrReserved
+);
+import Standard.Resolve (
+    AnyFamily,
+    ResolveFailure,
+    NotAHostName,
+    UnknownName,
+    ResolverUnavailable,
+    NoAddressOfFamily,
+    ResolveFailed,
+    validHostname,
+    resolveHost
+);
+import Standard.File (
+    FileDescriptor,
+    ConnectFailure,
+    ConnectRefused,
+    ConnectTimedOut,
+    ConnectUnreachable,
+    ConnectError,
+    connectTcp,
+    closeFile
+);
+import Standard.Tls (
+    Client,
+    connectOver,
+    connectOverAs,
+    sendWithin,
+    receiveWithin,
+    closeClient
+);
+import Standard.Http (
+    headerCount,
+    nthHeaderName,
+    nthHeaderValue
+);
+import Standard.Time (
+    monotonicNanos
+);
+
+module body Standard.HttpClient is
+    constant receiveSize: Index := 16384;
+    constant defaultPort: Nat16 := 443;
+    constant zeroIndex: Index := 0;
+    constant byteTab: Nat8 := 9;
+    constant byteLf: Nat8 := 10;
+    constant byteCr: Nat8 := 13;
+    constant byteSpace: Nat8 := 32;
+    constant byteHash: Nat8 := 35;
+    constant byteSlash: Nat8 := 47;
+    constant byteColon: Nat8 := 58;
+    constant byteSemicolon: Nat8 := 59;
+    constant byteQuestion: Nat8 := 63;
+    constant byteAt: Nat8 := 64;
+    constant byteLeftBracket: Nat8 := 91;
+    constant byteRightBracket: Nat8 := 93;
+    constant byteTilde: Nat8 := 126;
+    constant byteDelete: Nat8 := 127;
+    constant nanosPerMilli: Nat64 := 1000000;
+
+    function defaultLimits(): Limits is
+        let connect: Nat32 := 10000;
+        let total: Nat32 := 30000;
+        let most: Index := 104857600;
+        let limits: Limits := Limits(connectMillis => connect, totalMillis => total, maximumBytes => most, publicOnly => true);
+        return limits;
+    end;
+
+    function destroyFailure(failed: Failure): Unit is
+        let { kind: FailureKind, detail: String } := failed;
+        destroyString(detail);
+        return nil;
+    end;
+
+    function destroyResponse(response: Response): Unit is
+        let { status: Nat16, headers: String, content: String } := response;
+        destroyString(headers);
+        destroyString(content);
+        return nil;
+    end;
+
+    function destroyTarget(target: Target): Unit is
+        let { host: String, port: Nat16, path: String } := target;
+        destroyString(host);
+        destroyString(path);
+        return nil;
+    end;
+
+    -- A failure of kind with a fixed sentence.
+    function failure(kind: FailureKind, detail: Span[Nat8, Static]): Failure is
+        let made: Failure := Failure(kind => kind, detail => fromLiteral(detail));
+        return made;
+    end;
+
+    ---
+    --- The URL
+    ---
+
+    -- The byte at i in lower case, when it is an ASCII capital.
+    generic [R: Region]
+    function lowerAt(text: Span[Nat8, R], i: Index): Nat8 is
+        let byte: Nat8 := text[i];
+        if (byte >= 'A') and (byte <= 'Z') then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    -- Whether the URL begins with https:// in any case.
+    generic [R: Region]
+    function httpsScheme(url: Span[Nat8, R]): Bool is
+        let scheme: Span[Nat8, Static] := "https://";
+        let size: Index := spanLength(scheme);
+        if spanLength(url) <= size then
+            return false;
+        end if;
+        var i: Index := zeroIndex;
+        while i < size do
+            if lowerAt(url, i) /= scheme[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The port in the bytes from first to just before stop: 1 to 5 digits,
+    -- 1 to 65535.
+    generic [R: Region]
+    function portIn(url: Span[Nat8, R], first: Index, stop: Index): Option[Nat16] is
+        if (stop <= first) or ((stop - first) > 5) then
+            let none: Option[Nat16] := None();
+            return none;
+        end if;
+        let value: Option[Nat64] := parseNat(substring(url, first, stop));
+        case value of
+            when Some(value as number: Nat64) do
+                if (number = 0) or (number > 65535) then
+                    let none: Option[Nat16] := None();
+                    return none;
+                end if;
+                return toNat16(number);
+            when None do
+                let none: Option[Nat16] := None();
+                return none;
+        end case;
+    end;
+
+    -- Whether every byte of a path from first to just before stop is
+    -- visible ASCII.
+    generic [R: Region]
+    function visiblePath(url: Span[Nat8, R], first: Index, stop: Index): Bool is
+        var i: Index := first;
+        while i < stop do
+            let byte: Nat8 := url[i];
+            if (byte <= byteSpace) or (byte > byteTilde) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The first position from first on that holds one of slash, question
+    -- mark or hash, or size.
+    generic [R: Region]
+    function authorityEnd(url: Span[Nat8, R], first: Index): Index is
+        let size: Index := spanLength(url);
+        var i: Index := first;
+        while i < size do
+            let byte: Nat8 := url[i];
+            if (byte = byteSlash) or ((byte = byteQuestion) or (byte = byteHash)) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return size;
+    end;
+
+    -- The target from the path onwards: a slash when there is none, the
+    -- fragment dropped.  None when a byte is not visible ASCII.
+    generic [R: Region]
+    function pathFrom(url: Span[Nat8, R], first: Index): Option[String] is
+        let size: Index := spanLength(url);
+        var stop: Index := first;
+        while (stop < size) and (url[stop] /= byteHash) do
+            stop := stop + 1;
+        end while;
+        if not visiblePath(url, first, stop) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        if (first = stop) or (url[first] = byteQuestion) then
+            writeByte(&!out, byteSlash);
+        end if;
+        var i: Index := first;
+        while i < stop do
+            writeByte(&!out, url[i]);
+            i := i + 1;
+        end while;
+        return Some(value => finalize(out));
+    end;
+
+    -- The last colon between first and just before stop, or stop.
+    generic [R: Region]
+    function lastColon(url: Span[Nat8, R], first: Index, stop: Index): Index is
+        var found: Index := stop;
+        var i: Index := first;
+        while i < stop do
+            if url[i] = byteColon then
+                found := i;
+            end if;
+            i := i + 1;
+        end while;
+        return found;
+    end;
+
+    -- Whether the bytes from first to just before stop hold an at sign.
+    generic [R: Region]
+    function holdsAt(url: Span[Nat8, R], first: Index, stop: Index): Bool is
+        var i: Index := first;
+        while i < stop do
+            if url[i] = byteAt then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- Whether text is an IPv6 literal.
+    generic [R: Region]
+    function ipv6Literal(text: Span[Nat8, R]): Bool is
+        case parseIp(text) of
+            when Some(value as address: IpAddress) do
+                return isIpv6(address);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The target, once host, port and the start of the path are known.
+    generic [R: Region]
+    function targetOf(url: Span[Nat8, R], hostFirst: Index, hostStop: Index, port: Nat16, pathFirst: Index): Option[Target] is
+        case pathFrom(url, pathFirst) of
+            when Some(value as path: String) do
+                let host: String := fromSpan(substring(url, hostFirst, hostStop));
+                let target: Target := Target(host => host, port => port, path => path);
+                return Some(value => target);
+            when None do
+                let none: Option[Target] := None();
+                return none;
+        end case;
+    end;
+
+    -- A bracketed IPv6 host from first to just before stop.
+    generic [R: Region]
+    function bracketed(url: Span[Nat8, R], first: Index, stop: Index): Option[Target] is
+        var close: Index := first;
+        while (close < stop) and (url[close] /= byteRightBracket) do
+            close := close + 1;
+        end while;
+        if (close = stop) or (close = (first + 1)) then
+            let none: Option[Target] := None();
+            return none;
+        end if;
+        let v6: Bool := ipv6Literal(substring(url, first + 1, close));
+        if not v6 then
+            let none: Option[Target] := None();
+            return none;
+        end if;
+        if (close + 1) = stop then
+            return targetOf(url, first + 1, close, defaultPort, stop);
+        end if;
+        if url[close + 1] /= byteColon then
+            let none: Option[Target] := None();
+            return none;
+        end if;
+        case portIn(url, close + 2, stop) of
+            when Some(value as port: Nat16) do
+                return targetOf(url, first + 1, close, port, stop);
+            when None do
+                let none: Option[Target] := None();
+                return none;
+        end case;
+    end;
+
+    -- A host name or dotted quad from first to just before stop, with an
+    -- optional port.
+    generic [R: Region]
+    function named(url: Span[Nat8, R], first: Index, stop: Index): Option[Target] is
+        let colon: Index := lastColon(url, first, stop);
+        let valid: Bool := validHostname(substring(url, first, colon));
+        if not valid then
+            let none: Option[Target] := None();
+            return none;
+        end if;
+        if colon = stop then
+            return targetOf(url, first, colon, defaultPort, stop);
+        end if;
+        case portIn(url, colon + 1, stop) of
+            when Some(value as port: Nat16) do
+                return targetOf(url, first, colon, port, stop);
+            when None do
+                let none: Option[Target] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function parseUrl(url: Span[Nat8, R]): Option[Target] is
+        if not httpsScheme(url) then
+            let none: Option[Target] := None();
+            return none;
+        end if;
+        let first: Index := 8;
+        let stop: Index := authorityEnd(url, first);
+        if (stop = first) or holdsAt(url, first, stop) then
+            let none: Option[Target] := None();
+            return none;
+        end if;
+        if url[first] = byteLeftBracket then
+            return bracketed(url, first, stop);
+        end if;
+        return named(url, first, stop);
+    end;
+
+    ---
+    --- The caller's header lines
+    ---
+
+    -- A byte a header name may hold: RFC 9110's tchar.
+    function tokenByte(byte: Nat8): Bool is
+        if ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z')) then
+            return true;
+        end if;
+        if (byte >= '0') and (byte <= '9') then
+            return true;
+        end if;
+        let marks: Span[Nat8, Static] := "!#$%&'*+-.^_`|~";
+        var i: Index := zeroIndex;
+        while i < spanLength(marks) do
+            if marks[i] = byte then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- A byte a header value may hold: visible, space, tab, or above 127.
+    function valueByte(byte: Nat8): Bool is
+        return (byte = byteTab) or (((byte >= byteSpace) and (byte < byteDelete)) or (byte > byteDelete));
+    end;
+
+    -- Whether the name from first to just before stop is one the client
+    -- sets itself.
+    generic [R: Region]
+    function reservedName(headers: Span[Nat8, R], first: Index, stop: Index): Bool is
+        let name: String := toLower(substring(headers, first, stop));
+        let reserved: Bool := sameText(&name, "host") or (sameText(&name, "connection") or (sameText(&name, "content-length") or sameText(&name, "transfer-encoding")));
+        destroyString(name);
+        return reserved;
+    end;
+
+    generic [R: Region]
+    function sameText(text: &[String, R], other: Span[Nat8, Static]): Bool is
+        let size: Index := stringLength(text);
+        if size /= spanLength(other) then
+            return false;
+        end if;
+        var i: Index := zeroIndex;
+        while i < size do
+            if nthByte(text, i) /= other[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether the line from first to just before stop, its line end not
+    -- included, is a header line the client takes.
+    generic [R: Region]
+    function validLine(headers: Span[Nat8, R], first: Index, stop: Index): Bool is
+        var colon: Index := first;
+        while (colon < stop) and (headers[colon] /= byteColon) do
+            if not tokenByte(headers[colon]) then
+                return false;
+            end if;
+            colon := colon + 1;
+        end while;
+        if (colon = first) or (colon = stop) then
+            return false;
+        end if;
+        var i: Index := colon + 1;
+        while i < stop do
+            if not valueByte(headers[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return not reservedName(headers, first, colon);
+    end;
+
+    generic [R: Region]
+    function validHeaderLines(headers: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(headers);
+        var first: Index := zeroIndex;
+        while first < size do
+            var stop: Index := first;
+            while (stop < size) and (headers[stop] /= byteLf) do
+                stop := stop + 1;
+            end while;
+            -- A carriage return belongs to the line end only right before
+            -- a line feed.
+            var lineStop: Index := stop;
+            if (stop < size) and ((stop > first) and (headers[stop - 1] = byteCr)) then
+                lineStop := stop - 1;
+            end if;
+            if not validLine(headers, first, lineStop) then
+                return false;
+            end if;
+            first := stop + 1;
+        end while;
+        return true;
+    end;
+
+    ---
+    --- The clock
+    ---
+
+    -- When the request must be done, in the monotonic clock's
+    -- nanoseconds.  Where the build has no such clock, limited is false
+    -- and every step gets the whole time instead.
+    record Clock: Free is
+        deadline: Nat64;
+        limited: Bool;
+        perStep: Nat32;
+    end;
+
+    function startClock(totalMillis: Nat32): Clock is
+        let millis: Nat64 := wide(totalMillis);
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                let clock: Clock := Clock(deadline => now + (millis * nanosPerMilli), limited => true, perStep => totalMillis);
+                return clock;
+            when None do
+                let zero: Nat64 := 0;
+                let clock: Clock := Clock(deadline => zero, limited => false, perStep => totalMillis);
+                return clock;
+        end case;
+    end;
+
+    function wide(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.HttpClient: a Nat32 did not fit a Nat64");
+        end case;
+    end;
+
+    -- The milliseconds left, rounded up, 0 when the time is up.  Rounded
+    -- up, so that a step given all that is left ends after the deadline
+    -- and expired then says so.
+    function remainingMillis(clock: Clock): Nat32 is
+        if not clock.limited then
+            return clock.perStep;
+        end if;
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                if now >= clock.deadline then
+                    return 0;
+                end if;
+                case toNat32(((clock.deadline - now) + (nanosPerMilli - 1)) / nanosPerMilli) of
+                    when Some(value as left: Nat32) do
+                        return left;
+                    when None do
+                        return maximum_nat32;
+                end case;
+            when None do
+                return clock.perStep;
+        end case;
+    end;
+
+    -- Whether the time is up.
+    function expired(clock: Clock): Bool is
+        return clock.limited and (remainingMillis(clock) = 0);
+    end;
+
+    ---
+    --- Connecting
+    ---
+
+    generic [R: Region]
+    function anyNotPublic(found: &[Buffer[IpAddress], R]): Bool is
+        let count: Index := bufferLength(found);
+        var i: Index := zeroIndex;
+        while i < count do
+            if isPrivateOrReserved(nth(found, i)) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The addresses of host, or why there are none to use.
+    generic [R: Region]
+    function addressesOf(host: &[String, R], publicOnly: Bool): Either[Failure, Buffer[IpAddress]] is
+        case resolveHost(asSpan(host), AnyFamily()) of
+            when Right(right as found: Buffer[IpAddress]) do
+                if publicOnly and anyNotPublic(&found) then
+                    destroyFree(found);
+                    let refused: Either[Failure, Buffer[IpAddress]] := Left(left => failure(NotPublic(), "the host is or resolves to an address that is not public"));
+                    return refused;
+                else
+                    let some: Either[Failure, Buffer[IpAddress]] := Right(right => found);
+                    return some;
+                end if;
+            when Left(left as reason: ResolveFailure) do
+                case reason of
+                    when ResolverUnavailable do
+                        let late: Either[Failure, Buffer[IpAddress]] := Left(left => failure(NotResolved(), "the resolver did not answer"));
+                        return late;
+                    when NotAHostName do
+                        let none: Either[Failure, Buffer[IpAddress]] := Left(left => failure(NotResolved(), "the host has no address"));
+                        return none;
+                    when UnknownName do
+                        let none: Either[Failure, Buffer[IpAddress]] := Left(left => failure(NotResolved(), "the host has no address"));
+                        return none;
+                    when NoAddressOfFamily do
+                        let none: Either[Failure, Buffer[IpAddress]] := Left(left => failure(NotResolved(), "the host has no address"));
+                        return none;
+                    when ResolveFailed do
+                        let none: Either[Failure, Buffer[IpAddress]] := Left(left => failure(NotResolved(), "the host has no address"));
+                        return none;
+                end case;
+        end case;
+    end;
+
+    function connectTimedOut(why: ConnectFailure): Bool is
+        case why of
+            when ConnectTimedOut do
+                return true;
+            when ConnectRefused do
+                return false;
+            when ConnectUnreachable do
+                return false;
+            when ConnectError do
+                return false;
+        end case;
+    end;
+
+    -- A connection to the first of the addresses from i on that takes one,
+    -- each attempt within the connect limit and the time left.
+    generic [R: Region]
+    function connectFrom(addresses: &[Buffer[IpAddress], R], i: Index, port: Nat16, limits: Limits, clock: Clock, timedOut: Bool): Either[Failure, FileDescriptor] is
+        if i >= bufferLength(addresses) then
+            if timedOut then
+                let late: Either[Failure, FileDescriptor] := Left(left => failure(TimedOut(), "no connection was made within the time limit"));
+                return late;
+            end if;
+            let none: Either[Failure, FileDescriptor] := Left(left => failure(ConnectFailed(), "no address of the host took the connection"));
+            return none;
+        end if;
+        let left: Nat32 := remainingMillis(clock);
+        if left = 0 then
+            let late: Either[Failure, FileDescriptor] := Left(left => failure(TimedOut(), "the time limit ran out before a connection was made"));
+            return late;
+        end if;
+        var limit: Nat32 := limits.connectMillis;
+        if left < limit then
+            limit := left;
+        end if;
+        let bytes: String := ipToBytes(nth(addresses, i));
+        let attempt: Either[ConnectFailure, FileDescriptor] := connectTcp(asSpan(&bytes), port, limit);
+        destroyString(bytes);
+        case attempt of
+            when Right(right as socket: FileDescriptor) do
+                let made: Either[Failure, FileDescriptor] := Right(right => socket);
+                return made;
+            when Left(left as why: ConnectFailure) do
+                return connectFrom(addresses, i + 1, port, limits, clock, timedOut or connectTimedOut(why));
+        end case;
+    end;
+
+    ---
+    --- The request
+    ---
+
+    generic [B: Region]
+    function writeNumber(out: &![StringBuilder, B], value: Index): Unit is
+        let ten: Index := 10;
+        if value >= ten then
+            writeNumber(&~out, value / ten);
+        end if;
+        case toNat8(rem(value, ten)) of
+            when Some(value as digit: Nat8) do
+                writeByte(&~out, digit + '0');
+            when None do
+                abort("Standard.HttpClient: a digit did not fit a byte");
+        end case;
+        return nil;
+    end;
+
+    -- Whether the host is an IPv6 literal: it holds a colon.
+    generic [R: Region]
+    function hasColon(host: &[String, R]): Bool is
+        let size: Index := stringLength(host);
+        var i: Index := zeroIndex;
+        while i < size do
+            if nthByte(host, i) = byteColon then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The caller's header lines, each ended with CRLF.
+    generic [B: Region, R: Region]
+    function writeLines(out: &![StringBuilder, B], headers: Span[Nat8, R]): Unit is
+        let size: Index := spanLength(headers);
+        var i: Index := zeroIndex;
+        var open: Bool := false;
+        while i < size do
+            let byte: Nat8 := headers[i];
+            if byte = byteLf then
+                writeByte(&~out, byteCr);
+                writeByte(&~out, byteLf);
+                open := false;
+            else if byte /= byteCr then
+                writeByte(&~out, byte);
+                open := true;
+            end if;
+            i := i + 1;
+        end while;
+        if open then
+            writeByte(&~out, byteCr);
+            writeByte(&~out, byteLf);
+        end if;
+        return nil;
+    end;
+
+    -- The whole request: the request line, the client's own header lines,
+    -- the caller's, the empty line and the body.
+    generic [H: Region, P: Region, L: Region, B: Region]
+    function requestText(verb: Method, host: &[String, H], port: Nat16, path: &[String, P], headers: Span[Nat8, L], payload: Span[Nat8, B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        case verb of
+            when Get do
+                writeString(&!out, "GET ");
+            when Post do
+                writeString(&!out, "POST ");
+        end case;
+        writeString(&!out, asSpan(path));
+        writeString(&!out, " HTTP/1.1\r\nHost: ");
+        let v6: Bool := hasColon(host);
+        if v6 then
+            writeByte(&!out, byteLeftBracket);
+        end if;
+        writeString(&!out, asSpan(host));
+        if v6 then
+            writeByte(&!out, byteRightBracket);
+        end if;
+        if port /= defaultPort then
+            writeByte(&!out, byteColon);
+            case toIndex(port) of
+                when Some(value as number: Index) do
+                    writeNumber(&!out, number);
+                when None do
+                    abort("Standard.HttpClient: a port did not fit an Index");
+            end case;
+        end if;
+        writeString(&!out, "\r\nUser-Agent: Hilde\r\nAccept-Encoding: identity\r\nConnection: close\r\n");
+        case verb of
+            when Get do
+                skip;
+            when Post do
+                writeString(&!out, "Content-Length: ");
+                writeNumber(&!out, spanLength(payload));
+                writeString(&!out, "\r\n");
+        end case;
+        writeLines(&!out, headers);
+        writeString(&!out, "\r\n");
+        writeString(&!out, payload);
+        return finalize(out);
+    end;
+
+    ---
+    --- Reading the header
+    ---
+
+    -- How far the search for the empty line has come: blank when the
+    -- current line has nothing yet but a carriage return, found when the
+    -- empty line has been seen.
+    record HeadScan: Free is
+        blank: Bool;
+        found: Bool;
+    end;
+
+    -- The bytes of input into head up to and including the empty line,
+    -- the rest into rest.
+    generic [A: Region, B: Region, C: Region]
+    function scanHead(head: &![StringBuilder, A], rest: &![StringBuilder, B], input: &[String, C], state: HeadScan): HeadScan is
+        let size: Index := stringLength(input);
+        var blank: Bool := state.blank;
+        var found: Bool := state.found;
+        var i: Index := zeroIndex;
+        while i < size do
+            let byte: Nat8 := nthByte(input, i);
+            if found then
+                writeByte(&~rest, byte);
+            else
+                writeByte(&~head, byte);
+                if byte = byteLf then
+                    if blank then
+                        found := true;
+                    else
+                        blank := true;
+                    end if;
+                else if byte /= byteCr then
+                    blank := false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        let scanned: HeadScan := HeadScan(blank => blank, found => found);
+        return scanned;
+    end;
+
+    -- A header and the bytes that came after it.
+    record HeadRead: Linear is
+        head: String;
+        rest: String;
+        total: Index;
+    end;
+
+    -- How a read ended: go on, done, the server closed, too large, the
+    -- time ran out, the connection failed.
+    constant readOn: Nat8 := 0;
+    constant readDone: Nat8 := 1;
+    constant readClosed: Nat8 := 2;
+    constant readTooLarge: Nat8 := 3;
+    constant readLate: Nat8 := 4;
+    constant readFailed: Nat8 := 5;
+
+    -- The failure for a read that ended as outcome; message is the TLS
+    -- library's words for readFailed.
+    function readFailure(outcome: Nat8, message: String, closed: Span[Nat8, Static]): Failure is
+        if outcome = readFailed then
+            let failed: Failure := Failure(kind => TlsFailed(), detail => message);
+            return failed;
+        else
+            destroyString(message);
+            if outcome = readTooLarge then
+                return failure(TooLarge(), "the answer is larger than the limit");
+            end if;
+            if outcome = readLate then
+                return failure(TimedOut(), "the answer did not come within the time limit");
+            end if;
+            return failure(BadResponse(), closed);
+        end if;
+    end;
+
+    -- One piece from the server, within the time left and the bytes left.
+    -- The outcome, and the piece when it is readOn.
+    record Piece: Linear is
+        outcome: Nat8;
+        bytes: String;
+        message: String;
+    end;
+
+    generic [R: Region]
+    function nextPiece(client: &![Client, R], count: Index, limits: Limits, clock: Clock): Piece is
+        let left: Nat32 := remainingMillis(clock);
+        if left = 0 then
+            let late: Piece := Piece(outcome => readLate, bytes => makeEmpty(), message => makeEmpty());
+            return late;
+        end if;
+        case receiveWithin(&~client, receiveSize, left) of
+            when Right(right as bytes: String) do
+                let got: Index := stringLength(&bytes);
+                if got = zeroIndex then
+                    destroyString(bytes);
+                    let closed: Piece := Piece(outcome => readClosed, bytes => makeEmpty(), message => makeEmpty());
+                    return closed;
+                else if got > (limits.maximumBytes - count) then
+                    destroyString(bytes);
+                    let large: Piece := Piece(outcome => readTooLarge, bytes => makeEmpty(), message => makeEmpty());
+                    return large;
+                else
+                    let piece: Piece := Piece(outcome => readOn, bytes => bytes, message => makeEmpty());
+                    return piece;
+                end if;
+            when Left(left as message: String) do
+                if expired(clock) then
+                    destroyString(message);
+                    let late: Piece := Piece(outcome => readLate, bytes => makeEmpty(), message => makeEmpty());
+                    return late;
+                else
+                    let failed: Piece := Piece(outcome => readFailed, bytes => makeEmpty(), message => message);
+                    return failed;
+                end if;
+        end case;
+    end;
+
+    -- Reads until the empty line that ends a header: pending first, then
+    -- from the connection.  total is what the server has sent so far.
+    generic [R: Region]
+    function readHead(client: &![Client, R], pending: String, sent: Index, limits: Limits, clock: Clock): Either[Failure, HeadRead] is
+        var head: StringBuilder := makeStringBuilder();
+        var rest: StringBuilder := makeStringBuilder();
+        var words: String := makeEmpty();
+        let start: HeadScan := HeadScan(blank => false, found => false);
+        var scan: HeadScan := scanHead(&!head, &!rest, &pending, start);
+        destroyString(pending);
+        var count: Index := sent;
+        var result: Nat8 := readOn;
+        if scan.found then
+            result := readDone;
+        end if;
+        while result = readOn do
+            let piece: Piece := nextPiece(&~client, count, limits, clock);
+            let { outcome: Nat8, bytes: String, message: String } := piece;
+            if outcome = readOn then
+                count := count + stringLength(&bytes);
+                scan := scanHead(&!head, &!rest, &bytes, scan);
+                if scan.found then
+                    result := readDone;
+                end if;
+                destroyString(message);
+            else
+                result := outcome;
+                let old: String := words;
+                destroyString(old);
+                words := message;
+            end if;
+            destroyString(bytes);
+        end while;
+        let headText: String := finalize(head);
+        let restText: String := finalize(rest);
+        if result = readDone then
+            destroyString(words);
+            let read: HeadRead := HeadRead(head => headText, rest => restText, total => count);
+            let done: Either[Failure, HeadRead] := Right(right => read);
+            return done;
+        else
+            destroyString(headText);
+            destroyString(restText);
+            let failed: Either[Failure, HeadRead] := Left(left => readFailure(result, words, "the server closed the connection before the header ended"));
+            return failed;
+        end if;
+    end;
+
+    -- The status of a status line HTTP/1.0 or HTTP/1.1, three digits from
+    -- 100 to 599, then a space or the line end.
+    generic [R: Region]
+    function statusOf(head: &[String, R]): Option[Nat16] is
+        let prefix: Span[Nat8, Static] := "HTTP/1.";
+        let size: Index := stringLength(head);
+        if size < 13 then
+            let none: Option[Nat16] := None();
+            return none;
+        end if;
+        var i: Index := zeroIndex;
+        while i < spanLength(prefix) do
+            if nthByte(head, i) /= prefix[i] then
+                let none: Option[Nat16] := None();
+                return none;
+            end if;
+            i := i + 1;
+        end while;
+        let minor: Nat8 := nthByte(head, 7);
+        let after: Nat8 := nthByte(head, 12);
+        if ((minor /= '0') and (minor /= '1')) or (nthByte(head, 8) /= byteSpace) then
+            let none: Option[Nat16] := None();
+            return none;
+        end if;
+        if (after /= byteSpace) and ((after /= byteCr) and (after /= byteLf)) then
+            let none: Option[Nat16] := None();
+            return none;
+        end if;
+        var value: Nat16 := 0;
+        var k: Index := 9;
+        while k < 12 do
+            let digit: Nat8 := nthByte(head, k);
+            if (digit < '0') or (digit > '9') then
+                let none: Option[Nat16] := None();
+                return none;
+            end if;
+            case toNat16(digit - '0') of
+                when Some(value as d: Nat16) do
+                    value := (value * 10) + d;
+                when None do
+                    abort("Standard.HttpClient: a digit did not fit a Nat16");
+            end case;
+            k := k + 1;
+        end while;
+        if (value < 100) or (value > 599) then
+            let none: Option[Nat16] := None();
+            return none;
+        end if;
+        return Some(value => value);
+    end;
+
+    -- The header lines of head: everything after the status line.
+    generic [R: Region]
+    function headerBlock(head: &[String, R]): String is
+        let size: Index := stringLength(head);
+        var i: Index := zeroIndex;
+        while (i < size) and (nthByte(head, i) /= byteLf) do
+            i := i + 1;
+        end while;
+        return fromSpan(substring(asSpan(head), i + 1, size));
+    end;
+
+    ---
+    --- The framing of the body
+    ---
+
+    constant bodyNone: Nat8 := 0;
+    constant bodyLength: Nat8 := 1;
+    constant bodyChunked: Nat8 := 2;
+    constant bodyUntilClose: Nat8 := 3;
+    constant bodyBadCoding: Nat8 := 4;
+    constant bodyBadLength: Nat8 := 5;
+    constant bodyTooLarge: Nat8 := 6;
+
+    -- How the body is framed, and its length for bodyLength.
+    record Framing: Free is
+        kind: Nat8;
+        length: Index;
+    end;
+
+    function framed(kind: Nat8, length: Index): Framing is
+        let framing: Framing := Framing(kind => kind, length => length);
+        return framing;
+    end;
+
+    -- Whether the header name, in lower case, is name.
+    function nameIs(value: Option[String], name: Span[Nat8, Static]): Bool is
+        case value of
+            when Some(value as raw: String) do
+                let lower: String := toLower(asSpan(&raw));
+                destroyString(raw);
+                let same: Bool := sameText(&lower, name);
+                destroyString(lower);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The value of header n, trimmed; empty when there is none.
+    generic [R: Region]
+    function trimmedValue(block: Span[Nat8, R], n: Index): String is
+        case nthHeaderValue(block, n) of
+            when Some(value as raw: String) do
+                let trimmed: String := fromSpan(trim(asSpan(&raw)));
+                destroyString(raw);
+                return trimmed;
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    -- The framing of a body after status and the header lines in block:
+    -- chunked when Transfer-Encoding says exactly that, a length when
+    -- every Content-Length says the same number, until the server closes
+    -- otherwise; none for 204 and 304.
+    generic [R: Region]
+    function framingOf(status: Nat16, block: Span[Nat8, R], maximum: Index): Framing is
+        if (status = 204) or (status = 304) then
+            return framed(bodyNone, zeroIndex);
+        end if;
+        let count: Index := headerCount(block);
+        var chunked: Bool := false;
+        var coded: Bool := false;
+        var lengths: Index := zeroIndex;
+        var length: Nat64 := 0;
+        var badLength: Bool := false;
+        var i: Index := zeroIndex;
+        while i < count do
+            if nameIs(nthHeaderName(block, i), "transfer-encoding") then
+                let value: String := trimmedValue(block, i);
+                let lower: String := toLower(asSpan(&value));
+                destroyString(value);
+                if sameText(&lower, "chunked") then
+                    chunked := true;
+                else
+                    coded := true;
+                end if;
+                destroyString(lower);
+            else if nameIs(nthHeaderName(block, i), "content-length") then
+                let value: String := trimmedValue(block, i);
+                case parseNat(asSpan(&value)) of
+                    when Some(value as number: Nat64) do
+                        if (lengths > zeroIndex) and (number /= length) then
+                            badLength := true;
+                        end if;
+                        length := number;
+                        lengths := lengths + 1;
+                    when None do
+                        badLength := true;
+                end case;
+                destroyString(value);
+            end if;
+            i := i + 1;
+        end while;
+        if coded then
+            return framed(bodyBadCoding, zeroIndex);
+        end if;
+        if chunked then
+            return framed(bodyChunked, zeroIndex);
+        end if;
+        if badLength then
+            return framed(bodyBadLength, zeroIndex);
+        end if;
+        if lengths = zeroIndex then
+            return framed(bodyUntilClose, zeroIndex);
+        end if;
+        case toIndex(length) of
+            when Some(value as size: Index) do
+                if size > maximum then
+                    return framed(bodyTooLarge, zeroIndex);
+                end if;
+                return framed(bodyLength, size);
+            when None do
+                return framed(bodyTooLarge, zeroIndex);
+        end case;
+    end;
+
+    ---
+    --- Reading the body
+    ---
+
+    -- Where the reading of a body stands.  have counts the body's bytes;
+    -- phase, size and digits belong to the chunked framing.
+    record BodyScan: Free is
+        done: Bool;
+        bad: Bool;
+        have: Index;
+        phase: Nat8;
+        size: Index;
+        digits: Index;
+    end;
+
+    constant chunkSize: Nat8 := 0;
+    constant chunkExtension: Nat8 := 1;
+    constant chunkSizeLf: Nat8 := 2;
+    constant chunkData: Nat8 := 3;
+    constant chunkDataCr: Nat8 := 4;
+    constant chunkDataLf: Nat8 := 5;
+    constant chunkTrailerStart: Nat8 := 6;
+    constant chunkTrailerLf: Nat8 := 7;
+    constant chunkTrailerLine: Nat8 := 8;
+
+    function bodyScan(done: Bool, bad: Bool, have: Index, phase: Nat8, size: Index, digits: Index): BodyScan is
+        let scan: BodyScan := BodyScan(done => done, bad => bad, have => have, phase => phase, size => size, digits => digits);
+        return scan;
+    end;
+
+    -- The end of a chunk's size line: data follows, or the trailer after
+    -- the last chunk.
+    function sizeLineEnd(state: BodyScan): BodyScan is
+        if state.digits = zeroIndex then
+            return bodyScan(false, true, state.have, state.phase, state.size, state.digits);
+        end if;
+        if state.size = zeroIndex then
+            return bodyScan(false, false, state.have, chunkTrailerStart, zeroIndex, zeroIndex);
+        end if;
+        return bodyScan(false, false, state.have, chunkData, state.size, zeroIndex);
+    end;
+
+    -- One byte of a chunked body.
+    generic [A: Region]
+    function chunkByte(out: &![StringBuilder, A], byte: Nat8, state: BodyScan, maximum: Index): BodyScan is
+        let phase: Nat8 := state.phase;
+        if phase = chunkSize then
+            case hexDigitValue(byte) of
+                when Some(value as v: Nat8) do
+                    if state.size > (maximum / 16) then
+                        return bodyScan(false, true, state.have, phase, state.size, state.digits);
+                    end if;
+                    case toIndex(v) of
+                        when Some(value as w: Index) do
+                            return bodyScan(false, false, state.have, phase, (state.size * 16) + w, state.digits + 1);
+                        when None do
+                            return bodyScan(false, true, state.have, phase, state.size, state.digits);
+                    end case;
+                when None do
+                    if byte = byteLf then
+                        return sizeLineEnd(state);
+                    end if;
+                    if byte = byteCr then
+                        return bodyScan(false, state.digits = zeroIndex, state.have, chunkSizeLf, state.size, state.digits);
+                    end if;
+                    if (byte = byteSemicolon) or ((byte = byteSpace) or (byte = byteTab)) then
+                        return bodyScan(false, state.digits = zeroIndex, state.have, chunkExtension, state.size, state.digits);
+                    end if;
+                    return bodyScan(false, true, state.have, phase, state.size, state.digits);
+            end case;
+        end if;
+        if phase = chunkExtension then
+            if byte = byteLf then
+                return sizeLineEnd(state);
+            end if;
+            if byte = byteCr then
+                return bodyScan(false, false, state.have, chunkSizeLf, state.size, state.digits);
+            end if;
+            return state;
+        end if;
+        if phase = chunkSizeLf then
+            if byte = byteLf then
+                return sizeLineEnd(state);
+            end if;
+            return bodyScan(false, true, state.have, phase, state.size, state.digits);
+        end if;
+        if phase = chunkData then
+            writeByte(&~out, byte);
+            if state.size = 1 then
+                return bodyScan(false, false, state.have + 1, chunkDataCr, zeroIndex, zeroIndex);
+            end if;
+            return bodyScan(false, false, state.have + 1, phase, state.size - 1, zeroIndex);
+        end if;
+        if phase = chunkDataCr then
+            if byte = byteCr then
+                return bodyScan(false, false, state.have, chunkDataLf, zeroIndex, zeroIndex);
+            end if;
+            if byte = byteLf then
+                return bodyScan(false, false, state.have, chunkSize, zeroIndex, zeroIndex);
+            end if;
+            return bodyScan(false, true, state.have, phase, zeroIndex, zeroIndex);
+        end if;
+        if phase = chunkDataLf then
+            if byte = byteLf then
+                return bodyScan(false, false, state.have, chunkSize, zeroIndex, zeroIndex);
+            end if;
+            return bodyScan(false, true, state.have, phase, zeroIndex, zeroIndex);
+        end if;
+        if phase = chunkTrailerStart then
+            if byte = byteLf then
+                return bodyScan(true, false, state.have, phase, zeroIndex, zeroIndex);
+            end if;
+            if byte = byteCr then
+                return bodyScan(false, false, state.have, chunkTrailerLf, zeroIndex, zeroIndex);
+            end if;
+            return bodyScan(false, false, state.have, chunkTrailerLine, zeroIndex, zeroIndex);
+        end if;
+        if phase = chunkTrailerLf then
+            if byte = byteLf then
+                return bodyScan(true, false, state.have, phase, zeroIndex, zeroIndex);
+            end if;
+            return bodyScan(false, true, state.have, phase, zeroIndex, zeroIndex);
+        end if;
+        if byte = byteLf then
+            return bodyScan(false, false, state.have, chunkTrailerStart, zeroIndex, zeroIndex);
+        end if;
+        return state;
+    end;
+
+    -- The bytes of input into body, by the framing, until the body is
+    -- done or found bad.
+    generic [A: Region, C: Region]
+    function feedBody(out: &![StringBuilder, A], input: &[String, C], framing: Framing, state: BodyScan, maximum: Index): BodyScan is
+        let size: Index := stringLength(input);
+        var scan: BodyScan := state;
+        var i: Index := zeroIndex;
+        while (i < size) and ((not scan.done) and (not scan.bad)) do
+            let byte: Nat8 := nthByte(input, i);
+            if framing.kind = bodyChunked then
+                scan := chunkByte(&~out, byte, scan, maximum);
+            else
+                writeByte(&~out, byte);
+                let have: Index := scan.have + 1;
+                scan := bodyScan((framing.kind = bodyLength) and (have = framing.length), false, have, scan.phase, scan.size, scan.digits);
+            end if;
+            i := i + 1;
+        end while;
+        return scan;
+    end;
+
+    -- The body after the header, rest first, then from the connection.
+    generic [R: Region]
+    function readBody(client: &![Client, R], framing: Framing, rest: String, sent: Index, limits: Limits, clock: Clock): Either[Failure, String] is
+        var collected: StringBuilder := makeStringBuilder();
+        var words: String := makeEmpty();
+        let empty: Bool := (framing.kind = bodyNone) or ((framing.kind = bodyLength) and (framing.length = zeroIndex));
+        let start: BodyScan := bodyScan(empty, false, zeroIndex, chunkSize, zeroIndex, zeroIndex);
+        var scan: BodyScan := start;
+        if not empty then
+            scan := feedBody(&!collected, &rest, framing, start, limits.maximumBytes);
+        end if;
+        destroyString(rest);
+        var count: Index := sent;
+        var result: Nat8 := readOn;
+        if scan.done then
+            result := readDone;
+        end if;
+        while (result = readOn) and (not scan.bad) do
+            let piece: Piece := nextPiece(&~client, count, limits, clock);
+            let { outcome: Nat8, bytes: String, message: String } := piece;
+            if outcome = readOn then
+                count := count + stringLength(&bytes);
+                scan := feedBody(&!collected, &bytes, framing, scan, limits.maximumBytes);
+                if scan.done then
+                    result := readDone;
+                end if;
+                destroyString(message);
+            else
+                result := outcome;
+                if (outcome = readClosed) and (framing.kind = bodyUntilClose) then
+                    result := readDone;
+                end if;
+                let old: String := words;
+                destroyString(old);
+                words := message;
+            end if;
+            destroyString(bytes);
+        end while;
+        let text: String := finalize(collected);
+        if scan.bad then
+            destroyString(text);
+            destroyString(words);
+            let broken: Either[Failure, String] := Left(left => failure(BadResponse(), "the chunked body is not framed as RFC 9112 says"));
+            return broken;
+        else if result = readDone then
+            destroyString(words);
+            let done: Either[Failure, String] := Right(right => text);
+            return done;
+        else
+            destroyString(text);
+            let failed: Either[Failure, String] := Left(left => readFailure(result, words, "the server closed the connection before the body ended"));
+            return failed;
+        end if;
+    end;
+
+    ---
+    --- The answer
+    ---
+
+    constant mostInterim: Index := 8;
+
+    -- The answer, after at most mostInterim interim answers of status 1xx.
+    generic [R: Region]
+    function readAnswer(client: &![Client, R], pending: String, sent: Index, interim: Index, limits: Limits, clock: Clock): Either[Failure, Response] is
+        case readHead(&~client, pending, sent, limits, clock) of
+            when Left(left as failed: Failure) do
+                let out: Either[Failure, Response] := Left(left => failed);
+                return out;
+            when Right(right as read: HeadRead) do
+                let { head: String, rest: String, total: Index } := read;
+                case statusOf(&head) of
+                    when None do
+                        destroyString(head);
+                        destroyString(rest);
+                        let bad: Either[Failure, Response] := Left(left => failure(BadResponse(), "the status line is not HTTP/1.0 or HTTP/1.1"));
+                        return bad;
+                    when Some(value as status: Nat16) do
+                        if status < 200 then
+                            destroyString(head);
+                            if (status = 101) or (interim >= mostInterim) then
+                                destroyString(rest);
+                                let bad: Either[Failure, Response] := Left(left => failure(BadResponse(), "a switch of protocols or too many interim answers"));
+                                return bad;
+                            else
+                                return readAnswer(&~client, rest, total, interim + 1, limits, clock);
+                            end if;
+                        else
+                            let block: String := headerBlock(&head);
+                            destroyString(head);
+                            let framing: Framing := framingOf(status, asSpan(&block), limits.maximumBytes);
+                            return answerWith(&~client, status, block, framing, rest, total, limits, clock);
+                        end if;
+                end case;
+        end case;
+    end;
+
+    -- The answer once its status and header lines are read.
+    generic [R: Region]
+    function answerWith(client: &![Client, R], status: Nat16, block: String, framing: Framing, rest: String, sent: Index, limits: Limits, clock: Clock): Either[Failure, Response] is
+        if framing.kind = bodyTooLarge then
+            destroyString(block);
+            destroyString(rest);
+            let large: Either[Failure, Response] := Left(left => failure(TooLarge(), "the body the header announces is larger than the limit"));
+            return large;
+        else if (framing.kind = bodyBadCoding) or (framing.kind = bodyBadLength) then
+            destroyString(block);
+            destroyString(rest);
+            let bad: Either[Failure, Response] := Left(left => failure(BadResponse(), "a transfer coding other than chunked, or a Content-Length that is not one number"));
+            return bad;
+        else
+            case readBody(&~client, framing, rest, sent, limits, clock) of
+                when Right(right as content: String) do
+                    let response: Response := Response(status => status, headers => block, content => content);
+                    let answer: Either[Failure, Response] := Right(right => response);
+                    return answer;
+                when Left(left as failed: Failure) do
+                    destroyString(block);
+                    let out: Either[Failure, Response] := Left(left => failed);
+                    return out;
+            end case;
+        end if;
+    end;
+
+    ---
+    --- One exchange
+    ---
+
+    -- The failure of a TLS step: TimedOut when the time is up, TlsFailed
+    -- with the library's words otherwise.
+    function tlsFailure(message: String, clock: Clock): Failure is
+        if expired(clock) then
+            destroyString(message);
+            return failure(TimedOut(), "the time limit ran out during the TLS exchange");
+        else
+            let failed: Failure := Failure(kind => TlsFailed(), detail => message);
+            return failed;
+        end if;
+    end;
+
+    -- TLS over the connected socket, the request sent, the answer read,
+    -- and the connection closed whatever happened.  The TLS client takes
+    -- the socket, so closing the client closes it.  With a certificate
+    -- file the client presents that certificate and proves it holds the
+    -- key in keyFile; an empty certificateFile presents none.
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function exchange(socket: FileDescriptor, host: &[String, H], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], text: String, limits: Limits, clock: Clock): Either[Failure, Response] is
+        let left: Nat32 := remainingMillis(clock);
+        if left = 0 then
+            destroyString(text);
+            let closed: Bool := closeFile(socket);
+            let late: Either[Failure, Response] := Left(left => failure(TimedOut(), "the time limit ran out before TLS began"));
+            return late;
+        else
+            case tlsOver(socket, asSpan(host), caFile, certificateFile, keyFile, left) of
+                when Left(left as message: String) do
+                    destroyString(text);
+                    let failed: Either[Failure, Response] := Left(left => tlsFailure(message, clock));
+                    return failed;
+                when Right(right as client: Client) do
+                    var tls: Client := client;
+                    let result: Either[Failure, Response] := sendAndRead(&!tls, text, limits, clock);
+                    closeClient(tls);
+                    return result;
+            end case;
+        end if;
+    end;
+
+    -- The TLS client over the socket, with the client certificate when
+    -- certificateFile is not empty.
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function tlsOver(socket: FileDescriptor, host: Span[Nat8, H], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], milliseconds: Nat32): Either[String, Client] is
+        if spanLength(certificateFile) = 0 then
+            return connectOver(socket, host, caFile, milliseconds);
+        end if;
+        return connectOverAs(socket, host, caFile, certificateFile, keyFile, milliseconds);
+    end;
+
+    generic [R: Region]
+    function sendAndRead(client: &![Client, R], text: String, limits: Limits, clock: Clock): Either[Failure, Response] is
+        let left: Nat32 := remainingMillis(clock);
+        if left = 0 then
+            destroyString(text);
+            let late: Either[Failure, Response] := Left(left => failure(TimedOut(), "the time limit ran out before the request was sent"));
+            return late;
+        else
+            let sent: Either[String, Unit] := sendWithin(&~client, asSpan(&text), left);
+            destroyString(text);
+            case sent of
+                when Left(left as message: String) do
+                    let failed: Either[Failure, Response] := Left(left => tlsFailure(message, clock));
+                    return failed;
+                when Right(right as done: Unit) do
+                    return readAnswer(&~client, makeEmpty(), zeroIndex, zeroIndex, limits, clock);
+            end case;
+        end if;
+    end;
+
+    ---
+    --- The request
+    ---
+
+    function isGet(verb: Method): Bool is
+        case verb of
+            when Get do
+                return true;
+            when Post do
+                return false;
+        end case;
+    end;
+
+    generic [U: Region, H: Region, B: Region, C: Region]
+    function request(verb: Method, url: Span[Nat8, U], headers: Span[Nat8, H], payload: Span[Nat8, B], caFile: Span[Nat8, C], limits: Limits): Either[Failure, Response] is
+        return requestWith(verb, url, headers, payload, caFile, "", "", limits);
+    end;
+
+    generic [U: Region, H: Region, B: Region, C: Region, E: Region, K: Region]
+    function requestAs(verb: Method, url: Span[Nat8, U], headers: Span[Nat8, H], payload: Span[Nat8, B], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], limits: Limits): Either[Failure, Response] is
+        return requestWith(verb, url, headers, payload, caFile, certificateFile, keyFile, limits);
+    end;
+
+    -- request and requestAs: an empty certificateFile presents no client
+    -- certificate.
+    generic [U: Region, H: Region, B: Region, C: Region, E: Region, K: Region]
+    function requestWith(verb: Method, url: Span[Nat8, U], headers: Span[Nat8, H], payload: Span[Nat8, B], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], limits: Limits): Either[Failure, Response] is
+        if not validHeaderLines(headers) then
+            let refused: Either[Failure, Response] := Left(left => failure(BadRequest(), "a header line is refused"));
+            return refused;
+        end if;
+        if isGet(verb) and (spanLength(payload) > zeroIndex) then
+            let refused: Either[Failure, Response] := Left(left => failure(BadRequest(), "a GET carries no body"));
+            return refused;
+        end if;
+        case parseUrl(url) of
+            when None do
+                let refused: Either[Failure, Response] := Left(left => failure(BadUrl(), "the URL is not an https URL this client reads"));
+                return refused;
+            when Some(value as target: Target) do
+                let { host: String, port: Nat16, path: String } := target;
+                let clock: Clock := startClock(limits.totalMillis);
+                case addressesOf(&host, limits.publicOnly) of
+                    when Left(left as failed: Failure) do
+                        destroyString(host);
+                        destroyString(path);
+                        let out: Either[Failure, Response] := Left(left => failed);
+                        return out;
+                    when Right(right as addresses: Buffer[IpAddress]) do
+                        let zero: Index := 0;
+                        let connected: Either[Failure, FileDescriptor] := connectFrom(&addresses, zero, port, limits, clock, false);
+                        destroyFree(addresses);
+                        case connected of
+                            when Left(left as failed: Failure) do
+                                destroyString(host);
+                                destroyString(path);
+                                let out: Either[Failure, Response] := Left(left => failed);
+                                return out;
+                            when Right(right as socket: FileDescriptor) do
+                                let text: String := requestText(verb, &host, port, &path, headers, payload);
+                                destroyString(path);
+                                let result: Either[Failure, Response] := exchange(socket, &host, caFile, certificateFile, keyFile, text, limits, clock);
+                                destroyString(host);
+                                return result;
+                        end case;
+                end case;
+        end case;
+    end;
+end module body.

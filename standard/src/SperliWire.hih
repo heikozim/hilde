@@ -1,0 +1,271 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The bytes of Sperli, the cluster layer: frame headers, hello payloads and join tokens.
+
+- Every number is written least significant byte first, in a fixed width.
+- A header is 52 bytes and a payload at most maxPayload bytes; the length is checked before a payload is read.
+- checkHeader gives 0 for a frame to take, a code of Standard.SperliError for a frame to refuse.
+- A frame of an older incarnation gives staleIncarnation: the caller reads its payload and drops it.
+- Only the checkpoint frames carry an epoch; they carry no tag.
+- A join token holds the job, rank, size, incarnation, host and expiry, signed with Standard.CompositeSig.
+- verifyJoinToken checks the signature first, then the job, the rank, size, incarnation and host, then the expiry.
+
+    let header: String := frameHeader(dataKind(), 5, job, 1, 0, 0, 1, 7);
+    let verdict: Int32 := checkHeader(asSpan(&header), job, 1, 1, 0);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String,
+    length
+);
+import Standard.CompositeSig (
+    CompositeKey
+);
+
+module Standard.SperliWire is
+    """
+    The bytes of a frame header: 52.
+    """
+    function headerBytes(): Index
+        ensures result = 52;
+
+    """
+    The most bytes the payload of one frame may have: 16777216.
+    """
+    function maxPayload(): Index
+        ensures result = 16777216;
+
+    """
+    The type code of hello: 1.
+    """
+    function helloKind(): Nat8
+        ensures result = 1;
+
+    """
+    The type code of data: 2.
+    """
+    function dataKind(): Nat8
+        ensures result = 2;
+
+    """
+    The type code of heartbeat: 4.
+    """
+    function heartbeatKind(): Nat8
+        ensures result = 4;
+
+    """
+    The type code of abort: 5.
+    """
+    function abortKind(): Nat8
+        ensures result = 5;
+
+    """
+    The type code of the start of a checkpoint, ckpt begin: 6.
+    """
+    function ckptBeginKind(): Nat8
+        ensures result = 6;
+
+    """
+    The type code of a piece of a rank file, ckpt data: 7.
+    """
+    function ckptDataKind(): Nat8
+        ensures result = 7;
+
+    """
+    The type code of the acknowledgement of a rank file, ckpt ack: 8.
+    """
+    function ckptAckKind(): Nat8
+        ensures result = 8;
+
+    """
+    The type code of the COMMIT file, ckpt commit: 9.
+    """
+    function ckptCommitKind(): Nat8
+        ensures result = 9;
+
+    """
+    The type code of resume: 10.
+    """
+    function resumeKind(): Nat8
+        ensures result = 10;
+
+    """
+    The type code of bye: 11.
+    """
+    function byeKind(): Nat8
+        ensures result = 11;
+
+    """
+    The context of the signature of a join token, the join label.
+    """
+    function tokenContext(): Span[Nat8, Static]
+        ensures spanLength(result) = 13;
+
+    """
+    The header of a frame of the type kind that carries payloadLength bytes
+    of payload, from rank source to rank target, in job (16 bytes).
+    Flags, service and membership epoch are 0.  The result is 52 bytes.
+    """
+    generic [J: Region]
+    function frameHeader(kind: Nat8, payloadLength: Index, job: Span[Nat8, J], incarnation: Nat32, epoch: Nat64, source: Nat32, target: Nat32, tag: Nat32): String
+        requires (spanLength(job) = 16) and (payloadLength <= 16777216)
+        ensures length(&result) = 52;
+
+    """
+    The payload length a header announces.
+    """
+    generic [H: Region]
+    function headerLength(header: Span[Nat8, H]): Index
+        requires spanLength(header) = 52
+        ensures result <= 4294967295;
+
+    """
+    The type code a header holds.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [H: Region]
+    function headerKind(header: Span[Nat8, H]): Nat8
+        requires spanLength(header) = 52;
+
+    """
+    The tag a header holds.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [H: Region]
+    function headerTag(header: Span[Nat8, H]): Nat32
+        requires spanLength(header) = 52;
+
+    """
+    Whether a frame with this header is one to take.  0 for a frame of
+    job at incarnation from the rank peer to the rank own; the length is
+    checked first (oversizedFrame), then type, flags, service, membership
+    epoch, job, ranks (badFrame), then the incarnation: an older one gives
+    staleIncarnation, a newer one badFrame.  Last, badFrame for a data
+    frame whose tag is above 2147483647, for a collective frame with a
+    tag or with less than 16 bytes, for a checkpoint frame with a tag or,
+    other than resume, without an epoch, and for any other frame with an
+    epoch.
+    No contract: every header is allowed, a wrong one is an answer.
+    """
+    generic [H: Region, J: Region]
+    function checkHeader(header: Span[Nat8, H], job: Span[Nat8, J], incarnation: Nat32, own: Nat32, peer: Nat32): Int32
+        requires (spanLength(header) = 52) and (spanLength(job) = 16);
+
+    """
+    The payload of a hello of the language code (0 Hilde, 1 Go, 2 C), the
+    services bit set and the join token: 16 bytes and the token.
+    """
+    generic [T: Region]
+    function helloPayload(language: Nat8, services: Nat32, token: Span[Nat8, T]): String
+        requires spanLength(token) <= 65535
+        ensures length(&result) = (16 + spanLength(token));
+
+    """
+    0 when payload is a hello of version 1 that offers point-to-point
+    service and holds the token it announces; badHello otherwise.
+    No contract: every payload is allowed, a wrong one is an answer.
+    """
+    generic [P: Region]
+    function checkHello(payload: Span[Nat8, P]): Int32;
+
+    """
+    The join token a hello payload holds; empty when checkHello does not
+    give 0.
+    No contract: the empty string is the answer for a payload that is no hello.
+    """
+    generic [P: Region]
+    function helloToken(payload: Span[Nat8, P]): String;
+
+    """
+    The payload of an abort: the reason code and the text, cut to 1024 bytes.
+    """
+    generic [T: Region]
+    function abortPayload(reason: Nat32, text: Span[Nat8, T]): String
+        ensures length(&result) >= 4;
+
+    """
+    The reason code of an abort payload; 0 when it is shorter than 4 bytes.
+    No contract: a value whose only cheap property is its type.
+    """
+    generic [P: Region]
+    function abortReason(payload: Span[Nat8, P]): Nat32;
+
+    """
+    A join token for rank of size ranks of job at incarnation, to run on
+    host (1 to 255 bytes) until expiry, seconds since 1970: the message and
+    its signature under key.  None when the signing failed.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, J: Region, H: Region]
+    function signJoinToken(key: &[CompositeKey, R], job: Span[Nat8, J], rank: Nat32, size: Nat32, incarnation: Nat32, expiry: Nat64, host: Span[Nat8, H]): Option[String]
+        requires ((spanLength(job) = 16) and (spanLength(host) > 0)) and (spanLength(host) <= 255);
+
+    """
+    0 when token holds a signature of publicKey over a message for job,
+    rank, size, incarnation and host that has not expired at now, seconds
+    since 1970.  Otherwise tokenBadSignature for a token that is
+    malformed or whose signature fails, tokenForeignJob, tokenWrongRank
+    or tokenExpired, in that order.
+    No contract: every token is allowed, a wrong one is an answer.
+    """
+    generic [T: Region, K: Region, J: Region, H: Region]
+    function verifyJoinToken(token: Span[Nat8, T], publicKey: Span[Nat8, K], job: Span[Nat8, J], rank: Nat32, size: Nat32, incarnation: Nat32, host: Span[Nat8, H], now: Nat64): Int32
+        requires spanLength(job) = 16;
+
+    """
+    The name of the environment variable that lists the hosts which never
+    run a rank: SPERLI_REFUSED_HOSTS.
+    """
+    function refusedHostsVariable(): Span[Nat8, Static]
+        ensures spanLength(result) = 20;
+
+    """
+    Whether host is one of names or a name below one, in any letter case.
+    The names are separated by commas, blanks, tabs or line ends; an empty
+    host is never listed.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [H: Region, L: Region]
+    function hostListed(host: Span[Nat8, H], names: Span[Nat8, L]): Bool;
+
+    """
+    Whether host never runs a rank: host-a.invalid, host-b.invalid or a
+    name below either, or a host the variable named by
+    refusedHostsVariable lists, as hostListed reads it.  An unset variable,
+    or one longer than environmentLimit of Standard.File, adds no name.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [H: Region]
+    function hostRefused(host: Span[Nat8, H]): Bool;
+
+    """
+    The bytes as lower-case hexadecimal digits, two for each.
+    """
+    generic [B: Region]
+    function hexOf(bytes: Span[Nat8, B]): String
+        ensures length(&result) = (2 * spanLength(bytes));
+
+    """
+    The common name of the certificate of rank in job (16 bytes):
+    sperli-, the job as 32 hexadecimal digits, a hyphen, the rank in decimal.
+    """
+    generic [J: Region]
+    function certificateName(job: Span[Nat8, J], rank: Nat32): String
+        requires spanLength(job) = 16
+        ensures length(&result) >= 41;
+
+    """
+    Whether subject, as Standard.Tls.peerSubject writes it, is the one of
+    the certificate of rank in job.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [S: Region, J: Region]
+    function subjectIs(subject: Span[Nat8, S], job: Span[Nat8, J], rank: Nat32): Bool
+        requires spanLength(job) = 16;
+end module.

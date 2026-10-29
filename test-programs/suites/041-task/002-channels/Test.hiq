@@ -1,0 +1,203 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    yieldNow,
+    Sender,
+    Receiver,
+    Channel,
+    openChannel,
+    send,
+    receive,
+    closeSender,
+    closeReceiver
+);
+
+module body Test is
+    function widen(value: Bool): Int32 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    -- Send 1 to 5, printing 100+k after each send returns, then close.
+    function produce(sender: Sender[Int32]): Unit is
+        var out: Sender[Int32] := sender;
+        var k: Int32 := 1;
+        while k <= 5 do
+            case send(&!out, k) of
+                when Some(value as returned: Int32) do
+                    printLn(-returned);
+                when None do
+                    printLn(100 + k);
+            end case;
+            k := k + 1;
+        end while;
+        closeSender(out);
+        return nil;
+    end;
+
+    -- Receive until the end of the stream, printing each value, and give
+    -- back the sum.
+    function drain(receiver: Receiver[Int32]): Int32 is
+        var input: Receiver[Int32] := receiver;
+        var sum: Int32 := 0;
+        var more: Bool := true;
+        while more do
+            case receive(&!input) of
+                when Some(value as got: Int32) do
+                    printLn(got);
+                    sum := sum + got;
+                when None do
+                    more := false;
+            end case;
+        end while;
+        closeReceiver(input);
+        return sum;
+    end;
+
+    -- One run: a producer task and main as the consumer, over a channel of
+    -- the given capacity.  Prints a separator first.
+    generic [R: Region]
+    function run(scope: &![Scope, R], capacity: Index, marker: Int32): Unit is
+        printLn(marker);
+        let made: Option[Channel[Int32]] := openChannel(capacity);
+        case made of
+            when Some(value as ends: Channel[Int32]) do
+                let { sender: Sender[Int32], receiver: Receiver[Int32] } := ends;
+                let work: Fn[Sender[Int32], Unit] := produce;
+                case spawn(&~scope, work, sender) of
+                    when Right(right as producer: Task[Unit]) do
+                        printLn(drain(receiver));
+                        join(producer);
+                    when Left(left as unused: Sender[Int32]) do
+                        closeSender(unused);
+                        closeReceiver(receiver);
+                        printLn(-1);
+                end case;
+            when None do
+                printLn(-2);
+        end case;
+        return nil;
+    end;
+
+    -- The producer runs first: main yields before it receives.  On a
+    -- rendezvous the first send cannot complete until a receiver is there,
+    -- so 101 comes after main's second marker; on a channel of capacity 1
+    -- the first send would complete at once and 101 would come before it.
+    -- This is the run that tells the two apart -- in the two runs above the
+    -- receiver is always waiting first, and a capacity-1 channel prints the
+    -- same lines there (measured: the negative control that ignores the
+    -- rendezvous flag passed them).
+    generic [R: Region]
+    function runProducerFirst(scope: &![Scope, R], capacity: Index, marker: Int32): Unit is
+        printLn(marker);
+        let made: Option[Channel[Int32]] := openChannel(capacity);
+        case made of
+            when Some(value as ends: Channel[Int32]) do
+                let { sender: Sender[Int32], receiver: Receiver[Int32] } := ends;
+                let work: Fn[Sender[Int32], Unit] := produce;
+                case spawn(&~scope, work, sender) of
+                    when Right(right as producer: Task[Unit]) do
+                        yieldNow();
+                        printLn(marker + 1);
+                        printLn(drain(receiver));
+                        join(producer);
+                    when Left(left as unused: Sender[Int32]) do
+                        closeSender(unused);
+                        closeReceiver(receiver);
+                        printLn(-1);
+                end case;
+            when None do
+                printLn(-2);
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                -- Capacity 2: the producer runs ahead of the consumer by
+                -- two values and then waits.
+                run(&!scope, 2, 900);
+                -- Capacity 0, a rendezvous: every send waits for the
+                -- receive that takes it.
+                run(&!scope, 0, 901);
+                -- Capacity 0 again, with the producer first.
+                runProducerFirst(&!scope, 0, 904);
+                closeScope(scope);
+            when None do
+                printLn(-2);
+        end case;
+
+        -- A send to a channel whose receiver has closed hands the value
+        -- back instead of losing it -- here a Linear one, a String.
+        printLn(902);
+        let closedEarly: Option[Channel[String]] := openChannel(1);
+        case closedEarly of
+            when Some(value as ends: Channel[String]) do
+                let { sender: Sender[String], receiver: Receiver[String] } := ends;
+                closeReceiver(receiver);
+                var out: Sender[String] := sender;
+                case send(&!out, fromLiteral("kept")) of
+                    when Some(value as back: String) do
+                        printLn(length(&back));
+                        destroyString(back);
+                    when None do
+                        printLn(-3);
+                end case;
+                closeSender(out);
+            when None do
+                printLn(-2);
+        end case;
+
+        -- A Linear value through a channel, in one task: capacity 1, so the
+        -- send does not wait.
+        printLn(903);
+        let carrier: Option[Channel[String]] := openChannel(1);
+        case carrier of
+            when Some(value as ends: Channel[String]) do
+                let { sender: Sender[String], receiver: Receiver[String] } := ends;
+                var out: Sender[String] := sender;
+                var input: Receiver[String] := receiver;
+                case send(&!out, fromLiteral("moved")) of
+                    when Some(value as back: String) do
+                        destroyString(back);
+                        printLn(-3);
+                    when None do
+                        printLn(1);
+                end case;
+                closeSender(out);
+                case receive(&!input) of
+                    when Some(value as got: String) do
+                        printLn(length(&got));
+                        destroyString(got);
+                    when None do
+                        printLn(-4);
+                end case;
+                -- The sender has closed and the channel is empty: the end.
+                case receive(&!input) of
+                    when Some(value as got: String) do
+                        destroyString(got);
+                        printLn(-5);
+                    when None do
+                        printLn(0);
+                end case;
+                closeReceiver(input);
+            when None do
+                printLn(-2);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

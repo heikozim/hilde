@@ -1,0 +1,243 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Tests for Standard.Ini.  Each case stands for a fault seen in use: a
+-- default switched off by an empty local value, a continued value in the
+-- middle of a file and at its end, the names around a continuation, junk
+-- lines skipped and the rest still read, a # inside a value, and the
+-- vocabulary of a switch.  Sections are what INI adds.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    constantTimeEqual
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Ini (
+    IniFile,
+    readIni,
+    destroyIni,
+    skippedLines,
+    iniValue,
+    iniValueWith,
+    isOn,
+    iniSwitch,
+    entryCount,
+    entrySection,
+    entryName,
+    entryValue
+);
+
+module body Standard.Ini.Test is
+    generic [R: Region, S: Region]
+    function isValue(found: Option[Span[Nat8, R]], want: Span[Nat8, S]): Bool is
+        case found of
+            when Some(value as text: Span[Nat8, R]) do
+                return constantTimeEqual(text, want);
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [S: Region]
+    function isCopy(found: Option[String], want: Span[Nat8, S]): Bool is
+        case found of
+            when Some(value as text: String) do
+                let same: Bool := constantTimeEqual(asSpan(&text), want);
+                destroyString(text);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function noCopy(found: Option[String]): Bool is
+        case found of
+            when Some(value as text: String) do
+                destroyString(text);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [R: Region]
+    function isAbsent(found: Option[Span[Nat8, R]]): Bool is
+        case found of
+            when Some(value as text: Span[Nat8, R]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- Inheritance, a local value over the default, an empty local value
+    -- that switches the default off, and a name found nowhere.
+    function testDefaults(): Unit is
+        let defaults: IniFile := readIni("HEADER_FP = pp-default\nLAYOUT_SITE = base\nENFORCE_HTTPS = yes\n");
+        let local: IniFile := readIni("LAYOUT_SITE = custom\nHEADER_FP =\nWEBSITE_DOMAIN = tenant.example\n");
+        assertTrue(isCopy(iniValueWith(&local, &defaults, "", "LAYOUT_SITE"), "custom"), "a local value wins");
+        assertTrue(isCopy(iniValueWith(&local, &defaults, "", "ENFORCE_HTTPS"), "yes"), "a default is inherited");
+        assertTrue(isCopy(iniValueWith(&local, &defaults, "", "HEADER_FP"), ""), "an empty local value switches the default off");
+        assertTrue(isValue(iniValue(&local, "", "WEBSITE_DOMAIN"), "tenant.example"), "a local name");
+        assertTrue(noCopy(iniValueWith(&local, &defaults, "", "NOPE")), "a name found nowhere");
+        assertTrue(isAbsent(iniValue(&defaults, "", "WEBSITE_DOMAIN")), "nothing comes from where it is not");
+        destroyIni(local);
+        destroyIni(defaults);
+        return nil;
+    end;
+
+    -- A value continued with a backslash is put together again, in the
+    -- middle of a file and at its end, and the names around it survive.
+    function testContinuation(): Unit is
+        let middle: IniFile := readIni("ENFORCE_HTTPS = no\nHEADER_CSP = default-src 'self'; \\\n\tscript-src 'self'; \\\n\tstyle-src 'self' 'unsafe-inline'; \\\n\tframe-ancestors 'none'; base-uri 'self'\nPAGE_CACHE_TTL = 600\n");
+        assertTrue(isValue(iniValue(&middle, "", "HEADER_CSP"), "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'"), "a continued value in the middle");
+        assertTrue(isValue(iniValue(&middle, "", "PAGE_CACHE_TTL"), "600"), "the name after it");
+        destroyIni(middle);
+        let last: IniFile := readIni("PAGE_CACHE_TTL = 600\n\n# appended by tooling\nHEADER_CSP = default-src 'self'; \\\n\tconnect-src 'self'; \\\n\tframe-ancestors 'none'\n");
+        assertTrue(isValue(iniValue(&last, "", "HEADER_CSP"), "default-src 'self'; connect-src 'self'; frame-ancestors 'none'"), "a continued value at the end");
+        destroyIni(last);
+        let around: IniFile := readIni("A = 1\nB = x \\\n\ty\nC = 3\n");
+        assertTrue(isValue(iniValue(&around, "", "A"), "1"), "the name before");
+        assertTrue(isValue(iniValue(&around, "", "B"), "x y"), "the continued one");
+        assertTrue(isValue(iniValue(&around, "", "C"), "3"), "the name after");
+        destroyIni(around);
+        let open: IniFile := readIni("A = one \\\n");
+        assertTrue(isValue(iniValue(&open, "", "A"), "one "), "a continuation the file ends inside keeps what it had");
+        destroyIni(open);
+        return nil;
+    end;
+
+    -- Comments and junk lines are skipped and counted, the rest is read.
+    function testCommentsAndJunk(): Unit is
+        let file: IniFile := readIni("# a comment\n; another\n\nGOOD = 1\nthis line has no equals sign\n= no name\n[unclosed\nALSO_GOOD = 2\r\n");
+        assertTrue(isValue(iniValue(&file, "", "GOOD"), "1"), "a name after comments");
+        assertTrue(isValue(iniValue(&file, "", "ALSO_GOOD"), "2"), "a name after junk, its carriage return gone");
+        assertTrue(skippedLines(&file) = 3, "three junk lines");
+        assertTrue(entryCount(&file) = 2, "junk is no entry");
+        destroyIni(file);
+        let color: IniFile := readIni("COLOR = #ff0000\n");
+        assertTrue(isValue(iniValue(&color, "", "COLOR"), "#ff0000"), "a # inside a value is part of it");
+        assertTrue(skippedLines(&color) = 0, "nothing skipped");
+        destroyIni(color);
+        return nil;
+    end;
+
+    function testSections(): Unit is
+        let file: IniFile := readIni("name = top\n[server]\nport = 8080\n[ client ]\nport = 9090\nname = first\nname = second\n");
+        assertTrue(isValue(iniValue(&file, "", "name"), "top"), "a name before the first section");
+        assertTrue(isValue(iniValue(&file, "server", "port"), "8080"), "a name in a section");
+        assertTrue(isValue(iniValue(&file, "client", "port"), "9090"), "the same name in another section");
+        assertTrue(isValue(iniValue(&file, "client", "name"), "second"), "the later of two counts");
+        assertTrue(isAbsent(iniValue(&file, "server", "name")), "a name of another section");
+        assertTrue(entryCount(&file) = 4, "each name once per section");
+        assertTrue(isValue(entrySection(&file, 1), "server"), "the section of the second entry");
+        assertTrue(isValue(entryName(&file, 3), "name"), "the name of the fourth");
+        assertTrue(isValue(entryValue(&file, 3), "second"), "its value, replaced in its place");
+        assertTrue(isAbsent(entryName(&file, 4)), "no fifth entry");
+        destroyIni(file);
+        return nil;
+    end;
+
+    -- The vocabulary of a switch: yes and true in any case, everything
+    -- else off, 1, on and ja included.
+    function testSwitches(): Unit is
+        assertTrue(isOn("yes"), "yes");
+        assertTrue(isOn("true"), "true");
+        assertTrue(isOn("YES"), "YES");
+        assertTrue(isOn("True"), "True");
+        assertTrue(isOn(" yes "), "yes with spaces");
+        assertTrue(isOn("\tTRUE\n"), "TRUE with a tab and a line feed");
+        assertTrue(not isOn(""), "empty");
+        assertTrue(not isOn("no"), "no");
+        assertTrue(not isOn("false"), "false");
+        assertTrue(not isOn("0"), "0");
+        assertTrue(not isOn("1"), "1");
+        assertTrue(not isOn("on"), "on");
+        assertTrue(not isOn("ja"), "ja");
+        assertTrue(not isOn("maybe"), "maybe");
+        assertTrue(not isOn(" "), "a space");
+        assertTrue(not isOn("yess"), "a longer word");
+        let file: IniFile := readIni("[flags]\nA = yes\nB = on\n");
+        assertTrue(iniSwitch(&file, "flags", "A"), "a switch that is on");
+        assertTrue(not iniSwitch(&file, "flags", "B"), "on is off");
+        assertTrue(not iniSwitch(&file, "flags", "C"), "a missing switch is off");
+        destroyIni(file);
+        return nil;
+    end;
+
+    function testEmpty(): Unit is
+        let file: IniFile := readIni("");
+        assertTrue(entryCount(&file) = 0, "an empty text has no entries");
+        assertTrue(skippedLines(&file) = 0, "and skips nothing");
+        destroyIni(file);
+        return nil;
+    end;
+
+    -- Write the number in decimal digits.
+    generic [B: Region]
+    function writeNumber(out: &![StringBuilder, B], number: Index): Unit is
+        let ten: Index := 10;
+        if number >= ten then
+            writeNumber(&~out, number / ten);
+        end if;
+        case toNat8(number - ((number / ten) * ten)) of
+            when Some(value as digit: Nat8) do
+                writeByte(&~out, digit + 48);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Two pairs of section and name whose bytes join to the same are kept
+    -- apart, and many names are each found, the one given twice in its
+    -- first place with its second value.
+    function testJoinedAndMany(): Unit is
+        let joined: IniFile := readIni("[ab]\nc = 1\n[a]\nbc = 2\n");
+        assertTrue(isValue(iniValue(&joined, "ab", "c"), "1"), "section ab, name c");
+        assertTrue(isValue(iniValue(&joined, "a", "bc"), "2"), "section a, name bc");
+        assertTrue(isAbsent(iniValue(&joined, "a", "c")), "section a has no c");
+        assertTrue(entryCount(&joined) = 2, "two entries, not one");
+        destroyIni(joined);
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < 3000 do
+            writeByte(&!builder, 'n');
+            writeNumber(&!builder, i);
+            writeString(&!builder, " = ");
+            writeNumber(&!builder, i);
+            writeByte(&!builder, '\n');
+            i := i + 1;
+        end while;
+        writeString(&!builder, "n7 = again\n");
+        let text: String := finalize(builder);
+        let file: IniFile := readIni(asSpan(&text));
+        assertTrue(entryCount(&file) = 3000, "3000 entries");
+        assertTrue(isValue(iniValue(&file, "", "n0"), "0"), "the first name");
+        assertTrue(isValue(iniValue(&file, "", "n2999"), "2999"), "the last name");
+        assertTrue(isValue(iniValue(&file, "", "n7"), "again"), "the later of two counts");
+        assertTrue(isValue(entryName(&file, 7), "n7"), "in the place of the first");
+        assertTrue(isValue(entryValue(&file, 7), "again"), "with the second value");
+        assertTrue(isAbsent(iniValue(&file, "", "n3000")), "no name past the last");
+        destroyIni(file);
+        destroyString(text);
+        return nil;
+    end;
+end module body.

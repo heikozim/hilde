@@ -1,0 +1,200 @@
+-- Standard.FcgiServer against
+-- scripts/socket/fcgi-client.py, a FastCGI client written from the
+-- specification in Python that shares no code with Standard.Fcgi.  The
+-- loop takes one connection, the handler answers with three parameters
+-- and the body, and the client prints every record it gets back.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Listener,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    listenUnix,
+    closeListener,
+    removeFile,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readAll,
+    closeFile
+);
+import Standard.Signal (
+    Signals,
+    Wanted,
+    watchSignals,
+    stopWatching
+);
+import Standard.FcgiServer (
+    Limits,
+    Request,
+    defaultLimits,
+    requestParam,
+    requestBody,
+    destroyRequest,
+    cgiResponse,
+    serveUnix
+);
+
+module body Test is
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region, B: Region]
+    function writeParam(out: &![StringBuilder, B], request: &[Request, R], name: Span[Nat8, Static]): Unit is
+        writeString(&~out, name);
+        writeByte(&~out, '=');
+        case requestParam(request, name) of
+            when Some(value as found: String) do
+                writeString(&~out, asSpan(&found));
+                destroyString(found);
+            when None do
+                writeString(&~out, "(none)");
+        end case;
+        writeByte(&~out, ' ');
+        return nil;
+    end;
+
+    function answer(request: Request): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeParam(&!out, &request, "REQUEST_METHOD");
+        writeParam(&!out, &request, "SCRIPT_NAME");
+        writeParam(&!out, &request, "QUERY_STRING");
+        writeString(&!out, requestBody(&request));
+        destroyRequest(request);
+        let text: String := finalize(out);
+        let output: String := cgiResponse(200, "text/plain", asSpan(&text));
+        destroyString(text);
+        return output;
+    end;
+
+    generic [R: Region]
+    function clientCommand(path: &[String, R]): Command is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/socket/fcgi-client.py");
+        let command: Command :=
+            addArgument(addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script)), asSpan(path));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        return command;
+    end;
+
+    function finish(running: Running): Unit is
+        let { process: Process, input: FileDescriptor, output: FileDescriptor,
+            errors: FileDescriptor } := running;
+        let closedInput: Bool := closeFile(input);
+        var out: FileDescriptor := output;
+        var err: FileDescriptor := errors;
+        printLn("-- the client printed:");
+        case readAll(&!out) of
+            when Some(value as text: String) do
+                printText(&text);
+                destroyString(text);
+            when None do
+                printLn("(reading its output failed)");
+        end case;
+        case readAll(&!err) of
+            when Some(value as text: String) do
+                if length(&text) > 0 then
+                    printLn("-- and on its error stream:");
+                    printText(&text);
+                end if;
+                destroyString(text);
+            when None do
+                printLn("(reading its errors failed)");
+        end case;
+        let closedOut: Bool := closeFile(out);
+        let closedErr: Bool := closeFile(err);
+        let status: ProcessStatus := waitProcess(process);
+        print("client exited normally: ");
+        print(exitedNormally(status));
+        print(", code ");
+        printLn(exitCode(status));
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        let path: String := fromLiteral("hilde-081-001.sock");
+        let removed: Bool := removeFile(asSpan(&path));
+        case listenUnix(asSpan(&path), #o600) of
+            when Some(value as listener: Listener) do
+                case spawnProcess(clientCommand(&path)) of
+                    when Some(value as running: Running) do
+                        let base: Limits := defaultLimits();
+                        let limits: Limits := Limits(
+                            workers => 1,
+                            connections => 1,
+                            paramsBytes => base.paramsBytes,
+                            bodyBytes => base.bodyBytes,
+                            requestMilliseconds => 10000,
+                            writeMilliseconds => 10000
+                        );
+                        let wanted: Wanted := Wanted(hangup => false, interrupt => true, terminate => true, user1 => false, user2 => false);
+                        case watchSignals(wanted) of
+                            when Some(value as watching: Signals) do
+                                var signals: Signals := watching;
+                                case serveUnix(&listener, answer, limits, &!signals) of
+                                    when Some(value as accepted: Index) do
+                                        print("connections accepted: ");
+                                        printLn(accepted);
+                                    when None do
+                                        printLn("the loop could not start");
+                                end case;
+                                let stopped: Bool := stopWatching(signals);
+                            when None do
+                                printLn("no signals");
+                        end case;
+                        finish(running);
+                    when None do
+                        printLn("the client could not be started");
+                end case;
+                print("listener closed: ");
+                printLn(closeListener(listener));
+            when None do
+                printLn("listen: failed");
+        end case;
+        destroyString(path);
+        return ExitSuccess();
+    end;
+end module body.

@@ -1,0 +1,118 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    closeFile,
+    readAll,
+    connectUnix,
+    Command,
+    makeCommand,
+    addArgument,
+    Process,
+    Running,
+    spawnProcess,
+    waitProcess,
+    ProcessStatus,
+    exitedNormally,
+    exitCode,
+    endedBySignal,
+    signalNumber
+);
+import Standard.Sandbox (
+    Report,
+    makePolicy,
+    allowPromises,
+    applyPolicy,
+    reportHas,
+    mechanismPledge
+);
+
+module body Test is
+    -- The child: pledged to stdio alone, it opens a Unix socket, which
+    -- pledge allows only with the promise unix.  Where pledge is in force
+    -- the kernel stops the child with the abort signal before the call
+    -- returns.
+    function child(): ExitCode is
+        let promises: String := fromLiteral("stdio");
+        let report: Report := applyPolicy(allowPromises(makePolicy(), asSpan(&promises)));
+        destroyString(promises);
+        if not reportHas(report, mechanismPledge) then
+            printLn("no pledge here");
+            return ExitSuccess();
+        end if;
+        let path: String := fromLiteral("/nonexistent-hilde-035/socket");
+        let connected: Option[FileDescriptor] := connectUnix(asSpan(&path));
+        destroyString(path);
+        case connected of
+            when Some(value as socket: FileDescriptor) do
+                closeFile(socket);
+            when None do
+                skip;
+        end case;
+        printLn("the call went through");
+        return ExitSuccess();
+    end;
+
+    generic [R: Region]
+    function saysNoPledge(text: &[String, R]): Bool is
+        let expected: String := fromLiteral("no pledge here\n");
+        let size: Index := length(&expected);
+        var same: Bool := (length(text) = size);
+        if same then
+            for i from 0 to size - 1 do
+                if nthByte(text, i) /= nthByte(&expected, i) then
+                    same := false;
+                end if;
+            end for;
+        end if;
+        destroyString(expected);
+        return same;
+    end;
+
+    function main(): ExitCode is
+        if argumentCount() > 1 then
+            return child();
+        end if;
+        let self: String := fromLiteral(nthArgument(0));
+        let mode: String := fromLiteral("child");
+        let command: Command := addArgument(makeCommand(asSpan(&self)), asSpan(&mode));
+        destroyString(self);
+        destroyString(mode);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                var fromChild: FileDescriptor := output;
+                var noPledge: Bool := false;
+                case readAll(&!fromChild) of
+                    when Some(value as said: String) do
+                        noPledge := saysNoPledge(&said);
+                        destroyString(said);
+                    when None do
+                        noPledge := false;
+                end case;
+                closeFile(fromChild);
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                -- The abort signal is 6 on both platforms this project
+                -- builds for.
+                let stopped: Bool := endedBySignal(status) and (signalNumber(status) = 6);
+                let without: Bool := (noPledge and exitedNormally(status)) and (exitCode(status) = 0);
+                if stopped or without then
+                    printLn("a call pledge forbids stops the child, where there is pledge");
+                else
+                    printLn("the call went through");
+                end if;
+            when None do
+                printLn("the child did not start");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

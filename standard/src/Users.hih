@@ -1,0 +1,260 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+User accounts with Argon2id passwords, locks and a limit on failed attempts, over a store the programme chooses.
+
+- A store is any type with an instance of UserStore; Standard.SqliteUsers and Standard.DatabaseUsers are finished ones.
+- A name is 1 to 64 bytes of letters, digits, dot, underscore and hyphen, and starts with a letter or digit.
+- A password is 1 to 1024 bytes; only its hash from Standard.Password is stored.
+- verify answers Rejected alike for an unknown name and a wrong password, and spends a hash on both.
+- Locked is answered only to the right password, so a lock tells nothing to who does not know it.
+- Failed attempts are counted per client, at most limits.attempts within limits.windowSeconds.
+- Every time is seconds passed in by the caller; below 0 is refused.
+- No HTTP and no cookie inside; once verify gives Accepted, Standard.Session opens the login.
+
+    case verify(&!users, "alice", asSpan(&typed), asSpan(&address), limits, now) of
+        when Right(right as verdict: Verdict) do
+            answer(verdict);
+        when Left(left as error: UserError) do
+            reportFailure(error);
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin");
+import Standard.String (
+    String
+);
+import Standard.Buffer (
+    Buffer
+);
+
+module Standard.Users is
+    """
+    What went wrong, apart from an answer of verify.
+    """
+    union UserError: Free is
+        """
+        The name is not 1 to 64 bytes of the allowed kind.
+        """
+        case BadName;
+        """
+        The password is empty or longer than 1024 bytes.
+        """
+        case BadPassword;
+        """
+        The client is empty or longer than 256 bytes.
+        """
+        case BadClient;
+        """
+        A time below 0.
+        """
+        case BadTime;
+        """
+        A hash could not be made or checked, for lack of memory or of
+        random bytes.
+        """
+        case HashFailed;
+        """
+        The store failed: a statement of the database, or what the
+        instance of another store reports.
+        """
+        case StorageFailed;
+    end;
+
+    """
+    The answer of verify.
+    """
+    union Verdict: Free is
+        """
+        The name is known, not locked, and the password is its password.
+        """
+        case Accepted;
+        """
+        The name is unknown or the password is wrong.
+        """
+        case Rejected;
+        """
+        The password is right, and the user is locked.
+        """
+        case Locked;
+        """
+        The client failed limits.attempts times within the window; the
+        password was not looked at.
+        """
+        case Throttled;
+    end;
+
+    """
+    How many failed attempts a client may make within how many seconds
+    before verify answers Throttled.
+    """
+    record AttemptLimits: Free is
+        attempts: Int64;
+        windowSeconds: Int64;
+    end;
+
+    """
+    Five attempts within 900 seconds.
+    """
+    function defaultAttemptLimits(): AttemptLimits
+        ensures (result.attempts = 5) and (result.windowSeconds = 900);
+
+    """
+    What a store holds of one user: the stored hash and whether the user
+    is locked.
+    """
+    record StoredUser: Linear is
+        hash: String;
+        locked: Bool;
+    end;
+
+    """
+    A place that keeps users and the failed attempts of clients.  It only
+    keeps; every rule (names, hashes, locks, the limit on attempts) is made
+    by the functions of this module.  A method that fails gives
+    StorageFailed.  The names it is given are valid ones.
+    """
+    typeclass UserStore(T: Type) is
+        """
+        The user of that name, or None.
+        No contract: an Either result, which an ensures cannot look into.
+        """
+        generic [R: Region, N: Region]
+        method readUser(store: &![T, R], name: Span[Nat8, N]): Either[UserError, Option[StoredUser]];
+        """
+        Adds a user that is not locked; false when the name is taken.
+        No contract: an Either result, which an ensures cannot look into.
+        """
+        generic [R: Region, N: Region, H: Region]
+        method insertUser(store: &![T, R], name: Span[Nat8, N], hash: Span[Nat8, H]): Either[UserError, Bool];
+        """
+        Puts a new hash in place of the stored one; false when no user has
+        the name.
+        No contract: an Either result, which an ensures cannot look into.
+        """
+        generic [R: Region, N: Region, H: Region]
+        method replaceHash(store: &![T, R], name: Span[Nat8, N], hash: Span[Nat8, H]): Either[UserError, Bool];
+        """
+        Sets whether the user is locked; false when no user has the name.
+        No contract: an Either result, which an ensures cannot look into.
+        """
+        generic [R: Region, N: Region]
+        method setLocked(store: &![T, R], name: Span[Nat8, N], locked: Bool): Either[UserError, Bool];
+        """
+        Removes the user; false when no user has the name.
+        No contract: an Either result, which an ensures cannot look into.
+        """
+        generic [R: Region, N: Region]
+        method removeUser(store: &![T, R], name: Span[Nat8, N]): Either[UserError, Bool];
+        """
+        The names of all users, in the order of their bytes.
+        No contract: an Either result, which an ensures cannot look into.
+        """
+        generic [R: Region]
+        method userNames(store: &![T, R]): Either[UserError, Buffer[String]];
+        """
+        How many failed attempts of client the store holds later than
+        since.
+        No contract: an Either result, which an ensures cannot look into.
+        """
+        generic [R: Region, C: Region]
+        method failuresSince(store: &![T, R], client: Span[Nat8, C], since: Int64): Either[UserError, Int64];
+        """
+        Keeps a failed attempt of client at now, and may drop those of
+        client at keepSince or earlier.
+        No contract: an Either result, which an ensures cannot look into.
+        """
+        generic [R: Region, C: Region]
+        method noteFailure(store: &![T, R], client: Span[Nat8, C], now: Int64, keepSince: Int64): Either[UserError, Unit];
+        """
+        Drops every failed attempt of client.
+        No contract: an Either result, which an ensures cannot look into.
+        """
+        generic [R: Region, C: Region]
+        method forgetFailures(store: &![T, R], client: Span[Nat8, C]): Either[UserError, Unit];
+    end;
+
+    """
+    Whether name is a valid user name: 1 to 64 bytes of letters, digits,
+    dot, underscore and hyphen, the first a letter or digit.
+    """
+    generic [R: Region]
+    function isUserName(name: Span[Nat8, R]): Bool
+        ensures (not result) or ((spanLength(name) >= 1) and (spanLength(name) <= 64));
+
+    """
+    Adds a user with the hash of password, not locked.  Right of false
+    when the name is taken.
+    No contract: the result is I/O.
+    """
+    generic [T: Type(UserStore), R: Region, N: Region, P: Region]
+    function addUser(store: &![T, R], name: Span[Nat8, N], password: Span[Nat8, P]): Either[UserError, Bool];
+
+    """
+    Removes the user.  Right of false when there is none of that name.
+    No contract: the result is I/O.
+    """
+    generic [T: Type(UserStore), R: Region, N: Region]
+    function deleteUser(store: &![T, R], name: Span[Nat8, N]): Either[UserError, Bool];
+
+    """
+    Sets the password of a user without asking for the old one, as an
+    administrator does.  Right of false when there is no user of that name.
+    No contract: the result is I/O.
+    """
+    generic [T: Type(UserStore), R: Region, N: Region, P: Region]
+    function setPassword(store: &![T, R], name: Span[Nat8, N], password: Span[Nat8, P]): Either[UserError, Bool];
+
+    """
+    Sets a new password after the old one is verified as verify does, with
+    its count of attempts for client.  Right of the verdict; the password
+    is changed only when it is Accepted.  No ensures: the result is I/O.
+    """
+    generic [T: Type(UserStore), R: Region, N: Region, O: Region, P: Region, C: Region]
+    function changePassword(store: &![T, R], name: Span[Nat8, N], old: Span[Nat8, O], password: Span[Nat8, P], client: Span[Nat8, C], limits: AttemptLimits, now: Int64): Either[UserError, Verdict]
+        requires (limits.attempts >= 1) and (limits.windowSeconds >= 1);
+
+    """
+    The names of all users.  Give them back with destroyUserNames.
+    No contract: the result is I/O.
+    """
+    generic [T: Type(UserStore), R: Region]
+    function listUsers(store: &![T, R]): Either[UserError, Buffer[String]];
+
+    """
+    Gives back the names of listUsers.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyUserNames(names: Buffer[String]): Unit;
+
+    """
+    Whether password is the password of name, for client at now.  A client
+    over its limit is Throttled before anything is looked at; every
+    Rejected counts as a failed attempt of client; Accepted forgets them.
+    A hash made with an older method is replaced by a new one on Accepted.
+    No ensures: the result is I/O.
+    """
+    generic [T: Type(UserStore), R: Region, N: Region, P: Region, C: Region]
+    function verify(store: &![T, R], name: Span[Nat8, N], password: Span[Nat8, P], client: Span[Nat8, C], limits: AttemptLimits, now: Int64): Either[UserError, Verdict]
+        requires (limits.attempts >= 1) and (limits.windowSeconds >= 1);
+
+    """
+    Locks the user: verify answers Locked to the right password.  Right of
+    false when there is no user of that name.
+    No contract: the result is I/O.
+    """
+    generic [T: Type(UserStore), R: Region, N: Region]
+    function lockUser(store: &![T, R], name: Span[Nat8, N]): Either[UserError, Bool];
+
+    """
+    Takes the lock back.  Right of false when there is no user of that
+    name.
+    No contract: the result is I/O.
+    """
+    generic [T: Type(UserStore), R: Region, N: Region]
+    function unlockUser(store: &![T, R], name: Span[Nat8, N]): Either[UserError, Bool];
+end module.

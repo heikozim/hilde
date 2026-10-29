@@ -1,0 +1,851 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The document is checked first, without building anything, so that a
+-- refusal leaves nothing to free; the manifest is built afterwards from a
+-- document known to be right.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nthRef,
+    insertBack,
+    swapNth,
+    removeLast,
+    destroyEmpty
+);
+import Standard.Text (
+    equal,
+    formatNat
+);
+import Standard.Toml (
+    Toml,
+    TomlError,
+    TomlFault,
+    CutShort,
+    ByteOutOfPlace,
+    BadString,
+    BadNumber,
+    BadDateTime,
+    NotUtf8,
+    DefinedTwice,
+    NestedTooDeep,
+    TomlKind,
+    TomlString,
+    TomlInteger,
+    TomlFloat,
+    TomlOffsetDateTime,
+    TomlLocalDateTime,
+    TomlLocalDate,
+    TomlLocalTime,
+    TomlBoolean,
+    TomlArray,
+    TomlTable,
+    readToml,
+    destroyToml,
+    kindAt,
+    stringAt,
+    boolAt,
+    countAt,
+    keyAt
+);
+import Standard.Semver (
+    Version,
+    parseVersion,
+    formatVersion
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf
+);
+
+module body Pkg.Manifest is
+    constant noIndex: Index := 0;
+
+    -- Parts of a prefix start with a capital and go on with letters and
+    -- digits.
+    function isCapital(byte: Nat8): Bool is
+        return (byte >= 'A') and (byte <= 'Z');
+    end;
+
+    function isLetterOrDigit(byte: Nat8): Bool is
+        return (((byte >= 'A') and (byte <= 'Z')) or ((byte >= 'a') and (byte <= 'z'))) or ((byte >= '0') and (byte <= '9'));
+    end;
+
+    generic [R: Region]
+    function isPrefix(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        if size = 0 then
+            return false;
+        end if;
+        var start: Bool := true;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if start then
+                if not isCapital(byte) then
+                    return false;
+                end if;
+                start := false;
+            else if byte = '.' then
+                start := true;
+            else if not isLetterOrDigit(byte) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return not start;
+    end;
+
+    generic [R: Region]
+    function isPlainValue(text: Span[Nat8, R]): Bool is
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if (((byte < ' ') or (byte = 127)) or (byte = '"')) or (byte = '\\') then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function nameOf(manifest: &[Manifest, R]): Span[Nat8, R] is
+        return asSpan(&(manifest->name));
+    end;
+
+    generic [R: Region]
+    function nameLength(manifest: &[Manifest, R]): Index is
+        return length(&(manifest->name));
+    end;
+
+    generic [R: Region]
+    function prefixLength(requirement: &[Requirement, R]): Index is
+        return length(&(requirement->prefix));
+    end;
+
+    generic [R: Region]
+    function prefixOf(requirement: &[Requirement, R]): Span[Nat8, R] is
+        return asSpan(&(requirement->prefix));
+    end;
+
+    generic [N: Region]
+    function makeManifest(name: Span[Nat8, N], version: Version): Manifest is
+        return Manifest(
+            name => fromSpan(name),
+            version => version,
+            key => makeEmpty(),
+            capabilities => allocateEmpty(),
+            needs => allocateEmpty(),
+            targets => allocateEmpty(),
+            commitC => false,
+            cDir => fromLiteral("c"),
+            requireSignatures => false
+        );
+    end;
+
+    generic [P: Region, G: Region, K: Region]
+    function makeRequirement(prefix: Span[Nat8, P], git: Span[Nat8, G], version: Version, key: Span[Nat8, K]): Requirement is
+        return Requirement(prefix => fromSpan(prefix), git => fromSpan(git), version => version, key => fromSpan(key));
+    end;
+
+    function destroyRequirement(requirement: Requirement): Unit is
+        let { prefix: String, git: String, version: Version, key: String } := requirement;
+        destroyString(prefix);
+        destroyString(git);
+        destroyString(key);
+        return nil;
+    end;
+
+    function destroyRequirements(needs: Buffer[Requirement]): Unit is
+        var rest: Buffer[Requirement] := needs;
+        while bufferLength(&rest) > 0 do
+            destroyRequirement(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyManifest(manifest: Manifest): Unit is
+        let { name: String, version: Version, key: String, capabilities: Buffer[String], needs: Buffer[Requirement],
+              targets: Buffer[String], commitC: Bool, cDir: String, requireSignatures: Bool } := manifest;
+        destroyString(name);
+        destroyString(key);
+        destroyArguments(capabilities);
+        destroyRequirements(needs);
+        destroyArguments(targets);
+        destroyString(cDir);
+        return nil;
+    end;
+
+    -- Texts joined, for paths into the document and for messages.
+    generic [A: Region, B: Region]
+    function join2(a: Span[Nat8, A], b: Span[Nat8, B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        return finalize(out);
+    end;
+
+    generic [A: Region, B: Region, C: Region]
+    function join3(a: Span[Nat8, A], b: Span[Nat8, B], c: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        writeString(&!out, c);
+        return finalize(out);
+    end;
+
+    -- The path of a key of the requirement of prefix: require."P".key.
+    generic [P: Region]
+    function requirePath(prefix: Span[Nat8, P], key: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "require.\"");
+        writeString(&!out, prefix);
+        writeByte(&!out, '"');
+        if spanLength(key) > 0 then
+            writeByte(&!out, '.');
+            writeString(&!out, key);
+        end if;
+        return finalize(out);
+    end;
+
+    -- The path of element i of the array at path.
+    generic [P: Region]
+    function elementPath(path: Span[Nat8, P], i: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, path);
+        writeByte(&!out, '[');
+        case toNat64(i) of
+            when Some(value as n: Nat64) do
+                let digits: String := formatNat(n);
+                writeString(&!out, asSpan(&digits));
+                destroyString(digits);
+            when None do
+                abort("Pkg.Manifest: an index did not fit a Nat64");
+        end case;
+        writeByte(&!out, ']');
+        return finalize(out);
+    end;
+
+    function faultText(fault: TomlFault): Span[Nat8, Static] is
+        case fault of
+            when CutShort do
+                return "the text ends inside a value";
+            when ByteOutOfPlace do
+                return "a byte stands where it cannot";
+            when BadString do
+                return "a string is not written as TOML writes one";
+            when BadNumber do
+                return "a number is not written as TOML writes one";
+            when BadDateTime do
+                return "a date or time is not written as TOML writes one";
+            when NotUtf8 do
+                return "the text is not UTF-8";
+            when DefinedTwice do
+                return "a key or a table is defined twice";
+            when NestedTooDeep do
+                return "arrays or tables are nested too deep";
+        end case;
+    end;
+
+    function indexText(i: Index): String is
+        case toNat64(i) of
+            when Some(value as n: Nat64) do
+                return formatNat(n);
+            when None do
+                abort("Pkg.Manifest: an index did not fit a Nat64");
+        end case;
+    end;
+
+    function tomlProblem(error: TomlError): Problem is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "hilde.toml is not TOML: ");
+        writeString(&!out, faultText(error.fault));
+        writeString(&!out, ", at line ");
+        let line: String := indexText(error.line);
+        writeString(&!out, asSpan(&line));
+        destroyString(line);
+        writeString(&!out, ", column ");
+        let column: String := indexText(error.column);
+        writeString(&!out, asSpan(&column));
+        destroyString(column);
+        return problemOf(1502, finalize(out), fromLiteral("correct the line; TOML 1.0.0 is at toml.io"));
+    end;
+
+    -- H1503: a key in the table at path that is not one of the words,
+    -- separated by spaces, or None.
+    generic [R: Region, P: Region]
+    function unknownKey(doc: &[Toml, R], path: Span[Nat8, P], words: Span[Nat8, Static]): Option[Problem] is
+        case countAt(doc, path) of
+            when Some(value as count: Index) do
+                var i: Index := 0;
+                while i < count do
+                    case keyAt(doc, path, i) of
+                        when Some(value as key: String) do
+                            if not isWordOf(asSpan(&key), words) then
+                                var message: StringBuilder := makeStringBuilder();
+                                writeString(&!message, "hilde.toml has the key ");
+                                writeString(&!message, asSpan(&key));
+                                if spanLength(path) > 0 then
+                                    writeString(&!message, " in ");
+                                    writeString(&!message, path);
+                                end if;
+                                writeString(&!message, ", which a manifest does not have");
+                                destroyString(key);
+                                return Some(value => problemOf(1503, finalize(message), join2("the keys there are: ", words)));
+                            end if;
+                            destroyString(key);
+                        when None do
+                            skip;
+                    end case;
+                    i := i + 1;
+                end while;
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Whether key is one of the words, which are separated by single spaces.
+    generic [K: Region]
+    function isWordOf(key: Span[Nat8, K], words: Span[Nat8, Static]): Bool is
+        var start: Index := 0;
+        var i: Index := 0;
+        let size: Index := spanLength(words);
+        while i <= size do
+            if (i = size) or (words[i] = ' ') then
+                if (i - start) = spanLength(key) then
+                    var j: Index := 0;
+                    var same: Bool := true;
+                    while j < spanLength(key) do
+                        if words[start + j] /= key[j] then
+                            same := false;
+                        end if;
+                        j := j + 1;
+                    end while;
+                    if same then
+                        return true;
+                    end if;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [P: Region]
+    function formProblem(path: Span[Nat8, P], what: Span[Nat8, Static], suggestion: Span[Nat8, Static]): Problem is
+        return problemOf(1505, join3(path, " in hilde.toml ", what), fromLiteral(suggestion));
+    end;
+
+    function isKind(found: Option[TomlKind], want: Nat8): Bool is
+        case found of
+            when Some(value as kind: TomlKind) do
+                case kind of
+                    when TomlString do
+                        return want = 's';
+                    when TomlBoolean do
+                        return want = 'b';
+                    when TomlArray do
+                        return want = 'a';
+                    when TomlTable do
+                        return want = 't';
+                    when TomlInteger do
+                        return false;
+                    when TomlFloat do
+                        return false;
+                    when TomlOffsetDateTime do
+                        return false;
+                    when TomlLocalDateTime do
+                        return false;
+                    when TomlLocalDate do
+                        return false;
+                    when TomlLocalTime do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, P: Region]
+    function isThere(doc: &[Toml, R], path: Span[Nat8, P]): Bool is
+        case kindAt(doc, path) of
+            when Some(value as kind: TomlKind) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- H1505 when the value at path is there and is not a plain string.
+    generic [R: Region, P: Region]
+    function badText(doc: &[Toml, R], path: Span[Nat8, P]): Option[Problem] is
+        if not isThere(doc, path) then
+            return None();
+        end if;
+        case stringAt(doc, path) of
+            when Some(value as text: String) do
+                let plain: Bool := isPlainValue(asSpan(&text));
+                destroyString(text);
+                if plain then
+                    return None();
+                end if;
+                return Some(value => formProblem(path, "holds a quote, a backslash or a control character", "write the value without them"));
+            when None do
+                return Some(value => formProblem(path, "is not a string", "write it in double quotes"));
+        end case;
+    end;
+
+    -- H1505 when the value at path is there and is not true or false.
+    generic [R: Region, P: Region]
+    function badBool(doc: &[Toml, R], path: Span[Nat8, P]): Option[Problem] is
+        if isThere(doc, path) and (not isKind(kindAt(doc, path), 'b')) then
+            return Some(value => formProblem(path, "is not true or false", "write true or false"));
+        end if;
+        return None();
+    end;
+
+    -- H1505 when the value at path is there and is not an array of plain
+    -- strings.
+    generic [R: Region, P: Region]
+    function badTexts(doc: &[Toml, R], path: Span[Nat8, P]): Option[Problem] is
+        if not isThere(doc, path) then
+            return None();
+        end if;
+        if not isKind(kindAt(doc, path), 'a') then
+            return Some(value => formProblem(path, "is not an array", "write it as [\"a\", \"b\"]"));
+        end if;
+        case countAt(doc, path) of
+            when Some(value as count: Index) do
+                var i: Index := 0;
+                while i < count do
+                    let at: String := elementPath(path, i);
+                    let bad: Option[Problem] := badText(doc, asSpan(&at));
+                    destroyString(at);
+                    case bad of
+                        when Some(value as p: Problem) do
+                            return Some(value => p);
+                        when None do
+                            skip;
+                    end case;
+                    i := i + 1;
+                end while;
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- H1505 for a capability that is not unsafe, foreign or embed, the
+    -- three that hilde guard tells apart.
+    generic [R: Region]
+    function badCapabilities(doc: &[Toml, R]): Option[Problem] is
+        case countAt(doc, "package.capabilities") of
+            when Some(value as count: Index) do
+                var i: Index := 0;
+                while i < count do
+                    let at: String := elementPath("package.capabilities", i);
+                    let text: String := textOr(doc, asSpan(&at), "");
+                    destroyString(at);
+                    if not isWordOf(asSpan(&text), "unsafe foreign embed") then
+                        let p: Problem := problemOf(1505, join3("package.capabilities in hilde.toml names ", asSpan(&text), ", which is no capability"), fromLiteral("the capabilities are unsafe, foreign and embed"));
+                        destroyString(text);
+                        return Some(value => p);
+                    end if;
+                    destroyString(text);
+                    i := i + 1;
+                end while;
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- H1504 when the string at path is missing, H1505 when it is no
+    -- version.
+    generic [R: Region, P: Region]
+    function badVersion(doc: &[Toml, R], path: Span[Nat8, P]): Option[Problem] is
+        case stringAt(doc, path) of
+            when Some(value as text: String) do
+                let read: Option[Version] := parseVersion(asSpan(&text));
+                destroyString(text);
+                case read of
+                    when Some(value as v: Version) do
+                        return None();
+                    when None do
+                        return Some(value => formProblem(path, "is not a version vX.Y.Z", "write it as v1.0.0"));
+                end case;
+            when None do
+                return Some(value => problemOf(1504, join2(path, " is missing in hilde.toml"), fromLiteral("write it as v1.0.0")));
+        end case;
+    end;
+
+    -- The first of two problems.
+    function either(first: Option[Problem], second: Option[Problem]): Option[Problem] is
+        case first of
+            when Some(value as p: Problem) do
+                case second of
+                    when Some(value as q: Problem) do
+                        destroyProblemOf(q);
+                    when None do
+                        skip;
+                end case;
+                return Some(value => p);
+            when None do
+                return second;
+        end case;
+    end;
+
+    function destroyProblemOf(problem: Problem): Unit is
+        let { code: Int64, message: String, suggestion: String } := problem;
+        destroyString(message);
+        destroyString(suggestion);
+        return nil;
+    end;
+
+    -- Everything that may be wrong with one requirement.
+    generic [R: Region, K: Region]
+    function badRequirement(doc: &[Toml, R], prefix: Span[Nat8, K]): Option[Problem] is
+        if not isPrefix(prefix) then
+            return Some(value => formProblem(requirePathText(prefix), "does not name a module prefix", "a prefix is such as Acme.Json"));
+        end if;
+        let at: String := requirePath(prefix, "");
+        if not isKind(kindAt(doc, asSpan(&at)), 't') then
+            let p: Problem := formProblem(asSpan(&at), "is not a table", "write it as { git = \"...\", version = \"v1.0.0\" }");
+            destroyString(at);
+            return Some(value => p);
+        end if;
+        let unknown: Option[Problem] := unknownKey(doc, asSpan(&at), "git version signify-key");
+        destroyString(at);
+        let git: String := requirePath(prefix, "git");
+        var found: Option[Problem] := either(unknown, badText(doc, asSpan(&git)));
+        if not isThere(doc, asSpan(&git)) then
+            found := either(found, Some(value => problemOf(1504, join2(asSpan(&git), " is missing in hilde.toml"), fromLiteral("name where git finds the package"))));
+        end if;
+        destroyString(git);
+        let version: String := requirePath(prefix, "version");
+        found := either(found, badVersion(doc, asSpan(&version)));
+        destroyString(version);
+        let key: String := requirePath(prefix, "signify-key");
+        found := either(found, badText(doc, asSpan(&key)));
+        destroyString(key);
+        return found;
+    end;
+
+    generic [K: Region]
+    function requirePathText(prefix: Span[Nat8, K]): Span[Nat8, Static] is
+        return "a key of [require]";
+    end;
+
+    generic [R: Region]
+    function check(doc: &[Toml, R]): Option[Problem] is
+        var found: Option[Problem] := unknownKey(doc, "", "package require targets c-source policy");
+        found := either(found, unknownKey(doc, "package", "name version signify-key capabilities"));
+        found := either(found, unknownKey(doc, "c-source", "commit dir"));
+        found := either(found, unknownKey(doc, "policy", "require-signatures"));
+        case stringAt(doc, "package.name") of
+            when Some(value as name: String) do
+                if not isPrefix(asSpan(&name)) then
+                    found := either(found, Some(value => formProblem("package.name", "is not a module prefix", "a prefix is such as Acme.Json")));
+                end if;
+                destroyString(name);
+            when None do
+                found := either(found, Some(value => problemOf(1504, fromLiteral("package.name is missing in hilde.toml"), fromLiteral("name the package by its module prefix, such as Acme.Json"))));
+        end case;
+        found := either(found, badVersion(doc, "package.version"));
+        found := either(found, badText(doc, "package.signify-key"));
+        found := either(found, badTexts(doc, "package.capabilities"));
+        found := either(found, badCapabilities(doc));
+        found := either(found, badTexts(doc, "targets"));
+        found := either(found, badBool(doc, "c-source.commit"));
+        found := either(found, badText(doc, "c-source.dir"));
+        found := either(found, badBool(doc, "policy.require-signatures"));
+        if isThere(doc, "require") then
+            if not isKind(kindAt(doc, "require"), 't') then
+                found := either(found, Some(value => formProblem("require", "is not a table", "write it as [require]")));
+            else
+                case countAt(doc, "require") of
+                    when Some(value as count: Index) do
+                        var i: Index := 0;
+                        while i < count do
+                            case keyAt(doc, "require", i) of
+                                when Some(value as prefix: String) do
+                                    found := either(found, badRequirement(doc, asSpan(&prefix)));
+                                    destroyString(prefix);
+                                when None do
+                                    skip;
+                            end case;
+                            i := i + 1;
+                        end while;
+                    when None do
+                        skip;
+                end case;
+            end if;
+        end if;
+        return found;
+    end;
+
+    -- The string at path, known to be there, or the empty string when it
+    -- is not.
+    generic [R: Region, P: Region]
+    function textOr(doc: &[Toml, R], path: Span[Nat8, P], default: Span[Nat8, Static]): String is
+        case stringAt(doc, path) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                return fromLiteral(default);
+        end case;
+    end;
+
+    generic [R: Region, P: Region]
+    function versionAt(doc: &[Toml, R], path: Span[Nat8, P]): Version is
+        let text: String := textOr(doc, path, "");
+        let read: Option[Version] := parseVersion(asSpan(&text));
+        destroyString(text);
+        case read of
+            when Some(value as v: Version) do
+                return v;
+            when None do
+                abort("Pkg.Manifest: a version checked before was not read");
+        end case;
+    end;
+
+    generic [R: Region, P: Region]
+    function textsAt(doc: &[Toml, R], path: Span[Nat8, P]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        case countAt(doc, path) of
+            when Some(value as count: Index) do
+                var i: Index := 0;
+                while i < count do
+                    let at: String := elementPath(path, i);
+                    insertBack(&!out, textOr(doc, asSpan(&at), ""));
+                    destroyString(at);
+                    i := i + 1;
+                end while;
+            when None do
+                skip;
+        end case;
+        return out;
+    end;
+
+    generic [R: Region, P: Region]
+    function boolOr(doc: &[Toml, R], path: Span[Nat8, P]): Bool is
+        case boolAt(doc, path) of
+            when Some(value as b: Bool) do
+                return b;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function requirementsOf(doc: &[Toml, R]): Buffer[Requirement] is
+        var out: Buffer[Requirement] := allocateEmpty();
+        case countAt(doc, "require") of
+            when Some(value as count: Index) do
+                var i: Index := 0;
+                while i < count do
+                    case keyAt(doc, "require", i) of
+                        when Some(value as prefix: String) do
+                            let git: String := requirePath(asSpan(&prefix), "git");
+                            let version: String := requirePath(asSpan(&prefix), "version");
+                            let key: String := requirePath(asSpan(&prefix), "signify-key");
+                            insertBack(&!out, Requirement(
+                                prefix => prefix,
+                                git => textOr(doc, asSpan(&git), ""),
+                                version => versionAt(doc, asSpan(&version)),
+                                key => textOr(doc, asSpan(&key), "")
+                            ));
+                            destroyString(git);
+                            destroyString(version);
+                            destroyString(key);
+                        when None do
+                            skip;
+                    end case;
+                    i := i + 1;
+                end while;
+            when None do
+                skip;
+        end case;
+        return out;
+    end;
+
+    generic [R: Region]
+    function build(doc: &[Toml, R]): Manifest is
+        return Manifest(
+            name => textOr(doc, "package.name", ""),
+            version => versionAt(doc, "package.version"),
+            key => textOr(doc, "package.signify-key", ""),
+            capabilities => textsAt(doc, "package.capabilities"),
+            needs => requirementsOf(doc),
+            targets => textsAt(doc, "targets"),
+            commitC => boolOr(doc, "c-source.commit"),
+            cDir => textOr(doc, "c-source.dir", "c"),
+            requireSignatures => boolOr(doc, "policy.require-signatures")
+        );
+    end;
+
+    generic [R: Region]
+    function readManifest(text: Span[Nat8, R]): Either[Problem, Manifest] is
+        case readToml(text) of
+            when Right(right as doc: Toml) do
+                case check(&doc) of
+                    when Some(value as problem: Problem) do
+                        destroyToml(doc);
+                        return Left(left => problem);
+                    when None do
+                        let manifest: Manifest := build(&doc);
+                        destroyToml(doc);
+                        return Right(right => manifest);
+                end case;
+            when Left(left as error: TomlError) do
+                return Left(left => tomlProblem(error));
+        end case;
+    end;
+
+    generic [B: Region, P: Region]
+    function writeQuoted(out: &![StringBuilder, B], text: Span[Nat8, P]): Unit is
+        writeByte(&~out, '"');
+        writeString(&~out, text);
+        writeByte(&~out, '"');
+        return nil;
+    end;
+
+    generic [B: Region, T: Region]
+    function writeTexts(out: &![StringBuilder, B], texts: &[Buffer[String], T]): Unit is
+        writeByte(&~out, '[');
+        var i: Index := 0;
+        while i < bufferLength(texts) do
+            if i > 0 then
+                writeString(&~out, ", ");
+            end if;
+            writeQuoted(&~out, asSpan(nthRef(texts, i)));
+            i := i + 1;
+        end while;
+        writeString(&~out, "]\n");
+        return nil;
+    end;
+
+    generic [B: Region]
+    function writeVersion(out: &![StringBuilder, B], version: Version): Unit is
+        let text: String := formatVersion(version);
+        writeQuoted(&~out, asSpan(&text));
+        destroyString(text);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function formatManifest(manifest: &[Manifest, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        if bufferLength(&(manifest->targets)) > 0 then
+            writeString(&!out, "targets = ");
+            writeTexts(&!out, &(manifest->targets));
+            writeByte(&!out, '\n');
+        end if;
+        writeString(&!out, "[package]\nname = ");
+        writeQuoted(&!out, asSpan(&(manifest->name)));
+        writeString(&!out, "\nversion = ");
+        writeVersion(&!out, manifest->version);
+        writeByte(&!out, '\n');
+        if length(&(manifest->key)) > 0 then
+            writeString(&!out, "signify-key = ");
+            writeQuoted(&!out, asSpan(&(manifest->key)));
+            writeByte(&!out, '\n');
+        end if;
+        if bufferLength(&(manifest->capabilities)) > 0 then
+            writeString(&!out, "capabilities = ");
+            writeTexts(&!out, &(manifest->capabilities));
+        end if;
+        let needs: &[Buffer[Requirement], R] := &(manifest->needs);
+        if bufferLength(needs) > 0 then
+            writeString(&!out, "\n[require]\n");
+            var i: Index := 0;
+            while i < bufferLength(needs) do
+                let r: &[Requirement, R] := nthRef(needs, i);
+                writeQuoted(&!out, asSpan(&(r->prefix)));
+                writeString(&!out, " = { git = ");
+                writeQuoted(&!out, asSpan(&(r->git)));
+                writeString(&!out, ", version = ");
+                writeVersion(&!out, r->version);
+                if length(&(r->key)) > 0 then
+                    writeString(&!out, ", signify-key = ");
+                    writeQuoted(&!out, asSpan(&(r->key)));
+                end if;
+                writeString(&!out, " }\n");
+                i := i + 1;
+            end while;
+        end if;
+        if (manifest->commitC) or (not equal(asSpan(&(manifest->cDir)), "c")) then
+            writeString(&!out, "\n[c-source]\ncommit = ");
+            if manifest->commitC then
+                writeString(&!out, "true");
+            else
+                writeString(&!out, "false");
+            end if;
+            writeString(&!out, "\ndir = ");
+            writeQuoted(&!out, asSpan(&(manifest->cDir)));
+            writeByte(&!out, '\n');
+        end if;
+        if manifest->requireSignatures then
+            writeString(&!out, "\n[policy]\nrequire-signatures = true\n");
+        end if;
+        return finalize(out);
+    end;
+
+    generic [R: Region, P: Region]
+    function findRequirement(manifest: &[Manifest, R], prefix: Span[Nat8, P]): Option[Index] is
+        let needs: &[Buffer[Requirement], R] := &(manifest->needs);
+        var i: Index := 0;
+        while i < bufferLength(needs) do
+            let r: &[Requirement, R] := nthRef(needs, i);
+            if equal(asSpan(&(r->prefix)), prefix) then
+                return Some(value => i);
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    function setRequirement(manifest: Manifest, requirement: Requirement): Manifest is
+        var m: Manifest := manifest;
+        let at: Option[Index] := findRequirement(&m, prefixOf(&requirement));
+        borrow w: &![Manifest, W] := &!m do
+            case at of
+                when Some(value as i: Index) do
+                    let old: Requirement := swapNth(&!(w->needs), i, requirement);
+                    destroyRequirement(old);
+                when None do
+                    insertBack(&!(w->needs), requirement);
+            end case;
+        end borrow;
+        return m;
+    end;
+end module body.

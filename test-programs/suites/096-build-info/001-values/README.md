@@ -1,0 +1,1 @@
+Test that a programme reads its build through Standard.BuildInfo: no commit and a clean tree with --no-build-vcs, the time from SOURCE_DATE_EPOCH, a compiler version, and three --build-value in their order, one with =, ?, a quote and a backslash, which the compiler writes into a C string, and one empty; a name not given is None.

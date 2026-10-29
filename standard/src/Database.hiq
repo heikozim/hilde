@@ -1,0 +1,956 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- This module names no driver.  A database holds the connection its
+-- driver erased, the backend and whether it was opened for writing; every
+-- operation calls the slot of its backend's driver, which the driver
+-- module implements.  SQLite and SQLCipher share one driver, because
+-- libsqlcipher and libsqlite3 export the same functions and one programme
+-- links only one of them.  A write reaches only a database opened for
+-- writing, because the mode M says which it is.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    insertBack,
+    remove,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    storeNth
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Bindings.Database (
+    Erased,
+    abandon
+);
+import Standard.Graph (
+    Graph,
+    NodeId,
+    EdgeId,
+    makeGraph,
+    addNode,
+    addEdge
+);
+import Standard.HashMap (
+    HashMap,
+    makeHashMap,
+    put as mapPut,
+    get as mapGet
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Hash (
+    Hashable
+);
+import Standard.Tuples (
+    Pair
+);
+
+module body Standard.Database is
+    record Database[M: Free]: Linear is
+        connection: Erased;
+        backend: Backend;
+        writing: Bool;
+        mode: M;
+    end;
+
+    record Transaction: Linear is
+        backend: Backend;
+        inner: Erased;
+    end;
+
+    record Values: Linear is
+        items: Buffer[Value];
+    end;
+
+    record Cursor: Linear is
+        backend: Backend;
+        rows: Erased;
+    end;
+
+    -- The driver of a backend.
+    union Driver: Free is
+        case SqliteDriver;
+        case PostgresDriver;
+        case MariaDBDriver;
+    end;
+
+    function driverOf(backend: Backend): Driver is
+        case backend of
+            when SqliteBackend do
+                return SqliteDriver();
+            when SqlCipherBackend do
+                return SqliteDriver();
+            when PostgresBackend do
+                return PostgresDriver();
+            when MariaDBBackend do
+                return MariaDBDriver();
+        end case;
+    end;
+
+    function sameDriver(left: Backend, right: Backend): Bool is
+        case driverOf(left) of
+            when SqliteDriver do
+                case driverOf(right) of
+                    when SqliteDriver do
+                        return true;
+                    when PostgresDriver do
+                        return false;
+                    when MariaDBDriver do
+                        return false;
+                end case;
+            when PostgresDriver do
+                case driverOf(right) of
+                    when SqliteDriver do
+                        return false;
+                    when PostgresDriver do
+                        return true;
+                    when MariaDBDriver do
+                        return false;
+                end case;
+            when MariaDBDriver do
+                case driverOf(right) of
+                    when SqliteDriver do
+                        return false;
+                    when PostgresDriver do
+                        return false;
+                    when MariaDBDriver do
+                        return true;
+                end case;
+        end case;
+    end;
+
+    -- The quotes of SQL, which a character literal cannot hold.
+    constant byteApostrophe: Nat8 := 39;
+    constant byteDoubleQuote: Nat8 := 34;
+
+    constant wrongBackend: Span[Nat8, Static] := "Standard.Database: a transaction or a cursor was handed to a database of another backend";
+    constant wrongColumn: Span[Nat8, Static] := "Standard.Database: a driver read a column of another kind than it was asked for";
+    constant noSqlite: Span[Nat8, Static] := "Standard.Database: the SQLite driver is not in the programme; import Standard.Database.Sqlite";
+    constant noPostgres: Span[Nat8, Static] := "Standard.Database: the PostgreSQL driver is not in the programme; import Standard.Database.Postgres";
+    constant noMariaDB: Span[Nat8, Static] := "Standard.Database: the MariaDB driver is not in the programme; import Standard.Database.MariaDB";
+
+    ---
+    --- Errors
+    ---
+
+    function kindOf(error: DbError): ErrorKind is
+        case driverOf(error.backend) of
+            when SqliteDriver do
+                return sqliteKind(error.code);
+            when PostgresDriver do
+                return postgresKind(error.code);
+            when MariaDBDriver do
+                return mariadbKind(error.code);
+        end case;
+    end;
+
+    function isUniqueViolation(error: DbError): Bool is
+        let kind: ErrorKind := kindOf(error);
+        return kind.unique;
+    end;
+
+    function isConstraintViolation(error: DbError): Bool is
+        let kind: ErrorKind := kindOf(error);
+        return kind.constraint;
+    end;
+
+    function isBusy(error: DbError): Bool is
+        let kind: ErrorKind := kindOf(error);
+        return kind.busy;
+    end;
+
+    function describe(error: DbError): Span[Nat8, Static] is
+        let kind: ErrorKind := kindOf(error);
+        return kind.text;
+    end;
+
+    ---
+    --- Opening and closing
+    ---
+
+    function writerOf(connection: Erased, backend: Backend): Database[Writing] is
+        return Database(connection => connection, backend => backend, writing => true, mode => Writing());
+    end;
+
+    function readerOf(connection: Erased, backend: Backend): Database[Reading] is
+        return Database(connection => connection, backend => backend, writing => false, mode => Reading());
+    end;
+
+    generic [M: Free]
+    function closeDatabase(db: Database[M]): Unit is
+        let { connection: Erased, backend: Backend, writing: Bool, mode: M } := db;
+        case driverOf(backend) of
+            when SqliteDriver do
+                sqliteClose(connection, writing);
+            when PostgresDriver do
+                postgresClose(connection, writing);
+            when MariaDBDriver do
+                mariadbClose(connection, writing);
+        end case;
+        return nil;
+    end;
+
+    generic [M: Free, R: Region]
+    function backendOf(db: &[Database[M], R]): Backend is
+        return db->backend;
+    end;
+
+    ---
+    --- Placeholders
+    ---
+
+    -- The question marks of sql outside a string literal ('...'), a quoted
+    -- name ("..."), a line comment (-- to the end of the line) and a block
+    -- comment (/* ... */) become $1, $2 and so on.  A doubled quote inside
+    -- a literal closes and opens it again, which leaves the state as it was.
+    generic [R: Region]
+    function numberPlaceholders(sql: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let size: Index := spanLength(sql);
+        var number: Nat64 := 0;
+        var inText: Bool := false;
+        var inName: Bool := false;
+        var inLine: Bool := false;
+        var inBlock: Bool := false;
+        var i: Index := 0;
+        while i < size do
+            let b: Nat8 := sql[i];
+            var next: Nat8 := 0;
+            if (i + 1) < size then
+                next := sql[i + 1];
+            end if;
+            if inText then
+                writeByte(&!out, b);
+                if b = byteApostrophe then
+                    inText := false;
+                end if;
+            else if inName then
+                writeByte(&!out, b);
+                if b = byteDoubleQuote then
+                    inName := false;
+                end if;
+            else if inLine then
+                writeByte(&!out, b);
+                if b = '\n' then
+                    inLine := false;
+                end if;
+            else if inBlock then
+                writeByte(&!out, b);
+                if (b = '*') and (next = '/') then
+                    writeByte(&!out, next);
+                    i := i + 1;
+                    inBlock := false;
+                end if;
+            else if b = '?' then
+                number := number + 1;
+                writeByte(&!out, '$');
+                writeNumber(&!out, number);
+            else
+                writeByte(&!out, b);
+                if b = byteApostrophe then
+                    inText := true;
+                else if b = byteDoubleQuote then
+                    inName := true;
+                else if (b = '-') and (next = '-') then
+                    writeByte(&!out, next);
+                    i := i + 1;
+                    inLine := true;
+                else if (b = '/') and (next = '*') then
+                    writeByte(&!out, next);
+                    i := i + 1;
+                    inBlock := true;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The decimal digits of value, the most significant first.
+    generic [B: Region]
+    function writeNumber(out: &![StringBuilder, B], value: Nat64): Unit is
+        let ten: Nat64 := 10;
+        if value >= ten then
+            writeNumber(&~out, value / ten);
+        end if;
+        let digit: Nat64 := value - ((value / ten) * ten);
+        case toNat8(digit) of
+            when Some(value as d: Nat8) do
+                let zero: Nat8 := '0';
+                writeByte(&~out, zero + d);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Migrations and transactions
+    ---
+
+    generic [R: Region]
+    function migrate(db: &![Database[Writing], R], migrations: Span[Nat8, Static]): Either[DbError, Index] is
+        let backend: Backend := db->backend;
+        case driverOf(backend) of
+            when SqliteDriver do
+                return sqliteMigrate(&!(db->connection), backend, migrations);
+            when PostgresDriver do
+                return postgresMigrate(&!(db->connection), migrations);
+            when MariaDBDriver do
+                return mariadbMigrate(&!(db->connection), migrations);
+        end case;
+    end;
+
+    function opened(result: Either[DbError, Erased], backend: Backend): Either[DbError, Transaction] is
+        case result of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as inner: Erased) do
+                return Right(right => Transaction(backend => backend, inner => inner));
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function begin(db: &![Database[M], R]): Either[DbError, Transaction] is
+        let backend: Backend := db->backend;
+        let writing: Bool := db->writing;
+        case driverOf(backend) of
+            when SqliteDriver do
+                return opened(sqliteBegin(&!(db->connection), backend, writing), backend);
+            when PostgresDriver do
+                return opened(postgresBegin(&!(db->connection), writing), backend);
+            when MariaDBDriver do
+                return opened(mariadbBegin(&!(db->connection), writing), backend);
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function commit(db: &![Database[M], R], transaction: Transaction): Either[DbError, Unit] is
+        return endTransaction(db, transaction, true);
+    end;
+
+    generic [M: Free, R: Region]
+    function rollback(db: &![Database[M], R], transaction: Transaction): Unit is
+        case endTransaction(db, transaction, false) of
+            when Left(left as error: DbError) do
+                skip;
+            when Right(right as done: Unit) do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Commit when keep is true, else roll back.  A transaction of another
+    -- driver than the database's stops the programme.
+    generic [M: Free, R: Region]
+    function endTransaction(db: &![Database[M], R], transaction: Transaction, keep: Bool): Either[DbError, Unit] is
+        let { backend as begun: Backend, inner: Erased } := transaction;
+        let backend: Backend := db->backend;
+        let writing: Bool := db->writing;
+        if sameDriver(begun, backend) then
+            case driverOf(backend) of
+                when SqliteDriver do
+                    return sqliteEnd(&!(db->connection), backend, writing, inner, keep);
+                when PostgresDriver do
+                    return postgresEnd(&!(db->connection), writing, inner, keep);
+                when MariaDBDriver do
+                    return mariadbEnd(&!(db->connection), writing, inner, keep);
+            end case;
+        else
+            abandon(inner, wrongBackend);
+        end if;
+    end;
+
+    ---
+    --- Values
+    ---
+
+    function noValues(): Values is
+        let items: Buffer[Value] := allocateEmpty();
+        return Values(items => items);
+    end;
+
+    function withValue(values: Values, value: Value): Values is
+        let { items: Buffer[Value] } := values;
+        var list: Buffer[Value] := items;
+        insertBack(&!list, value);
+        return Values(items => list);
+    end;
+
+    function withInt64(values: Values, value: Int64): Values is
+        return withValue(values, IntValue(value => value));
+    end;
+
+    function withFloat64(values: Values, value: Float64): Values is
+        return withValue(values, FloatValue(value => value));
+    end;
+
+    function withBool(values: Values, value: Bool): Values is
+        return withValue(values, BoolValue(value => value));
+    end;
+
+    function withTimestamp(values: Values, value: Int64): Values is
+        return withValue(values, TimeValue(value => value));
+    end;
+
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values is
+        return withValue(values, TextValue(value => copyOf(value)));
+    end;
+
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values is
+        return withValue(values, BytesValue(value => copyOf(value)));
+    end;
+
+    function withNull(values: Values): Values is
+        return withValue(values, NullValue());
+    end;
+
+    function dropValues(values: Values): Unit is
+        let { items: Buffer[Value] } := values;
+        var list: Buffer[Value] := items;
+        while bufferLength(&list) > 0 do
+            case remove(&!list, 0) of
+                when TextValue(value as s: String) do
+                    destroyString(s);
+                when BytesValue(value as s: String) do
+                    destroyString(s);
+                when IntValue(value as v: Int64) do
+                    skip;
+                when FloatValue(value as v: Float64) do
+                    skip;
+                when BoolValue(value as v: Bool) do
+                    skip;
+                when TimeValue(value as v: Int64) do
+                    skip;
+                when NullValue do
+                    skip;
+            end case;
+        end while;
+        destroyEmpty(list);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index is
+        return bufferLength(&(values->items));
+    end;
+
+    function takeValues(values: Values): Buffer[Value] is
+        let { items: Buffer[Value] } := values;
+        return items;
+    end;
+
+    generic [R: Region]
+    function copyOf(text: Span[Nat8, R]): String is
+        let size: Index := spanLength(text);
+        var copy: String := makeString(size, '0');
+        var i: Index := 0;
+        while i < size do
+            storeNth(&!copy, i, text[i]);
+            i := i + 1;
+        end while;
+        return copy;
+    end;
+
+    ---
+    --- Statements
+    ---
+
+    generic [M: Free, R: Region]
+    function start(db: &![Database[M], R], sql: Span[Nat8, Static], values: Values): Cursor is
+        let backend: Backend := db->backend;
+        let writing: Bool := db->writing;
+        case driverOf(backend) of
+            when SqliteDriver do
+                return Cursor(backend => backend, rows => sqliteStart(&!(db->connection), writing, sql, values));
+            when PostgresDriver do
+                return Cursor(backend => backend, rows => postgresStart(&!(db->connection), writing, sql, values));
+            when MariaDBDriver do
+                return Cursor(backend => backend, rows => mariadbStart(&!(db->connection), writing, sql, values));
+        end case;
+    end;
+
+    generic [R: Region]
+    function execute(db: &![Database[Writing], R], sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64] is
+        let backend: Backend := db->backend;
+        case driverOf(backend) of
+            when SqliteDriver do
+                return sqliteExecute(&!(db->connection), backend, sql, values);
+            when PostgresDriver do
+                return postgresExecute(&!(db->connection), sql, values);
+            when MariaDBDriver do
+                return mariadbExecute(&!(db->connection), sql, values);
+        end case;
+    end;
+
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool is
+        case driverOf(cursor->backend) of
+            when SqliteDriver do
+                return sqliteAdvance(&!(cursor->rows));
+            when PostgresDriver do
+                return postgresAdvance(&!(cursor->rows));
+            when MariaDBDriver do
+                return mariadbAdvance(&!(cursor->rows));
+        end case;
+    end;
+
+    generic [R: Region]
+    function column(cursor: &[Cursor, R], index: Int32, kind: ColumnKind): Column[R] is
+        case driverOf(cursor->backend) of
+            when SqliteDriver do
+                return sqliteColumn(&(cursor->rows), index, kind);
+            when PostgresDriver do
+                return postgresColumn(&(cursor->rows), index, kind);
+            when MariaDBDriver do
+                return mariadbColumn(&(cursor->rows), index, kind);
+        end case;
+    end;
+
+    generic [R: Region]
+    function boolOf(read: Column[R]): Bool is
+        case read of
+            when BoolColumn(value as v: Bool) do
+                return v;
+            when IntColumn(value as v: Int64) do
+                abort(wrongColumn);
+            when FloatColumn(value as v: Float64) do
+                abort(wrongColumn);
+            when TextColumn(value as v: Span[Nat8, R]) do
+                abort(wrongColumn);
+        end case;
+    end;
+
+    generic [R: Region]
+    function intOf(read: Column[R]): Int64 is
+        case read of
+            when IntColumn(value as v: Int64) do
+                return v;
+            when BoolColumn(value as v: Bool) do
+                abort(wrongColumn);
+            when FloatColumn(value as v: Float64) do
+                abort(wrongColumn);
+            when TextColumn(value as v: Span[Nat8, R]) do
+                abort(wrongColumn);
+        end case;
+    end;
+
+    generic [R: Region]
+    function floatOf(read: Column[R]): Float64 is
+        case read of
+            when FloatColumn(value as v: Float64) do
+                return v;
+            when BoolColumn(value as v: Bool) do
+                abort(wrongColumn);
+            when IntColumn(value as v: Int64) do
+                abort(wrongColumn);
+            when TextColumn(value as v: Span[Nat8, R]) do
+                abort(wrongColumn);
+        end case;
+    end;
+
+    generic [R: Region]
+    function textOf(read: Column[R]): Span[Nat8, R] is
+        case read of
+            when TextColumn(value as v: Span[Nat8, R]) do
+                return v;
+            when BoolColumn(value as v: Bool) do
+                abort(wrongColumn);
+            when IntColumn(value as v: Int64) do
+                abort(wrongColumn);
+            when FloatColumn(value as v: Float64) do
+                abort(wrongColumn);
+        end case;
+    end;
+
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool is
+        return boolOf(column(cursor, index, NullKind()));
+    end;
+
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64 is
+        return intOf(column(cursor, index, IntKind()));
+    end;
+
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64 is
+        return floatOf(column(cursor, index, FloatKind()));
+    end;
+
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool is
+        return boolOf(column(cursor, index, BoolKind()));
+    end;
+
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64 is
+        return intOf(column(cursor, index, TimeKind()));
+    end;
+
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        return textOf(column(cursor, index, TextKind()));
+    end;
+
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        return textOf(column(cursor, index, BytesKind()));
+    end;
+
+    generic [M: Free, R: Region]
+    function finish(db: &![Database[M], R], cursor: Cursor): Option[DbError] is
+        let { backend as begun: Backend, rows: Erased } := cursor;
+        let backend: Backend := db->backend;
+        let writing: Bool := db->writing;
+        if sameDriver(begun, backend) then
+            case driverOf(backend) of
+                when SqliteDriver do
+                    return sqliteFinish(&!(db->connection), backend, writing, rows);
+                when PostgresDriver do
+                    return postgresFinish(&!(db->connection), writing, rows);
+                when MariaDBDriver do
+                    return mariadbFinish(&!(db->connection), writing, rows);
+            end case;
+        else
+            abandon(rows, wrongBackend);
+        end if;
+    end;
+
+    ---
+    --- The config table: settings as text, a value under a key
+    ---
+
+    -- MariaDB reserves the word key, which a backquote makes a name, and
+    -- takes no column of unbounded text as a primary key, so its key is a
+    -- column of at most 255 characters.
+    generic [R: Region]
+    function createConfigTable(db: &![Database[Writing], R]): Either[DbError, Unit] is
+        let zero: Nat64 := 0;
+        var result: Either[DbError, Nat64] := Right(right => zero);
+        case db->backend of
+            when MariaDBBackend do
+                result := execute(&~db, "CREATE TABLE IF NOT EXISTS config (`key` VARCHAR(255) PRIMARY KEY, value TEXT)", noValues());
+            when PostgresBackend do
+                result := execute(&~db, "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)", noValues());
+            when SqliteBackend do
+                result := execute(&~db, "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)", noValues());
+            when SqlCipherBackend do
+                result := execute(&~db, "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)", noValues());
+        end case;
+        case result of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as count: Nat64) do
+                return Right(right => nil);
+        end case;
+    end;
+
+    generic [R: Region, K: Region, V: Region]
+    function setConfig(db: &![Database[Writing], R], key: Span[Nat8, K], value: Span[Nat8, V]): Either[DbError, Unit] is
+        let values: Values := withText(withText(noValues(), key), value);
+        let zero: Nat64 := 0;
+        var result: Either[DbError, Nat64] := Right(right => zero);
+        case db->backend of
+            when PostgresBackend do
+                result := execute(&~db, "INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", values);
+            when MariaDBBackend do
+                result := execute(&~db, "INSERT INTO config (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)", values);
+            when SqliteBackend do
+                result := execute(&~db, "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", values);
+            when SqlCipherBackend do
+                result := execute(&~db, "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", values);
+        end case;
+        case result of
+            when Left(left as error: DbError) do
+                return Left(left => error);
+            when Right(right as count: Nat64) do
+                return Right(right => nil);
+        end case;
+    end;
+
+    generic [M: Free, R: Region, K: Region]
+    function getConfig(db: &![Database[M], R], key: Span[Nat8, K]): Either[DbError, Option[String]] is
+        var rows: Cursor := startConfigRead(&~db, key);
+        if advance(&!rows) then
+            let found: Option[String] := valueOf(&rows);
+            case finish(&~db, rows) of
+                when Some(value as error: DbError) do
+                    dropFound(found);
+                    return Left(left => error);
+                when None do
+                    return Right(right => found);
+            end case;
+        else
+            case finish(&~db, rows) of
+                when Some(value as error: DbError) do
+                    return Left(left => error);
+                when None do
+                    let none: Option[String] := None();
+                    return Right(right => none);
+            end case;
+        end if;
+    end;
+
+    generic [M: Free, R: Region, K: Region]
+    function startConfigRead(db: &![Database[M], R], key: Span[Nat8, K]): Cursor is
+        let values: Values := withText(noValues(), key);
+        case db->backend of
+            when MariaDBBackend do
+                return start(&~db, "SELECT value FROM config WHERE `key` = ?", values);
+            when PostgresBackend do
+                return start(&~db, "SELECT value FROM config WHERE key = ?", values);
+            when SqliteBackend do
+                return start(&~db, "SELECT value FROM config WHERE key = ?", values);
+            when SqlCipherBackend do
+                return start(&~db, "SELECT value FROM config WHERE key = ?", values);
+        end case;
+    end;
+
+    -- The first column of the current row as a String of its own; None
+    -- when it is null.
+    generic [R: Region]
+    function valueOf(rows: &[Cursor, R]): Option[String] is
+        if isNullColumn(rows, 0) then
+            return None();
+        end if;
+        return Some(value => copyOf(columnText(rows, 0)));
+    end;
+
+    function dropFound(found: Option[String]): Unit is
+        case found of
+            when Some(value as text: String) do
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- A graph from two statements
+    ---
+
+    generic [R: Region, S: Region]
+    function graphFromRows(nodes: &![Cursor, R], edges: &![Cursor, S]): LoadedGraph is
+        var graph: Graph[Int64, Float64] := makeGraph();
+        var ids: HashMap[Int64, NodeId] := makeHashMap();
+        var duplicates: Index := 0;
+        var unknown: Index := 0;
+        while advance(&~nodes) do
+            let id: Int64 := idOf(&~nodes, 0);
+            case mapGet(&ids, &id) of
+                when Some(value as known: NodeId) do
+                    duplicates := duplicates + 1;
+                when None do
+                    let node: NodeId := addNode(&!graph, id);
+                    let before: Option[Pair[Int64, NodeId]] := mapPut(&!ids, id, node);
+            end case;
+        end while;
+        while advance(&~edges) do
+            let tail: Int64 := idOf(&~edges, 0);
+            let head: Int64 := idOf(&~edges, 1);
+            let weight: Float64 := weightOf(&~edges, 2);
+            case mapGet(&ids, &tail) of
+                when Some(value as source: NodeId) do
+                    case mapGet(&ids, &head) of
+                        when Some(value as target: NodeId) do
+                            case addEdge(&!graph, source, target, weight) of
+                                when Right(right as edge: EdgeId) do
+                                    skip;
+                                when Left(left as refused: Float64) do
+                                    unknown := unknown + 1;
+                            end case;
+                        when None do
+                            unknown := unknown + 1;
+                    end case;
+                when None do
+                    unknown := unknown + 1;
+            end case;
+        end while;
+        return LoadedGraph(graph => graph, nodes => ids, duplicateNodes => duplicates, unknownEnds => unknown);
+    end;
+
+    -- One column of the current row, read through a write borrow, which
+    -- the readers of a column take as a read borrow.
+    generic [R: Region]
+    function idOf(rows: &![Cursor, R], index: Int32): Int64 is
+        return columnInt64(&rows, index);
+    end;
+
+    generic [R: Region]
+    function weightOf(rows: &![Cursor, R], index: Int32): Float64 is
+        return columnFloat64(&rows, index);
+    end;
+
+    ---
+    --- The defaults of the driver slots: a database of a backend comes
+    --- only from its driver, so none of them is reached.
+    ---
+
+    function noDriverKind(code: Int32): ErrorKind is
+        return ErrorKind(unique => false, constraint => false, busy => false, text => "an error of a database driver that is not in the programme");
+    end;
+
+    function sqliteClose(connection: Erased, writing: Bool): Unit is
+        abandon(connection, noSqlite);
+    end;
+
+    generic [R: Region]
+    function sqliteMigrate(connection: &![Erased, R], backend: Backend, migrations: Span[Nat8, Static]): Either[DbError, Index] is
+        abort(noSqlite);
+    end;
+
+    generic [R: Region]
+    function sqliteBegin(connection: &![Erased, R], backend: Backend, writing: Bool): Either[DbError, Erased] is
+        abort(noSqlite);
+    end;
+
+    generic [R: Region]
+    function sqliteEnd(connection: &![Erased, R], backend: Backend, writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit] is
+        abandon(transaction, noSqlite);
+    end;
+
+    generic [R: Region]
+    function sqliteStart(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased is
+        abandon(values, noSqlite);
+    end;
+
+    generic [R: Region]
+    function sqliteExecute(connection: &![Erased, R], backend: Backend, sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64] is
+        abandon(values, noSqlite);
+    end;
+
+    generic [R: Region]
+    function sqliteAdvance(rows: &![Erased, R]): Bool is
+        abort(noSqlite);
+    end;
+
+    generic [R: Region]
+    function sqliteColumn(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R] is
+        abort(noSqlite);
+    end;
+
+    generic [R: Region]
+    function sqliteFinish(connection: &![Erased, R], backend: Backend, writing: Bool, rows: Erased): Option[DbError] is
+        abandon(rows, noSqlite);
+    end;
+
+    function sqliteKind(code: Int32): ErrorKind is
+        return noDriverKind(code);
+    end;
+
+    function postgresClose(connection: Erased, writing: Bool): Unit is
+        abandon(connection, noPostgres);
+    end;
+
+    generic [R: Region]
+    function postgresMigrate(connection: &![Erased, R], migrations: Span[Nat8, Static]): Either[DbError, Index] is
+        abort(noPostgres);
+    end;
+
+    generic [R: Region]
+    function postgresBegin(connection: &![Erased, R], writing: Bool): Either[DbError, Erased] is
+        abort(noPostgres);
+    end;
+
+    generic [R: Region]
+    function postgresEnd(connection: &![Erased, R], writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit] is
+        abandon(transaction, noPostgres);
+    end;
+
+    generic [R: Region]
+    function postgresStart(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased is
+        abandon(values, noPostgres);
+    end;
+
+    generic [R: Region]
+    function postgresExecute(connection: &![Erased, R], sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64] is
+        abandon(values, noPostgres);
+    end;
+
+    generic [R: Region]
+    function postgresAdvance(rows: &![Erased, R]): Bool is
+        abort(noPostgres);
+    end;
+
+    generic [R: Region]
+    function postgresColumn(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R] is
+        abort(noPostgres);
+    end;
+
+    generic [R: Region]
+    function postgresFinish(connection: &![Erased, R], writing: Bool, rows: Erased): Option[DbError] is
+        abandon(rows, noPostgres);
+    end;
+
+    function postgresKind(code: Int32): ErrorKind is
+        return noDriverKind(code);
+    end;
+
+    function mariadbClose(connection: Erased, writing: Bool): Unit is
+        abandon(connection, noMariaDB);
+    end;
+
+    generic [R: Region]
+    function mariadbMigrate(connection: &![Erased, R], migrations: Span[Nat8, Static]): Either[DbError, Index] is
+        abort(noMariaDB);
+    end;
+
+    generic [R: Region]
+    function mariadbBegin(connection: &![Erased, R], writing: Bool): Either[DbError, Erased] is
+        abort(noMariaDB);
+    end;
+
+    generic [R: Region]
+    function mariadbEnd(connection: &![Erased, R], writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit] is
+        abandon(transaction, noMariaDB);
+    end;
+
+    generic [R: Region]
+    function mariadbStart(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased is
+        abandon(values, noMariaDB);
+    end;
+
+    generic [R: Region]
+    function mariadbExecute(connection: &![Erased, R], sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64] is
+        abandon(values, noMariaDB);
+    end;
+
+    generic [R: Region]
+    function mariadbAdvance(rows: &![Erased, R]): Bool is
+        abort(noMariaDB);
+    end;
+
+    generic [R: Region]
+    function mariadbColumn(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R] is
+        abort(noMariaDB);
+    end;
+
+    generic [R: Region]
+    function mariadbFinish(connection: &![Erased, R], writing: Bool, rows: Erased): Option[DbError] is
+        abandon(rows, noMariaDB);
+    end;
+
+    function mariadbKind(code: Int32): ErrorKind is
+        return noDriverKind(code);
+    end;
+end module body.

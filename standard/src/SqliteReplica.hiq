@@ -1,0 +1,970 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A safe module: the database is Bindings.SqliteReplica's, the log is
+-- Standard.Raft's.  A write goes into the log as bytes: its kind, the log
+-- index it is to take, its SQL and its values; every node runs it when it
+-- applies that entry, so that all of them run the same statements in the
+-- same order on the same data.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    destroyFree,
+    length,
+    nth,
+    nthRef,
+    insertBack,
+    removeFirst,
+    removeLast
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    length as textLength,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    openWrite,
+    readAll,
+    writeAll,
+    closeFile,
+    removeFile
+);
+import Standard.Raft (
+    StateMachine,
+    Node,
+    propose,
+    isLeader,
+    currentTerm,
+    lastIndex,
+    appliedIndex
+);
+import Bindings.SqliteReplica (
+    Database,
+    Statement,
+    openDatabase,
+    closeDatabase,
+    prepareOne,
+    isReadOnly,
+    parameterCount,
+    columnCount,
+    bindInt64,
+    bindText,
+    bindBlob,
+    bindNull,
+    stepStatement,
+    columnKind,
+    columnInt64,
+    columnFloat64,
+    columnBytes,
+    finalizeStatement,
+    changes,
+    errorCode,
+    errorWords,
+    backupInto,
+    restoreFrom,
+    int64Bits,
+    int64OfBits
+);
+
+module body Standard.SqliteReplica is
+    constant zeroReal: Float64 := 0.0;
+    constant singleQuote: Nat8 := 39;
+    constant doubleQuote: Nat8 := 34;
+    constant backtick: Nat8 := 96;
+    constant openBracket: Nat8 := 91;
+    constant closeBracket: Nat8 := 93;
+    constant dash: Nat8 := 45;
+    constant slash: Nat8 := 47;
+    constant star: Nat8 := 42;
+    constant newline: Nat8 := 10;
+    constant byteMask: Nat64 := 255;
+    constant byteBase: Nat64 := 256;
+    constant top32: Nat64 := 16777216;
+    constant top64: Nat64 := 72057594037927936;
+    constant commandWrite: Nat8 := 1;
+    constant commandBarrier: Nat8 := 2;
+    constant sqliteRow: Int32 := 100;
+    constant sqliteDone: Int32 := 101;
+    -- SQLITE_RANGE, for a count of values that is not the statement's.
+    constant sqliteRange: Int32 := 25;
+    -- SQLITE_MISUSE, for a text refused before SQLite saw a statement in it.
+    constant sqliteMisuse: Int32 := 21;
+
+    ---
+    --- Kinds and refusals
+    ---
+
+    function kindNull(): Nat8 is
+        return 0;
+    end;
+
+    function kindInteger(): Nat8 is
+        return 1;
+    end;
+
+    function kindReal(): Nat8 is
+        return 2;
+    end;
+
+    function kindText(): Nat8 is
+        return 3;
+    end;
+
+    function kindBlob(): Nat8 is
+        return 4;
+    end;
+
+    function refusedNot(): Nat8 is
+        return 0;
+    end;
+
+    function refusedEmpty(): Nat8 is
+        return 1;
+    end;
+
+    function refusedLiteral(): Nat8 is
+        return 2;
+    end;
+
+    function refusedNondeterministic(): Nat8 is
+        return 3;
+    end;
+
+    function refusedStatementKind(): Nat8 is
+        return 4;
+    end;
+
+    function refusedNotLeader(): Nat8 is
+        return 5;
+    end;
+
+    function refusedDoesNotPrepare(): Nat8 is
+        return 6;
+    end;
+
+    function refusedReadOnly(): Nat8 is
+        return 7;
+    end;
+
+    function refusedParameterCount(): Nat8 is
+        return 8;
+    end;
+
+    function resultLimit(): Index is
+        return 1024;
+    end;
+
+    ---
+    --- Values
+    ---
+
+    function nullValue(): Value is
+        return Value(kind => kindNull(), number => 0, real => zeroReal, bytes => fromSpan(""));
+    end;
+
+    function integerValue(number: Int64): Value is
+        return Value(kind => kindInteger(), number => number, real => zeroReal, bytes => fromSpan(""));
+    end;
+
+    function realValue(real: Float64): Value is
+        return Value(kind => kindReal(), number => 0, real => real, bytes => fromSpan(""));
+    end;
+
+    generic [R: Region]
+    function textValue(text: Span[Nat8, R]): Value is
+        return Value(kind => kindText(), number => 0, real => zeroReal, bytes => fromSpan(text));
+    end;
+
+    generic [R: Region]
+    function blobValue(bytes: Span[Nat8, R]): Value is
+        return Value(kind => kindBlob(), number => 0, real => zeroReal, bytes => fromSpan(bytes));
+    end;
+
+    function destroyValue(value: Value): Unit is
+        let { kind: Nat8, number: Int64, real: Float64, bytes: String } := value;
+        destroyString(bytes);
+        return nil;
+    end;
+
+    function destroyValues(values: Buffer[Value]): Unit is
+        var rest: Buffer[Value] := values;
+        while length(&rest) > 0 do
+            destroyValue(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyRows(rows: Buffer[Buffer[Value]]): Unit is
+        var rest: Buffer[Buffer[Value]] := rows;
+        while length(&rest) > 0 do
+            destroyValues(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function noValues(): Buffer[Value] is
+        return allocateEmpty();
+    end;
+
+    function noRows(): Buffer[Buffer[Value]] is
+        return allocateEmpty();
+    end;
+
+    ---
+    --- What the text says
+    ---
+
+    function lowered(byte: Nat8): Nat8 is
+        if (byte >= 'A') and (byte <= 'Z') then
+            return byte + 32;
+        end if;
+        return byte;
+    end;
+
+    function isWordByte(byte: Nat8): Bool is
+        return (((((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'))) or ((byte >= '0') and (byte <= '9'))) or (byte = '_')) or (byte >= 128);
+    end;
+
+    function isWordStart(byte: Nat8): Bool is
+        return ((((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'))) or (byte = '_')) or (byte >= 128);
+    end;
+
+    -- Whether the word of count bytes at start is word, in small letters.
+    generic [R: Region]
+    function wordIs(sql: Span[Nat8, R], start: Index, count: Index, word: Span[Nat8, Static]): Bool is
+        if count /= spanLength(word) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < count do
+            if lowered(sql[start + i]) /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- A function whose answer is not the same on every node, whatever the
+    -- data: chance, the clock, the version of the library, an extension.
+    generic [R: Region]
+    function isChanceWord(sql: Span[Nat8, R], start: Index, count: Index): Bool is
+        return ((((((wordIs(sql, start, count, "random") or wordIs(sql, start, count, "randomblob"))
+            or wordIs(sql, start, count, "current_timestamp")) or wordIs(sql, start, count, "current_date"))
+            or wordIs(sql, start, count, "current_time")) or wordIs(sql, start, count, "sqlite_version"))
+            or wordIs(sql, start, count, "sqlite_source_id")) or wordIs(sql, start, count, "load_extension");
+    end;
+
+    -- A function of time and date, whose answer depends on the clock when
+    -- one of its arguments is now.
+    generic [R: Region]
+    function isTimeWord(sql: Span[Nat8, R], start: Index, count: Index): Bool is
+        return (((((wordIs(sql, start, count, "date") or wordIs(sql, start, count, "time"))
+            or wordIs(sql, start, count, "datetime")) or wordIs(sql, start, count, "julianday"))
+            or wordIs(sql, start, count, "unixepoch")) or wordIs(sql, start, count, "strftime"))
+            or wordIs(sql, start, count, "timediff");
+    end;
+
+    -- A statement that reaches past its own database or its own
+    -- transaction.
+    generic [R: Region]
+    function isRefusedKind(sql: Span[Nat8, R], start: Index, count: Index): Bool is
+        return ((((((((wordIs(sql, start, count, "attach") or wordIs(sql, start, count, "detach"))
+            or wordIs(sql, start, count, "pragma")) or wordIs(sql, start, count, "vacuum"))
+            or wordIs(sql, start, count, "begin")) or wordIs(sql, start, count, "commit"))
+            or wordIs(sql, start, count, "end")) or wordIs(sql, start, count, "rollback"))
+            or wordIs(sql, start, count, "savepoint")) or wordIs(sql, start, count, "release");
+    end;
+
+    generic [V: Region]
+    function hasNowValue(values: &[Buffer[Value], V]): Bool is
+        var i: Index := 0;
+        while i < length(values) do
+            let value: &[Value, V] := nthRef(values, i);
+            if (value->kind) = kindText() then
+                let text: Span[Nat8, V] := asSpan(&(value->bytes));
+                if spanLength(text) = 3 then
+                    if ((lowered(text[0]) = 'n') and (lowered(text[1]) = 'o')) and (lowered(text[2]) = 'w') then
+                        return true;
+                    end if;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The index after the end of a quoted name that opens at start with
+    -- close as its last byte, or the length of the text when it does not
+    -- end.
+    generic [R: Region]
+    function skipQuoted(sql: Span[Nat8, R], start: Index, close: Nat8): Index is
+        var i: Index := start + 1;
+        while i < spanLength(sql) do
+            if sql[i] = close then
+                return i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return spanLength(sql);
+    end;
+
+    generic [S: Region, V: Region]
+    function textRefusal(sql: Span[Nat8, S], values: &[Buffer[Value], V]): Nat8 is
+        let size: Index := spanLength(sql);
+        var words: Index := 0;
+        var literal: Bool := false;
+        var chance: Bool := false;
+        var clock: Bool := false;
+        var kind: Bool := false;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := sql[i];
+            if byte = singleQuote then
+                literal := true;
+                i := i + 1;
+            else if ((byte = doubleQuote) or (byte = backtick)) then
+                i := skipQuoted(sql, i, byte);
+            else if byte = openBracket then
+                i := skipQuoted(sql, i, closeBracket);
+            else if ((byte = dash) and ((i + 1) < size)) and (sql[(i + 1)] = dash) then
+                while (i < size) and (sql[i] /= newline) do
+                    i := i + 1;
+                end while;
+            else if ((byte = slash) and ((i + 1) < size)) and (sql[(i + 1)] = star) then
+                i := i + 2;
+                var open: Bool := true;
+                while open and (i < size) do
+                    if ((sql[i] = star) and ((i + 1) < size)) and (sql[(i + 1)] = slash) then
+                        open := false;
+                        i := i + 2;
+                    else
+                        i := i + 1;
+                    end if;
+                end while;
+            else if isWordStart(byte) then
+                let start: Index := i;
+                while (i < size) and isWordByte(sql[i]) do
+                    i := i + 1;
+                end while;
+                let count: Index := i - start;
+                if (words = 0) and isRefusedKind(sql, start, count) then
+                    kind := true;
+                end if;
+                if isChanceWord(sql, start, count) then
+                    chance := true;
+                end if;
+                if isTimeWord(sql, start, count) then
+                    clock := true;
+                end if;
+                words := words + 1;
+            else
+                i := i + 1;
+            end if;
+        end while;
+        if words = 0 then
+            return refusedEmpty();
+        end if;
+        if literal then
+            return refusedLiteral();
+        end if;
+        if chance or (clock and hasNowValue(values)) then
+            return refusedNondeterministic();
+        end if;
+        if kind then
+            return refusedStatementKind();
+        end if;
+        return refusedNot();
+    end;
+
+    ---
+    --- The bytes of a command
+    ---
+
+    function lowByte(value: Nat64): Nat8 is
+        case toNat8(bitwiseAnd(value, byteMask)) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                abort("Standard.SqliteReplica: a byte did not fit a Nat8");
+        end case;
+    end;
+
+    function byteValue(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.SqliteReplica: a byte did not fit a Nat64");
+        end case;
+    end;
+
+    function wide(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.SqliteReplica: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function narrow(value: Nat64): Index is
+        case toIndex(value) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.SqliteReplica: a length did not fit an Index");
+        end case;
+    end;
+
+    generic [R: Region]
+    function putNumber(out: &![StringBuilder, R], value: Nat64, top: Nat64): Unit is
+        var shift: Nat64 := top;
+        while shift > 0 do
+            writeByte(&~out, lowByte(value / shift));
+            shift := shift / byteBase;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function putBytes(out: &![StringBuilder, R], data: Span[Nat8, S]): Unit is
+        putNumber(&~out, wide(spanLength(data)), top32);
+        writeString(&~out, data);
+        return nil;
+    end;
+
+    generic [S: Region, V: Region]
+    function encodeWrite(index: Nat64, sql: Span[Nat8, S], values: &[Buffer[Value], V]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, commandWrite);
+        putNumber(&!out, index, top64);
+        putBytes(&!out, sql);
+        putNumber(&!out, wide(length(values)), top32);
+        var i: Index := 0;
+        while i < length(values) do
+            let value: &[Value, V] := nthRef(values, i);
+            writeByte(&!out, (value->kind));
+            if (value->kind) = kindInteger() then
+                putNumber(&!out, int64Bits((value->number)), top64);
+            else if ((value->kind) = kindText()) or ((value->kind) = kindBlob()) then
+                putBytes(&!out, asSpan(&(value->bytes)));
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function encodeBarrier(index: Nat64): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, commandBarrier);
+        putNumber(&!out, index, top64);
+        return finalize(out);
+    end;
+
+    record Cursor: Free is
+        at: Index;
+        good: Bool;
+    end;
+
+    generic [R: Region, C: Region]
+    function takeNumber(bytes: Span[Nat8, R], cursor: &![Cursor, C], width: Index): Nat64 is
+        if (not (cursor->good)) or ((spanLength(bytes) - (cursor->at)) < width) then
+            cursor->good := false;
+            return 0;
+        end if;
+        var value: Nat64 := 0;
+        var i: Index := 0;
+        while i < width do
+            value := modularAdd(modularMultiply(value, byteBase), byteValue(bytes[(cursor->at) + i]));
+            i := i + 1;
+        end while;
+        cursor->at := (cursor->at) + width;
+        return value;
+    end;
+
+    generic [R: Region, C: Region]
+    function takeBytes(bytes: Span[Nat8, R], cursor: &![Cursor, C]): String is
+        let size: Nat64 := takeNumber(bytes, &~cursor, 4);
+        let left: Nat64 := wide(spanLength(bytes) - (cursor->at));
+        if (not (cursor->good)) or (size > left) then
+            cursor->good := false;
+            return fromSpan("");
+        end if;
+        let count: Index := narrow(size);
+        let text: String := fromSpan(spanPart(bytes, (cursor->at), count));
+        cursor->at := (cursor->at) + count;
+        return text;
+    end;
+
+    -- One value of a command; a kind it does not know clears good.
+    generic [R: Region, C: Region]
+    function takeValue(bytes: Span[Nat8, R], cursor: &![Cursor, C]): Value is
+        let kind: Nat8 := lowByte(takeNumber(bytes, &~cursor, 1));
+        if kind = kindInteger() then
+            return integerValue(int64OfBits(takeNumber(bytes, &~cursor, 8)));
+        else if kind = kindText() then
+            let text: String := takeBytes(bytes, &~cursor);
+            return Value(kind => kindText(), number => 0, real => zeroReal, bytes => text);
+        else if kind = kindBlob() then
+            let blob: String := takeBytes(bytes, &~cursor);
+            return Value(kind => kindBlob(), number => 0, real => zeroReal, bytes => blob);
+        else if kind = kindNull() then
+            return nullValue();
+        else
+            cursor->good := false;
+            return nullValue();
+        end if;
+    end;
+
+    ---
+    --- The store
+    ---
+
+    record Store: Linear is
+        db: Database;
+        scratch: String;
+        results: Buffer[WriteResult];
+        invariant length(&results) <= 1024;
+    end;
+
+    function noResults(): Buffer[WriteResult] is
+        return allocateEmpty();
+    end;
+
+    generic [P: Region, S: Region]
+    function openStore(path: Span[Nat8, P], scratch: Span[Nat8, S]): Either[String, Store] is
+        case openDatabase(path) of
+            when Right(right as db: Database) do
+                let store: Either[String, Store] := Right(right => Store(db => db, scratch => fromSpan(scratch), results => noResults()));
+                return store;
+            when Left(left as message: String) do
+                let failed: Either[String, Store] := Left(left => message);
+                return failed;
+        end case;
+    end;
+
+    function closeStore(store: Store): Unit is
+        let { db: Database, scratch: String, results: Buffer[WriteResult] } := store;
+        closeDatabase(db);
+        destroyString(scratch);
+        destroyFree(results);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function resultOf(store: &[Store, R], index: Nat64): Option[WriteResult] is
+        var i: Index := 0;
+        while i < length(&(store->results)) do
+            let result: WriteResult := nth(&(store->results), i);
+            if result.index = index then
+                let some: Option[WriteResult] := Some(value => result);
+                return some;
+            end if;
+            i := i + 1;
+        end while;
+        let none: Option[WriteResult] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function resultCount(store: &[Store, R]): Index is
+        return length(&(store->results));
+    end;
+
+    generic [R: Region]
+    function dropOldest(store: &![Store, R]): Unit is
+        let gone: WriteResult := removeFirst(&!(store->results));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushResult(store: &![Store, R], result: WriteResult): Unit is
+        insertBack(&!(store->results), result);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function remember(store: &![Store, R], result: WriteResult): Unit is
+        while resultCount(&store) >= resultLimit() do
+            dropOldest(&~store);
+        end while;
+        pushResult(&~store, result);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function clearResults(store: &![Store, R]): Unit is
+        while resultCount(&store) > 0 do
+            dropOldest(&~store);
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Running statements
+    ---
+
+    -- The values bound to the statement in their order; SQLite's first
+    -- code that is not 0, or 0.
+    generic [S: Region, V: Region]
+    function bindAll(statement: &![Statement, S], values: &[Buffer[Value], V]): Int32 is
+        var i: Index := 0;
+        while i < length(values) do
+            let value: &[Value, V] := nthRef(values, i);
+            var rc: Int32 := 0;
+            if (value->kind) = kindInteger() then
+                rc := bindInt64(&~statement, i + 1, (value->number));
+            else if (value->kind) = kindText() then
+                rc := bindText(&~statement, i + 1, asSpan(&(value->bytes)));
+            else if (value->kind) = kindBlob() then
+                rc := bindBlob(&~statement, i + 1, asSpan(&(value->bytes)));
+            else
+                rc := bindNull(&~statement, i + 1);
+            end if;
+            if rc /= 0 then
+                return rc;
+            end if;
+            i := i + 1;
+        end while;
+        return 0;
+    end;
+
+    generic [D: Region, S: Region, V: Region]
+    function runWrite(db: &[Database, D], index: Nat64, sql: Span[Nat8, S], values: &[Buffer[Value], V]): WriteResult is
+        case prepareOne(db, sql) of
+            when Left(left as message: String) do
+                destroyString(message);
+                -- A refusal of prepareOne itself leaves no code in SQLite, and
+                -- 0 would read as success.
+                var code: Int32 := errorCode(db);
+                if code = 0 then
+                    code := sqliteMisuse;
+                end if;
+                return WriteResult(index => index, applied => false, changes => 0, code => code);
+            when Right(right as prepared: Statement) do
+                var statement: Statement := prepared;
+                var result: WriteResult := WriteResult(index => index, applied => false, changes => 0, code => sqliteRange);
+                if parameterCount(&statement) = length(values) then
+                    let bound: Int32 := bindAll(&!statement, values);
+                    if bound = 0 then
+                        var rc: Int32 := stepStatement(&!statement);
+                        while rc = sqliteRow do
+                            rc := stepStatement(&!statement);
+                        end while;
+                        if rc = sqliteDone then
+                            result := WriteResult(index => index, applied => true, changes => changes(db), code => 0);
+                        else
+                            result := WriteResult(index => index, applied => false, changes => 0, code => errorCode(db));
+                        end if;
+                    else
+                        result := WriteResult(index => index, applied => false, changes => 0, code => bound);
+                    end if;
+                end if;
+                finalizeStatement(statement);
+                return result;
+        end case;
+    end;
+
+    -- The result of the command in bytes run on store; None for a barrier
+    -- and for bytes that are no command.
+    generic [R: Region, B: Region]
+    function runCommand(store: &[Store, R], bytes: Span[Nat8, B]): Option[WriteResult] is
+        var cursor: Cursor := Cursor(at => 0, good => true);
+        let kind: Nat8 := lowByte(takeNumber(bytes, &!cursor, 1));
+        let index: Nat64 := takeNumber(bytes, &!cursor, 8);
+        if (not cursor.good) or (kind /= commandWrite) then
+            let none: Option[WriteResult] := None();
+            return none;
+        end if;
+        let sql: String := takeBytes(bytes, &!cursor);
+        let count: Nat64 := takeNumber(bytes, &!cursor, 4);
+        var values: Buffer[Value] := noValues();
+        var k: Nat64 := 0;
+        while cursor.good and (k < count) do
+            insertBack(&!values, takeValue(bytes, &!cursor));
+            k := k + 1;
+        end while;
+        var outcome: Option[WriteResult] := None();
+        if cursor.good and (cursor.at = spanLength(bytes)) then
+            outcome := Some(value => runWrite(&(store->db), index, asSpan(&sql), &values));
+        end if;
+        destroyString(sql);
+        destroyValues(values);
+        return outcome;
+    end;
+
+    ---
+    --- Snapshots through the online backup
+    ---
+
+    generic [R: Region]
+    function scratchPath(store: &[Store, R], name: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&(store->scratch)));
+        writeByte(&!out, '/');
+        writeString(&!out, name);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function readWhole(path: Span[Nat8, R]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return read;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, D: Region]
+    function writeWhole(path: Span[Nat8, R], data: Span[Nat8, D]): Bool is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, data);
+                let closed: Bool := closeFile(file);
+                return wrote and closed;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function snapshotOf(store: &[Store, R]): String is
+        let path: String := scratchPath(store, "replica-snapshot.db");
+        let gone: Bool := removeFile(asSpan(&path));
+        if not backupInto(&(store->db), asSpan(&path)) then
+            abort("Standard.SqliteReplica: the backup of the database failed");
+        end if;
+        let read: Option[String] := readWhole(asSpan(&path));
+        let removed: Bool := removeFile(asSpan(&path));
+        destroyString(path);
+        case read of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                abort("Standard.SqliteReplica: the backup could not be read");
+        end case;
+    end;
+
+    generic [R: Region, D: Region]
+    function restoreInto(store: &[Store, R], data: Span[Nat8, D]): Bool is
+        let path: String := scratchPath(store, "replica-restore.db");
+        let gone: Bool := removeFile(asSpan(&path));
+        var restored: Bool := false;
+        if writeWhole(asSpan(&path), data) then
+            restored := restoreFrom(&(store->db), asSpan(&path));
+        end if;
+        let removed: Bool := removeFile(asSpan(&path));
+        destroyString(path);
+        return restored;
+    end;
+
+    instance StateMachine(Store) is
+        generic [R: Region, D: Region]
+        method applyCommand(machine: &![Store, R], command: Span[Nat8, D]): Unit is
+            case runCommand(&machine, command) of
+                when Some(value as result: WriteResult) do
+                    remember(&~machine, result);
+                when None do
+                    skip;
+            end case;
+            return nil;
+        end;
+
+        generic [R: Region]
+        method takeSnapshot(machine: &[Store, R]): String is
+            return snapshotOf(machine);
+        end;
+
+        generic [R: Region, D: Region]
+        method restoreSnapshot(machine: &![Store, R], data: Span[Nat8, D]): Bool is
+            let restored: Bool := restoreInto(&machine, data);
+            clearResults(&~machine);
+            return restored;
+        end;
+    end;
+
+    ---
+    --- Writing through the log
+    ---
+
+    -- refusedNot when sql prepares on store as one statement that writes
+    -- and takes as many values as values holds; the refusal otherwise.
+    generic [T: Region, S: Region, V: Region]
+    function prepareRefusal(store: &[Store, T], sql: Span[Nat8, S], values: &[Buffer[Value], V]): Nat8 is
+        case prepareOne(&(store->db), sql) of
+            when Left(left as message: String) do
+                destroyString(message);
+                return refusedDoesNotPrepare();
+            when Right(right as statement: Statement) do
+                var refusal: Nat8 := refusedNot();
+                if isReadOnly(&statement) then
+                    refusal := refusedReadOnly();
+                else if parameterCount(&statement) /= length(values) then
+                    refusal := refusedParameterCount();
+                end if;
+                finalizeStatement(statement);
+                return refusal;
+        end case;
+    end;
+
+    generic [N: Region, T: Region, S: Region, V: Region]
+    function proposeWrite(node: &![Node, N], store: &[Store, T], sql: Span[Nat8, S], values: &[Buffer[Value], V]): Either[Nat8, Nat64] is
+        var refusal: Nat8 := textRefusal(sql, values);
+        if (refusal = refusedNot()) and (not isLeader(&node)) then
+            refusal := refusedNotLeader();
+        end if;
+        if refusal = refusedNot() then
+            refusal := prepareRefusal(store, sql, values);
+            -- The leader's database knows only what it applied; a statement
+            -- on a table an entry still in the log makes cannot prepare yet,
+            -- and the apply decides on every node alike.
+            let behind: Bool := appliedIndex(&node) < lastIndex(&node);
+            if (refusal = refusedDoesNotPrepare()) and behind then
+                refusal := refusedNot();
+            end if;
+        end if;
+        if refusal /= refusedNot() then
+            let left: Either[Nat8, Nat64] := Left(left => refusal);
+            return left;
+        end if;
+        let index: Nat64 := lastIndex(&node) + 1;
+        let command: String := encodeWrite(index, sql, values);
+        let taken: Bool := propose(&~node, asSpan(&command));
+        destroyString(command);
+        if taken then
+            let right: Either[Nat8, Nat64] := Right(right => index);
+            return right;
+        end if;
+        let lost: Either[Nat8, Nat64] := Left(left => refusedNotLeader());
+        return lost;
+    end;
+
+    generic [N: Region]
+    function readBarrier(node: &![Node, N]): Option[Barrier] is
+        if not isLeader(&node) then
+            let none: Option[Barrier] := None();
+            return none;
+        end if;
+        let index: Nat64 := lastIndex(&node) + 1;
+        let term: Nat64 := currentTerm(&node);
+        let command: String := encodeBarrier(index);
+        let taken: Bool := propose(&~node, asSpan(&command));
+        destroyString(command);
+        if taken then
+            let some: Option[Barrier] := Some(value => Barrier(index => index, term => term));
+            return some;
+        end if;
+        let lost: Option[Barrier] := None();
+        return lost;
+    end;
+
+    generic [N: Region]
+    function linearizableReady(node: &[Node, N], barrier: Barrier): Bool is
+        return (isLeader(node) and (currentTerm(node) = barrier.term)) and (appliedIndex(node) >= barrier.index);
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    generic [S: Region]
+    function rowOf(statement: &[Statement, S]): Buffer[Value] is
+        var row: Buffer[Value] := noValues();
+        var c: Index := 0;
+        while c < columnCount(statement) do
+            let kind: Int32 := columnKind(statement, c);
+            if kind = 1 then
+                insertBack(&!row, integerValue(columnInt64(statement, c)));
+            else if kind = 2 then
+                insertBack(&!row, realValue(columnFloat64(statement, c)));
+            else if kind = 3 then
+                insertBack(&!row, Value(kind => kindText(), number => 0, real => zeroReal, bytes => columnBytes(statement, c)));
+            else if kind = 4 then
+                insertBack(&!row, Value(kind => kindBlob(), number => 0, real => zeroReal, bytes => columnBytes(statement, c)));
+            else
+                insertBack(&!row, nullValue());
+            end if;
+            c := c + 1;
+        end while;
+        return row;
+    end;
+
+    generic [T: Region, S: Region, V: Region]
+    function queryLocal(store: &[Store, T], sql: Span[Nat8, S], values: &[Buffer[Value], V]): Either[String, Buffer[Buffer[Value]]] is
+        case prepareOne(&(store->db), sql) of
+            when Left(left as message: String) do
+                let failed: Either[String, Buffer[Buffer[Value]]] := Left(left => message);
+                return failed;
+            when Right(right as prepared: Statement) do
+                var statement: Statement := prepared;
+                let answer: Either[String, Buffer[Buffer[Value]]] := collect(&!statement, &(store->db), values);
+                finalizeStatement(statement);
+                return answer;
+        end case;
+    end;
+
+    -- The rows of a prepared statement that only reads, with values bound.
+    generic [S: Region, D: Region, V: Region]
+    function collect(statement: &![Statement, S], db: &[Database, D], values: &[Buffer[Value], V]): Either[String, Buffer[Buffer[Value]]] is
+        if not isReadOnly(&statement) then
+            let writes: Either[String, Buffer[Buffer[Value]]] := Left(left => fromSpan("Standard.SqliteReplica: a read that writes"));
+            return writes;
+        end if;
+        if parameterCount(&statement) /= length(values) then
+            let count: Either[String, Buffer[Buffer[Value]]] := Left(left => fromSpan("Standard.SqliteReplica: another count of values"));
+            return count;
+        end if;
+        if bindAll(&~statement, values) /= 0 then
+            let bound: Either[String, Buffer[Buffer[Value]]] := Left(left => errorWords(db));
+            return bound;
+        end if;
+        var rows: Buffer[Buffer[Value]] := noRows();
+        var rc: Int32 := stepStatement(&~statement);
+        while rc = sqliteRow do
+            insertBack(&!rows, rowOf(&statement));
+            rc := stepStatement(&~statement);
+        end while;
+        if rc = sqliteDone then
+            let found: Either[String, Buffer[Buffer[Value]]] := Right(right => rows);
+            return found;
+        else
+            destroyRows(rows);
+            let failed: Either[String, Buffer[Buffer[Value]]] := Left(left => errorWords(db));
+            return failed;
+        end if;
+    end;
+
+    generic [T: Region, N: Region, S: Region, V: Region]
+    function queryLinearizable(store: &[Store, T], node: &[Node, N], barrier: Barrier, sql: Span[Nat8, S], values: &[Buffer[Value], V]): Either[String, Buffer[Buffer[Value]]] is
+        if not linearizableReady(node, barrier) then
+            let late: Either[String, Buffer[Buffer[Value]]] := Left(left => fromSpan("Standard.SqliteReplica: the barrier is not applied by the leader of its term"));
+            return late;
+        end if;
+        return queryLocal(store, sql, values);
+    end;
+end module body.

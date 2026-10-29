@@ -1,0 +1,745 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Reading a programme's command line against a declared command, its options and subcommands.
+
+- Every declaration hands back a key, so a misspelt name is one the compiler does not know.
+- Nothing on the command line stops the programme: every mistake comes back as an ArgumentError.
+- An error names the argument it was found at and, for a name nearly right, the name meant.
+- The syntax is POSIX with long options; options and positional arguments may be mixed.
+- -h, --help, and -V and --version once a version is set, are built in, as are help and version as words; --full after a version asks for the full text.
+- -v -s -c -e and --verbose --sandbox --config --env --pepper --socket --json are reserved for their one meaning.
+- Help, usage, an mdoc man page and completion for bash, zsh and fish come from the declarations.
+- Option names and words are ASCII; a text value must be UTF-8, and a path is taken as its bytes.
+- In help and in messages a byte that is not UTF-8 is shown as \xNN.
+
+    var command: Command := makeCommand("fetch", "Fetches a file.");
+    let verbose: FlagKey := addVerbose(&!command, "Say more.");
+    let output: PathKey := addPath(&!command, option("output", 0, "Where to write."));
+    let arguments: Buffer[String] := processArguments();
+    let parsed: Either[ArgumentError, Outcome] := parse(&command, &arguments);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.Buffer (
+    Buffer
+);
+import Standard.String (
+    String
+);
+
+module Standard.Arguments is
+    ---
+    --- Declaring
+    ---
+
+    """
+    A command: its name, what it does, its options, positional arguments
+    and subcommands.  Linear: destroyCommand gives it back.
+    """
+    type Command: Linear;
+
+    """
+    What an option is called and what its help says.  Made with option,
+    then changed with the functions below it.
+    """
+    type Spec: Free;
+
+    """
+    Whether span is a name: letters, digits, - and _, starting with a letter
+    or a digit, not empty.  The rule for the name of a command, an alias, a
+    long option name, an environment variable and a positional argument; the
+    requires of the calls below say so with it.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isName(span: Span[Nat8, R]): Bool;
+
+    """
+    Whether longName and shortLetter can name an option: at least one is
+    given, longName is empty or a name, and shortLetter is 0 or a letter or a
+    digit.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    function isOptionNames(longName: Span[Nat8, Static], shortLetter: Nat8): Bool;
+
+    """
+    A new command.  name is what the user types; about is one line for the
+    help.  name must be a name (isName): that is the duty of the caller, a
+    requires, a mistake of the programme and not of its user, and a call
+    with another name stops the programme with the line of the call.
+    """
+    function makeCommand(name: Span[Nat8, Static], about: Span[Nat8, Static]): Command
+        requires isName(name);
+
+    """
+    Destroy a command and its subcommands.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyCommand(command: Command): Unit;
+
+    """
+    The version -V and --version show.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function setVersion(command: &![Command, R], version: Span[Nat8, Static]): Unit;
+
+    """
+    The copyright the version line ends with, as year and holder: the line
+    reads name version, Copyright (C) notice.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function setCopyright(command: &![Command, R], notice: Span[Nat8, Static]): Unit;
+
+    """
+    The text version --full, --version --full and -V --full show, made by
+    the programme, for example with Standard.About; without it they show
+    the version line.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function setFullVersion(command: &![Command, R], text: String): Unit;
+
+    """
+    -v and --verbose with its help, repeatable and global.  These names, -s and --sandbox,
+    -c and --config, -e and --env, and --pepper, --socket and --json are
+    reserved: only the functions here declare them, and option with one of
+    them stops the programme when it is added.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addVerbose(command: &![Command, R], help: Span[Nat8, Static]): FlagKey;
+
+    """
+    -c and --config, the path of the configuration file, global: every
+    subcommand takes it too, as in tool serve --config path.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addConfig(command: &![Command, R]): PathKey;
+
+    """
+    -e and --env, the path of the file of secrets.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addEnv(command: &![Command, R]): PathKey;
+
+    """
+    --pepper, the path of the file of the pepper.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addPepper(command: &![Command, R]): PathKey;
+
+    """
+    --socket, the path of the socket to listen on.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addSocket(command: &![Command, R]): PathKey;
+
+    """
+    --json, global: the programme prints JSON.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addJson(command: &![Command, R]): FlagKey;
+
+    """
+    The word info at the root: it gives text as Help, which the programme
+    prints; info of Standard.About writes such a text.  A subcommand named
+    info takes the word.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function setInfo(command: &![Command, R], text: String): Unit;
+
+    """
+    -s and --sandbox, global, and the word sandbox at the root, which gives
+    the flag as well unless a subcommand has that name.  The programme
+    prints its sandbox when the flag is given: describePaths and
+    describeReport of Standard.Sandbox, which this module does not import.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addSandbox(command: &![Command, R]): FlagKey;
+
+    """
+    The words setup completion bash, setup completion zsh and setup
+    completion fish: they give the script of completionScript as Help,
+    which the programme prints.  A subcommand named setup takes the word.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function addCompletion(command: &![Command, R]): Unit;
+
+    """
+    The words setup manual: they give the page of manPage with date as
+    Help, which the programme prints.  A subcommand named setup takes the
+    word.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function addManual(command: &![Command, R], date: Span[Nat8, Static]): Unit;
+
+    """
+    Another name the user may type for this command when it is a
+    subcommand.  alias must be a name (isName), the duty of the caller.
+    """
+    generic [R: Region]
+    function addAlias(command: &![Command, R], alias: Span[Nat8, Static]): Unit
+        requires isName(alias);
+
+    """
+    An option with a long name, a short letter or 0 for none, and a line of
+    help.  longName is letters, digits, - and _, starting with a letter or
+    a digit, or empty when shortLetter is set; shortLetter is a letter or
+    a digit.  Both are the duty of the caller, a requires (isOptionNames),
+    and a call that breaks it stops the programme with the line of the call.
+    """
+    function option(longName: Span[Nat8, Static], shortLetter: Nat8, help: Span[Nat8, Static]): Spec
+        requires isOptionNames(longName, shortLetter);
+
+    """
+    The option must be given, on the command line or through its
+    environment variable.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function required(spec: Spec): Spec;
+
+    """
+    The option may be given more than once, and every value is kept in
+    order.  Without this, a second value is an error.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function repeatable(spec: Spec): Spec;
+
+    """
+    The option is accepted by every subcommand below the command that
+    declares it, as well as by that command.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function global(spec: Spec): Spec;
+
+    """
+    When the option is not on the command line, the variable name of the
+    environment gives its value, checked as if it had been typed.  name is
+    empty, which gives no variable, or a name (isName): the duty of the
+    caller, a requires.
+    """
+    function fromEnvironment(spec: Spec, name: Span[Nat8, Static]): Spec
+        requires (spanLength(name) = 0) or isName(name);
+
+    """
+    What the help calls the option's value; the help writes it in capitals.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function valueName(spec: Spec, name: Span[Nat8, Static]): Spec;
+
+    ---
+    --- Keys
+    ---
+
+    """
+    A flag: given or not, never with a value.  A repeatable flag is
+    counted, as in -vvv.
+    """
+    type FlagKey: Free;
+
+    """
+    An option whose value is UTF-8 text.
+    """
+    type TextKey: Free;
+
+    """
+    An option whose value is a whole number in a range.
+    """
+    type WholeKey: Free;
+
+    """
+    An option whose value is true or false: true, yes, on or 1, and false,
+    no, off or 0.
+    """
+    type BoolKey: Free;
+
+    """
+    An option whose value is one of the words it was declared with.
+    """
+    type ChoiceKey: Free;
+
+    """
+    An option or a positional argument whose value is a path: any bytes,
+    not empty.
+    """
+    type PathKey: Free;
+
+    """
+    A positional argument whose value is UTF-8 text.
+    """
+    type PositionalKey: Free;
+
+    """
+    A subcommand.
+    """
+    type SubcommandKey: Free;
+
+    """
+    Any key, for a conflict or a dependency between two options.
+    """
+    type AnyKey: Free;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addFlag(command: &![Command, R], spec: Spec): FlagKey;
+
+    """
+    An option with a text value; default is used when it is not given, an
+    empty default meaning none.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addText(command: &![Command, R], spec: Spec, default: Span[Nat8, Static]): TextKey;
+
+    """
+    An option with a whole number from lowest to highest.  default is the
+    number as the user would type it, empty for none; a default that is no
+    number or lies outside the range aborts, a mistake of the programme.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addWhole(command: &![Command, R], spec: Spec, lowest: Int64, highest: Int64, default: Span[Nat8, Static]): WholeKey;
+
+    """
+    An option with a Bool value.  default is one of the words a Bool
+    takes, empty for none; any other word aborts.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addBool(command: &![Command, R], spec: Spec, default: Span[Nat8, Static]): BoolKey;
+
+    """
+    An option whose value is one of words, given separated by |, as in
+    "fast|safe|small".  default, when not empty, must be one of them.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addChoice(command: &![Command, R], spec: Spec, words: Span[Nat8, Static], default: Span[Nat8, Static]): ChoiceKey;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addPath(command: &![Command, R], spec: Spec): PathKey;
+
+    """
+    A positional argument, in the order of the calls.  A required one may
+    not follow one that is not; only the last may be repeatable.  name must
+    be a name (isName), the duty of the caller, a requires; the order is
+    checked by the call, which aborts.
+    """
+    generic [R: Region]
+    function addPositional(command: &![Command, R], name: Span[Nat8, Static], help: Span[Nat8, Static], isRequired: Bool, isRepeatable: Bool): PositionalKey
+        requires isName(name);
+
+    """
+    As addPositional, for a path.
+    """
+    generic [R: Region]
+    function addPositionalPath(command: &![Command, R], name: Span[Nat8, Static], help: Span[Nat8, Static], isRequired: Bool, isRepeatable: Bool): PathKey
+        requires isName(name);
+
+    """
+    Attach sub as a subcommand.  Its keys stay valid.  A command with
+    subcommands has a help subcommand without declaring one.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function addSubcommand(command: &![Command, R], sub: Command): SubcommandKey;
+
+    """
+    A subcommand must be given.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function requireSubcommand(command: &![Command, R]): Unit;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function anyFlag(key: FlagKey): AnyKey;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function anyText(key: TextKey): AnyKey;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function anyWhole(key: WholeKey): AnyKey;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function anyBool(key: BoolKey): AnyKey;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function anyChoice(key: ChoiceKey): AnyKey;
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function anyPath(key: PathKey): AnyKey;
+
+    """
+    first and second may not both be given.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function addConflict(command: &![Command, R], first: AnyKey, second: AnyKey): Unit;
+
+    """
+    When needing is given, needed must be given too.
+    No contract: it changes its argument in place; the accessors of its type say what holds afterwards.
+    """
+    generic [R: Region]
+    function addDependency(command: &![Command, R], needing: AnyKey, needed: AnyKey): Unit;
+
+    ---
+    --- Parsing
+    ---
+
+    """
+    What was wrong with a command line.
+    """
+    union ErrorKind: Free is
+        """
+        An option no command in reach declares.
+        """
+        case UnknownOption;
+        """
+        A word where a subcommand was wanted that names none.
+        """
+        case UnknownSubcommand;
+        """
+        An option that takes a value, at the end of the line.
+        """
+        case MissingValue;
+        """
+        A value given to a flag, as in --verbose=1.
+        """
+        case UnexpectedValue;
+        """
+        A whole number that is not one, or does not fit an Int64.
+        """
+        case InvalidNumber;
+        """
+        A whole number outside its range.
+        """
+        case OutOfRange;
+        """
+        A word a choice or a Bool does not allow.
+        """
+        case NotAllowed;
+        """
+        A text value that is not UTF-8.
+        """
+        case InvalidUtf8;
+        """
+        An empty path.
+        """
+        case EmptyPath;
+        """
+        A required option or positional argument that was not given.
+        """
+        case MissingRequired;
+        """
+        An option given twice that is not repeatable, or a positional
+        argument too many.
+        """
+        case Repeated;
+        """
+        Two options that may not be given together.
+        """
+        case Conflict;
+        """
+        An option given without the one it needs.
+        """
+        case MissingDependency;
+        """
+        No subcommand where one is required.
+        """
+        case MissingSubcommand;
+        """
+        An argument file that cannot be read: it is not there, it is not a
+        regular file, or a read failed.
+        """
+        case ArgumentFileUnreadable;
+        """
+        An argument file or the files together beyond a limit: 16 MiB a
+        file, 64 MiB in all, 1024 files, a million words.
+        """
+        case ArgumentFileTooLarge;
+        """
+        An argument file that names itself, directly or through others.
+        """
+        case ArgumentFileCycle;
+        """
+        Argument files named inside each other more than 10 deep.
+        """
+        case ArgumentFileTooDeep;
+        """
+        An argument file with a quote that is never closed, a backslash at
+        its end or a zero byte.
+        """
+        case ArgumentFileSyntax;
+    end;
+
+    """
+    One mistake of the command line: its kind, the argument it was found
+    at, the word concerned, and for a word nearly right the name that was
+    probably meant.  Linear: destroyError gives it back.
+    """
+    type ArgumentError: Linear;
+
+    """
+    What a parse brings.  Run holds what the command line said; Help and
+    Version hold the text the user asked for, which the programme prints
+    to standard output before it exits successfully.
+    """
+    union Outcome: Linear is
+        case Run is
+            matches: Matches;
+        case Help is
+            text: String;
+        case Version is
+            text: String;
+    end;
+
+    """
+    What a command line said: the subcommands chosen and every value.
+    Linear: destroyMatches gives it back.
+    """
+    type Matches: Linear;
+
+    """
+    The process's arguments without the programme's name, each as a
+    String.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    function processArguments(): Buffer[String];
+
+    """
+    Destroy an argument buffer.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyArguments(arguments: Buffer[String]): Unit;
+
+    """
+    The arguments with every word that begins with @ and names a file
+    replaced by the words of that file, nested files included and a cycle
+    found.  Words are separated by white space, quotes group them, and a
+    backslash takes the next byte as it is.  @ alone and a word after --
+    are kept, @@name becomes @name.  The files are read from the working
+    directory; the error's position is the index of the word that led to it.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function expandArgumentFiles(arguments: &[Buffer[String], R]): Either[ArgumentError, Buffer[String]];
+
+    """
+    Parse arguments against command.  -vq is two flags; -o value, -ovalue,
+    --output value and --output=value give a value, and in a cluster the
+    option that takes a value ends it.  After -- every argument is
+    positional, and so is - alone.  The first word that names a subcommand
+    switches to it.  The environment is read for the options that name a
+    variable; nothing of either is kept.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function parse(command: &[Command, R], arguments: &[Buffer[String], S]): Either[ArgumentError, Outcome];
+
+    """
+    Frees matches.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyMatches(matches: Matches): Unit;
+
+    """
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function errorKind(error: &[ArgumentError, R]): ErrorKind;
+
+    """
+    The index of the argument the mistake was found at, None when it was
+    found in the environment or concerns a thing not given at all.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function errorPosition(error: &[ArgumentError, R]): Option[Index];
+
+    """
+    A message for the user, one line, then the usage line of the command
+    concerned and a pointer to --help.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region, S: Region]
+    function describeError(command: &[Command, R], error: &[ArgumentError, S]): String;
+
+    """
+    Frees error.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyError(error: ArgumentError): Unit;
+
+    ---
+    --- Asking
+    ---
+    --- A key of another command, or of a subcommand the line did not
+    --- choose, answers as an option not given.
+    ---
+
+    """
+    How often the flag was given.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function flagCount(matches: &[Matches, R], key: FlagKey): Index;
+
+    """
+    The value: the last one given, else the environment's, else the
+    default; None when there is none of them.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function textOf(matches: &[Matches, R], key: TextKey): Option[&[String, R]];
+
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function wholeOf(matches: &[Matches, R], key: WholeKey): Option[Int64];
+
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function boolOf(matches: &[Matches, R], key: BoolKey): Option[Bool];
+
+    """
+    The index of the word given, counted from 0 in the order of the
+    declaration.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function choiceOf(matches: &[Matches, R], key: ChoiceKey): Option[Index];
+
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function pathOf(matches: &[Matches, R], key: PathKey): Option[&[String, R]];
+
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function positionalOf(matches: &[Matches, R], key: PositionalKey): Option[&[String, R]];
+
+    """
+    How many values a repeatable option or positional argument was given,
+    and the value at pos, None past the last.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function textCount(matches: &[Matches, R], key: TextKey): Index;
+
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function textAt(matches: &[Matches, R], key: TextKey, pos: Index): Option[&[String, R]];
+
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function pathCount(matches: &[Matches, R], key: PathKey): Index;
+
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function pathAt(matches: &[Matches, R], key: PathKey, pos: Index): Option[&[String, R]];
+
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function positionalCount(matches: &[Matches, R], key: PositionalKey): Index;
+
+    """
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function positionalAt(matches: &[Matches, R], key: PositionalKey, pos: Index): Option[&[String, R]];
+
+    """
+    Whether the subcommand was chosen.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function chosen(matches: &[Matches, R], key: SubcommandKey): Bool;
+
+    ---
+    --- Texts written from the declarations
+    ---
+
+    """
+    The help of the command: usage line, what it does, its options,
+    positional arguments and subcommands.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region]
+    function helpText(command: &[Command, R]): String;
+
+    """
+    The usage line alone.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region]
+    function usageLine(command: &[Command, R]): String;
+
+    """
+    A manual page in mdoc(7), the format of OpenBSD's manual, in section
+    1.  date is the page's date as mdoc writes it, "September 28, 2026",
+    so that the page is a function of its input.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region, S: Region]
+    function manPage(command: &[Command, R], date: Span[Nat8, S]): String;
+
+    """
+    A shell that can complete a command's words.
+    """
+    union Shell: Free is
+        case Bash;
+        case Zsh;
+        case Fish;
+    end;
+
+    """
+    A script that makes shell complete the command's options, subcommands
+    and choice words.
+    No contract: a text whose length follows its input.
+    """
+    generic [R: Region]
+    function completionScript(command: &[Command, R], shell: Shell): String;
+end module.

@@ -1,0 +1,1 @@
+The first example of docs/arguments-from-clap.md: a command with a text option that has a default, a whole number in a range with a default, and a flag, written as clap's builder has them; the vectors run are the defaults, all three options, a count out of its range, a name nearly right, the version and the help.

@@ -1,0 +1,1 @@
+Test that libcrypto, PCRE2, SQLite, libpq, the MariaDB client and libduckdb each tell their version at run time through libraryVersion of their module, and that Standard.About.fullVersionWith writes them as lines library before the copyright; the programme checks the versions itself, so its output is the same on every system.

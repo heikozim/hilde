@@ -1,0 +1,672 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  An entry keeps its message and its fields already
+-- cleaned, the fields twice, once in the text form and once in the JSON
+-- form, so that writing a line only puts pieces together.  The system log
+-- is reached through Bindings.SystemLog; the process has one connection
+-- to it, which the runtime holds.
+import Standard.String (
+    String,
+    length as stringLength,
+    nthByte,
+    asSpan,
+    getSpan,
+    makeString,
+    storeNth,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Utf8 (
+    Decoded,
+    codePointValue,
+    decodeAt,
+    decodedPoint,
+    decodedWidth
+);
+import Standard.File (
+    FileDescriptor,
+    openAppend,
+    reopenAppend,
+    writeAll,
+    closeFile
+);
+import Standard.IO.Terminal (
+    StandardError,
+    releaseError,
+    writeErrorText
+);
+import Standard.Calendar (
+    Instant,
+    formatRfc3339
+);
+import Standard.Time (
+    wallNanos
+);
+import Bindings.SystemLog (
+    openSystemLog,
+    writeSystemLog,
+    closeSystemLog
+);
+
+module body Standard.Log is
+    constant zeroIndex: Index := 0;
+    constant zero: Int64 := 0;
+    constant ten: Int64 := 10;
+    constant widest: Index := 20;
+    -- Mode 0640: the owner writes, the group reads.
+    constant fileMode: Nat32 := 416;
+    constant tab: Nat32 := 9;
+    constant lineFeed: Nat32 := 10;
+    constant firstPrintable: Nat32 := 32;
+    constant delete: Nat32 := 127;
+    constant lastControl: Nat32 := 159;
+    constant nanosPerSecond: Nat64 := 1000000000;
+    constant nanosPerMilli: Nat32 := 1000000;
+    constant hundred: Nat32 := 100;
+    constant tenNat: Nat32 := 10;
+    constant noNanos: Nat32 := 0;
+
+    -- Where a log writes.  The stream is there for toError, the file and
+    -- its path for toFile; each field a sink does not use is None or
+    -- empty, so a case over a reference to it has a branch that binds
+    -- nothing.
+    constant toNothing: Nat8 := 0;
+    constant toError: Nat8 := 1;
+    constant toFile: Nat8 := 2;
+    constant toSystem: Nat8 := 3;
+
+    record Log: Linear is
+        sink: Nat8;
+        stream: Option[StandardError];
+        file: Option[FileDescriptor];
+        path: String;
+        least: Level;
+        format: Format;
+    end;
+
+    record Entry: Linear is
+        level: Level;
+        message: String;
+        text: String;
+        json: String;
+    end;
+
+    ---
+    --- Levels
+    ---
+
+    function rankOf(level: Level): Nat8 is
+        case level of
+            when Debug do
+                return 0;
+            when Info do
+                return 1;
+            when Warning do
+                return 2;
+            when Error do
+                return 3;
+        end case;
+    end;
+
+    function levelName(level: Level): Span[Nat8, Static] is
+        case level of
+            when Debug do
+                return "DEBUG";
+            when Info do
+                return "INFO";
+            when Warning do
+                return "WARN";
+            when Error do
+                return "ERROR";
+        end case;
+    end;
+
+    ---
+    --- Cleaning
+    ---
+
+    -- Whether scalar is a C0 or C1 control or the delete character.
+    function isControl(scalar: Nat32): Bool is
+        return (scalar < firstPrintable) or ((scalar >= delete) and (scalar <= lastControl));
+    end;
+
+    -- Appends text to out with every control character and every byte
+    -- that is not part of well-formed UTF-8 replaced: a tab and a line
+    -- feed by a space, the others by a full stop.
+    generic [R: Region, B: Region]
+    function appendClean(out: &![StringBuilder, B], text: Span[Nat8, R]): Unit is
+        let size: Index := spanLength(text);
+        var at: Index := zeroIndex;
+        while at < size do
+            case decodeAt(text, at) of
+                when Some(value as decoded: Decoded) do
+                    let width: Index := decodedWidth(decoded);
+                    let scalar: Nat32 := codePointValue(decodedPoint(decoded));
+                    if isControl(scalar) then
+                        if (scalar = tab) or (scalar = lineFeed) then
+                            writeByte(&~out, ' ');
+                        else
+                            writeByte(&~out, '.');
+                        end if;
+                    else
+                        var k: Index := zeroIndex;
+                        while k < width do
+                            writeByte(&~out, text[at + k]);
+                            k := k + 1;
+                        end while;
+                    end if;
+                    at := at + width;
+                when None do
+                    writeByte(&~out, '.');
+                    at := at + 1;
+            end case;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function cleaned(text: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        appendClean(&!out, text);
+        return finalize(out);
+    end;
+
+    function isNameByte(byte: Nat8): Bool is
+        if ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z')) then
+            return true;
+        end if;
+        if (byte >= '0') and (byte <= '9') then
+            return true;
+        end if;
+        return (byte = '_') or ((byte = '.') or (byte = '-'));
+    end;
+
+    -- Appends name with every byte outside letters, digits and _ . -
+    -- replaced by _; an empty name is written as _.
+    generic [R: Region, B: Region]
+    function appendName(out: &![StringBuilder, B], name: Span[Nat8, R]): Unit is
+        let size: Index := spanLength(name);
+        if size = zeroIndex then
+            writeByte(&~out, '_');
+            return nil;
+        end if;
+        var i: Index := zeroIndex;
+        while i < size do
+            let byte: Nat8 := name[i];
+            if isNameByte(byte) then
+                writeByte(&~out, byte);
+            else
+                writeByte(&~out, '_');
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Quoting
+    ---
+
+    -- Whether a cleaned value needs quotation marks in the text form.
+    generic [R: Region]
+    function needsQuotes(value: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(value);
+        if size = zeroIndex then
+            return true;
+        end if;
+        var i: Index := zeroIndex;
+        while i < size do
+            let byte: Nat8 := value[i];
+            if ((byte = ' ') or (byte = '=')) or ((byte = '"') or (byte = '\\')) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- Appends a cleaned value between quotation marks, a quotation mark
+    -- and a backslash in it each after a backslash.  The same for the
+    -- text form and for a JSON string: a cleaned value holds no control
+    -- character.
+    generic [R: Region, B: Region]
+    function appendQuoted(out: &![StringBuilder, B], value: Span[Nat8, R]): Unit is
+        writeByte(&~out, '"');
+        let size: Index := spanLength(value);
+        var i: Index := zeroIndex;
+        while i < size do
+            let byte: Nat8 := value[i];
+            if (byte = '"') or (byte = '\\') then
+                writeByte(&~out, '\\');
+            end if;
+            writeByte(&~out, byte);
+            i := i + 1;
+        end while;
+        writeByte(&~out, '"');
+        return nil;
+    end;
+
+    generic [R: Region, B: Region]
+    function appendTextValue(out: &![StringBuilder, B], value: Span[Nat8, R]): Unit is
+        if needsQuotes(value) then
+            appendQuoted(&~out, value);
+        else
+            writeString(&~out, value);
+        end if;
+        return nil;
+    end;
+
+    -- The decimal digits of value, after a minus sign when it is below
+    -- zero.  Each digit is taken from the remainder, which is below zero
+    -- for a value below zero, so the least Int64 needs no special case.
+    generic [B: Region]
+    function appendInteger(out: &![StringBuilder, B], value: Int64): Unit is
+        if value < zero then
+            writeByte(&~out, '-');
+        end if;
+        var digits: String := makeString(widest, '0');
+        var at: Index := widest;
+        var rest: Int64 := value;
+        var more: Bool := true;
+        while more do
+            var digit: Int64 := rem(rest, ten);
+            if digit < zero then
+                digit := zero - digit;
+            end if;
+            at := at - 1;
+            storeNth(&!digits, at, narrowNat8(digit) + '0');
+            rest := rest / ten;
+            more := rest /= zero;
+        end while;
+        writeString(&~out, getSpan(&digits, at, widest - 1));
+        destroyString(digits);
+        return nil;
+    end;
+
+    function narrowNat8(value: Int64): Nat8 is
+        case toNat8(value) of
+            when Some(value as narrow: Nat8) do
+                return narrow;
+            when None do
+                abort("Standard.Log: a digit did not fit a Nat8");
+        end case;
+    end;
+
+    -- The time as RFC 3339 in UTC with milliseconds: the text of
+    -- formatRfc3339 for the whole second, and the milliseconds put in
+    -- before its Z.
+    generic [B: Region]
+    function appendTime(out: &![StringBuilder, B], at: Instant): Unit is
+        let whole: Instant := Instant(seconds => at.seconds, nanos => noNanos);
+        case formatRfc3339(whole, 0) of
+            when Some(value as text: String) do
+                let size: Index := stringLength(&text);
+                writeString(&~out, getSpan(&text, zeroIndex, size - 2));
+                destroyString(text);
+                let millis: Nat32 := at.nanos / nanosPerMilli;
+                writeByte(&~out, '.');
+                writeByte(&~out, digitOf(millis / hundred));
+                writeByte(&~out, digitOf((millis / tenNat) - ((millis / hundred) * tenNat)));
+                writeByte(&~out, digitOf(millis - ((millis / tenNat) * tenNat)));
+                writeByte(&~out, 'Z');
+            when None do
+                -- A clock beyond the year 9999: the seconds as they are.
+                appendInteger(&~out, at.seconds);
+        end case;
+        return nil;
+    end;
+
+    function digitOf(value: Nat32): Nat8 is
+        case toNat8(value) of
+            when Some(value as small: Nat8) do
+                return small + '0';
+            when None do
+                abort("Standard.Log: a digit did not fit a Nat8");
+        end case;
+    end;
+
+    function now(): Instant is
+        let nanos: Nat64 := wallNanos();
+        let seconds: Nat64 := nanos / nanosPerSecond;
+        let part: Nat64 := nanos - (seconds * nanosPerSecond);
+        case toInt64(seconds) of
+            when Some(value as wide: Int64) do
+                case toNat32(part) of
+                    when Some(value as small: Nat32) do
+                        return Instant(seconds => wide, nanos => small);
+                    when None do
+                        abort("Standard.Log: nanoseconds did not fit a Nat32");
+                end case;
+            when None do
+                abort("Standard.Log: the clock did not fit an Int64");
+        end case;
+    end;
+
+    ---
+    --- Entries
+    ---
+
+    generic [R: Region]
+    function makeEntry(level: Level, message: Span[Nat8, R]): Entry is
+        let empty: Span[Nat8, Static] := "";
+        return Entry(level => level, message => cleaned(message), text => cleaned(empty), json => cleaned(empty));
+    end;
+
+    -- entry with one more field: the name cleaned, the value written by
+    -- the two appenders given as text already.
+    generic [R: Region, S: Region, T: Region]
+    function addField(entry: Entry, name: Span[Nat8, R], textValue: Span[Nat8, S], jsonValue: Span[Nat8, T]): Entry is
+        let { level: Level, message: String, text: String, json: String } := entry;
+        var moreText: StringBuilder := makeStringBuilder();
+        writeString(&!moreText, asSpan(&text));
+        writeByte(&!moreText, ' ');
+        appendName(&!moreText, name);
+        writeByte(&!moreText, '=');
+        writeString(&!moreText, textValue);
+        destroyString(text);
+        var moreJson: StringBuilder := makeStringBuilder();
+        writeString(&!moreJson, asSpan(&json));
+        writeString(&!moreJson, ",\"");
+        appendName(&!moreJson, name);
+        writeString(&!moreJson, "\":");
+        writeString(&!moreJson, jsonValue);
+        destroyString(json);
+        return Entry(level => level, message => message, text => finalize(moreText), json => finalize(moreJson));
+    end;
+
+    generic [R: Region, S: Region]
+    function addText(entry: Entry, name: Span[Nat8, R], value: Span[Nat8, S]): Entry is
+        let clean: String := cleaned(value);
+        var asText: StringBuilder := makeStringBuilder();
+        appendTextValue(&!asText, asSpan(&clean));
+        var asJson: StringBuilder := makeStringBuilder();
+        appendQuoted(&!asJson, asSpan(&clean));
+        destroyString(clean);
+        let textForm: String := finalize(asText);
+        let jsonForm: String := finalize(asJson);
+        let added: Entry := addField(entry, name, asSpan(&textForm), asSpan(&jsonForm));
+        destroyString(textForm);
+        destroyString(jsonForm);
+        return added;
+    end;
+
+    generic [R: Region]
+    function addInteger(entry: Entry, name: Span[Nat8, R], value: Int64): Entry is
+        var digits: StringBuilder := makeStringBuilder();
+        appendInteger(&!digits, value);
+        let form: String := finalize(digits);
+        let added: Entry := addField(entry, name, asSpan(&form), asSpan(&form));
+        destroyString(form);
+        return added;
+    end;
+
+    generic [R: Region]
+    function addBool(entry: Entry, name: Span[Nat8, R], value: Bool): Entry is
+        if value then
+            return addField(entry, name, "true", "true");
+        else
+            return addField(entry, name, "false", "false");
+        end if;
+    end;
+
+    function discardEntry(entry: Entry): Unit is
+        let { level: Level, message: String, text: String, json: String } := entry;
+        destroyString(message);
+        destroyString(text);
+        destroyString(json);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function formatEntry(entry: &[Entry, R], at: Instant, format: Format): String is
+        var out: StringBuilder := makeStringBuilder();
+        let level: Level := entry->level;
+        case format of
+            when TextLines do
+                writeString(&!out, "time=");
+                appendTime(&!out, at);
+                writeString(&!out, " level=");
+                writeString(&!out, levelName(level));
+                writeString(&!out, " msg=");
+                appendTextValue(&!out, asSpan(&(entry->message)));
+                writeString(&!out, asSpan(&(entry->text)));
+            when JsonLines do
+                writeString(&!out, "{\"time\":\"");
+                appendTime(&!out, at);
+                writeString(&!out, "\",\"level\":\"");
+                writeString(&!out, levelName(level));
+                writeString(&!out, "\",\"msg\":");
+                appendQuoted(&!out, asSpan(&(entry->message)));
+                writeString(&!out, asSpan(&(entry->json)));
+                writeByte(&!out, '}');
+        end case;
+        return finalize(out);
+    end;
+
+    -- The line for the system log: the message and the fields, since the
+    -- system log writes the time and the level itself.
+    generic [R: Region]
+    function systemLine(entry: &[Entry, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "msg=");
+        appendTextValue(&!out, asSpan(&(entry->message)));
+        writeString(&!out, asSpan(&(entry->text)));
+        return finalize(out);
+    end;
+
+    ---
+    --- Logs
+    ---
+
+    function emptyPath(): String is
+        let empty: Span[Nat8, Static] := "";
+        return cleaned(empty);
+    end;
+
+    function noStream(): Option[StandardError] is
+        let none: Option[StandardError] := None();
+        return none;
+    end;
+
+    function noFile(): Option[FileDescriptor] is
+        let none: Option[FileDescriptor] := None();
+        return none;
+    end;
+
+    function logToError(stream: StandardError, least: Level, format: Format): Log is
+        let held: Option[StandardError] := Some(value => stream);
+        return Log(sink => toError, stream => held, file => noFile(), path => emptyPath(), least => least, format => format);
+    end;
+
+    generic [R: Region]
+    function logToFile(path: Span[Nat8, R], least: Level, format: Format): Option[Log] is
+        case openAppend(path, fileMode) of
+            when Some(value as opened: FileDescriptor) do
+                let held: Option[FileDescriptor] := Some(value => opened);
+                let made: Log := Log(sink => toFile, stream => noStream(), file => held, path => copied(path), least => least, format => format);
+                return Some(value => made);
+            when None do
+                let none: Option[Log] := None();
+                return none;
+        end case;
+    end;
+
+    -- The path kept for reopenLog, byte for byte as it was given.
+    generic [R: Region]
+    function copied(path: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, path);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function logToSystem(name: Span[Nat8, R], facility: Facility, least: Level): Log is
+        let clean: String := cleaned(name);
+        openSystemLog(asSpan(&clean), facilityIndex(facility));
+        destroyString(clean);
+        return Log(sink => toSystem, stream => noStream(), file => noFile(), path => emptyPath(), least => least, format => TextLines());
+    end;
+
+    function facilityIndex(facility: Facility): Nat8 is
+        case facility of
+            when User do
+                return 0;
+            when Daemon do
+                return 1;
+            when Local0 do
+                return 2;
+            when Local1 do
+                return 3;
+            when Local2 do
+                return 4;
+            when Local3 do
+                return 5;
+            when Local4 do
+                return 6;
+            when Local5 do
+                return 7;
+            when Local6 do
+                return 8;
+            when Local7 do
+                return 9;
+        end case;
+    end;
+
+    -- The priority of level for Bindings.SystemLog: 0 for Debug to 3 for
+    -- Error, the order rankOf gives.
+    function priorityIndex(level: Level): Nat8 is
+        return rankOf(level);
+    end;
+
+    function logToNothing(): Log is
+        return Log(sink => toNothing, stream => noStream(), file => noFile(), path => emptyPath(), least => Error(), format => TextLines());
+    end;
+
+    generic [R: Region]
+    function logsLevel(log: &[Log, R], level: Level): Bool is
+        if log->sink = toNothing then
+            return false;
+        end if;
+        return rankOf(level) >= rankOf(log->least);
+    end;
+
+    generic [R: Region]
+    function copiedPath(log: &![Log, R]): String is
+        return copied(asSpan(&(log->path)));
+    end;
+
+    generic [R: Region]
+    function reopenLog(log: &![Log, R]): Bool is
+        let path: String := copiedPath(&~log);
+        case &!(log->file) of
+            when Some(value as open: &![FileDescriptor, R]) do
+                let done: Bool := reopenAppend(open, asSpan(&path), fileMode);
+                destroyString(path);
+                return done;
+            when None do
+                destroyString(path);
+                return true;
+        end case;
+    end;
+
+    function closeLog(log: Log): Bool is
+        let { sink: Nat8, stream: Option[StandardError], file: Option[FileDescriptor], path: String, least: Level, format: Format } := log;
+        destroyString(path);
+        case stream of
+            when Some(value as held: StandardError) do
+                releaseError(held);
+            when None do
+                skip;
+        end case;
+        if sink = toSystem then
+            closeSystemLog();
+        end if;
+        case file of
+            when Some(value as open: FileDescriptor) do
+                return closeFile(open);
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [R: Region]
+    function levelOf(entry: &[Entry, R]): Level is
+        return entry->level;
+    end;
+
+    -- The line of entry with its line feed.
+    generic [R: Region]
+    function lineOf(entry: &[Entry, R], at: Instant, format: Format): String is
+        let text: String := formatEntry(entry, at, format);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&text));
+        writeByte(&!out, '\n');
+        destroyString(text);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function writeEntry(log: &![Log, R], entry: Entry): Bool is
+        let level: Level := levelOf(&entry);
+        let wanted: Bool := rankOf(level) >= rankOf(log->least);
+        let format: Format := log->format;
+        let sink: Nat8 := log->sink;
+        if (not wanted) or (sink = toNothing) then
+            discardEntry(entry);
+            return true;
+        else
+            if sink = toSystem then
+                let forSystem: String := systemLine(&entry);
+                discardEntry(entry);
+                writeSystemLog(priorityIndex(level), asSpan(&forSystem));
+                destroyString(forSystem);
+                return true;
+            else
+                -- The line is built whole in a string first and handed over
+                -- to the stream or the file in one call.
+                let line: String := lineOf(&entry, now(), format);
+                discardEntry(entry);
+                let done: Bool := writeLine(&~log, &line);
+                destroyString(line);
+                return done;
+            end if;
+        end if;
+    end;
+
+    -- Writes line to the stream or the file of log, whichever it holds.
+    generic [R: Region, S: Region]
+    function writeLine(log: &![Log, R], line: &[String, S]): Bool is
+        if log->sink = toError then
+            case &!(log->stream) of
+                when Some(value as held: &![StandardError, R]) do
+                    return writeErrorText(held, asSpan(line));
+                when None do
+                    return false;
+            end case;
+        else
+            case &!(log->file) of
+                when Some(value as open: &![FileDescriptor, R]) do
+                    return writeAll(open, asSpan(line));
+                when None do
+                    return false;
+            end case;
+        end if;
+    end;
+
+    generic [R: Region, S: Region]
+    function logLine(log: &![Log, R], level: Level, message: Span[Nat8, S]): Bool is
+        return writeEntry(log, makeEntry(level, message));
+    end;
+end module body.

@@ -1,0 +1,150 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The same table in a file encrypted by SQLCipher.  The key below is an
+-- example and nothing else: a real programme reads its key from a place
+-- that is not its source.  The file is made in the working directory and
+-- removed at the end, with the files SQLite keeps beside it.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readExactly,
+    closeFile,
+    removeFile
+);
+import Standard.SqlCipher (
+    Connection,
+    Writing,
+    Reading,
+    SqlError,
+    makeKey,
+    describe,
+    openWriter,
+    openReader,
+    closeDatabase,
+    migrate
+);
+
+module body Example.LearnSqlCipher is
+    record Note[R: Region]: Free is
+        id: Int64;
+        content: Span[Nat8, R];
+    end;
+
+    function failed(what: Span[Nat8, Static], error: SqlError): Unit is
+        print(what);
+        print(": failed, code ");
+        print(error.code);
+        print(", ");
+        printLn(describe(error));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function write(db: &![Connection[Writing], R]): Unit is
+        case migrate(&~db, @migrations) of
+            when Left(left as error: SqlError) do
+                failed("migrate", error);
+            when Right(right as applied: Index) do
+                print("migrations applied: ");
+                printLn(applied);
+        end case;
+        case @execute(&~db, "INSERT INTO notes (content) VALUES (?)", "the code of the safe") of
+            when Left(left as error: SqlError) do
+                failed("insert", error);
+            when Right(right as changed: Nat64) do
+                print("inserted: ");
+                printLn(changed);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function read(db: &![Connection[Reading], R]): Unit is
+        @query(&~db, "SELECT id, content FROM notes ORDER BY id")
+            for note: Note[Q] do
+            print(note.id);
+            print(" ");
+            printLn(note.content);
+        else error do
+            failed("select", error);
+        end for;
+        return nil;
+    end;
+
+    -- True when the file starts with the 15 bytes a plain SQLite file
+    -- starts with.  An encrypted file does not.
+    function plainHeader(): Bool is
+        let path: String := fromLiteral("notes.db");
+        var plain: Bool := false;
+        case openRead(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                case readExactly(&!file, 15) of
+                    when Some(value as head: String) do
+                        let magic: String := fromLiteral("SQLite format 3");
+                        plain := true;
+                        var i: Index := 0;
+                        while i < 15 do
+                            if nthByte(&head, i) /= nthByte(&magic, i) then
+                                plain := false;
+                            end if;
+                            i := i + 1;
+                        end while;
+                        destroyString(magic);
+                        destroyString(head);
+                    when None do
+                        printLn("the file is shorter than 15 bytes");
+                end case;
+                let closed: Bool := closeFile(file);
+            when None do
+                printLn("the file cannot be opened");
+        end case;
+        destroyString(path);
+        return plain;
+    end;
+
+    function main(): ExitCode is
+        case openWriter("notes.db", makeKey("an example key, never a real one")) of
+            when Left(left as error: SqlError) do
+                failed("open writer", error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                write(&!db);
+                closeDatabase(db);
+        end case;
+        case openReader("notes.db", makeKey("an example key, never a real one")) of
+            when Left(left as error: SqlError) do
+                failed("open reader", error);
+            when Right(right as opened: Connection[Reading]) do
+                var db: Connection[Reading] := opened;
+                read(&!db);
+                closeDatabase(db);
+        end case;
+        -- Without the key the file is only noise: it does not even start
+        -- the way every plain SQLite file does.
+        print("the file starts with the plain SQLite header: ");
+        printLn(plainHeader());
+        -- In WAL mode SQLite keeps two more files beside the database, the
+        -- log of changes and the memory the connections share, and they
+        -- can remain after the last connection is closed.  They go with
+        -- the database.
+        removeFile("notes.db-wal");
+        removeFile("notes.db-shm");
+        print("the file removed: ");
+        printLn(removeFile("notes.db"));
+        return ExitSuccess();
+    end;
+end module body.

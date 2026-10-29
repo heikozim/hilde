@@ -1,0 +1,4236 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.Arguments.  A command is kept flat: its nodes (the command and
+-- every subcommand, each naming its parent), its declarations, its rules
+-- and its extras (versions, aliases, a required subcommand) are buffers
+-- that are only ever added to, so that every change is an insertBack
+-- through a write reference.  A subcommand attached to a command has its
+-- nodes, declarations, rules and extras moved over, its parents counted
+-- anew.  A key names the serial of the node that declared it and its slot
+-- there, so it stays valid when its node moves.
+import Standard.Tuples (
+    Pair
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    destroyEmpty as destroyEmptyBuffer,
+    destroyFree as destroyFreeBuffer,
+    length as bufferLength,
+    lengthMut as bufferLengthMut,
+    nth,
+    nthRef,
+    storeNth as storeBufferNth,
+    insertBack,
+    removeFirst,
+    removeLast
+);
+import Standard.String (
+    String,
+    makeEmpty,
+    makeString,
+    fromLiteral,
+    fromSpan,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    parseInt
+);
+import Standard.Utf8 (
+    isValid
+);
+import Standard.File (
+    FileDescriptor,
+    FileStatus,
+    environmentValue,
+    openRead,
+    readAll,
+    closeFile,
+    statusOfOpen,
+    sameKind,
+    kindOfTarget,
+    kindRegular
+);
+import Bindings.Serial (
+    nextSerial
+);
+
+module body Standard.Arguments is
+    ---
+    --- The kinds of a declaration
+    ---
+
+    constant kindFlag: Nat8 := 0;
+    constant kindText: Nat8 := 1;
+    constant kindWhole: Nat8 := 2;
+    constant kindBool: Nat8 := 3;
+    constant kindChoice: Nat8 := 4;
+    constant kindPath: Nat8 := 5;
+    constant kindPositional: Nat8 := 6;
+    constant kindPositionalPath: Nat8 := 7;
+
+    -- The kinds of an extra.
+    constant extraVersion: Nat8 := 0;
+    constant extraAlias: Nat8 := 1;
+    constant extraNeedsSub: Nat8 := 2;
+    constant extraCopyright: Nat8 := 3;
+    constant extraFullVersion: Nat8 := 4;
+    constant extraCompletion: Nat8 := 5;
+    constant extraManual: Nat8 := 6;
+    constant extraInfo: Nat8 := 7;
+
+    -- Where a value came from.
+    constant fromLine: Nat8 := 0;
+    constant fromEnvironmentVariable: Nat8 := 1;
+    constant fromDefault: Nat8 := 2;
+
+    -- No index: the parent of a root, a place not found.
+    constant noIndex: Index := maximum_index;
+
+    constant zeroWhole: Int64 := 0;
+    constant oneWhole: Int64 := 1;
+    constant zeroIndex: Index := 0;
+    constant oneIndex: Index := 1;
+    constant farIndex: Index := 3;
+
+    -- The byte ' , which has no character literal.
+    constant apostrophe: Nat8 := 39;
+
+    ---
+    --- The records
+    ---
+
+    record Spec: Free is
+        longName: Span[Nat8, Static];
+        shortLetter: Nat8;
+        help: Span[Nat8, Static];
+        env: Span[Nat8, Static];
+        placeholder: Span[Nat8, Static];
+        isRequired: Bool;
+        isRepeatable: Bool;
+        isGlobal: Bool;
+    end;
+
+    record FlagKey: Free is
+        owner: Nat64;
+        slot: Index;
+    end;
+
+    record TextKey: Free is
+        owner: Nat64;
+        slot: Index;
+    end;
+
+    record WholeKey: Free is
+        owner: Nat64;
+        slot: Index;
+    end;
+
+    record BoolKey: Free is
+        owner: Nat64;
+        slot: Index;
+    end;
+
+    record ChoiceKey: Free is
+        owner: Nat64;
+        slot: Index;
+    end;
+
+    record PathKey: Free is
+        owner: Nat64;
+        slot: Index;
+    end;
+
+    record PositionalKey: Free is
+        owner: Nat64;
+        slot: Index;
+    end;
+
+    record SubcommandKey: Free is
+        owner: Nat64;
+    end;
+
+    record AnyKey: Free is
+        owner: Nat64;
+        slot: Index;
+    end;
+
+    -- One declaration: an option or a positional argument.
+    record Decl: Linear is
+        owner: Nat64;
+        slot: Index;
+        kind: Nat8;
+        longName: String;
+        shortLetter: Nat8;
+        help: String;
+        placeholder: String;
+        env: String;
+        isRequired: Bool;
+        isRepeatable: Bool;
+        isGlobal: Bool;
+        lowest: Int64;
+        highest: Int64;
+        words: Buffer[String];
+        hasDefault: Bool;
+        defaultText: String;
+    end;
+
+    -- A command or a subcommand; parent is noIndex for the root.
+    record Node: Linear is
+        id: Nat64;
+        parent: Index;
+        name: String;
+        about: String;
+    end;
+
+    -- A version, an alias, or a required subcommand, of the node id.
+    record Extra: Linear is
+        node: Nat64;
+        kind: Nat8;
+        text: String;
+    end;
+
+    -- A conflict, or a dependency: needing first, needed second.
+    record Rule: Free is
+        isConflict: Bool;
+        first: AnyKey;
+        second: AnyKey;
+    end;
+
+    record Command: Linear is
+        nodes: Buffer[Node];
+        decls: Buffer[Decl];
+        rules: Buffer[Rule];
+        extras: Buffer[Extra];
+    end;
+
+    -- One value of a parse, of the declaration owner/slot.
+    record Given: Linear is
+        owner: Nat64;
+        slot: Index;
+        text: String;
+        whole: Int64;
+        source: Nat8;
+    end;
+
+    record Matches: Linear is
+        given: Buffer[Given];
+        picked: Buffer[Nat64];
+    end;
+
+    -- word is what the user wrote, option the name of the declaration
+    -- concerned as the user writes it, decl its index or noIndex, node the
+    -- node whose usage line the message shows.
+    --
+    -- An error about an argument file has the path in word, the file that
+    -- names it in via and the line there in line (a syntax error has the
+    -- line in the file itself), and a reason.
+    record ArgumentError: Linear is
+        kind: ErrorKind;
+        position: Option[Index];
+        word: String;
+        optionName: String;
+        suggestion: String;
+        environment: Bool;
+        node: Index;
+        decl: Index;
+        via: String;
+        line: Index;
+        reason: Nat8;
+    end;
+
+    ---
+    --- Small helpers of text
+    ---
+
+    function isLetter(b: Nat8): Bool is
+        return ((b >= 'a') and (b <= 'z')) or ((b >= 'A') and (b <= 'Z'));
+    end;
+
+    function isDigit(b: Nat8): Bool is
+        return (b >= '0') and (b <= '9');
+    end;
+
+    function isNameByte(b: Nat8): Bool is
+        return (isLetter(b) or isDigit(b)) or ((b = '-') or (b = '_'));
+    end;
+
+    -- Whether span is a name: letters, digits, - and _, starting with a
+    -- letter or a digit, not empty.
+    generic [R: Region]
+    function isName(span: Span[Nat8, R]): Bool is
+        let n: Index := spanLength(span);
+        if n = 0 then
+            return false;
+        end if;
+        if not (isLetter(span[0]) or isDigit(span[0])) then
+            return false;
+        end if;
+        var good: Bool := true;
+        for i from 0 to n - 1 do
+            if not isNameByte(span[i]) then
+                good := false;
+            end if;
+        end for;
+        return good;
+    end;
+
+    -- Whether a long name and a short letter can name an option: at least
+    -- one is given, the long name is empty or a name, the short letter is 0
+    -- or a letter or a digit.
+    function isOptionNames(longName: Span[Nat8, Static], shortLetter: Nat8): Bool is
+        let n: Index := spanLength(longName);
+        if (n = 0) and (shortLetter = 0) then
+            return false;
+        end if;
+        if (n > 0) and (not isName(longName)) then
+            return false;
+        end if;
+        if (shortLetter /= 0) and (not (isLetter(shortLetter) or isDigit(shortLetter))) then
+            return false;
+        end if;
+        return true;
+    end;
+
+    -- Bytes start up to but not including stop of s, as a String.
+    generic [R: Region]
+    function slice(s: &[String, R], start: Index, stop: Index): String is
+        if stop <= start then
+            return makeEmpty();
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := start;
+        while i < stop do
+            writeByte(&!out, nthByte(s, i));
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function copyOf(s: &[String, R]): String is
+        return slice(s, 0, stringLength(s));
+    end;
+
+    -- Whether bytes start up to stop of arg are exactly name.
+    generic [R: Region, S: Region]
+    function sameAs(name: &[String, R], arg: &[String, S], start: Index, stop: Index): Bool is
+        let n: Index := stringLength(name);
+        if stop < start then
+            return false;
+        end if;
+        if (stop - start) /= n then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < n do
+            if nthByte(name, i) /= nthByte(arg, start + i) then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    -- Whether s is exactly the bytes of span.
+    generic [R: Region, S: Region]
+    function sameSpan(s: &[String, R], span: Span[Nat8, S]): Bool is
+        let n: Index := stringLength(s);
+        if n /= spanLength(span) then
+            return false;
+        end if;
+        var same: Bool := true;
+        var i: Index := 0;
+        while i < n do
+            if nthByte(s, i) /= span[i] then
+                same := false;
+            end if;
+            i := i + 1;
+        end while;
+        return same;
+    end;
+
+    -- Writes s to out, a byte that is not part of UTF-8 as \xNN.
+    generic [R: Region, S: Region]
+    function writeShown(out: &![StringBuilder, R], s: &[String, S]): Unit is
+        if isValid(asSpan(s)) then
+            writeString(&~out, asSpan(s));
+            return nil;
+        end if;
+        let hex: Span[Nat8, Static] := "0123456789abcdef";
+        var i: Index := 0;
+        while i < stringLength(s) do
+            let b: Nat8 := nthByte(s, i);
+            if b < 128 then
+                writeByte(&~out, b);
+            else
+                writeString(&~out, "\\x");
+                let sixteen: Nat8 := 16;
+                writeByte(&~out, hex[toIndexOf(b / sixteen)]);
+                writeByte(&~out, hex[toIndexOf(rem(b, sixteen))]);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    function toIndexOf(b: Nat8): Index is
+        case toIndex(b) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    ---
+    --- Declaring
+    ---
+
+    function makeCommand(name: Span[Nat8, Static], about: Span[Nat8, Static]): Command is
+        var nodes: Buffer[Node] := allocateEmpty();
+        insertBack(&!nodes, Node(id => nextSerial(), parent => noIndex,
+            name => fromLiteral(name), about => fromLiteral(about)));
+        let decls: Buffer[Decl] := allocateEmpty();
+        let rules: Buffer[Rule] := allocateEmpty();
+        let extras: Buffer[Extra] := allocateEmpty();
+        return Command(nodes => nodes, decls => decls, rules => rules, extras => extras);
+    end;
+
+    function noWords(): Buffer[String] is
+        return allocateEmpty();
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var s: Buffer[String] := strings;
+        while bufferLength(&s) > 0 do
+            destroyString(removeLast(&!s));
+        end while;
+        destroyEmptyBuffer(s);
+        return nil;
+    end;
+
+    function destroyDecl(decl: Decl): Unit is
+        let { owner: Nat64, slot: Index, kind: Nat8, longName: String, shortLetter: Nat8, help: String,
+            placeholder: String, env: String, isRequired: Bool, isRepeatable: Bool,
+            isGlobal: Bool, lowest: Int64, highest: Int64, words: Buffer[String],
+            hasDefault: Bool, defaultText: String } := decl;
+        destroyString(longName);
+        destroyString(help);
+        destroyString(placeholder);
+        destroyString(env);
+        destroyStrings(words);
+        destroyString(defaultText);
+        return nil;
+    end;
+
+    function destroyCommand(command: Command): Unit is
+        let { nodes: Buffer[Node], decls: Buffer[Decl], rules: Buffer[Rule], extras: Buffer[Extra] } := command;
+        var n: Buffer[Node] := nodes;
+        while bufferLength(&n) > 0 do
+            let { id: Nat64, parent: Index, name: String, about: String } := removeLast(&!n);
+            destroyString(name);
+            destroyString(about);
+        end while;
+        destroyEmptyBuffer(n);
+        var d: Buffer[Decl] := decls;
+        while bufferLength(&d) > 0 do
+            destroyDecl(removeLast(&!d));
+        end while;
+        destroyEmptyBuffer(d);
+        destroyFreeBuffer(rules);
+        var e: Buffer[Extra] := extras;
+        while bufferLength(&e) > 0 do
+            let { node: Nat64, kind: Nat8, text: String } := removeLast(&!e);
+            destroyString(text);
+        end while;
+        destroyEmptyBuffer(e);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function rootId(command: &[Command, R]): Nat64 is
+        return nodeId(command, 0);
+    end;
+
+    generic [R: Region]
+    function nodeCount(command: &[Command, R]): Index is
+        return bufferLength(&(command->nodes));
+    end;
+
+    -- Write references to the buffers of a command.  A write reference to a
+    -- slot uses up the reference to the whole, so a function that adds to
+    -- a buffer more than once asks here with a reborrow each time.
+    generic [R: Region]
+    function nodesMut(command: &![Command, R]): &![Buffer[Node], R] is
+        return &!(command->nodes);
+    end;
+
+    generic [R: Region]
+    function declsMut(command: &![Command, R]): &![Buffer[Decl], R] is
+        return &!(command->decls);
+    end;
+
+    generic [R: Region]
+    function rulesMut(command: &![Command, R]): &![Buffer[Rule], R] is
+        return &!(command->rules);
+    end;
+
+    generic [R: Region]
+    function extrasMut(command: &![Command, R]): &![Buffer[Extra], R] is
+        return &!(command->extras);
+    end;
+
+    generic [R: Region]
+    function nodeId(command: &[Command, R], k: Index): Nat64 is
+        let node: &[Node, R] := nthRef(&(command->nodes), k);
+        return node->id;
+    end;
+
+    generic [R: Region]
+    function nodeParent(command: &[Command, R], k: Index): Index is
+        let node: &[Node, R] := nthRef(&(command->nodes), k);
+        return node->parent;
+    end;
+
+    generic [R: Region]
+    function nodeName(command: &[Command, R], k: Index): &[String, R] is
+        let node: &[Node, R] := nthRef(&(command->nodes), k);
+        return &(node->name);
+    end;
+
+    generic [R: Region]
+    function declOwner(command: &[Command, R], k: Index): Nat64 is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        return d->owner;
+    end;
+
+    generic [R: Region]
+    function declSlot(command: &[Command, R], k: Index): Index is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        return d->slot;
+    end;
+
+    generic [R: Region]
+    function declKind(command: &[Command, R], k: Index): Nat8 is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        return d->kind;
+    end;
+
+    generic [R: Region]
+    function declEnv(command: &[Command, R], k: Index): &[String, R] is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        return &(d->env);
+    end;
+
+    generic [R: Region]
+    function extraText(command: &[Command, R], k: Index): &[String, R] is
+        let e: &[Extra, R] := nthRef(&(command->extras), k);
+        return &(e->text);
+    end;
+
+    generic [R: Region]
+    function givenText(matches: &[Matches, R], k: Index): &[String, R] is
+        let g: &[Given, R] := nthRef(&(matches->given), k);
+        return &(g->text);
+    end;
+
+    generic [R: Region]
+    function givenWhole(matches: &[Matches, R], k: Index): Int64 is
+        let g: &[Given, R] := nthRef(&(matches->given), k);
+        return g->whole;
+    end;
+
+    generic [R: Region]
+    function setVersion(command: &![Command, R], version: Span[Nat8, Static]): Unit is
+        let id: Nat64 := rootId(&command);
+        insertBack(extrasMut(&~command), Extra(node => id, kind => extraVersion, text => fromLiteral(version)));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setCopyright(command: &![Command, R], notice: Span[Nat8, Static]): Unit is
+        let id: Nat64 := rootId(&command);
+        insertBack(extrasMut(&~command), Extra(node => id, kind => extraCopyright, text => fromLiteral(notice)));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setFullVersion(command: &![Command, R], text: String): Unit is
+        let id: Nat64 := rootId(&command);
+        insertBack(extrasMut(&~command), Extra(node => id, kind => extraFullVersion, text => text));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function addAlias(command: &![Command, R], alias: Span[Nat8, Static]): Unit is
+        let id: Nat64 := rootId(&command);
+        insertBack(extrasMut(&~command), Extra(node => id, kind => extraAlias, text => fromLiteral(alias)));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function requireSubcommand(command: &![Command, R]): Unit is
+        let id: Nat64 := rootId(&command);
+        insertBack(extrasMut(&~command), Extra(node => id, kind => extraNeedsSub, text => makeEmpty()));
+        return nil;
+    end;
+
+    function option(longName: Span[Nat8, Static], shortLetter: Nat8, help: Span[Nat8, Static]): Spec is
+        return Spec(longName => longName, shortLetter => shortLetter, help => help, env => "", placeholder => "",
+            isRequired => false, isRepeatable => false, isGlobal => false);
+    end;
+
+    function required(spec: Spec): Spec is
+        return Spec(longName => spec.longName, shortLetter => spec.shortLetter, help => spec.help, env => spec.env,
+            placeholder => spec.placeholder, isRequired => true,
+            isRepeatable => spec.isRepeatable, isGlobal => spec.isGlobal);
+    end;
+
+    function repeatable(spec: Spec): Spec is
+        return Spec(longName => spec.longName, shortLetter => spec.shortLetter, help => spec.help, env => spec.env,
+            placeholder => spec.placeholder, isRequired => spec.isRequired,
+            isRepeatable => true, isGlobal => spec.isGlobal);
+    end;
+
+    function global(spec: Spec): Spec is
+        return Spec(longName => spec.longName, shortLetter => spec.shortLetter, help => spec.help, env => spec.env,
+            placeholder => spec.placeholder, isRequired => spec.isRequired,
+            isRepeatable => spec.isRepeatable, isGlobal => true);
+    end;
+
+    function fromEnvironment(spec: Spec, name: Span[Nat8, Static]): Spec is
+        return Spec(longName => spec.longName, shortLetter => spec.shortLetter, help => spec.help, env => name,
+            placeholder => spec.placeholder, isRequired => spec.isRequired,
+            isRepeatable => spec.isRepeatable, isGlobal => spec.isGlobal);
+    end;
+
+    function valueName(spec: Spec, name: Span[Nat8, Static]): Spec is
+        return Spec(longName => spec.longName, shortLetter => spec.shortLetter, help => spec.help, env => spec.env,
+            placeholder => name, isRequired => spec.isRequired,
+            isRepeatable => spec.isRepeatable, isGlobal => spec.isGlobal);
+    end;
+
+    -- The next slot of the root: how many declarations it owns.
+    generic [R: Region]
+    function nextSlot(command: &[Command, R]): Index is
+        let id: Nat64 := rootId(command);
+        var count: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            if declOwner(command, k) = id then
+                count := count + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return count;
+    end;
+
+    -- Whether a declaration of the root already has this long name or this
+    -- short letter; the reserved names help, version, h and V count too.
+    generic [R: Region]
+    function nameTaken(command: &[Command, R], longName: Span[Nat8, Static], shortLetter: Nat8): Bool is
+        let id: Nat64 := rootId(command);
+        var taken: Bool := false;
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if d->owner = id then
+                if (spanLength(longName) > 0) and sameSpan(&(d->longName), longName) then
+                    taken := true;
+                end if;
+                if (shortLetter /= 0) and (d->shortLetter = shortLetter) then
+                    taken := true;
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        return taken;
+    end;
+
+    -- Checks that the names of a spec are not declared already, which only
+    -- the command knows.  That they are names is a requires of option and of
+    -- fromEnvironment.  Aborts on a mistake of the programme.
+    generic [R: Region]
+    function checkSpec(command: &[Command, R], spec: Spec): Unit is
+        if isReserved(spec) then
+            abort("Standard.Arguments: this name is reserved; addVerbose, addConfig, addEnv, addPepper, addSocket and addJson declare it");
+        end if;
+        checkFree(command, spec);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function checkFree(command: &[Command, R], spec: Spec): Unit is
+        if nameTaken(command, spec.longName, spec.shortLetter) then
+            abort("Standard.Arguments: this name is declared already");
+        end if;
+        return nil;
+    end;
+
+    -- The names every programme means the same by: -v --verbose, -s
+    -- --sandbox, -c --config, -e --env, and --pepper, --socket and --json
+    -- without a letter.  Only the functions below declare them, each with
+    -- its one meaning.
+    function isReserved(spec: Spec): Bool is
+        let b: Nat8 := spec.shortLetter;
+        if (b = 'v') or (b = 's') or (b = 'c') or (b = 'e') then
+            return true;
+        end if;
+        let n: Span[Nat8, Static] := spec.longName;
+        return equalSpan(n, "verbose") or equalSpan(n, "sandbox") or equalSpan(n, "config")
+            or equalSpan(n, "env") or equalSpan(n, "pepper") or equalSpan(n, "socket") or equalSpan(n, "json");
+    end;
+
+    function equalSpan(a: Span[Nat8, Static], b: Span[Nat8, Static]): Bool is
+        if spanLength(a) /= spanLength(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(a) do
+            if a[i] /= b[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function addVerbose(command: &![Command, R], help: Span[Nat8, Static]): FlagKey is
+        let spec: Spec := global(repeatable(option("verbose", 'v', help)));
+        checkFree(&command, spec);
+        let k: AnyKey := declare(&~command, spec, kindFlag, zeroWhole, zeroWhole, noWords(), false, makeEmpty());
+        return FlagKey(owner => k.owner, slot => k.slot);
+    end;
+
+    generic [R: Region]
+    function addConfig(command: &![Command, R]): PathKey is
+        return addReservedPath(&~command, global(option("config", 'c', "The configuration file")));
+    end;
+
+    generic [R: Region]
+    function addEnv(command: &![Command, R]): PathKey is
+        return addReservedPath(&~command, option("env", 'e', "The file of secrets the programme reads"));
+    end;
+
+    generic [R: Region]
+    function addPepper(command: &![Command, R]): PathKey is
+        return addReservedPath(&~command, option("pepper", 0, "The file of the pepper"));
+    end;
+
+    generic [R: Region]
+    function addSocket(command: &![Command, R]): PathKey is
+        return addReservedPath(&~command, option("socket", 0, "The socket to listen on"));
+    end;
+
+    generic [R: Region]
+    function addJson(command: &![Command, R]): FlagKey is
+        let spec: Spec := global(option("json", 0, "Print JSON"));
+        checkFree(&command, spec);
+        let k: AnyKey := declare(&~command, spec, kindFlag, zeroWhole, zeroWhole, noWords(), false, makeEmpty());
+        return FlagKey(owner => k.owner, slot => k.slot);
+    end;
+
+    generic [R: Region]
+    function setInfo(command: &![Command, R], text: String): Unit is
+        let id: Nat64 := rootId(&command);
+        insertBack(extrasMut(&~command), Extra(node => id, kind => extraInfo, text => text));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function addSandbox(command: &![Command, R]): FlagKey is
+        let spec: Spec := global(option("sandbox", 's', "Print the sandbox: mechanism, promises and paths"));
+        checkFree(&command, spec);
+        let k: AnyKey := declare(&~command, spec, kindFlag, zeroWhole, zeroWhole, noWords(), false, makeEmpty());
+        return FlagKey(owner => k.owner, slot => k.slot);
+    end;
+
+    generic [R: Region]
+    function addCompletion(command: &![Command, R]): Unit is
+        let id: Nat64 := rootId(&command);
+        insertBack(extrasMut(&~command), Extra(node => id, kind => extraCompletion, text => makeEmpty()));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function addManual(command: &![Command, R], date: Span[Nat8, Static]): Unit is
+        let id: Nat64 := rootId(&command);
+        insertBack(extrasMut(&~command), Extra(node => id, kind => extraManual, text => fromLiteral(date)));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function addReservedPath(command: &![Command, R], spec: Spec): PathKey is
+        checkFree(&command, spec);
+        let k: AnyKey := declare(&~command, spec, kindPath, zeroWhole, zeroWhole, noWords(), false, makeEmpty());
+        return PathKey(owner => k.owner, slot => k.slot);
+    end;
+
+    generic [R: Region]
+    function declare(command: &![Command, R], spec: Spec, kind: Nat8, lowest: Int64,
+        highest: Int64, words: Buffer[String], hasDefault: Bool,
+        defaultText: String): AnyKey is
+        let id: Nat64 := rootId(&command);
+        let slot: Index := nextSlot(&command);
+        insertBack(declsMut(&~command), Decl(owner => id, slot => slot, kind => kind,
+            longName => fromLiteral(spec.longName), shortLetter => spec.shortLetter, help => fromLiteral(spec.help),
+            placeholder => fromLiteral(spec.placeholder), env => fromLiteral(spec.env),
+            isRequired => spec.isRequired, isRepeatable => spec.isRepeatable,
+            isGlobal => spec.isGlobal, lowest => lowest, highest => highest, words => words,
+            hasDefault => hasDefault, defaultText => defaultText));
+        return AnyKey(owner => id, slot => slot);
+    end;
+
+    generic [R: Region]
+    function addFlag(command: &![Command, R], spec: Spec): FlagKey is
+        checkSpec(&command, spec);
+        let k: AnyKey := declare(&~command, spec, kindFlag, zeroWhole, zeroWhole, noWords(), false, makeEmpty());
+        return FlagKey(owner => k.owner, slot => k.slot);
+    end;
+
+    generic [R: Region]
+    function addText(command: &![Command, R], spec: Spec, default: Span[Nat8, Static]): TextKey is
+        checkSpec(&command, spec);
+        if not isValid(default) then
+            abort("Standard.Arguments: a default text is UTF-8");
+        end if;
+        let k: AnyKey := declare(&~command, spec, kindText, zeroWhole, zeroWhole, noWords(),
+            spanLength(default) > 0, fromLiteral(default));
+        return TextKey(owner => k.owner, slot => k.slot);
+    end;
+
+    generic [R: Region]
+    function addWhole(command: &![Command, R], spec: Spec, lowest: Int64, highest: Int64, default: Span[Nat8, Static]): WholeKey is
+        checkSpec(&command, spec);
+        if lowest > highest then
+            abort("Standard.Arguments: a range whose lowest is above its highest");
+        end if;
+        let has: Bool := spanLength(default) > 0;
+        if has then
+            case parseInt(default) of
+                when Some(value as d: Int64) do
+                    if (d < lowest) or (d > highest) then
+                        abort("Standard.Arguments: a default out of its range");
+                    end if;
+                when None do
+                    abort("Standard.Arguments: a default that is not a whole number");
+            end case;
+        end if;
+        let k: AnyKey := declare(&~command, spec, kindWhole, lowest, highest, noWords(), has, fromLiteral(default));
+        return WholeKey(owner => k.owner, slot => k.slot);
+    end;
+
+    -- The decimal digits of a whole number, with its sign.
+    function wholeText(value: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        var digits: Buffer[Nat8] := allocateEmpty();
+        if value = zeroWhole then
+            let zero: Nat8 := 0;
+            insertBack(&!digits, zero);
+        end if;
+        var rest: Int64 := value;
+        let ten: Int64 := 10;
+        while rest /= zeroWhole do
+            let digit: Int64 := rem(rest, ten);
+            var d: Int64 := digit;
+            if d < zeroWhole then
+                d := zeroWhole - d;
+            end if;
+            case toNat8(d) of
+                when Some(value as b: Nat8) do
+                    insertBack(&!digits, b);
+                when None do
+                    skip;
+            end case;
+            rest := rest / ten;
+        end while;
+        if value < zeroWhole then
+            writeByte(&!out, '-');
+        end if;
+        while bufferLength(&digits) > 0 do
+            let zero: Nat8 := '0';
+            writeByte(&!out, zero + removeLast(&!digits));
+        end while;
+        destroyEmptyBuffer(digits);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function addBool(command: &![Command, R], spec: Spec, default: Span[Nat8, Static]): BoolKey is
+        checkSpec(&command, spec);
+        let has: Bool := spanLength(default) > 0;
+        let text: String := fromLiteral(default);
+        if has and (boolWord(&text) = 2) then
+            abort("Standard.Arguments: a default that is no Bool word");
+        end if;
+        let k: AnyKey := declare(&~command, spec, kindBool, zeroWhole, zeroWhole, noWords(), has, text);
+        return BoolKey(owner => k.owner, slot => k.slot);
+    end;
+
+    -- The words of words, separated by |.
+    function splitWords(words: Span[Nat8, Static]): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        let n: Index := spanLength(words);
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= n do
+            var ends: Bool := i = n;
+            if not ends then
+                ends := words[i] = '|';
+            end if;
+            if ends then
+                var b: StringBuilder := makeStringBuilder();
+                var j: Index := start;
+                while j < i do
+                    writeByte(&!b, words[j]);
+                    j := j + 1;
+                end while;
+                insertBack(&!out, finalize(b));
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region, S: Region]
+    function wordIndex(words: &[Buffer[String], R], word: Span[Nat8, S]): Index is
+        var found: Index := noIndex;
+        var k: Index := 0;
+        while k < bufferLength(words) do
+            if (found = noIndex) and sameSpan(nthRef(words, k), word) then
+                found := k;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    generic [R: Region]
+    function addChoice(command: &![Command, R], spec: Spec, words: Span[Nat8, Static], default: Span[Nat8, Static]): ChoiceKey is
+        checkSpec(&command, spec);
+        let list: Buffer[String] := splitWords(words);
+        var k: Index := 0;
+        while k < bufferLength(&list) do
+            if not isName(asSpan(nthRef(&list, k))) then
+                abort("Standard.Arguments: a choice word is letters, digits, - and _");
+            end if;
+            k := k + 1;
+        end while;
+        let has: Bool := spanLength(default) > 0;
+        if has and (wordIndex(&list, default) = noIndex) then
+            abort("Standard.Arguments: a default choice that is not one of the words");
+        end if;
+        let key: AnyKey := declare(&~command, spec, kindChoice, zeroWhole, zeroWhole, list, has, fromLiteral(default));
+        return ChoiceKey(owner => key.owner, slot => key.slot);
+    end;
+
+    generic [R: Region]
+    function addPath(command: &![Command, R], spec: Spec): PathKey is
+        checkSpec(&command, spec);
+        let k: AnyKey := declare(&~command, spec, kindPath, zeroWhole, zeroWhole, noWords(), false, makeEmpty());
+        return PathKey(owner => k.owner, slot => k.slot);
+    end;
+
+    -- Checks the order of positional arguments: a required one may not
+    -- follow an optional one, and nothing may follow a repeatable one.
+    generic [R: Region]
+    function checkPositional(command: &[Command, R], name: Span[Nat8, Static], isRequired: Bool): Unit is
+        let id: Nat64 := rootId(command);
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (d->owner = id) and isPositionalKind(d->kind) then
+                if d->isRepeatable then
+                    abort("Standard.Arguments: no positional argument after a repeatable one");
+                end if;
+                if isRequired and (not d->isRequired) then
+                    abort("Standard.Arguments: a required positional argument after an optional one");
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    function isPositionalKind(kind: Nat8): Bool is
+        return (kind = kindPositional) or (kind = kindPositionalPath);
+    end;
+
+    generic [R: Region]
+    function addPositional(command: &![Command, R], name: Span[Nat8, Static], help: Span[Nat8, Static], isRequired: Bool, isRepeatable: Bool): PositionalKey is
+        checkPositional(&command, name, isRequired);
+        let spec: Spec := Spec(longName => "", shortLetter => 0, help => help, env => "", placeholder => name,
+            isRequired => isRequired, isRepeatable => isRepeatable, isGlobal => false);
+        let k: AnyKey := declare(&~command, spec, kindPositional, zeroWhole, zeroWhole, noWords(), false, makeEmpty());
+        return PositionalKey(owner => k.owner, slot => k.slot);
+    end;
+
+    generic [R: Region]
+    function addPositionalPath(command: &![Command, R], name: Span[Nat8, Static], help: Span[Nat8, Static], isRequired: Bool, isRepeatable: Bool): PathKey is
+        checkPositional(&command, name, isRequired);
+        let spec: Spec := Spec(longName => "", shortLetter => 0, help => help, env => "", placeholder => name,
+            isRequired => isRequired, isRepeatable => isRepeatable, isGlobal => false);
+        let k: AnyKey := declare(&~command, spec, kindPositionalPath, zeroWhole, zeroWhole, noWords(), false, makeEmpty());
+        return PathKey(owner => k.owner, slot => k.slot);
+    end;
+
+    generic [R: Region]
+    function addSubcommand(command: &![Command, R], sub: Command): SubcommandKey is
+        let subId: Nat64 := rootId(&sub);
+        let { nodes: Buffer[Node], decls: Buffer[Decl], rules: Buffer[Rule], extras: Buffer[Extra] } := sub;
+        -- A subcommand's name must be new among the root's children.
+        let base: Index := nodeCount(&command);
+        var n: Buffer[Node] := nodes;
+        var first: Bool := true;
+        while bufferLength(&n) > 0 do
+            let { id: Nat64, parent: Index, name: String, about: String } := removeFirst(&!n);
+            var moved: Index := 0;
+            if parent = noIndex then
+                moved := zeroIndex;
+            else
+                moved := parent + base;
+            end if;
+            if first then
+                if childNamed(&command, 0, asSpan(&name)) /= noIndex then
+                    abort("Standard.Arguments: a subcommand of this name is attached already");
+                end if;
+                first := false;
+            end if;
+            insertBack(nodesMut(&~command), Node(id => id, parent => moved, name => name, about => about));
+        end while;
+        destroyEmptyBuffer(n);
+        var d: Buffer[Decl] := decls;
+        while bufferLength(&d) > 0 do
+            insertBack(declsMut(&~command), removeFirst(&!d));
+        end while;
+        destroyEmptyBuffer(d);
+        var r: Buffer[Rule] := rules;
+        while bufferLength(&r) > 0 do
+            insertBack(rulesMut(&~command), removeFirst(&!r));
+        end while;
+        destroyEmptyBuffer(r);
+        var e: Buffer[Extra] := extras;
+        while bufferLength(&e) > 0 do
+            insertBack(extrasMut(&~command), removeFirst(&!e));
+        end while;
+        destroyEmptyBuffer(e);
+        return SubcommandKey(owner => subId);
+    end;
+
+    function anyFlag(key: FlagKey): AnyKey is
+        return AnyKey(owner => key.owner, slot => key.slot);
+    end;
+
+    function anyText(key: TextKey): AnyKey is
+        return AnyKey(owner => key.owner, slot => key.slot);
+    end;
+
+    function anyWhole(key: WholeKey): AnyKey is
+        return AnyKey(owner => key.owner, slot => key.slot);
+    end;
+
+    function anyBool(key: BoolKey): AnyKey is
+        return AnyKey(owner => key.owner, slot => key.slot);
+    end;
+
+    function anyChoice(key: ChoiceKey): AnyKey is
+        return AnyKey(owner => key.owner, slot => key.slot);
+    end;
+
+    function anyPath(key: PathKey): AnyKey is
+        return AnyKey(owner => key.owner, slot => key.slot);
+    end;
+
+    -- The index of the declaration of key, or noIndex.
+    generic [R: Region]
+    function declOf(command: &[Command, R], owner: Nat64, slot: Index): Index is
+        var found: Index := noIndex;
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (d->owner = owner) and (d->slot = slot) then
+                found := k;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    generic [R: Region]
+    function addRule(command: &![Command, R], isConflict: Bool, first: AnyKey, second: AnyKey): Unit is
+        if (declOf(&command, first.owner, first.slot) = noIndex) or (declOf(&command, second.owner, second.slot) = noIndex) then
+            abort("Standard.Arguments: a rule names a key of another command");
+        end if;
+        insertBack(rulesMut(&~command), Rule(isConflict => isConflict, first => first, second => second));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function addConflict(command: &![Command, R], first: AnyKey, second: AnyKey): Unit is
+        return addRule(&~command, true, first, second);
+    end;
+
+    generic [R: Region]
+    function addDependency(command: &![Command, R], needing: AnyKey, needed: AnyKey): Unit is
+        return addRule(&~command, false, needing, needed);
+    end;
+
+    ---
+    --- The tree
+    ---
+
+    -- The child of node parent whose name or alias is word, or noIndex.
+    generic [R: Region, S: Region]
+    function childNamed(command: &[Command, R], parent: Index, word: Span[Nat8, S]): Index is
+        var found: Index := noIndex;
+        var k: Index := 1;
+        while k < bufferLength(&(command->nodes)) do
+            let node: &[Node, R] := nthRef(&(command->nodes), k);
+            if (found = noIndex) and (node->parent = parent) then
+                if sameSpan(&(node->name), word) then
+                    found := k;
+                else if hasAlias(command, node->id, word) then
+                    found := k;
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    generic [R: Region, S: Region]
+    function hasAlias(command: &[Command, R], id: Nat64, word: Span[Nat8, S]): Bool is
+        var found: Bool := false;
+        var k: Index := 0;
+        while k < bufferLength(&(command->extras)) do
+            let e: &[Extra, R] := nthRef(&(command->extras), k);
+            if ((e->node = id) and (e->kind = extraAlias)) and sameSpan(&(e->text), word) then
+                found := true;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    generic [R: Region]
+    function childCount(command: &[Command, R], parent: Index): Index is
+        var count: Index := 0;
+        var k: Index := 1;
+        while k < bufferLength(&(command->nodes)) do
+            if nodeParent(command, k) = parent then
+                count := count + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return count;
+    end;
+
+    generic [R: Region]
+    function hasExtra(command: &[Command, R], id: Nat64, kind: Nat8): Bool is
+        var found: Bool := false;
+        var k: Index := 0;
+        while k < bufferLength(&(command->extras)) do
+            let e: &[Extra, R] := nthRef(&(command->extras), k);
+            if (e->node = id) and (e->kind = kind) then
+                found := true;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    -- The last text of an extra of this kind, or noIndex.
+    generic [R: Region]
+    function lastExtra(command: &[Command, R], id: Nat64, kind: Nat8): Index is
+        var found: Index := noIndex;
+        var k: Index := 0;
+        while k < bufferLength(&(command->extras)) do
+            let e: &[Extra, R] := nthRef(&(command->extras), k);
+            if (e->node = id) and (e->kind = kind) then
+                found := k;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    -- The index of the node of id, or noIndex.
+    generic [R: Region]
+    function nodeOf(command: &[Command, R], id: Nat64): Index is
+        var found: Index := noIndex;
+        var k: Index := 0;
+        while k < bufferLength(&(command->nodes)) do
+            if nodeId(command, k) = id then
+                found := k;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    -- Whether node above is node, or one of its ancestors.
+    generic [R: Region]
+    function isAbove(command: &[Command, R], above: Index, node: Index): Bool is
+        var at: Index := node;
+        var found: Bool := false;
+        var steps: Index := 0;
+        while (at /= noIndex) and (steps <= bufferLength(&(command->nodes))) do
+            if at = above then
+                found := true;
+            end if;
+            at := nodeParent(command, at);
+            steps := steps + 1;
+        end while;
+        return found;
+    end;
+
+    -- Whether declaration k is in reach at node: declared by it, or global
+    -- and declared by one of its ancestors.
+    generic [R: Region]
+    function inReach(command: &[Command, R], k: Index, node: Index): Bool is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        let owner: Index := nodeOf(command, d->owner);
+        if owner = node then
+            return true;
+        end if;
+        if not d->isGlobal then
+            return false;
+        end if;
+        return isAbove(command, owner, node);
+    end;
+
+    -- The option in reach at node whose long name is bytes start to stop of
+    -- arg, or noIndex.
+    generic [R: Region, S: Region]
+    function findLong(command: &[Command, R], node: Index, arg: &[String, S], start: Index, stop: Index): Index is
+        var found: Index := noIndex;
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if ((found = noIndex) and (not isPositionalKind(d->kind))) and (stringLength(&(d->longName)) > 0) then
+                if sameAs(&(d->longName), arg, start, stop) and inReach(command, k, node) then
+                    found := k;
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    generic [R: Region]
+    function findShort(command: &[Command, R], node: Index, shortLetter: Nat8): Index is
+        var found: Index := noIndex;
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if ((found = noIndex) and (d->shortLetter = shortLetter)) and (shortLetter /= 0) then
+                if inReach(command, k, node) then
+                    found := k;
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    -- Whether help is built in at node: no option in reach is named help or
+    -- h.
+    generic [R: Region]
+    function builtinHelpLong(command: &[Command, R], node: Index): Bool is
+        let word: String := fromLiteral("--help");
+        let taken: Bool := findLong(command, node, &word, 2, 6) /= noIndex;
+        destroyString(word);
+        return not taken;
+    end;
+
+    generic [R: Region]
+    function builtinVersionLong(command: &[Command, R], node: Index): Bool is
+        if lastExtra(command, rootId(command), extraVersion) = noIndex then
+            return false;
+        end if;
+        let word: String := fromLiteral("--version");
+        let taken: Bool := findLong(command, node, &word, 2, 9) /= noIndex;
+        destroyString(word);
+        return not taken;
+    end;
+
+    ---
+    --- Values
+    ---
+
+    -- How many values the declaration owner/slot holds in given.
+    generic [R: Region]
+    function countOf(given: &[Buffer[Given], R], owner: Nat64, slot: Index): Index is
+        var count: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(given) do
+            let g: &[Given, R] := nthRef(given, k);
+            if (g->owner = owner) and (g->slot = slot) then
+                count := count + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return count;
+    end;
+
+    -- The index in given of the value number pos of owner/slot, or noIndex.
+    generic [R: Region]
+    function valueAt(given: &[Buffer[Given], R], owner: Nat64, slot: Index, pos: Index): Index is
+        var found: Index := noIndex;
+        var seen: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(given) do
+            let g: &[Given, R] := nthRef(given, k);
+            if (g->owner = owner) and (g->slot = slot) then
+                if seen = pos then
+                    found := k;
+                end if;
+                seen := seen + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    -- The index in given of the last value of owner/slot, or noIndex.
+    generic [R: Region]
+    function lastValue(given: &[Buffer[Given], R], owner: Nat64, slot: Index): Index is
+        var found: Index := noIndex;
+        var k: Index := 0;
+        while k < bufferLength(given) do
+            let g: &[Given, R] := nthRef(given, k);
+            if (g->owner = owner) and (g->slot = slot) then
+                found := k;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    -- 1 for true, yes, on and 1; 0 for false, no, off and 0; 2 for any
+    -- other word.
+    generic [R: Region]
+    function boolWord(text: &[String, R]): Nat8 is
+        if ((sameSpan(text, "true") or sameSpan(text, "yes")) or (sameSpan(text, "on") or sameSpan(text, "1"))) then
+            return 1;
+        end if;
+        if ((sameSpan(text, "false") or sameSpan(text, "no")) or (sameSpan(text, "off") or sameSpan(text, "0"))) then
+            return 0;
+        end if;
+        return 2;
+    end;
+
+    -- Checks text as a value of declaration k and keeps it in given, or
+    -- gives it back and names what is wrong with it.
+    generic [R: Region, S: Region]
+    function takeValue(command: &[Command, R], given: &![Buffer[Given], S], k: Index, text: String, source: Nat8): Option[ErrorKind] is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        let kind: Nat8 := d->kind;
+        var whole: Int64 := zeroWhole;
+        var failure: Option[ErrorKind] := None();
+        if (kind = kindText) or (kind = kindPositional) then
+            if not isValid(asSpan(&text)) then
+                failure := Some(value => InvalidUtf8());
+            end if;
+        else if kind = kindWhole then
+            case parseInt(asSpan(&text)) of
+                when Some(value as number: Int64) do
+                    if (number < d->lowest) or (number > d->highest) then
+                        failure := Some(value => OutOfRange());
+                    else
+                        whole := number;
+                    end if;
+                when None do
+                    failure := Some(value => InvalidNumber());
+            end case;
+        else if kind = kindBool then
+            let b: Nat8 := boolWord(&text);
+            if b = 2 then
+                failure := Some(value => NotAllowed());
+            else if b = 1 then
+                whole := oneWhole;
+            end if;
+        else if kind = kindChoice then
+            let at: Index := wordIndex(&(d->words), asSpan(&text));
+            if at = noIndex then
+                failure := Some(value => NotAllowed());
+            else
+                case toInt64(at) of
+                    when Some(value as w: Int64) do
+                        whole := w;
+                    when None do
+                        failure := Some(value => NotAllowed());
+                end case;
+            end if;
+        else if (kind = kindPath) or (kind = kindPositionalPath) then
+            if stringLength(&text) = 0 then
+                failure := Some(value => EmptyPath());
+            end if;
+        end if;
+        case failure of
+            when Some(value as kindFound: ErrorKind) do
+                destroyString(text);
+                return Some(value => kindFound);
+            when None do
+                insertBack(&~given, Given(owner => d->owner, slot => d->slot, text => text, whole => whole, source => source));
+                let none: Option[ErrorKind] := None();
+                return none;
+        end case;
+    end;
+
+    -- The positional declaration the next positional argument at node goes
+    -- to, or noIndex when there is none left.
+    generic [R: Region, S: Region]
+    function nextPositional(command: &[Command, R], given: &[Buffer[Given], S], node: Index): Index is
+        let id: Nat64 := nodeId(command, node);
+        var found: Index := noIndex;
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if ((found = noIndex) and (d->owner = id)) and isPositionalKind(d->kind) then
+                if d->isRepeatable or (countOf(given, d->owner, d->slot) = 0) then
+                    found := k;
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    -- Whether node declares a positional argument.
+    generic [R: Region]
+    function hasPositional(command: &[Command, R], node: Index): Bool is
+        let id: Nat64 := nodeId(command, node);
+        var found: Bool := false;
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (d->owner = id) and isPositionalKind(d->kind) then
+                found := true;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    ---
+    --- Parsing
+    ---
+
+    -- What a step of the parse ended in.
+    constant goOn: Nat8 := 0;
+    constant stopHelp: Nat8 := 1;
+    constant stopVersion: Nat8 := 2;
+    constant stopFailed: Nat8 := 3;
+    constant stopFullVersion: Nat8 := 4;
+    constant stopBash: Nat8 := 5;
+    constant stopZsh: Nat8 := 6;
+    constant stopFish: Nat8 := 7;
+    constant stopManual: Nat8 := 8;
+    constant stopInfo: Nat8 := 9;
+
+    -- A mistake found at argument, bytes start up to stop, about
+    -- declaration decl or noIndex, at node.
+    record Pending: Free is
+        kind: ErrorKind;
+        argument: Index;
+        start: Index;
+        stop: Index;
+        decl: Index;
+        node: Index;
+    end;
+
+    -- One step: how many arguments it used, how it ended, the node the
+    -- parse is at after it (for a help, the node whose help is wanted),
+    -- and the mistake when it failed.
+    record Step: Free is
+        consumed: Index;
+        ending: Nat8;
+        node: Index;
+        failure: Pending;
+    end;
+
+    function stepOn(consumed: Index, node: Index): Step is
+        return Step(consumed => consumed, ending => goOn, node => node,
+            failure => Pending(kind => UnknownOption(), argument => noIndex, start => zeroIndex, stop => zeroIndex, decl => noIndex, node => node));
+    end;
+
+    function stepStop(ending: Nat8, node: Index): Step is
+        return Step(consumed => zeroIndex, ending => ending, node => node,
+            failure => Pending(kind => UnknownOption(), argument => noIndex, start => zeroIndex, stop => zeroIndex, decl => noIndex, node => node));
+    end;
+
+    function stepFail(kind: ErrorKind, argument: Index, start: Index, stop: Index, decl: Index, node: Index): Step is
+        return Step(consumed => zeroIndex, ending => stopFailed, node => node,
+            failure => Pending(kind => kind, argument => argument, start => start, stop => stop, decl => decl, node => node));
+    end;
+
+    -- The failure of a value of declaration k at argument, bytes start up
+    -- to stop, or a step on by consumed.
+    function valueStep(result: Option[ErrorKind], consumed: Index, argument: Index, start: Index, stop: Index, k: Index, node: Index): Step is
+        case result of
+            when Some(value as kind: ErrorKind) do
+                return stepFail(kind, argument, start, stop, k, node);
+            when None do
+                return stepOn(consumed, node);
+        end case;
+    end;
+
+    -- A value given on the line for k: a second one is a mistake unless k
+    -- is repeatable.
+    generic [R: Region, S: Region]
+    function repeatedAt(command: &[Command, R], given: &[Buffer[Given], S], k: Index): Bool is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        if d->isRepeatable then
+            return false;
+        end if;
+        return countOf(given, d->owner, d->slot) > 0;
+    end;
+
+    -- --name, --name=value or --name value, at argument i.
+    generic [R: Region, S: Region, T: Region]
+    function longStep(command: &[Command, R], arguments: &[Buffer[String], S], i: Index, node: Index, given: &![Buffer[Given], T]): Step is
+        let arg: &[String, S] := nthRef(arguments, i);
+        let len: Index := stringLength(arg);
+        var eq: Index := len;
+        var j: Index := 2;
+        while j < len do
+            if (eq = len) and (nthByte(arg, j) = '=') then
+                eq := j;
+            end if;
+            j := j + 1;
+        end while;
+        let k: Index := findLong(command, node, arg, 2, eq);
+        if k = noIndex then
+            let helpWord: String := fromLiteral("help");
+            let versionWord: String := fromLiteral("version");
+            let isHelp: Bool := sameAs(&helpWord, arg, 2, eq);
+            let isVersion: Bool := sameAs(&versionWord, arg, 2, eq);
+            destroyString(helpWord);
+            destroyString(versionWord);
+            if isHelp and (eq = len) then
+                return stepStop(stopHelp, node);
+            end if;
+            if (isVersion and (eq = len)) and builtinVersionLong(command, node) then
+                return stepStop(versionStop(command, arguments, i), node);
+            end if;
+            if isHelp or (isVersion and builtinVersionLong(command, node)) then
+                return stepFail(UnexpectedValue(), i, 0, eq, noIndex, node);
+            end if;
+            return stepFail(UnknownOption(), i, 0, eq, noIndex, node);
+        end if;
+        let kind: Nat8 := declKind(command, k);
+        if kind = kindFlag then
+            if eq < len then
+                return stepFail(UnexpectedValue(), i, 0, eq, k, node);
+            end if;
+            if repeatedAt(command, &given, k) then
+                return stepFail(Repeated(), i, 0, len, k, node);
+            end if;
+            insertBack(&~given, Given(owner => declOwner(command, k), slot => declSlot(command, k),
+                text => makeEmpty(), whole => oneWhole, source => fromLine));
+            return stepOn(1, node);
+        end if;
+        if repeatedAt(command, &given, k) then
+            return stepFail(Repeated(), i, 0, eq, k, node);
+        end if;
+        if eq < len then
+            let result: Option[ErrorKind] := takeValue(command, &~given, k, slice(arg, eq + 1, len), fromLine);
+            return valueStep(result, 1, i, eq + 1, len, k, node);
+        end if;
+        if (i + 1) < bufferLength(arguments) then
+            let next: &[String, S] := nthRef(arguments, i + 1);
+            let result: Option[ErrorKind] := takeValue(command, &~given, k, copyOf(next), fromLine);
+            return valueStep(result, 2, i + 1, 0, stringLength(next), k, node);
+        end if;
+        return stepFail(MissingValue(), i, 0, eq, k, node);
+    end;
+
+    -- -abc, -ovalue or -o value, at argument i.
+    generic [R: Region, S: Region, T: Region]
+    function shortStep(command: &[Command, R], arguments: &[Buffer[String], S], i: Index, node: Index, given: &![Buffer[Given], T]): Step is
+        let arg: &[String, S] := nthRef(arguments, i);
+        let len: Index := stringLength(arg);
+        var j: Index := 1;
+        var result: Step := stepOn(1, node);
+        var done: Bool := false;
+        while (not done) and (j < len) do
+            let b: Nat8 := nthByte(arg, j);
+            let k: Index := findShort(command, node, b);
+            if k = noIndex then
+                if b = 'h' then
+                    result := stepStop(stopHelp, node);
+                else if (b = 'V') and builtinVersionLong(command, node) then
+                    result := stepStop(versionStop(command, arguments, i), node);
+                else
+                    result := stepFail(UnknownOption(), i, j, j + 1, noIndex, node);
+                end if;
+                done := true;
+            else if declKind(command, k) = kindFlag then
+                if repeatedAt(command, &given, k) then
+                    result := stepFail(Repeated(), i, j, j + 1, k, node);
+                    done := true;
+                else
+                    insertBack(&~given, Given(owner => declOwner(command, k), slot => declSlot(command, k),
+                        text => makeEmpty(), whole => oneWhole, source => fromLine));
+                    j := j + 1;
+                end if;
+            else
+                if repeatedAt(command, &given, k) then
+                    result := stepFail(Repeated(), i, j, j + 1, k, node);
+                else if (j + 1) < len then
+                    let taken: Option[ErrorKind] := takeValue(command, &~given, k, slice(arg, j + 1, len), fromLine);
+                    result := valueStep(taken, 1, i, j + 1, len, k, node);
+                else if (i + 1) < bufferLength(arguments) then
+                    let next: &[String, S] := nthRef(arguments, i + 1);
+                    let taken: Option[ErrorKind] := takeValue(command, &~given, k, copyOf(next), fromLine);
+                    result := valueStep(taken, 2, i + 1, 0, stringLength(next), k, node);
+                else
+                    result := stepFail(MissingValue(), i, j, j + 1, k, node);
+                end if;
+                done := true;
+            end if;
+        end while;
+        return result;
+    end;
+
+    -- The stop for a version asked for at argument i: the full text when
+    -- --full follows it.
+    generic [R: Region, S: Region]
+    function versionStop(command: &[Command, R], arguments: &[Buffer[String], S], i: Index): Nat8 is
+        if (i + 1) < bufferLength(arguments) then
+            if sameSpan(nthRef(arguments, i + 1), "--full") then
+                return stopFullVersion;
+            end if;
+        end if;
+        return stopVersion;
+    end;
+
+    -- The declaration of --sandbox at the root, or noIndex when the
+    -- programme did not call addSandbox.
+    generic [R: Region]
+    function sandboxDecl(command: &[Command, R]): Index is
+        let word: String := fromLiteral("sandbox");
+        let k: Index := findLong(command, 0, &word, 0, 7);
+        destroyString(word);
+        return k;
+    end;
+
+    -- Whether an extra of kind is there for the root.
+    generic [R: Region]
+    function rootHas(command: &[Command, R], kind: Nat8): Bool is
+        return lastExtra(command, rootId(command), kind) /= noIndex;
+    end;
+
+    -- Whether setup is a word of the root: one of its words is switched on
+    -- and no subcommand of the root is named setup.
+    generic [R: Region]
+    function setupWord(command: &[Command, R]): Bool is
+        if rootHas(command, extraCompletion) or rootHas(command, extraManual) then
+            return childNamed(command, 0, "setup") = noIndex;
+        end if;
+        return false;
+    end;
+
+    -- setup at argument i, followed by one of its words that is switched
+    -- on.  No word after it fails as a missing subcommand, another word as
+    -- an unknown one.
+    generic [R: Region, S: Region]
+    function setupStep(command: &[Command, R], arguments: &[Buffer[String], S], i: Index, node: Index): Step is
+        if (i + 1) >= bufferLength(arguments) then
+            return stepFail(MissingSubcommand(), i, 0, 5, noIndex, node);
+        end if;
+        let word: &[String, S] := nthRef(arguments, i + 1);
+        if sameSpan(word, "completion") and rootHas(command, extraCompletion) then
+            return completionStep(arguments, i + 1, node);
+        else if sameSpan(word, "manual") and rootHas(command, extraManual) then
+            return stepStop(stopManual, node);
+        end if;
+        return stepFail(UnknownSubcommand(), i + 1, 0, stringLength(word), noIndex, node);
+    end;
+
+    -- completion at argument i, followed by the name of a shell: the stop
+    -- for that shell.  No word after it fails as a missing subcommand, a
+    -- word that names no shell as an unknown one.
+    generic [S: Region]
+    function completionStep(arguments: &[Buffer[String], S], i: Index, node: Index): Step is
+        if (i + 1) >= bufferLength(arguments) then
+            return stepFail(MissingSubcommand(), i, 0, 10, noIndex, node);
+        end if;
+        let shell: &[String, S] := nthRef(arguments, i + 1);
+        if sameSpan(shell, "bash") then
+            return stepStop(stopBash, node);
+        else if sameSpan(shell, "zsh") then
+            return stepStop(stopZsh, node);
+        else if sameSpan(shell, "fish") then
+            return stepStop(stopFish, node);
+        end if;
+        return stepFail(UnknownSubcommand(), i + 1, 0, stringLength(shell), noIndex, node);
+    end;
+
+    -- help followed by the names of subcommands, at argument i: the help of
+    -- the last of them.
+    generic [R: Region, S: Region]
+    function helpStep(command: &[Command, R], arguments: &[Buffer[String], S], i: Index, node: Index): Step is
+        var at: Index := node;
+        var j: Index := i + 1;
+        while j < bufferLength(arguments) do
+            let arg: &[String, S] := nthRef(arguments, j);
+            let child: Index := childNamed(command, at, asSpan(arg));
+            -- help help is the help of the command help stands under.
+            if child /= noIndex then
+                at := child;
+            else if not sameSpan(arg, "help") then
+                return stepFail(UnknownSubcommand(), j, 0, stringLength(arg), noIndex, at);
+            end if;
+            j := j + 1;
+        end while;
+        return stepStop(stopHelp, at);
+    end;
+
+    -- A word that is no option, at argument i: a subcommand, the help
+    -- subcommand, or a positional argument.
+    generic [R: Region, S: Region, T: Region]
+    function wordStep(command: &[Command, R], arguments: &[Buffer[String], S], i: Index, node: Index, rest: Bool, given: &![Buffer[Given], T]): Step is
+        let arg: &[String, S] := nthRef(arguments, i);
+        let children: Bool := childCount(command, node) > 0;
+        if (not rest) and children then
+            let child: Index := childNamed(command, node, asSpan(arg));
+            if child /= noIndex then
+                return stepOn(1, child);
+            end if;
+            if sameSpan(arg, "help") then
+                return helpStep(command, arguments, i, node);
+            end if;
+        end if;
+        -- version as a word at the root, as help is one: the version line,
+        -- or with --full after it the full text.
+        if (not rest) and (node = 0) and sameSpan(arg, "version") then
+            if (childNamed(command, node, "version") = noIndex) and builtinVersionLong(command, node) then
+                return stepStop(versionStop(command, arguments, i), node);
+            end if;
+        end if;
+        -- info, a word at the root when the programme set its text and
+        -- declares no subcommand of that name.
+        if (not rest) and (node = 0) and sameSpan(arg, "info") then
+            if rootHas(command, extraInfo) and (childNamed(command, node, "info") = noIndex) then
+                return stepStop(stopInfo, node);
+            end if;
+        end if;
+        -- sandbox, a word at the root that gives the flag of addSandbox, as
+        -- help gives --help, unless a subcommand has that name.
+        if (not rest) and (node = 0) and sameSpan(arg, "sandbox") then
+            if childNamed(command, node, "sandbox") = noIndex then
+                let k: Index := sandboxDecl(command);
+                if k /= noIndex then
+                    if repeatedAt(command, &given, k) then
+                        return stepFail(Repeated(), i, 0, 7, k, node);
+                    end if;
+                    insertBack(&~given, Given(owner => declOwner(command, k), slot => declSlot(command, k),
+                        text => makeEmpty(), whole => oneWhole, source => fromLine));
+                    return stepOn(1, node);
+                end if;
+            end if;
+        end if;
+        -- setup, a word at the root when the programme switched on one of
+        -- its words and declares no subcommand of that name.
+        if (not rest) and (node = 0) and sameSpan(arg, "setup") then
+            if setupWord(command) then
+                return setupStep(command, arguments, i, node);
+            end if;
+        end if;
+        let k: Index := nextPositional(command, &given, node);
+        if k = noIndex then
+            if children and (not hasPositional(command, node)) then
+                return stepFail(UnknownSubcommand(), i, 0, stringLength(arg), noIndex, node);
+            end if;
+            return stepFail(Repeated(), i, 0, stringLength(arg), noIndex, node);
+        end if;
+        let result: Option[ErrorKind] := takeValue(command, &~given, k, copyOf(arg), fromLine);
+        return valueStep(result, 1, i, 0, stringLength(arg), k, node);
+    end;
+
+    -- Whether node id was picked.
+    generic [R: Region]
+    function isChosen(picked: &[Buffer[Nat64], R], id: Nat64): Bool is
+        var found: Bool := false;
+        var k: Index := 0;
+        while k < bufferLength(picked) do
+            if nth(picked, k) = id then
+                found := true;
+            end if;
+            k := k + 1;
+        end while;
+        return found;
+    end;
+
+    function destroyGiven(given: Buffer[Given]): Unit is
+        var g: Buffer[Given] := given;
+        while bufferLength(&g) > 0 do
+            let { owner: Nat64, slot: Index, text: String, whole: Int64, source: Nat8 } := removeLast(&!g);
+            destroyString(text);
+        end while;
+        destroyEmptyBuffer(g);
+        return nil;
+    end;
+
+    function destroyMatches(matches: Matches): Unit is
+        let { given: Buffer[Given], picked: Buffer[Nat64] } := matches;
+        destroyGiven(given);
+        destroyFreeBuffer(picked);
+        return nil;
+    end;
+
+    -- The name of declaration k as the user writes it: --long, -s, or
+    -- its name in capitals between angle brackets for a positional argument.
+    generic [R: Region]
+    function displayName(command: &[Command, R], k: Index): String is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        var out: StringBuilder := makeStringBuilder();
+        if isPositionalKind(d->kind) then
+            writeByte(&!out, '<');
+            writeUpper(&!out, &(d->placeholder));
+            writeByte(&!out, '>');
+        else if stringLength(&(d->longName)) > 0 then
+            writeString(&!out, "--");
+            writeString(&!out, asSpan(&(d->longName)));
+        else
+            writeByte(&!out, '-');
+            writeByte(&!out, d->shortLetter);
+        end if;
+        return finalize(out);
+    end;
+
+    generic [R: Region, S: Region]
+    function writeUpper(out: &![StringBuilder, R], s: &[String, S]): Unit is
+        var i: Index := 0;
+        while i < stringLength(s) do
+            let b: Nat8 := nthByte(s, i);
+            if (b >= 'a') and (b <= 'z') then
+                let gap: Nat8 := 32;
+                writeByte(&~out, b - gap);
+            else if b = '-' then
+                writeByte(&~out, '_');
+            else
+                writeByte(&~out, b);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Suggestions
+    ---
+
+    -- The optimal string alignment distance of a and b: insertions,
+    -- deletions, substitutions and swaps of two neighbours, each 1.  Words
+    -- whose lengths differ by more than two are not compared: their
+    -- distance is at least three, and the answer is then 3.
+    generic [R: Region, S: Region]
+    function distance(a: &[String, R], b: &[String, S]): Index is
+        let la: Index := stringLength(a);
+        let lb: Index := stringLength(b);
+        let far: Index := 3;
+        if la > (lb + 2) then
+            return far;
+        end if;
+        if lb > (la + 2) then
+            return far;
+        end if;
+        let width: Index := lb + 1;
+        let zero: Index := 0;
+        var before: Buffer[Index] := initialize(width, zero);
+        var last: Buffer[Index] := initialize(width, zero);
+        var row: Buffer[Index] := initialize(width, zero);
+        var j: Index := 0;
+        while j <= lb do
+            storeBufferNth(&!last, j, j);
+            j := j + 1;
+        end while;
+        var i: Index := 1;
+        while i <= la do
+            storeBufferNth(&!row, 0, i);
+            j := oneIndex;
+            while j <= lb do
+                var cost: Index := 1;
+                if nthByte(a, i - 1) = nthByte(b, j - 1) then
+                    cost := zeroIndex;
+                end if;
+                var best: Index := nth(&last, j) + 1;
+                let insert: Index := nth(&row, j - 1) + 1;
+                if insert < best then
+                    best := insert;
+                end if;
+                let change: Index := nth(&last, j - 1) + cost;
+                if change < best then
+                    best := change;
+                end if;
+                if (i > 1) and (j > 1) then
+                    if (nthByte(a, i - 1) = nthByte(b, j - 2)) and (nthByte(a, i - 2) = nthByte(b, j - 1)) then
+                        let swapped: Index := nth(&before, j - 2) + 1;
+                        if swapped < best then
+                            best := swapped;
+                        end if;
+                    end if;
+                end if;
+                storeBufferNth(&!row, j, best);
+                j := j + 1;
+            end while;
+            j := zeroIndex;
+            while j <= lb do
+                storeBufferNth(&!before, j, nth(&last, j));
+                storeBufferNth(&!last, j, nth(&row, j));
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        let result: Index := nth(&last, lb);
+        destroyFreeBuffer(before);
+        destroyFreeBuffer(last);
+        destroyFreeBuffer(row);
+        return result;
+    end;
+
+    -- Keeps candidate in best when it is nearer to word than what best
+    -- holds and at most two away.
+    generic [R: Region]
+    function consider(best: Pair[Index, String], word: &[String, R], candidate: String): Pair[Index, String] is
+        let d: Index := distance(word, &candidate);
+        let { first: Index, second: String } := best;
+        if (d <= 2) and (d < first) then
+            destroyString(second);
+            return Pair(first => d, second => candidate);
+        else
+            destroyString(candidate);
+            return Pair(first => first, second => second);
+        end if;
+    end;
+
+    function bestOf(best: Pair[Index, String]): String is
+        let { first: Index, second: String } := best;
+        if first <= 2 then
+            return second;
+        else
+            destroyString(second);
+            return makeEmpty();
+        end if;
+    end;
+
+    function startBest(): Pair[Index, String] is
+        return Pair(first => farIndex, second => makeEmpty());
+    end;
+
+    -- The name nearest to word among the options in reach at node, written
+    -- as the user would: --long.
+    generic [R: Region, S: Region]
+    function suggestOption(command: &[Command, R], node: Index, word: &[String, S]): String is
+        var best: Pair[Index, String] := startBest();
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if ((not isPositionalKind(d->kind)) and (stringLength(&(d->longName)) > 0)) and inReach(command, k, node) then
+                best := consider(best, word, dashed(&(d->longName)));
+            end if;
+            k := k + 1;
+        end while;
+        best := consider(best, word, fromLiteral("--help"));
+        if builtinVersionLong(command, node) then
+            best := consider(best, word, fromLiteral("--version"));
+        end if;
+        return bestOf(best);
+    end;
+
+    generic [R: Region]
+    function dashed(longName: &[String, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "--");
+        writeString(&!out, asSpan(longName));
+        return finalize(out);
+    end;
+
+    -- The subcommand nearest to word among the children of node.
+    generic [R: Region, S: Region]
+    function suggestSubcommand(command: &[Command, R], node: Index, word: &[String, S]): String is
+        var best: Pair[Index, String] := startBest();
+        var k: Index := 1;
+        while k < bufferLength(&(command->nodes)) do
+            let child: &[Node, R] := nthRef(&(command->nodes), k);
+            if child->parent = node then
+                best := consider(best, word, copyOf(&(child->name)));
+            end if;
+            k := k + 1;
+        end while;
+        if childCount(command, node) > 0 then
+            best := consider(best, word, fromLiteral("help"));
+        end if;
+        return bestOf(best);
+    end;
+
+    -- The word of a choice nearest to word.
+    generic [R: Region, S: Region]
+    function suggestWord(command: &[Command, R], k: Index, word: &[String, S]): String is
+        var best: Pair[Index, String] := startBest();
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        var w: Index := 0;
+        while w < bufferLength(&(d->words)) do
+            best := consider(best, word, copyOf(nthRef(&(d->words), w)));
+            w := w + 1;
+        end while;
+        return bestOf(best);
+    end;
+
+    ---
+    --- Errors
+    ---
+
+    function kindCode(kind: ErrorKind): Nat8 is
+        case kind of
+            when UnknownOption do
+                return 0;
+            when UnknownSubcommand do
+                return 1;
+            when MissingValue do
+                return 2;
+            when UnexpectedValue do
+                return 3;
+            when InvalidNumber do
+                return 4;
+            when OutOfRange do
+                return 5;
+            when NotAllowed do
+                return 6;
+            when InvalidUtf8 do
+                return 7;
+            when EmptyPath do
+                return 8;
+            when MissingRequired do
+                return 9;
+            when Repeated do
+                return 10;
+            when Conflict do
+                return 11;
+            when MissingDependency do
+                return 12;
+            when MissingSubcommand do
+                return 13;
+            when ArgumentFileUnreadable do
+                return 14;
+            when ArgumentFileTooLarge do
+                return 15;
+            when ArgumentFileCycle do
+                return 16;
+            when ArgumentFileTooDeep do
+                return 17;
+            when ArgumentFileSyntax do
+                return 18;
+        end case;
+    end;
+
+    -- The error of a pending mistake of the line.
+    generic [R: Region, S: Region]
+    function errorOfPending(command: &[Command, R], arguments: &[Buffer[String], S], p: Pending): ArgumentError is
+        var word: String := makeEmpty();
+        var position: Option[Index] := None();
+        if p.argument /= noIndex then
+            destroyString(word);
+            word := slice(nthRef(arguments, p.argument), p.start, p.stop);
+            position := Some(value => p.argument);
+        end if;
+        var optionName: String := makeEmpty();
+        if p.decl /= noIndex then
+            destroyString(optionName);
+            optionName := displayName(command, p.decl);
+        end if;
+        let suggestion: String := suggestionFor(command, p.kind, p.decl, p.node, &word);
+        return ArgumentError(kind => p.kind, position => position, word => word, optionName => optionName,
+            suggestion => suggestion, environment => false, node => p.node, decl => p.decl,
+            via => makeEmpty(), line => zeroIndex, reason => reasonNone);
+    end;
+
+    -- The name the user probably meant: for an unknown long option the
+    -- nearest option, for an unknown subcommand the nearest subcommand, for
+    -- a word a choice does not allow the nearest word.
+    generic [R: Region, S: Region]
+    function suggestionFor(command: &[Command, R], kind: ErrorKind, decl: Index, node: Index, word: &[String, S]): String is
+        let code: Nat8 := kindCode(kind);
+        if code = 0 then
+            if stringLength(word) > 2 then
+                if (nthByte(word, 0) = '-') and (nthByte(word, 1) = '-') then
+                    return suggestOption(command, node, word);
+                end if;
+            end if;
+        else if code = 1 then
+            return suggestSubcommand(command, node, word);
+        else if (code = 6) and (decl /= noIndex) then
+            if declKind(command, decl) = kindChoice then
+                return suggestWord(command, decl, word);
+            end if;
+        end if;
+        return makeEmpty();
+    end;
+
+    -- An error about declaration k, found after the line was read.
+    generic [R: Region]
+    function errorOfDecl(command: &[Command, R], kind: ErrorKind, k: Index, word: String, environment: Bool, node: Index): ArgumentError is
+        let suggestion: String := suggestionFor(command, kind, k, node, &word);
+        let position: Option[Index] := None();
+        return ArgumentError(kind => kind, position => position, word => word, optionName => displayName(command, k),
+            suggestion => suggestion, environment => environment, node => node, decl => k,
+            via => makeEmpty(), line => zeroIndex, reason => reasonNone);
+    end;
+
+    function destroyError(error: ArgumentError): Unit is
+        let { kind: ErrorKind, position: Option[Index], word: String, optionName: String, suggestion: String,
+            environment: Bool, node: Index, decl: Index, via: String, line: Index, reason: Nat8 } := error;
+        destroyString(word);
+        destroyString(optionName);
+        destroyString(suggestion);
+        destroyString(via);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function errorKind(error: &[ArgumentError, R]): ErrorKind is
+        return error->kind;
+    end;
+
+    generic [R: Region]
+    function errorPosition(error: &[ArgumentError, R]): Option[Index] is
+        return error->position;
+    end;
+
+    ---
+    --- After the line: environment, defaults, what is required, rules
+    ---
+
+    -- The deepest node picked.
+    generic [R: Region, S: Region]
+    function deepest(command: &[Command, R], picked: &[Buffer[Nat64], S]): Index is
+        return nodeOf(command, nth(picked, bufferLength(picked) - 1));
+    end;
+
+    -- Reads the environment for every option of a picked node that names a
+    -- variable and was not given on the line; an error when a value there
+    -- is wrong.
+    generic [R: Region, S: Region, T: Region]
+    function readEnvironment(command: &[Command, R], picked: &[Buffer[Nat64], S], given: &![Buffer[Given], T]): Option[ArgumentError] is
+        let node: Index := deepest(command, picked);
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (isChosen(picked, d->owner) and (stringLength(&(d->env)) > 0)) and (countOf(&given, d->owner, d->slot) = 0) then
+                case environmentValue(asSpan(&(d->env))) of
+                    when Some(value as found: String) do
+                        let shown: String := copyOf(&found);
+                        if d->kind = kindFlag then
+                            let b: Nat8 := boolWord(&found);
+                            destroyString(found);
+                            if b = 2 then
+                                return Some(value => errorOfDecl(command, NotAllowed(), k, shown, true, node));
+                            else
+                                destroyString(shown);
+                            end if;
+                            if b = 1 then
+                                insertBack(&~given, Given(owner => d->owner, slot => d->slot, text => makeEmpty(), whole => oneWhole, source => fromEnvironmentVariable));
+                            end if;
+                        else
+                            case takeValue(command, &~given, k, found, fromEnvironmentVariable) of
+                                when Some(value as kind: ErrorKind) do
+                                    return Some(value => errorOfDecl(command, kind, k, shown, true, node));
+                                when None do
+                                    destroyString(shown);
+                            end case;
+                        end if;
+                    when None do
+                        skip;
+                end case;
+            end if;
+            k := k + 1;
+        end while;
+        let none: Option[ArgumentError] := None();
+        return none;
+    end;
+
+    -- Whether declaration k was given, on the line or in the environment.
+    generic [R: Region, S: Region]
+    function wasGiven(command: &[Command, R], given: &[Buffer[Given], S], k: Index): Bool is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        return countOf(given, d->owner, d->slot) > 0;
+    end;
+
+    -- The first required declaration of a picked node not given, the first
+    -- broken rule, a missing subcommand; else None.
+    generic [R: Region, S: Region, T: Region]
+    function checkGiven(command: &[Command, R], picked: &[Buffer[Nat64], S], given: &[Buffer[Given], T]): Option[ArgumentError] is
+        let node: Index := deepest(command, picked);
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (isChosen(picked, d->owner) and d->isRequired) and (not wasGiven(command, given, k)) then
+                return Some(value => errorOfDecl(command, MissingRequired(), k, makeEmpty(), false, node));
+            end if;
+            k := k + 1;
+        end while;
+        var r: Index := 0;
+        while r < bufferLength(&(command->rules)) do
+            let rule: Rule := nth(&(command->rules), r);
+            let first: Index := declOf(command, rule.first.owner, rule.first.slot);
+            let second: Index := declOf(command, rule.second.owner, rule.second.slot);
+            if wasGiven(command, given, first) then
+                if rule.isConflict and wasGiven(command, given, second) then
+                    return Some(value => errorOfDecl(command, Conflict(), first, displayName(command, second), false, node));
+                end if;
+                if (not rule.isConflict) and (not wasGiven(command, given, second)) then
+                    return Some(value => errorOfDecl(command, MissingDependency(), first, displayName(command, second), false, node));
+                end if;
+            end if;
+            r := r + 1;
+        end while;
+        let id: Nat64 := nodeId(command, node);
+        if hasExtra(command, id, extraNeedsSub) then
+            let noPosition: Option[Index] := None();
+            return Some(value => ArgumentError(kind => MissingSubcommand(), position => noPosition, word => makeEmpty(), optionName => makeEmpty(),
+                suggestion => makeEmpty(), environment => false, node => node, decl => noIndex,
+                via => makeEmpty(), line => zeroIndex, reason => reasonNone));
+        end if;
+        let none: Option[ArgumentError] := None();
+        return none;
+    end;
+
+    -- Adds the default of every declaration of a picked node that has one
+    -- and was not given.
+    generic [R: Region, S: Region, T: Region]
+    function addDefaults(command: &[Command, R], picked: &[Buffer[Nat64], S], given: &![Buffer[Given], T]): Unit is
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (isChosen(picked, d->owner) and d->hasDefault) and (countOf(&given, d->owner, d->slot) = 0) then
+                case takeValue(command, &~given, k, copyOf(&(d->defaultText)), fromDefault) of
+                    when Some(value as kind: ErrorKind) do
+                        abort("Standard.Arguments: a default its own check refuses");
+                    when None do
+                        skip;
+                end case;
+            end if;
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function parse(command: &[Command, R], arguments: &[Buffer[String], S]): Either[ArgumentError, Outcome] is
+        var given: Buffer[Given] := allocateEmpty();
+        var picked: Buffer[Nat64] := allocateEmpty();
+        insertBack(&!picked, rootId(command));
+        var node: Index := 0;
+        var rest: Bool := false;
+        var ending: Nat8 := goOn;
+        var failure: Pending := Pending(kind => UnknownOption(), argument => noIndex, start => zeroIndex, stop => zeroIndex, decl => noIndex, node => zeroIndex);
+        let n: Index := bufferLength(arguments);
+        var i: Index := 0;
+        while (ending = goOn) and (i < n) do
+            let arg: &[String, S] := nthRef(arguments, i);
+            let len: Index := stringLength(arg);
+            -- Written so that a byte is read only when there is one:
+            -- neither and nor or skips its right side.
+            var isWord: Bool := true;
+            if (not rest) and (len >= 2) then
+                isWord := nthByte(arg, 0) /= '-';
+            end if;
+            var step: Step := stepOn(1, node);
+            if isWord then
+                step := wordStep(command, arguments, i, node, rest, &!given);
+            else if (len = 2) and (nthByte(arg, 1) = '-') then
+                rest := true;
+            else if nthByte(arg, 1) = '-' then
+                step := longStep(command, arguments, i, node, &!given);
+            else
+                step := shortStep(command, arguments, i, node, &!given);
+            end if;
+            ending := step.ending;
+            if ending = goOn then
+                if step.node /= node then
+                    node := step.node;
+                    insertBack(&!picked, nodeId(command, node));
+                end if;
+                i := i + step.consumed;
+            else
+                node := step.node;
+                failure := step.failure;
+            end if;
+        end while;
+        if ending /= goOn then
+            destroyGiven(given);
+            destroyFreeBuffer(picked);
+            if ending = stopHelp then
+                return Right(right => Help(text => helpAt(command, node)));
+            else if ending = stopVersion then
+                return Right(right => Version(text => versionText(command)));
+            else if ending = stopFullVersion then
+                return Right(right => Version(text => fullVersionText(command)));
+            else if ending = stopBash then
+                return Right(right => Help(text => completionScript(command, Bash())));
+            else if ending = stopZsh then
+                return Right(right => Help(text => completionScript(command, Zsh())));
+            else if ending = stopFish then
+                return Right(right => Help(text => completionScript(command, Fish())));
+            else if ending = stopInfo then
+                let f: Index := lastExtra(command, rootId(command), extraInfo);
+                return Right(right => Help(text => fromSpan(asSpan(extraText(command, f)))));
+            else if ending = stopManual then
+                let m: Index := lastExtra(command, rootId(command), extraManual);
+                return Right(right => Help(text => manPage(command, asSpan(extraText(command, m)))));
+            else
+                return Left(left => errorOfPending(command, arguments, failure));
+            end if;
+        else
+            return finish(command, given, picked);
+        end if;
+    end;
+
+    -- The environment read, what is required checked, the defaults added.
+    generic [R: Region]
+    function finish(command: &[Command, R], given: Buffer[Given], picked: Buffer[Nat64]): Either[ArgumentError, Outcome] is
+        var g: Buffer[Given] := given;
+        case readEnvironment(command, &picked, &!g) of
+            when Some(value as error: ArgumentError) do
+                destroyGiven(g);
+                destroyFreeBuffer(picked);
+                return Left(left => error);
+            when None do
+                case checkGiven(command, &picked, &g) of
+                    when Some(value as error: ArgumentError) do
+                        destroyGiven(g);
+                        destroyFreeBuffer(picked);
+                        return Left(left => error);
+                    when None do
+                        addDefaults(command, &picked, &!g);
+                        return Right(right => Run(matches => Matches(given => g, picked => picked)));
+                end case;
+        end case;
+    end;
+
+    function processArguments(): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        let n: Index := argumentCount();
+        if n > 1 then
+            for i from 1 to n - 1 do
+                insertBack(&!out, fromLiteral(nthArgument(i)));
+            end for;
+        end if;
+        return out;
+    end;
+
+    function destroyArguments(arguments: Buffer[String]): Unit is
+        destroyStrings(arguments);
+        return nil;
+    end;
+
+    ---
+    --- Argument files
+    ---
+
+    -- The limits of an expansion: how deep files are named inside each
+    -- other, how many files are read, the bytes of one file and of all of
+    -- them, and the words that come out.
+    constant fileDepthLimit: Index := 10;
+    constant fileCountLimit: Index := 1024;
+    constant fileSizeLimit: Index := 4194304;
+    constant fileSizeLimitBytes: Nat64 := 4194304;
+    constant fileTotalLimit: Index := 16777216;
+    constant fileWordLimit: Index := 250000;
+
+    -- No quote is open.
+    constant noQuote: Nat8 := 0;
+
+    -- What went wrong, in the reason of an error about an argument file.
+    constant reasonNone: Nat8 := 0;
+    constant reasonQuote: Nat8 := 1;
+    constant reasonBackslash: Nat8 := 2;
+    constant reasonZero: Nat8 := 3;
+    constant reasonWords: Nat8 := 4;
+    constant reasonSize: Nat8 := 5;
+    constant reasonFiles: Nat8 := 6;
+    constant reasonTotal: Nat8 := 7;
+
+    -- What an expansion has done so far: the words it has, whether a -- has
+    -- ended the expansion, the files read and their bytes.
+    record Expansion: Linear is
+        out: Buffer[String];
+        plain: Bool;
+        files: Index;
+        total: Index;
+    end;
+
+    -- The error of a named file: top is the index of the word of the line
+    -- that led to it, path the file, via the file that names it, empty for
+    -- the line, and line the line of via where it is named.
+    generic [R: Region, S: Region]
+    function fileError(kind: ErrorKind, top: Index, path: &[String, R], via: &[String, S], line: Index, reason: Nat8): ArgumentError is
+        let position: Option[Index] := Some(value => top);
+        return ArgumentError(kind => kind, position => position, word => copyOf(path), optionName => makeEmpty(),
+            suggestion => makeEmpty(), environment => false, node => zeroIndex, decl => noIndex,
+            via => copyOf(via), line => line, reason => reason);
+    end;
+
+    -- The error of a file that does not parse, the line being its own.
+    generic [R: Region]
+    function syntaxError(top: Index, path: &[String, R], line: Index, reason: Nat8): ArgumentError is
+        let empty: String := makeEmpty();
+        let error: ArgumentError := fileError(ArgumentFileSyntax(), top, path, &empty, line, reason);
+        destroyString(empty);
+        return error;
+    end;
+
+    -- White space in an argument file: space, tab, line feed, vertical tab,
+    -- form feed and carriage return.
+    function isBlank(b: Nat8): Bool is
+        return ((b = 32) or (b = 9)) or (((b = 10) or (b = 11)) or ((b = 12) or (b = 13)));
+    end;
+
+    -- Where the word that begins at start ends: at the first white space that
+    -- is not in quotes and not after a backslash, or at the end of the text.
+    -- A quote of either kind groups, a backslash takes the next byte as it
+    -- is, in quotes as well, as in gcc.  The reason when the text does not
+    -- parse: a zero byte, a backslash at the end, a quote never closed.
+    generic [R: Region]
+    function wordEnd(text: &[String, R], start: Index): Either[Nat8, Index] is
+        let n: Index := stringLength(text);
+        var quote: Nat8 := 0;
+        var escaped: Bool := false;
+        var i: Index := start;
+        while i < n do
+            let b: Nat8 := nthByte(text, i);
+            if b = 0 then
+                return Left(left => reasonZero);
+            end if;
+            if escaped then
+                escaped := false;
+            else if b = 92 then
+                escaped := true;
+            else if quote /= 0 then
+                if b = quote then
+                    quote := noQuote;
+                end if;
+            else if (b = apostrophe) or (b = 34) then
+                quote := b;
+            else if isBlank(b) then
+                return Right(right => i);
+            end if;
+            i := i + 1;
+        end while;
+        if escaped then
+            return Left(left => reasonBackslash);
+        end if;
+        if quote /= 0 then
+            return Left(left => reasonQuote);
+        end if;
+        return Right(right => n);
+    end;
+
+    -- The word from start up to stop, with the quotes and backslashes taken
+    -- away; wordEnd has seen that the text parses.
+    generic [R: Region]
+    function unquoted(text: &[String, R], start: Index, stop: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var quote: Nat8 := 0;
+        var escaped: Bool := false;
+        var i: Index := start;
+        while i < stop do
+            let b: Nat8 := nthByte(text, i);
+            if escaped then
+                writeByte(&!out, b);
+                escaped := false;
+            else if b = 92 then
+                escaped := true;
+            else if quote /= 0 then
+                if b = quote then
+                    quote := noQuote;
+                else
+                    writeByte(&!out, b);
+                end if;
+            else if (b = apostrophe) or (b = 34) then
+                quote := b;
+            else
+                writeByte(&!out, b);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- How many line feeds lie from start up to stop.
+    generic [R: Region]
+    function lineFeeds(text: &[String, R], start: Index, stop: Index): Index is
+        var count: Index := 0;
+        var i: Index := start;
+        while i < stop do
+            if nthByte(text, i) = 10 then
+                count := count + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return count;
+    end;
+
+    -- The words of an argument file, each with the line it begins on, put
+    -- at the end of words and lines.  The error when the file does not
+    -- parse, with the line of the word at fault.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function splitText(text: &[String, R], path: &[String, S], top: Index, words: &![Buffer[String], T], lines: &![Buffer[Index], U]): Option[ArgumentError] is
+        let n: Index := stringLength(text);
+        var line: Index := 1;
+        var i: Index := 0;
+        while i < n do
+            let b: Nat8 := nthByte(text, i);
+            if isBlank(b) then
+                if b = 10 then
+                    line := line + 1;
+                end if;
+                i := i + 1;
+            else
+                case wordEnd(text, i) of
+                    when Left(left as reason: Nat8) do
+                        return Some(value => syntaxError(top, path, line, reason));
+                    when Right(right as stop: Index) do
+                        insertBack(&~words, unquoted(text, i, stop));
+                        insertBack(&~lines, line);
+                        line := line + lineFeeds(text, i, stop);
+                        i := stop;
+                end case;
+            end if;
+        end while;
+        let none: Option[ArgumentError] := None();
+        return none;
+    end;
+
+    -- The path with the empty parts and the . parts taken out, so that the
+    -- same file under two spellings is found twice on a chain.  A .. stays:
+    -- it depends on links.
+    generic [R: Region]
+    function normalizedPath(path: &[String, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let n: Index := stringLength(path);
+        var absolute: Bool := false;
+        if n > 0 then
+            absolute := nthByte(path, 0) = '/';
+        end if;
+        if absolute then
+            writeByte(&!out, '/');
+        end if;
+        var first: Bool := true;
+        var i: Index := 0;
+        while i < n do
+            var j: Index := i;
+            var more: Bool := true;
+            while more do
+                if j >= n then
+                    more := false;
+                else if nthByte(path, j) = '/' then
+                    more := false;
+                else
+                    j := j + 1;
+                end if;
+            end while;
+            var keep: Bool := j > i;
+            if (j - i) = 1 then
+                if nthByte(path, i) = '.' then
+                    keep := false;
+                end if;
+            end if;
+            if keep then
+                if not first then
+                    writeByte(&!out, '/');
+                end if;
+                var k: Index := i;
+                while k < j do
+                    writeByte(&!out, nthByte(path, k));
+                    k := k + 1;
+                end while;
+                first := false;
+            end if;
+            i := j + 1;
+        end while;
+        if first and (not absolute) then
+            writeByte(&!out, '.');
+        end if;
+        return finalize(out);
+    end;
+
+    -- Whether the chain holds the path.
+    generic [R: Region, S: Region]
+    function onChain(chain: &[Buffer[String], R], path: &[String, S]): Bool is
+        var k: Index := 0;
+        while k < bufferLength(chain) do
+            let entry: &[String, R] := nthRef(chain, k);
+            if sameAs(path, entry, 0, stringLength(entry)) then
+                return true;
+            end if;
+            k := k + 1;
+        end while;
+        return false;
+    end;
+
+    -- The chain with one more path at its end; the paths are copied.
+    generic [R: Region]
+    function longerChain(chain: &[Buffer[String], R], path: String): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        var k: Index := 0;
+        while k < bufferLength(chain) do
+            insertBack(&!out, copyOf(nthRef(chain, k)));
+            k := k + 1;
+        end while;
+        insertBack(&!out, path);
+        return out;
+    end;
+
+    -- The whole file at path, which must be a regular file of at most the
+    -- limit.  The reason when it is not: reasonSize for a file too large,
+    -- reasonNone for one that cannot be read.
+    generic [R: Region]
+    function readFileText(path: &[String, R]): Either[Nat8, String] is
+        -- Looked at before it is opened: the open of a pipe waits for a writer.
+        if not sameKind(kindOfTarget(asSpan(path)), kindRegular) then
+            return Left(left => reasonNone);
+        end if;
+        case openRead(asSpan(path)) of
+            when None do
+                return Left(left => reasonNone);
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var verdict: Nat8 := reasonNone;
+                var found: Bool := false;
+                case statusOfOpen(&file) of
+                    when None do
+                        skip;
+                    when Some(value as status: FileStatus) do
+                        if sameKind(status.kind, kindRegular) then
+                            if status.size > fileSizeLimitBytes then
+                                verdict := reasonSize;
+                            else
+                                found := true;
+                            end if;
+                        end if;
+                end case;
+                if found then
+                    case readAll(&!file) of
+                        when None do
+                            let closedAfterFailure: Bool := closeFile(file);
+                            return Left(left => reasonNone);
+                        when Some(value as text: String) do
+                            let closed: Bool := closeFile(file);
+                            if stringLength(&text) > fileSizeLimit then
+                                destroyString(text);
+                                return Left(left => reasonSize);
+                            else
+                                return Right(right => text);
+                            end if;
+                    end case;
+                else
+                    let closedAtOnce: Bool := closeFile(file);
+                    return Left(left => verdict);
+                end if;
+        end case;
+    end;
+
+    generic [R: Region]
+    function wordsSoFar(state: &![Expansion, R]): Index is
+        return bufferLengthMut(&!(state->out));
+    end;
+
+    generic [R: Region]
+    function pushWord(state: &![Expansion, R], word: String): Unit is
+        insertBack(&!(state->out), word);
+        return nil;
+    end;
+
+    -- One word, kept: the limit of words is held here.  here is the file the
+    -- word comes from, empty for the line, and line where in it.
+    generic [R: Region, S: Region]
+    function keepWord(state: &![Expansion, R], word: String, top: Index, here: &[String, S], line: Index): Option[ArgumentError] is
+        if wordsSoFar(&~state) >= fileWordLimit then
+            destroyString(word);
+            let empty: String := makeEmpty();
+            let error: ArgumentError := fileError(ArgumentFileTooLarge(), top, here, &empty, line, reasonWords);
+            destroyString(empty);
+            return Some(value => error);
+        else
+            pushWord(&~state, word);
+            let none: Option[ArgumentError] := None();
+            return none;
+        end if;
+    end;
+
+    -- One word of the line or of a file.  chain holds the files being read,
+    -- the outermost first, here the one the word is in.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function takeWord(state: &![Expansion, R], chain: &[Buffer[String], S], word: &[String, T], top: Index, here: &[String, U], line: Index): Option[ArgumentError] is
+        if state->plain then
+            return keepWord(&~state, copyOf(word), top, here, line);
+        end if;
+        let n: Index := stringLength(word);
+        if sameSpan(word, "--") then
+            state->plain := true;
+            return keepWord(&~state, copyOf(word), top, here, line);
+        end if;
+        var isAt: Bool := false;
+        if n > 0 then
+            isAt := nthByte(word, 0) = '@';
+        end if;
+        if (not isAt) or (n = 1) then
+            return keepWord(&~state, copyOf(word), top, here, line);
+        end if;
+        if nthByte(word, 1) = '@' then
+            return keepWord(&~state, slice(word, 1, n), top, here, line);
+        end if;
+        let path: String := slice(word, 1, n);
+        let result: Option[ArgumentError] := readArgumentFile(&~state, chain, &path, top, here, line);
+        destroyString(path);
+        return result;
+    end;
+
+    -- Whether the chain holds the path as the file's own name: the same
+    -- file named again inside itself.
+    generic [R: Region, S: Region]
+    function namedAgain(chain: &[Buffer[String], R], path: &[String, S]): Bool is
+        let key: String := normalizedPath(path);
+        let again: Bool := onChain(chain, &key);
+        destroyString(key);
+        return again;
+    end;
+
+    -- The words of the file at path in the place of the word that named it.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function readArgumentFile(state: &![Expansion, R], chain: &[Buffer[String], S], path: &[String, T], top: Index, here: &[String, U], line: Index): Option[ArgumentError] is
+        if bufferLength(chain) >= fileDepthLimit then
+            return Some(value => fileError(ArgumentFileTooDeep(), top, path, here, line, reasonNone));
+        end if;
+        if namedAgain(chain, path) then
+            return Some(value => fileError(ArgumentFileCycle(), top, path, here, line, reasonNone));
+        end if;
+        if state->files >= fileCountLimit then
+            return Some(value => fileError(ArgumentFileTooLarge(), top, path, here, line, reasonFiles));
+        end if;
+        state->files := state->files + 1;
+        case readFileText(path) of
+            when Left(left as reason: Nat8) do
+                if reason = reasonSize then
+                    return Some(value => fileError(ArgumentFileTooLarge(), top, path, here, line, reasonSize));
+                end if;
+                return Some(value => fileError(ArgumentFileUnreadable(), top, path, here, line, reasonNone));
+            when Right(right as text: String) do
+                if (state->total + stringLength(&text)) > fileTotalLimit then
+                    destroyString(text);
+                    return Some(value => fileError(ArgumentFileTooLarge(), top, path, here, line, reasonTotal));
+                else
+                    state->total := state->total + stringLength(&text);
+                    return readSplit(&~state, chain, text, path, top);
+                end if;
+        end case;
+    end;
+
+    -- The words of the text of the file at path, which this destroys, in
+    -- the place of the word that named it; the file is on the chain while
+    -- they are read.
+    generic [R: Region, S: Region, T: Region]
+    function readSplit(state: &![Expansion, R], chain: &[Buffer[String], S], text: String, path: &[String, T], top: Index): Option[ArgumentError] is
+        var words: Buffer[String] := allocateEmpty();
+        var lines: Buffer[Index] := allocateEmpty();
+        let split: Option[ArgumentError] := splitText(&text, path, top, &!words, &!lines);
+        destroyString(text);
+        case split of
+            when Some(value as error: ArgumentError) do
+                destroyStrings(words);
+                destroyFreeBuffer(lines);
+                return Some(value => error);
+            when None do
+                let inner: Buffer[String] := longerChain(chain, normalizedPath(path));
+                let found: Option[ArgumentError] := takeWords(&~state, &inner, &words, &lines, top, path);
+                destroyStrings(inner);
+                destroyStrings(words);
+                destroyFreeBuffer(lines);
+                return found;
+        end case;
+    end;
+
+    -- Every word of a file in turn; the first error ends it.
+    generic [R: Region, S: Region, T: Region, U: Region, V: Region]
+    function takeWords(state: &![Expansion, R], chain: &[Buffer[String], S], words: &[Buffer[String], T], lines: &[Buffer[Index], U], top: Index, here: &[String, V]): Option[ArgumentError] is
+        let count: Index := bufferLength(words);
+        var k: Index := 0;
+        while k < count do
+            case takeWord(&~state, chain, nthRef(words, k), top, here, nth(lines, k)) of
+                when Some(value as error: ArgumentError) do
+                    return Some(value => error);
+                when None do
+                    skip;
+            end case;
+            k := k + 1;
+        end while;
+        let none: Option[ArgumentError] := None();
+        return none;
+    end;
+
+    -- The words of the line in turn; the first error ends it.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function takeLine(state: &![Expansion, R], chain: &[Buffer[String], S], arguments: &[Buffer[String], T], here: &[String, U]): Option[ArgumentError] is
+        let count: Index := bufferLength(arguments);
+        var i: Index := 0;
+        while i < count do
+            case takeWord(&~state, chain, nthRef(arguments, i), i, here, zeroIndex) of
+                when Some(value as error: ArgumentError) do
+                    return Some(value => error);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        let none: Option[ArgumentError] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function expandArgumentFiles(arguments: &[Buffer[String], R]): Either[ArgumentError, Buffer[String]] is
+        let nothingYet: Buffer[String] := allocateEmpty();
+        var state: Expansion := Expansion(out => nothingYet, plain => false, files => zeroIndex, total => zeroIndex);
+        let chain: Buffer[String] := allocateEmpty();
+        let here: String := makeEmpty();
+        let failure: Option[ArgumentError] := takeLine(&!state, &chain, arguments, &here);
+        let { out: Buffer[String], plain: Bool, files: Index, total: Index } := state;
+        destroyEmptyBuffer(chain);
+        destroyString(here);
+        case failure of
+            when Some(value as error: ArgumentError) do
+                destroyStrings(out);
+                return Left(left => error);
+            when None do
+                return Right(right => out);
+        end case;
+    end;
+
+    -- The part of the message of an error about an argument file that says
+    -- where the file was named.
+    generic [R: Region, S: Region]
+    function writeNamedIn(out: &![StringBuilder, R], error: &[ArgumentError, S]): Unit is
+        if stringLength(&(error->via)) > 0 then
+            writeString(&~out, ", named in ");
+            writeShown(&~out, &(error->via));
+            writeString(&~out, " at line ");
+            writeLineOf(&~out, error->line);
+        end if;
+        return nil;
+    end;
+
+    -- A line number as text.
+    function lineText(line: Index): String is
+        case toInt64(line) of
+            when Some(value as whole: Int64) do
+                return wholeText(whole);
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    generic [R: Region]
+    function writeLineOf(out: &![StringBuilder, R], line: Index): Unit is
+        let at: String := lineText(line);
+        writeString(&~out, asSpan(&at));
+        destroyString(at);
+        return nil;
+    end;
+
+    -- The message of an error about an argument file, without its line end.
+    generic [R: Region, S: Region]
+    function writeFileProblem(out: &![StringBuilder, R], error: &[ArgumentError, S]): Unit is
+        let code: Nat8 := kindCode(error->kind);
+        let word: &[String, S] := &(error->word);
+        if code = 14 then
+            writeString(&~out, "cannot read the argument file ");
+            writeShown(&~out, word);
+            writeNamedIn(&~out, error);
+        else if code = 15 then
+            if error->reason = reasonSize then
+                writeString(&~out, "the argument file ");
+                writeShown(&~out, word);
+                writeString(&~out, " is larger than 4 MiB");
+            else if error->reason = reasonTotal then
+                writeString(&~out, "the argument files hold more than 16 MiB, at ");
+                writeShown(&~out, word);
+            else if error->reason = reasonFiles then
+                writeString(&~out, "more than 1024 argument files, at ");
+                writeShown(&~out, word);
+            else
+                writeString(&~out, "more than 250000 arguments");
+                if stringLength(word) > 0 then
+                    writeString(&~out, ", at the argument file ");
+                    writeShown(&~out, word);
+                end if;
+            end if;
+            writeNamedIn(&~out, error);
+        else if code = 16 then
+            writeString(&~out, "the argument file ");
+            writeShown(&~out, word);
+            writeString(&~out, " names itself, directly or through others");
+            writeNamedIn(&~out, error);
+        else if code = 17 then
+            writeString(&~out, "argument files are nested more than 10 deep, at ");
+            writeShown(&~out, word);
+            writeNamedIn(&~out, error);
+        else
+            writeString(&~out, "the argument file ");
+            writeShown(&~out, word);
+            if error->reason = reasonQuote then
+                writeString(&~out, " has a quote that is never closed");
+            else if error->reason = reasonBackslash then
+                writeString(&~out, " ends in a backslash");
+            else
+                writeString(&~out, " holds a zero byte");
+            end if;
+            writeString(&~out, ", at line ");
+            writeLineOf(&~out, error->line);
+        end if;
+        return nil;
+    end;
+
+    ---
+    --- Asking
+    ---
+
+    generic [R: Region]
+    function flagCount(matches: &[Matches, R], key: FlagKey): Index is
+        return countOf(&(matches->given), key.owner, key.slot);
+    end;
+
+    generic [R: Region]
+    function textIn(matches: &[Matches, R], owner: Nat64, slot: Index): Option[&[String, R]] is
+        let k: Index := lastValue(&(matches->given), owner, slot);
+        if k = noIndex then
+            let none: Option[&[String, R]] := None();
+            return none;
+        end if;
+        return Some(value => givenText(matches, k));
+    end;
+
+    generic [R: Region]
+    function wholeIn(matches: &[Matches, R], owner: Nat64, slot: Index): Option[Int64] is
+        let k: Index := lastValue(&(matches->given), owner, slot);
+        if k = noIndex then
+            let none: Option[Int64] := None();
+            return none;
+        end if;
+        return Some(value => givenWhole(matches, k));
+    end;
+
+    generic [R: Region]
+    function textNumbered(matches: &[Matches, R], owner: Nat64, slot: Index, pos: Index): Option[&[String, R]] is
+        let k: Index := valueAt(&(matches->given), owner, slot, pos);
+        if k = noIndex then
+            let none: Option[&[String, R]] := None();
+            return none;
+        end if;
+        return Some(value => givenText(matches, k));
+    end;
+
+    generic [R: Region]
+    function textOf(matches: &[Matches, R], key: TextKey): Option[&[String, R]] is
+        return textIn(matches, key.owner, key.slot);
+    end;
+
+    generic [R: Region]
+    function wholeOf(matches: &[Matches, R], key: WholeKey): Option[Int64] is
+        return wholeIn(matches, key.owner, key.slot);
+    end;
+
+    generic [R: Region]
+    function boolOf(matches: &[Matches, R], key: BoolKey): Option[Bool] is
+        case wholeIn(matches, key.owner, key.slot) of
+            when Some(value as w: Int64) do
+                return Some(value => w /= zeroWhole);
+            when None do
+                let none: Option[Bool] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function choiceOf(matches: &[Matches, R], key: ChoiceKey): Option[Index] is
+        case wholeIn(matches, key.owner, key.slot) of
+            when Some(value as w: Int64) do
+                return toIndex(w);
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function pathOf(matches: &[Matches, R], key: PathKey): Option[&[String, R]] is
+        return textIn(matches, key.owner, key.slot);
+    end;
+
+    generic [R: Region]
+    function positionalOf(matches: &[Matches, R], key: PositionalKey): Option[&[String, R]] is
+        return textIn(matches, key.owner, key.slot);
+    end;
+
+    generic [R: Region]
+    function textCount(matches: &[Matches, R], key: TextKey): Index is
+        return countOf(&(matches->given), key.owner, key.slot);
+    end;
+
+    generic [R: Region]
+    function textAt(matches: &[Matches, R], key: TextKey, pos: Index): Option[&[String, R]] is
+        return textNumbered(matches, key.owner, key.slot, pos);
+    end;
+
+    generic [R: Region]
+    function pathCount(matches: &[Matches, R], key: PathKey): Index is
+        return countOf(&(matches->given), key.owner, key.slot);
+    end;
+
+    generic [R: Region]
+    function pathAt(matches: &[Matches, R], key: PathKey, pos: Index): Option[&[String, R]] is
+        return textNumbered(matches, key.owner, key.slot, pos);
+    end;
+
+    generic [R: Region]
+    function positionalCount(matches: &[Matches, R], key: PositionalKey): Index is
+        return countOf(&(matches->given), key.owner, key.slot);
+    end;
+
+    generic [R: Region]
+    function positionalAt(matches: &[Matches, R], key: PositionalKey, pos: Index): Option[&[String, R]] is
+        return textNumbered(matches, key.owner, key.slot, pos);
+    end;
+
+    generic [R: Region]
+    function chosen(matches: &[Matches, R], key: SubcommandKey): Bool is
+        return isChosen(&(matches->picked), key.owner);
+    end;
+
+    ---
+    --- Texts
+    ---
+
+    -- The indices of the nodes from the root down to node.
+    generic [R: Region]
+    function pathTo(command: &[Command, R], node: Index): Buffer[Index] is
+        var up: Buffer[Index] := allocateEmpty();
+        var at: Index := node;
+        var steps: Index := 0;
+        while (at /= noIndex) and (steps <= bufferLength(&(command->nodes))) do
+            insertBack(&!up, at);
+            at := nodeParent(command, at);
+            steps := steps + 1;
+        end while;
+        var down: Buffer[Index] := allocateEmpty();
+        while bufferLength(&up) > 0 do
+            insertBack(&!down, removeLast(&!up));
+        end while;
+        destroyEmptyBuffer(up);
+        return down;
+    end;
+
+    -- The names from the root down to node, with between them.
+    generic [R: Region, S: Region]
+    function writePath(out: &![StringBuilder, S], command: &[Command, R], node: Index, between: Span[Nat8, Static]): Unit is
+        let path: Buffer[Index] := pathTo(command, node);
+        var k: Index := 0;
+        while k < bufferLength(&path) do
+            if k > 0 then
+                writeString(&~out, between);
+            end if;
+            writeString(&~out, asSpan(nodeName(command, nth(&path, k))));
+            k := k + 1;
+        end while;
+        destroyFreeBuffer(path);
+        return nil;
+    end;
+
+    -- What the help and the usage line call the value of declaration k.
+    generic [R: Region, S: Region]
+    function writeValueName(out: &![StringBuilder, S], command: &[Command, R], k: Index): Unit is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        if stringLength(&(d->placeholder)) > 0 then
+            writeUpper(&~out, &(d->placeholder));
+        else if stringLength(&(d->longName)) > 0 then
+            writeUpper(&~out, &(d->longName));
+        else
+            writeString(&~out, "VALUE");
+        end if;
+        return nil;
+    end;
+
+    function takesValue(kind: Nat8): Bool is
+        return (kind /= kindFlag) and (not isPositionalKind(kind));
+    end;
+
+    -- The option k as the usage line writes it: the dashes, the name and the
+    -- name of the value in capitals between angle brackets.
+    generic [R: Region, S: Region]
+    function writeOptionUse(out: &![StringBuilder, S], command: &[Command, R], k: Index): Unit is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        if stringLength(&(d->longName)) > 0 then
+            writeString(&~out, "--");
+            writeString(&~out, asSpan(&(d->longName)));
+        else
+            writeByte(&~out, '-');
+            writeByte(&~out, d->shortLetter);
+        end if;
+        if takesValue(d->kind) then
+            writeString(&~out, " <");
+            writeValueName(&~out, command, k);
+            writeByte(&~out, '>');
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function usageAt(command: &[Command, R], node: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "Usage: ");
+        writePath(&!out, command, node, " ");
+        writeString(&!out, " [OPTIONS]");
+        let id: Nat64 := nodeId(command, node);
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if ((not isPositionalKind(d->kind)) and d->isRequired) and inReach(command, k, node) then
+                writeByte(&!out, ' ');
+                writeOptionUse(&!out, command, k);
+            end if;
+            k := k + 1;
+        end while;
+        k := zeroIndex;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (d->owner = id) and isPositionalKind(d->kind) then
+                writeByte(&!out, ' ');
+                if d->isRequired then
+                    writeByte(&!out, '<');
+                    writeUpper(&!out, &(d->placeholder));
+                    writeByte(&!out, '>');
+                else
+                    writeByte(&!out, '[');
+                    writeUpper(&!out, &(d->placeholder));
+                    writeByte(&!out, ']');
+                end if;
+                if d->isRepeatable then
+                    writeString(&!out, "...");
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        if childCount(command, node) > 0 then
+            if hasExtra(command, id, extraNeedsSub) then
+                writeString(&!out, " <COMMAND>");
+            else
+                writeString(&!out, " [COMMAND]");
+            end if;
+        end if;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function usageLine(command: &[Command, R]): String is
+        return usageAt(command, 0);
+    end;
+
+    -- Writes the rows of a table, the left column padded to one width, and
+    -- gives both columns back.
+    generic [R: Region]
+    function writeTable(out: &![StringBuilder, R], lefts: Buffer[String], rights: Buffer[String]): Unit is
+        var width: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(&lefts) do
+            let w: Index := stringLength(nthRef(&lefts, k));
+            if w > width then
+                width := w;
+            end if;
+            k := k + 1;
+        end while;
+        var l: Buffer[String] := lefts;
+        var r: Buffer[String] := rights;
+        while bufferLength(&l) > 0 do
+            let left: String := removeFirst(&!l);
+            let right: String := removeFirst(&!r);
+            writeString(&~out, "  ");
+            writeShown(&~out, &left);
+            var pad: Index := stringLength(&left);
+            while pad < (width + 2) do
+                writeByte(&~out, ' ');
+                pad := pad + 1;
+            end while;
+            writeShown(&~out, &right);
+            writeByte(&~out, '\n');
+            destroyString(left);
+            destroyString(right);
+        end while;
+        destroyEmptyBuffer(l);
+        destroyStrings(r);
+        return nil;
+    end;
+
+    -- The words of a choice, separated by between.
+    generic [R: Region, S: Region]
+    function writeWords(out: &![StringBuilder, S], words: &[Buffer[String], R], between: Span[Nat8, Static]): Unit is
+        var w: Index := 0;
+        while w < bufferLength(words) do
+            if w > 0 then
+                writeString(&~out, between);
+            end if;
+            writeString(&~out, asSpan(nthRef(words, w)));
+            w := w + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The help column of declaration k: its help, then what it takes.
+    generic [R: Region]
+    function helpColumn(command: &[Command, R], k: Index): String is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&(d->help)));
+        if d->kind = kindChoice then
+            writeString(&!out, " [possible values: ");
+            writeWords(&!out, &(d->words), ", ");
+            writeByte(&!out, ']');
+        end if;
+        if d->kind = kindWhole then
+            writeString(&!out, " [range: ");
+            let low: String := wholeText(d->lowest);
+            let high: String := wholeText(d->highest);
+            writeString(&!out, asSpan(&low));
+            writeString(&!out, " to ");
+            writeString(&!out, asSpan(&high));
+            destroyString(low);
+            destroyString(high);
+            writeByte(&!out, ']');
+        end if;
+        if d->hasDefault then
+            writeString(&!out, " [default: ");
+            writeString(&!out, asSpan(&(d->defaultText)));
+            writeByte(&!out, ']');
+        end if;
+        if stringLength(&(d->env)) > 0 then
+            writeString(&!out, " [env: ");
+            writeString(&!out, asSpan(&(d->env)));
+            writeByte(&!out, ']');
+        end if;
+        if d->isRepeatable and (not isPositionalKind(d->kind)) then
+            writeString(&!out, " [repeatable]");
+        end if;
+        return finalize(out);
+    end;
+
+    -- The left column of option k: the letter, the long name and the name of
+    -- the value.
+    generic [R: Region]
+    function optionColumn(command: &[Command, R], k: Index): String is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        var out: StringBuilder := makeStringBuilder();
+        if d->shortLetter /= 0 then
+            writeByte(&!out, '-');
+            writeByte(&!out, d->shortLetter);
+            if stringLength(&(d->longName)) > 0 then
+                writeString(&!out, ", ");
+            end if;
+        else
+            writeString(&!out, "    ");
+        end if;
+        if stringLength(&(d->longName)) > 0 then
+            writeString(&!out, "--");
+            writeString(&!out, asSpan(&(d->longName)));
+        end if;
+        if takesValue(d->kind) then
+            writeString(&!out, " <");
+            writeValueName(&!out, command, k);
+            writeByte(&!out, '>');
+        end if;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function helpAt(command: &[Command, R], node: Index): String is
+        let here: &[Node, R] := nthRef(&(command->nodes), node);
+        let id: Nat64 := here->id;
+        var out: StringBuilder := makeStringBuilder();
+        if stringLength(&(here->about)) > 0 then
+            writeShown(&!out, &(here->about));
+            writeString(&!out, "\n\n");
+        end if;
+        let usage: String := usageAt(command, node);
+        writeShown(&!out, &usage);
+        destroyString(usage);
+        writeByte(&!out, '\n');
+        var lefts: Buffer[String] := allocateEmpty();
+        var rights: Buffer[String] := allocateEmpty();
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (d->owner = id) and isPositionalKind(d->kind) then
+                var left: StringBuilder := makeStringBuilder();
+                writeByte(&!left, '<');
+                writeUpper(&!left, &(d->placeholder));
+                writeByte(&!left, '>');
+                if d->isRepeatable then
+                    writeString(&!left, "...");
+                end if;
+                insertBack(&!lefts, finalize(left));
+                insertBack(&!rights, helpColumn(command, k));
+            end if;
+            k := k + 1;
+        end while;
+        if bufferLength(&lefts) > 0 then
+            writeString(&!out, "\nArguments:\n");
+        end if;
+        writeTable(&!out, lefts, rights);
+        writeString(&!out, "\nOptions:\n");
+        var optionLefts: Buffer[String] := allocateEmpty();
+        var optionRights: Buffer[String] := allocateEmpty();
+        k := zeroIndex;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (not isPositionalKind(d->kind)) and inReach(command, k, node) then
+                insertBack(&!optionLefts, optionColumn(command, k));
+                insertBack(&!optionRights, helpColumn(command, k));
+            end if;
+            k := k + 1;
+        end while;
+        if builtinHelpLong(command, node) then
+            if findShort(command, node, 'h') = noIndex then
+                insertBack(&!optionLefts, fromLiteral("-h, --help"));
+            else
+                insertBack(&!optionLefts, fromLiteral("    --help"));
+            end if;
+            insertBack(&!optionRights, fromLiteral("Print help"));
+        end if;
+        if builtinVersionLong(command, node) then
+            if findShort(command, node, 'V') = noIndex then
+                insertBack(&!optionLefts, fromLiteral("-V, --version"));
+            else
+                insertBack(&!optionLefts, fromLiteral("    --version"));
+            end if;
+            insertBack(&!optionRights, fromLiteral("Print version"));
+        end if;
+        writeTable(&!out, optionLefts, optionRights);
+        let setupHere: Bool := (node = 0) and setupWord(command);
+        let infoHere: Bool := ((node = 0) and rootHas(command, extraInfo)) and (childNamed(command, 0, "info") = noIndex);
+        if ((childCount(command, node) > 0) or setupHere) or infoHere then
+            writeString(&!out, "\nCommands:\n");
+            var commandLefts: Buffer[String] := allocateEmpty();
+            var commandRights: Buffer[String] := allocateEmpty();
+            k := oneIndex;
+            while k < bufferLength(&(command->nodes)) do
+                let child: &[Node, R] := nthRef(&(command->nodes), k);
+                if child->parent = node then
+                    insertBack(&!commandLefts, copyOf(&(child->name)));
+                    insertBack(&!commandRights, aboutColumn(command, k));
+                end if;
+                k := k + 1;
+            end while;
+            if infoHere then
+                insertBack(&!commandLefts, fromLiteral("info"));
+                insertBack(&!commandRights, fromLiteral("Print what the programme is, how it was built and where it runs"));
+            end if;
+            if setupHere then
+                insertBack(&!commandLefts, fromLiteral("setup"));
+                insertBack(&!commandRights, setupAbout(command));
+            end if;
+            if (childCount(command, node) > 0) and (childNamed(command, node, "help") = noIndex) then
+                insertBack(&!commandLefts, fromLiteral("help"));
+                insertBack(&!commandRights, fromLiteral("Print the help of a command"));
+            end if;
+            writeTable(&!out, commandLefts, commandRights);
+        end if;
+        return finalize(out);
+    end;
+
+    -- The help line of setup: what its words switched on do.
+    generic [R: Region]
+    function setupAbout(command: &[Command, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "Print");
+        if rootHas(command, extraCompletion) then
+            writeString(&!out, " the completion script of bash, zsh or fish (completion SHELL)");
+            if rootHas(command, extraManual) then
+                writeString(&!out, " or");
+            end if;
+        end if;
+        if rootHas(command, extraManual) then
+            writeString(&!out, " the manual page (manual)");
+        end if;
+        return finalize(out);
+    end;
+
+    -- The about line of node k with its aliases.
+    generic [R: Region]
+    function aboutColumn(command: &[Command, R], k: Index): String is
+        let node: &[Node, R] := nthRef(&(command->nodes), k);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&(node->about)));
+        var first: Bool := true;
+        var e: Index := 0;
+        while e < bufferLength(&(command->extras)) do
+            let extra: &[Extra, R] := nthRef(&(command->extras), e);
+            if (extra->node = node->id) and (extra->kind = extraAlias) then
+                if first then
+                    writeString(&!out, " [aliases: ");
+                    first := false;
+                else
+                    writeString(&!out, ", ");
+                end if;
+                writeString(&!out, asSpan(&(extra->text)));
+            end if;
+            e := e + 1;
+        end while;
+        if not first then
+            writeByte(&!out, ']');
+        end if;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function helpText(command: &[Command, R]): String is
+        return helpAt(command, 0);
+    end;
+
+    generic [R: Region]
+    function versionText(command: &[Command, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(nodeName(command, 0)));
+        let v: Index := lastExtra(command, rootId(command), extraVersion);
+        if v /= noIndex then
+            writeByte(&!out, ' ');
+            writeString(&!out, asSpan(extraText(command, v)));
+        end if;
+        let c: Index := lastExtra(command, rootId(command), extraCopyright);
+        if c /= noIndex then
+            writeString(&!out, ", Copyright (C) ");
+            writeString(&!out, asSpan(extraText(command, c)));
+        end if;
+        writeByte(&!out, '\n');
+        return finalize(out);
+    end;
+
+    -- The text of setFullVersion, or the line of --version when none was
+    -- set.
+    generic [R: Region]
+    function fullVersionText(command: &[Command, R]): String is
+        let f: Index := lastExtra(command, rootId(command), extraFullVersion);
+        if f = noIndex then
+            return versionText(command);
+        end if;
+        return fromSpan(asSpan(extraText(command, f)));
+    end;
+
+    generic [R: Region, S: Region]
+    function describeError(command: &[Command, R], error: &[ArgumentError, S]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(nodeName(command, 0)));
+        writeString(&!out, ": ");
+        let code: Nat8 := kindCode(error->kind);
+        let word: &[String, S] := &(error->word);
+        let optionName: &[String, S] := &(error->optionName);
+        if code = 0 then
+            writeString(&!out, "unknown option ");
+            -- A letter of a cluster is kept without its dash.
+            if stringLength(word) = 1 then
+                writeByte(&!out, '-');
+            end if;
+            writeShown(&!out, word);
+        else if code = 1 then
+            writeString(&!out, "unknown subcommand ");
+            writeShown(&!out, word);
+        else if code = 2 then
+            writeString(&!out, "option ");
+            writeShown(&!out, optionName);
+            writeString(&!out, " needs a value");
+        else if code = 3 then
+            writeString(&!out, "option ");
+            if stringLength(optionName) > 0 then
+                writeShown(&!out, optionName);
+            else
+                writeShown(&!out, word);
+            end if;
+            writeString(&!out, " takes no value");
+        else if code = 4 then
+            writeShown(&!out, word);
+            writeString(&!out, " is not a whole number, for ");
+            writeShown(&!out, optionName);
+        else if code = 5 then
+            writeShown(&!out, word);
+            writeString(&!out, " is out of range for ");
+            writeShown(&!out, optionName);
+            let d: &[Decl, R] := nthRef(&(command->decls), error->decl);
+            let low: String := wholeText(d->lowest);
+            let high: String := wholeText(d->highest);
+            writeString(&!out, ", which takes ");
+            writeString(&!out, asSpan(&low));
+            writeString(&!out, " to ");
+            writeString(&!out, asSpan(&high));
+            destroyString(low);
+            destroyString(high);
+        else if code = 6 then
+            writeShown(&!out, word);
+            writeString(&!out, " is not allowed for ");
+            writeShown(&!out, optionName);
+            let d: &[Decl, R] := nthRef(&(command->decls), error->decl);
+            writeString(&!out, ", which takes ");
+            if d->kind = kindChoice then
+                writeWords(&!out, &(d->words), ", ");
+            else
+                writeString(&!out, "true, false, yes, no, on, off, 1 or 0");
+            end if;
+        else if code = 7 then
+            writeString(&!out, "the value ");
+            writeShown(&!out, word);
+            writeString(&!out, " for ");
+            writeShown(&!out, optionName);
+            writeString(&!out, " is not UTF-8");
+        else if code = 8 then
+            writeShown(&!out, optionName);
+            writeString(&!out, " needs a path that is not empty");
+        else if code = 9 then
+            writeShown(&!out, optionName);
+            writeString(&!out, " is required");
+        else if code = 10 then
+            if error->decl = noIndex then
+                writeString(&!out, "unexpected argument ");
+                writeShown(&!out, word);
+            else
+                writeShown(&!out, optionName);
+                writeString(&!out, " is given more than once");
+            end if;
+        else if code = 11 then
+            writeShown(&!out, optionName);
+            writeString(&!out, " cannot be given together with ");
+            writeShown(&!out, word);
+        else if code = 12 then
+            writeShown(&!out, optionName);
+            writeString(&!out, " needs ");
+            writeShown(&!out, word);
+        else if code = 13 then
+            writeString(&!out, "a subcommand is required");
+        else
+            writeFileProblem(&!out, error);
+        end if;
+        if error->environment then
+            writeString(&!out, " (from the environment variable ");
+            writeString(&!out, asSpan(declEnv(command, error->decl)));
+            writeByte(&!out, ')');
+        end if;
+        if stringLength(&(error->suggestion)) > 0 then
+            writeString(&!out, ", did you mean ");
+            writeShown(&!out, &(error->suggestion));
+            writeByte(&!out, '?');
+        end if;
+        writeByte(&!out, '\n');
+        let usage: String := usageAt(command, error->node);
+        writeString(&!out, asSpan(&usage));
+        destroyString(usage);
+        writeString(&!out, "\nTry ");
+        writePath(&!out, command, error->node, " ");
+        writeString(&!out, " --help for more information.\n");
+        return finalize(out);
+    end;
+
+    ---
+    --- The manual page
+    ---
+
+    -- Writes s as roff text: a backslash as \e, and a line that would start
+    -- with a dot or an apostrophe behind \&.
+    generic [R: Region, S: Region]
+    function writeRoff(out: &![StringBuilder, R], s: &[String, S]): Unit is
+        let n: Index := stringLength(s);
+        if n > 0 then
+            let b: Nat8 := nthByte(s, 0);
+            if (b = '.') or (b = apostrophe) then
+                writeString(&~out, "\\&");
+            end if;
+        end if;
+        var i: Index := 0;
+        while i < n do
+            let b: Nat8 := nthByte(s, i);
+            if b = '\\' then
+                writeString(&~out, "\\e");
+            else if b = '\n' then
+                writeByte(&~out, ' ');
+            else
+                writeByte(&~out, b);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The lower-case name of the value of declaration k, for .Ar.
+    generic [R: Region, S: Region]
+    function writeArgument(out: &![StringBuilder, S], command: &[Command, R], k: Index): Unit is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        if stringLength(&(d->placeholder)) > 0 then
+            writeString(&~out, asSpan(&(d->placeholder)));
+        else if stringLength(&(d->longName)) > 0 then
+            writeString(&~out, asSpan(&(d->longName)));
+        else
+            writeString(&~out, "value");
+        end if;
+        return nil;
+    end;
+
+    -- The option k in mdoc: Fl o Ar file, or Fl -output Ar file.
+    generic [R: Region, S: Region]
+    function writeMdocOption(out: &![StringBuilder, S], command: &[Command, R], k: Index): Unit is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        writeString(&~out, "Fl ");
+        if d->shortLetter /= 0 then
+            writeByte(&~out, d->shortLetter);
+        else
+            writeByte(&~out, '-');
+            writeString(&~out, asSpan(&(d->longName)));
+        end if;
+        if takesValue(d->kind) then
+            writeString(&~out, " Ar ");
+            writeArgument(&~out, command, k);
+        end if;
+        return nil;
+    end;
+
+    -- The names below the root down to node, as mdoc's commands: create,
+    -- or remote Cm show.
+    generic [R: Region, S: Region]
+    function writeBelowRoot(out: &![StringBuilder, S], command: &[Command, R], node: Index): Unit is
+        let path: Buffer[Index] := pathTo(command, node);
+        var p: Index := 1;
+        while p < bufferLength(&path) do
+            if p > 1 then
+                writeString(&~out, " Cm ");
+            end if;
+            writeString(&~out, asSpan(nodeName(command, nth(&path, p))));
+            p := p + 1;
+        end while;
+        destroyFreeBuffer(path);
+        return nil;
+    end;
+
+    -- One line of the synopsis, for node.
+    generic [R: Region, S: Region]
+    function writeSynopsis(out: &![StringBuilder, S], command: &[Command, R], node: Index): Unit is
+        let id: Nat64 := nodeId(command, node);
+        writeString(&~out, ".Nm");
+        if node /= 0 then
+            let path: Buffer[Index] := pathTo(command, node);
+            var p: Index := 1;
+            while p < bufferLength(&path) do
+                writeString(&~out, "\n.Cm ");
+                writeString(&~out, asSpan(nodeName(command, nth(&path, p))));
+                p := p + 1;
+            end while;
+            destroyFreeBuffer(path);
+        end if;
+        writeByte(&~out, '\n');
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (d->owner = id) and (not isPositionalKind(d->kind)) then
+                if d->isRequired then
+                    writeByte(&~out, '.');
+                else
+                    writeString(&~out, ".Op ");
+                end if;
+                writeMdocOption(&~out, command, k);
+                writeByte(&~out, '\n');
+            end if;
+            k := k + 1;
+        end while;
+        k := zeroIndex;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (d->owner = id) and isPositionalKind(d->kind) then
+                if d->isRequired then
+                    writeString(&~out, ".Ar ");
+                else
+                    writeString(&~out, ".Op Ar ");
+                end if;
+                writeString(&~out, asSpan(&(d->placeholder)));
+                if d->isRepeatable then
+                    writeString(&~out, " ...");
+                end if;
+                writeByte(&~out, '\n');
+            end if;
+            k := k + 1;
+        end while;
+        if childCount(command, node) > 0 then
+            writeString(&~out, ".Ar command\n");
+        end if;
+        return nil;
+    end;
+
+    -- The list of the options node declares, with their help.
+    generic [R: Region, S: Region]
+    function writeOptionList(out: &![StringBuilder, S], command: &[Command, R], node: Index): Unit is
+        let id: Nat64 := nodeId(command, node);
+        var any: Bool := false;
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (d->owner = id) and (not isPositionalKind(d->kind)) then
+                if not any then
+                    writeString(&~out, ".Bl -tag -width Ds\n");
+                    any := true;
+                end if;
+                writeString(&~out, ".It ");
+                if (d->shortLetter /= 0) and (stringLength(&(d->longName)) > 0) then
+                    writeString(&~out, "Fl ");
+                    writeByte(&~out, d->shortLetter);
+                    if takesValue(d->kind) then
+                        writeString(&~out, " Ar ");
+                        writeArgument(&~out, command, k);
+                    end if;
+                    writeString(&~out, " , Fl -");
+                    writeString(&~out, asSpan(&(d->longName)));
+                    if takesValue(d->kind) then
+                        writeString(&~out, " Ns = Ns Ar ");
+                        writeArgument(&~out, command, k);
+                    end if;
+                else
+                    writeMdocOption(&~out, command, k);
+                end if;
+                writeByte(&~out, '\n');
+                let help: String := helpColumn(command, k);
+                writeRoff(&~out, &help);
+                destroyString(help);
+                writeByte(&~out, '\n');
+            end if;
+            k := k + 1;
+        end while;
+        if any then
+            writeString(&~out, ".El\n");
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function manPage(command: &[Command, R], date: Span[Nat8, S]): String is
+        let root: &[Node, R] := nthRef(&(command->nodes), 0);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, ".Dd ");
+        writeString(&!out, date);
+        writeString(&!out, "\n.Dt ");
+        var i: Index := 0;
+        while i < stringLength(&(root->name)) do
+            let b: Nat8 := nthByte(&(root->name), i);
+            if (b >= 'a') and (b <= 'z') then
+                let gap: Nat8 := 32;
+                writeByte(&!out, b - gap);
+            else
+                writeByte(&!out, b);
+            end if;
+            i := i + 1;
+        end while;
+        writeString(&!out, " 1\n.Os\n.Sh NAME\n.Nm ");
+        writeString(&!out, asSpan(&(root->name)));
+        writeString(&!out, "\n.Nd ");
+        writeRoff(&!out, &(root->about));
+        writeString(&!out, "\n.Sh SYNOPSIS\n");
+        var k: Index := 0;
+        while k < bufferLength(&(command->nodes)) do
+            writeSynopsis(&!out, command, k);
+            k := k + 1;
+        end while;
+        writeString(&!out, ".Sh DESCRIPTION\n");
+        writeRoff(&!out, &(root->about));
+        writeString(&!out, "\n.Pp\nThe options are as follows:\n");
+        writeOptionList(&!out, command, 0);
+        if bufferLength(&(command->nodes)) > 1 then
+            writeString(&!out, ".Pp\nThe commands are as follows:\n.Bl -tag -width Ds\n");
+            k := oneIndex;
+            while k < bufferLength(&(command->nodes)) do
+                writeString(&!out, ".It Cm ");
+                writeBelowRoot(&!out, command, k);
+                writeByte(&!out, '\n');
+                let about: String := aboutColumn(command, k);
+                writeRoff(&!out, &about);
+                destroyString(about);
+                writeByte(&!out, '\n');
+                writeOptionList(&!out, command, k);
+                k := k + 1;
+            end while;
+            writeString(&!out, ".El\n");
+        end if;
+        var env: Bool := false;
+        k := zeroIndex;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if stringLength(&(d->env)) > 0 then
+                if not env then
+                    writeString(&!out, ".Sh ENVIRONMENT\n.Bl -tag -width Ds\n");
+                    env := true;
+                end if;
+                writeString(&!out, ".It Ev ");
+                writeString(&!out, asSpan(&(d->env)));
+                writeString(&!out, "\nThe value of\n.");
+                writeMdocOption(&!out, command, k);
+                writeString(&!out, "\nwhen it is not given.\n");
+            end if;
+            k := k + 1;
+        end while;
+        if env then
+            writeString(&!out, ".El\n");
+        end if;
+        writeString(&!out, ".Sh EXIT STATUS\n.Ex -std\n");
+        return finalize(out);
+    end;
+
+    ---
+    --- Completion
+    ---
+
+    -- The words that complete at node: its options as the user writes
+    -- them, its subcommands and their aliases, separated by spaces.
+    generic [R: Region, S: Region]
+    function writeNodeWords(out: &![StringBuilder, S], command: &[Command, R], node: Index): Unit is
+        var first: Bool := true;
+        var k: Index := 0;
+        while k < bufferLength(&(command->decls)) do
+            let d: &[Decl, R] := nthRef(&(command->decls), k);
+            if (not isPositionalKind(d->kind)) and inReach(command, k, node) then
+                if stringLength(&(d->longName)) > 0 then
+                    if not first then
+                        writeByte(&~out, ' ');
+                    end if;
+                    first := false;
+                    writeString(&~out, "--");
+                    writeString(&~out, asSpan(&(d->longName)));
+                end if;
+                if d->shortLetter /= 0 then
+                    if not first then
+                        writeByte(&~out, ' ');
+                    end if;
+                    first := false;
+                    writeByte(&~out, '-');
+                    writeByte(&~out, d->shortLetter);
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        if not first then
+            writeByte(&~out, ' ');
+        end if;
+        writeString(&~out, "--help");
+        if builtinVersionLong(command, node) then
+            writeString(&~out, " --version");
+        end if;
+        k := oneIndex;
+        while k < bufferLength(&(command->nodes)) do
+            let child: &[Node, R] := nthRef(&(command->nodes), k);
+            if child->parent = node then
+                writeByte(&~out, ' ');
+                writeString(&~out, asSpan(&(child->name)));
+                var e: Index := 0;
+                while e < bufferLength(&(command->extras)) do
+                    let extra: &[Extra, R] := nthRef(&(command->extras), e);
+                    if (extra->node = child->id) and (extra->kind = extraAlias) then
+                        writeByte(&~out, ' ');
+                        writeString(&~out, asSpan(&(extra->text)));
+                    end if;
+                    e := e + 1;
+                end while;
+            end if;
+            k := k + 1;
+        end while;
+        if childCount(command, node) > 0 then
+            writeString(&~out, " help");
+        end if;
+        return nil;
+    end;
+
+    -- The case patterns that move from the path of node's parent to node:
+    -- "parent:name"|"parent:alias".
+    generic [R: Region, S: Region]
+    function writeStepPatterns(out: &![StringBuilder, S], command: &[Command, R], node: Index): Unit is
+        let here: &[Node, R] := nthRef(&(command->nodes), node);
+        writeByte(&~out, '"');
+        writePath(&~out, command, here->parent, " ");
+        writeByte(&~out, ':');
+        writeString(&~out, asSpan(&(here->name)));
+        writeByte(&~out, '"');
+        var e: Index := 0;
+        while e < bufferLength(&(command->extras)) do
+            let extra: &[Extra, R] := nthRef(&(command->extras), e);
+            if (extra->node = here->id) and (extra->kind = extraAlias) then
+                writeString(&~out, "|\"");
+                writePath(&~out, command, here->parent, " ");
+                writeByte(&~out, ':');
+                writeString(&~out, asSpan(&(extra->text)));
+                writeByte(&~out, '"');
+            end if;
+            e := e + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The case patterns of option k at node: "path:--long"|"path:-s".
+    generic [R: Region, S: Region]
+    function writeOptionPatterns(out: &![StringBuilder, S], command: &[Command, R], k: Index, node: Index): Unit is
+        let d: &[Decl, R] := nthRef(&(command->decls), k);
+        var first: Bool := true;
+        if stringLength(&(d->longName)) > 0 then
+            writeByte(&~out, '"');
+            writePath(&~out, command, node, " ");
+            writeString(&~out, ":--");
+            writeString(&~out, asSpan(&(d->longName)));
+            writeByte(&~out, '"');
+            first := false;
+        end if;
+        if d->shortLetter /= 0 then
+            if not first then
+                writeByte(&~out, '|');
+            end if;
+            writeByte(&~out, '"');
+            writePath(&~out, command, node, " ");
+            writeString(&~out, ":-");
+            writeByte(&~out, d->shortLetter);
+            writeByte(&~out, '"');
+        end if;
+        return nil;
+    end;
+
+    -- The name of the shell function: _ and the root's name, a - as _.
+    generic [R: Region, S: Region]
+    function writeFunctionName(out: &![StringBuilder, S], command: &[Command, R]): Unit is
+        writeByte(&~out, '_');
+        let name: &[String, R] := nodeName(command, 0);
+        var i: Index := 0;
+        while i < stringLength(name) do
+            let b: Nat8 := nthByte(name, i);
+            if b = '-' then
+                writeByte(&~out, '_');
+            else
+                writeByte(&~out, b);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The part the bash and zsh scripts share: the loop that finds the
+    -- path of subcommands typed so far, and the values after an option.
+    -- first is the index of the first word after the command's name, word
+    -- the expression of word number i, previous the word before the
+    -- cursor; files and words are how the shell completes a path and a
+    -- list of words.
+    generic [R: Region, S: Region]
+    function writeShellBody(out: &![StringBuilder, S], command: &[Command, R], isZsh: Bool): Unit is
+        writeString(&~out, "    local path_=\"");
+        writeString(&~out, asSpan(nodeName(command, 0)));
+        writeString(&~out, "\" i w\n");
+        if isZsh then
+            writeString(&~out, "    for (( i = 2; i < CURRENT; i++ )); do\n        w=${words[i]}\n");
+        else
+            writeString(&~out, "    for (( i = 1; i < COMP_CWORD; i++ )); do\n        w=${COMP_WORDS[i]}\n");
+        end if;
+        writeString(&~out, "        case \"$path_:$w\" in\n");
+        var k: Index := 1;
+        while k < bufferLength(&(command->nodes)) do
+            writeString(&~out, "            ");
+            if isZsh then
+                writeByte(&~out, '(');
+            end if;
+            writeStepPatterns(&~out, command, k);
+            writeString(&~out, ") path_=\"");
+            writePath(&~out, command, k, " ");
+            writeString(&~out, "\" ;;\n");
+            k := k + 1;
+        end while;
+        writeString(&~out, "        esac\n    done\n");
+        if isZsh then
+            writeString(&~out, "    local prev=${words[CURRENT-1]}\n");
+        else
+            writeString(&~out, "    local prev=${COMP_WORDS[COMP_CWORD-1]} cur=${COMP_WORDS[COMP_CWORD]}\n");
+        end if;
+        writeString(&~out, "    case \"$path_:$prev\" in\n");
+        var d: Index := 0;
+        while d < bufferLength(&(command->decls)) do
+            let decl: &[Decl, R] := nthRef(&(command->decls), d);
+            if takesValue(decl->kind) then
+                var node: Index := 0;
+                while node < bufferLength(&(command->nodes)) do
+                    if inReach(command, d, node) then
+                        writeString(&~out, "        ");
+                        if isZsh then
+                            writeByte(&~out, '(');
+                        end if;
+                        writeOptionPatterns(&~out, command, d, node);
+                        writeString(&~out, ")\n            ");
+                        if decl->kind = kindPath then
+                            if isZsh then
+                                writeString(&~out, "_files");
+                            else
+                                writeString(&~out, "COMPREPLY=( $(compgen -f -- \"$cur\") )");
+                            end if;
+                        else if (decl->kind = kindChoice) or (decl->kind = kindBool) then
+                            if isZsh then
+                                writeString(&~out, "compadd -- ");
+                            else
+                                writeString(&~out, "COMPREPLY=( $(compgen -W \"");
+                            end if;
+                            if decl->kind = kindChoice then
+                                writeWords(&~out, &(decl->words), " ");
+                            else
+                                writeString(&~out, "true false");
+                            end if;
+                            if not isZsh then
+                                writeString(&~out, "\" -- \"$cur\") )");
+                            end if;
+                        else
+                            if isZsh then
+                                writeString(&~out, "_message value");
+                            else
+                                writeString(&~out, "COMPREPLY=()");
+                            end if;
+                        end if;
+                        writeString(&~out, "\n            return ;;\n");
+                    end if;
+                    node := node + 1;
+                end while;
+            end if;
+            d := d + 1;
+        end while;
+        writeString(&~out, "    esac\n    case \"$path_\" in\n");
+        k := zeroIndex;
+        while k < bufferLength(&(command->nodes)) do
+            writeString(&~out, "        ");
+            if isZsh then
+                writeByte(&~out, '(');
+            end if;
+            writeByte(&~out, '"');
+            writePath(&~out, command, k, " ");
+            writeString(&~out, "\")\n            ");
+            if isZsh then
+                writeString(&~out, "compadd -- ");
+                writeNodeWords(&~out, command, k);
+            else
+                writeString(&~out, "COMPREPLY=( $(compgen -W \"");
+                writeNodeWords(&~out, command, k);
+                writeString(&~out, "\" -- \"$cur\") )");
+            end if;
+            writeString(&~out, " ;;\n");
+            k := k + 1;
+        end while;
+        writeString(&~out, "    esac\n");
+        return nil;
+    end;
+
+    -- Writes s for fish between single quotes: a quote and a backslash
+    -- behind a backslash.
+    generic [R: Region, S: Region]
+    function writeFishQuoted(out: &![StringBuilder, R], s: &[String, S]): Unit is
+        writeByte(&~out, apostrophe);
+        var i: Index := 0;
+        while i < stringLength(s) do
+            let b: Nat8 := nthByte(s, i);
+            if (b = apostrophe) or (b = '\\') then
+                writeByte(&~out, '\\');
+            end if;
+            if b = '\n' then
+                writeByte(&~out, ' ');
+            else
+                writeByte(&~out, b);
+            end if;
+            i := i + 1;
+        end while;
+        writeByte(&~out, apostrophe);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function writeFish(out: &![StringBuilder, S], command: &[Command, R]): Unit is
+        let name: &[String, R] := nodeName(command, 0);
+        writeString(&~out, "function ");
+        writeFunctionName(&~out, command);
+        writeString(&~out, "_path\n    set -l path_ '");
+        writeString(&~out, asSpan(name));
+        writeString(&~out, "'\n    for w in (commandline -opc)[2..-1]\n        switch \"$path_:$w\"\n");
+        var k: Index := 1;
+        while k < bufferLength(&(command->nodes)) do
+            writeString(&~out, "            case ");
+            var p: StringBuilder := makeStringBuilder();
+            writeStepPatterns(&!p, command, k);
+            let joined: String := finalize(p);
+            -- fish's case takes words separated by spaces, not by |.
+            var i: Index := 0;
+            while i < stringLength(&joined) do
+                let b: Nat8 := nthByte(&joined, i);
+                if b = '|' then
+                    writeByte(&~out, ' ');
+                else
+                    writeByte(&~out, b);
+                end if;
+                i := i + 1;
+            end while;
+            destroyString(joined);
+            writeString(&~out, "\n                set path_ '");
+            writePath(&~out, command, k, " ");
+            writeString(&~out, "'\n");
+            k := k + 1;
+        end while;
+        writeString(&~out, "        end\n    end\n    echo $path_\nend\n\ncomplete -c ");
+        writeString(&~out, asSpan(name));
+        writeString(&~out, " -f\n");
+        var node: Index := 0;
+        while node < bufferLength(&(command->nodes)) do
+            var d: Index := 0;
+            while d < bufferLength(&(command->decls)) do
+                let decl: &[Decl, R] := nthRef(&(command->decls), d);
+                if (not isPositionalKind(decl->kind)) and inReach(command, d, node) then
+                    writeFishHead(&~out, command, node);
+                    if stringLength(&(decl->longName)) > 0 then
+                        writeString(&~out, " -l ");
+                        writeString(&~out, asSpan(&(decl->longName)));
+                    end if;
+                    if decl->shortLetter /= 0 then
+                        writeString(&~out, " -s ");
+                        writeByte(&~out, decl->shortLetter);
+                    end if;
+                    if decl->kind = kindPath then
+                        writeString(&~out, " -r -F");
+                    else if (decl->kind = kindChoice) or (decl->kind = kindBool) then
+                        writeString(&~out, " -x -a '");
+                        if decl->kind = kindChoice then
+                            writeWords(&~out, &(decl->words), " ");
+                        else
+                            writeString(&~out, "true false");
+                        end if;
+                        writeByte(&~out, apostrophe);
+                    else if takesValue(decl->kind) then
+                        writeString(&~out, " -x");
+                    end if;
+                    writeString(&~out, " -d ");
+                    writeFishQuoted(&~out, &(decl->help));
+                    writeByte(&~out, '\n');
+                end if;
+                d := d + 1;
+            end while;
+            -- The words the bash and zsh scripts offer as well: --help at
+            -- every node, --version where it is built in, and each alias
+            -- of a subcommand beside its name.
+            writeFishHead(&~out, command, node);
+            writeString(&~out, " -l help -d 'Print help'\n");
+            if builtinVersionLong(command, node) then
+                writeFishHead(&~out, command, node);
+                writeString(&~out, " -l version -d 'Print version'\n");
+            end if;
+            var c: Index := 1;
+            while c < bufferLength(&(command->nodes)) do
+                let child: &[Node, R] := nthRef(&(command->nodes), c);
+                if child->parent = node then
+                    writeFishHead(&~out, command, node);
+                    writeString(&~out, " -a ");
+                    writeString(&~out, asSpan(&(child->name)));
+                    writeString(&~out, " -d ");
+                    writeFishQuoted(&~out, &(child->about));
+                    writeByte(&~out, '\n');
+                    var e: Index := 0;
+                    while e < bufferLength(&(command->extras)) do
+                        let extra: &[Extra, R] := nthRef(&(command->extras), e);
+                        if (extra->node = child->id) and (extra->kind = extraAlias) then
+                            writeFishHead(&~out, command, node);
+                            writeString(&~out, " -a ");
+                            writeString(&~out, asSpan(&(extra->text)));
+                            writeString(&~out, " -d ");
+                            writeFishQuoted(&~out, &(child->about));
+                            writeByte(&~out, '\n');
+                        end if;
+                        e := e + 1;
+                    end while;
+                end if;
+                c := c + 1;
+            end while;
+            if childCount(command, node) > 0 then
+                writeFishHead(&~out, command, node);
+                writeString(&~out, " -a help -d 'Print the help of a command'\n");
+            end if;
+            node := node + 1;
+        end while;
+        return nil;
+    end;
+
+    -- complete -c name -n 'test "(_name_path)" = "path"'
+    generic [R: Region, S: Region]
+    function writeFishHead(out: &![StringBuilder, S], command: &[Command, R], node: Index): Unit is
+        writeString(&~out, "complete -c ");
+        writeString(&~out, asSpan(nodeName(command, 0)));
+        writeString(&~out, " -n \"test (");
+        writeFunctionName(&~out, command);
+        writeString(&~out, "_path) = '");
+        writePath(&~out, command, node, " ");
+        writeString(&~out, "'\"");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function completionScript(command: &[Command, R], shell: Shell): String is
+        let name: &[String, R] := nodeName(command, 0);
+        var out: StringBuilder := makeStringBuilder();
+        case shell of
+            when Bash do
+                writeString(&!out, "# bash completion for ");
+                writeString(&!out, asSpan(name));
+                writeByte(&!out, '\n');
+                writeFunctionName(&!out, command);
+                writeString(&!out, "() {\n");
+                writeShellBody(&!out, command, false);
+                writeString(&!out, "}\ncomplete -F ");
+                writeFunctionName(&!out, command);
+                writeByte(&!out, ' ');
+                writeString(&!out, asSpan(name));
+                writeByte(&!out, '\n');
+            when Zsh do
+                writeString(&!out, "#compdef ");
+                writeString(&!out, asSpan(name));
+                writeByte(&!out, '\n');
+                writeFunctionName(&!out, command);
+                writeString(&!out, "() {\n");
+                writeShellBody(&!out, command, true);
+                writeString(&!out, "}\nif [ \"$funcstack[1]\" = \"");
+                writeFunctionName(&!out, command);
+                writeString(&!out, "\" ]; then\n    ");
+                writeFunctionName(&!out, command);
+                writeString(&!out, " \"$@\"\nelse\n    compdef ");
+                writeFunctionName(&!out, command);
+                writeByte(&!out, ' ');
+                writeString(&!out, asSpan(name));
+                writeString(&!out, "\nfi\n");
+            when Fish do
+                writeString(&!out, "# fish completion for ");
+                writeString(&!out, asSpan(name));
+                writeByte(&!out, '\n');
+                writeFish(&!out, command);
+        end case;
+        return finalize(out);
+    end;
+end module body.

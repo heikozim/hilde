@@ -1,0 +1,182 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Archives and compression in memory.  Standard.Gzip packs bytes with
+-- DEFLATE and checks them with CRC-32 when it unpacks them; Standard.Archive
+-- writes a tar archive, compressed with gzip, and reads it back entry by
+-- entry within a budget that limits what an archive from outside may ask
+-- for.  Nothing is written to disk.
+import Standard.String (
+    String,
+    destroyString,
+    length as stringLength,
+    asSpan
+);
+import Standard.Failure (
+    Failure,
+    destroyFailure
+);
+import Standard.Gzip (
+    GzipFailure,
+    NotGzip,
+    Truncated,
+    BadData,
+    TooLarge,
+    BadChecksum,
+    TrailingData,
+    crc32,
+    gzip,
+    gunzip
+);
+import Standard.Archive (
+    Archive,
+    ArchiveWriter,
+    ArchiveFormat,
+    Tar,
+    TarGz,
+    EntryKind,
+    ArchivedFile,
+    ArchivedDirectory,
+    ArchivedLink,
+    ArchivedHardLink,
+    ArchivedOther,
+    defaultBudget,
+    makeArchiveWriter,
+    addFile,
+    addDirectory,
+    finishArchive,
+    readArchive,
+    destroyArchive,
+    entryCount,
+    entryName,
+    entryKind,
+    entrySize,
+    entryContent
+);
+
+module body Example.LearnArchive is
+    function kindName(kind: EntryKind): Span[Nat8, Static] is
+        case kind of
+            when ArchivedFile do
+                return "file";
+            when ArchivedDirectory do
+                return "directory";
+            when ArchivedLink do
+                return "link";
+            when ArchivedHardLink do
+                return "hard link";
+            when ArchivedOther do
+                return "other";
+        end case;
+    end;
+
+    function failureName(f: GzipFailure): Span[Nat8, Static] is
+        case f of
+            when NotGzip do
+                return "not gzip";
+            when Truncated do
+                return "cut short";
+            when BadData do
+                return "bad data";
+            when TooLarge do
+                return "too large";
+            when BadChecksum do
+                return "a wrong checksum";
+            when TrailingData do
+                return "bytes after the end";
+        end case;
+    end;
+
+    -- Every entry of the archive: its kind, name and size, and the content
+    -- of a file.
+    generic [R: Region]
+    function listEntries(archive: &[Archive, R]): Unit is
+        var n: Index := 0;
+        while n < entryCount(archive) do
+            print("  ");
+            print(kindName(entryKind(archive, n)));
+            print(" ");
+            print(entryName(archive, n));
+            print(", ");
+            print(entrySize(archive, n));
+            printLn(" bytes");
+            if entrySize(archive, n) > 0 then
+                case entryContent(archive, n) of
+                    when Right(right as content: String) do
+                        print("    ");
+                        print(asSpan(&content));
+                        destroyString(content);
+                    when Left(left as f: Failure) do
+                        printLn("    (unreadable)");
+                        destroyFailure(f);
+                end case;
+            end if;
+            n := n + 1;
+        end while;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        -- gzip of a text that repeats, and back.
+        let text: Span[Nat8, Static] := "hilde hilde hilde hilde hilde hilde hilde hilde\n";
+        print("CRC-32 of the text: ");
+        printLn(crc32(text));
+        let packed: String := gzip(text);
+        print("the text: ");
+        print(spanLength(text));
+        print(" bytes, packed: ");
+        printLn(stringLength(&packed));
+        let limit: Index := 1048576;
+        case gunzip(asSpan(&packed), limit) of
+            when Right(right as back: String) do
+                print("unpacked: ");
+                print(asSpan(&back));
+                destroyString(back);
+            when Left(left as f: GzipFailure) do
+                printLn(failureName(f));
+        end case;
+        destroyString(packed);
+        case gunzip("not gzip at all", limit) of
+            when Right(right as back: String) do
+                destroyString(back);
+                printLn("unpacked what is not gzip");
+            when Left(left as f: GzipFailure) do
+                print("unpacking plain text: ");
+                printLn(failureName(f));
+        end case;
+        -- A tar archive, compressed, and read back.
+        let mode: Nat32 := 420;
+        let dirMode: Nat32 := 493;
+        var w: ArchiveWriter := makeArchiveWriter(TarGz(), true);
+        let a: Bool := addDirectory(&!w, "site", dirMode);
+        let b: Bool := addFile(&!w, "site/index.html", "<p>hello</p>\n", mode);
+        let c: Bool := addFile(&!w, "site/robots.txt", "User-agent: *\n", mode);
+        let bytes: String := finishArchive(w);
+        print("entries added: ");
+        printLn((a and b) and c);
+        case readArchive(asSpan(&bytes), TarGz(), defaultBudget()) of
+            when Right(right as archive: Archive) do
+                print("entries read: ");
+                printLn(entryCount(&archive));
+                listEntries(&archive);
+                destroyArchive(archive);
+            when Left(left as f: Failure) do
+                printLn("the archive was refused");
+                destroyFailure(f);
+        end case;
+        case readArchive(asSpan(&bytes), Tar(), defaultBudget()) of
+            when Right(right as archive: Archive) do
+                printLn("read as plain tar, which it is not");
+                destroyArchive(archive);
+            when Left(left as f: Failure) do
+                printLn("read as plain tar: refused");
+                destroyFailure(f);
+        end case;
+        destroyString(bytes);
+        return ExitSuccess();
+    end;
+end module body.

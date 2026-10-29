@@ -1,0 +1,1048 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The reader is a descent over lines: a node starts at a
+-- position on a line, and its column decides which of the lines after it
+-- belong to it.  Every step writes into a writer of Standard.Json as it
+-- reads, so the value is never held twice; the writer itself refuses a
+-- key twice in one mapping when it is finished.  A step that finds the
+-- text wrong records the problem and the offset in the state, and every
+-- step after it does nothing.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString as writeText,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Utf8 (
+    isValid
+);
+import Standard.Json (
+    Json,
+    JsonError,
+    JsonWriter,
+    readJson,
+    makeJsonWriter,
+    beginObject,
+    endObject,
+    beginArray,
+    endArray,
+    writeName,
+    writeString,
+    writeNumber,
+    writeBool,
+    writeNull,
+    finishJson
+);
+
+module body Standard.Yaml is
+    constant noIndex: Index := 0;
+    constant zeroNat: Nat64 := 0;
+    constant mostDepth: Index := 64;
+    constant newline: Nat8 := 10;
+    constant space: Nat8 := 32;
+
+    -- The problem found, 0 for none, and where: 1 not YAML, 2 unsupported,
+    -- 3 too deep, 4 no JSON form.
+    record State: Free is
+        problem: Index;
+        offset: Index;
+    end;
+
+    generic [S: Region]
+    function fail(state: &![State, S], code: Index, at: Index): Unit is
+        if state->problem = 0 then
+            state->problem := code;
+            state->offset := at;
+        end if;
+        return nil;
+    end;
+
+    generic [S: Region]
+    function failed(state: &![State, S]): Bool is
+        return state->problem /= 0;
+    end;
+
+    ---
+    --- Lines
+    ---
+
+    generic [R: Region]
+    function lineStartOf(text: Span[Nat8, R], at: Index): Index is
+        var i: Index := at;
+        while (i > 0) and (text[i - 1] /= newline) do
+            i := i - 1;
+        end while;
+        return i;
+    end;
+
+    generic [R: Region]
+    function columnOf(text: Span[Nat8, R], at: Index): Index is
+        return at - lineStartOf(text, at);
+    end;
+
+    -- The index of the line break that ends the line of at, or the size.
+    generic [R: Region]
+    function lineStopOf(text: Span[Nat8, R], at: Index): Index is
+        var i: Index := at;
+        while (i < spanLength(text)) and (text[i] /= newline) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- The start of the line after the line of at.
+    generic [R: Region]
+    function lineAfter(text: Span[Nat8, R], at: Index): Index is
+        let stop: Index := lineStopOf(text, at);
+        if stop >= spanLength(text) then
+            return stop;
+        end if;
+        return stop + 1;
+    end;
+
+    -- From the start of a line on, the first byte of content of the first
+    -- line that is neither blank nor only a comment, or the size.  A tab
+    -- before the content is refused.
+    generic [R: Region, S: Region]
+    function nextContent(text: Span[Nat8, R], state: &![State, S], lineBegin: Index): Index is
+        let size: Index := spanLength(text);
+        var line: Index := lineBegin;
+        while line < size do
+            var i: Index := line;
+            while (i < size) and (text[i] = space) do
+                i := i + 1;
+            end while;
+            if (i < size) and (text[i] = 9) then
+                fail(&~state, 1, i);
+                return size;
+            end if;
+            if (i < size) and (((text[i] /= newline) and (text[i] /= 13)) and (text[i] /= '#')) then
+                return i;
+            end if;
+            line := lineAfter(text, i);
+        end while;
+        return size;
+    end;
+
+    -- The line start that belongs to a content position: its own line, or
+    -- the size.
+    generic [R: Region]
+    function startOrSize(text: Span[Nat8, R], at: Index): Index is
+        if at >= spanLength(text) then
+            return at;
+        end if;
+        return lineStartOf(text, at);
+    end;
+
+    generic [R: Region]
+    function isBreak(text: Span[Nat8, R], at: Index): Bool is
+        if at >= spanLength(text) then
+            return true;
+        end if;
+        return ((text[at] = space) or (text[at] = newline)) or (text[at] = 13);
+    end;
+
+    generic [R: Region]
+    function isDash(text: Span[Nat8, R], at: Index): Bool is
+        return (text[at] = '-') and isBreak(text, at + 1);
+    end;
+
+    -- A line of three dashes or three dots at the start of a line.
+    generic [R: Region]
+    function isMarker(text: Span[Nat8, R], at: Index): Bool is
+        if (columnOf(text, at) /= 0) or ((at + 3) > spanLength(text)) then
+            return false;
+        end if;
+        let dashes: Bool := ((text[at] = '-') and (text[at + 1] = '-')) and (text[at + 2] = '-');
+        let dots: Bool := ((text[at] = '.') and (text[at + 1] = '.')) and (text[at + 2] = '.');
+        return (dashes or dots) and isBreak(text, at + 3);
+    end;
+
+    -- After a value on its line: only spaces and a comment may follow.
+    generic [R: Region, S: Region]
+    function restOfLine(text: Span[Nat8, R], state: &![State, S], at: Index): Index is
+        var i: Index := at;
+        while (i < spanLength(text)) and ((text[i] = space) or (text[i] = 13)) do
+            i := i + 1;
+        end while;
+        if (i < spanLength(text)) and ((text[i] /= newline) and (text[i] /= '#')) then
+            fail(&~state, 1, i);
+        end if;
+        if (i < spanLength(text)) and ((text[i] = '#') and (i > 0)) then
+            if text[i - 1] /= space then
+                fail(&~state, 1, i);
+            end if;
+        end if;
+        return lineAfter(text, i);
+    end;
+
+    ---
+    --- Scalars
+    ---
+
+    function hexValue(byte: Nat8): Nat64 is
+        if (byte >= '0') and (byte <= '9') then
+            return natOf(byte - '0');
+        end if;
+        if (byte >= 'a') and (byte <= 'f') then
+            return natOf(byte - 'a') + 10;
+        end if;
+        if (byte >= 'A') and (byte <= 'F') then
+            return natOf(byte - 'A') + 10;
+        end if;
+        return 99;
+    end;
+
+    function natOf(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    function byteOf(wide: Nat64): Nat8 is
+        case toNat8(wide) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                abort("Standard.Yaml: a byte did not fit a Nat8");
+                let zero: Nat8 := 0;
+                return zero;
+        end case;
+    end;
+
+    generic [B: Region]
+    function putCodePoint(out: &![StringBuilder, B], point: Nat64): Unit is
+        if point < 128 then
+            writeByte(&~out, byteOf(point));
+        else if point < 2048 then
+            writeByte(&~out, byteOf((point / 64) + 192));
+            writeByte(&~out, byteOf((point - ((point / 64) * 64)) + 128));
+        else
+            writeByte(&~out, byteOf((point / 4096) + 224));
+            writeByte(&~out, byteOf(((point / 64) - ((point / 4096) * 64)) + 128));
+            writeByte(&~out, byteOf((point - ((point / 64) * 64)) + 128));
+        end if;
+        return nil;
+    end;
+
+    -- A scalar in double quotes at at; the index after the closing quote.
+    generic [R: Region, S: Region, B: Region]
+    function doubleQuoted(text: Span[Nat8, R], state: &![State, S], at: Index, out: &![StringBuilder, B]): Index is
+        let size: Index := spanLength(text);
+        var i: Index := at + 1;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if byte = '"' then
+                return i + 1;
+            end if;
+            if (byte = newline) or (byte = 13) then
+                fail(&~state, 1, i);
+                return size;
+            end if;
+            if byte = 92 then
+                if (i + 1) >= size then
+                    fail(&~state, 1, i);
+                    return size;
+                end if;
+                let code: Nat8 := text[i + 1];
+                var digits: Index := 0;
+                if code = 'n' then
+                    writeByte(&~out, newline);
+                else if code = 't' then
+                    writeByte(&~out, 9 : Nat8);
+                else if code = 'r' then
+                    writeByte(&~out, 13 : Nat8);
+                else if code = 'b' then
+                    writeByte(&~out, 8 : Nat8);
+                else if code = 'f' then
+                    writeByte(&~out, 12 : Nat8);
+                else if code = '0' then
+                    writeByte(&~out, 0 : Nat8);
+                else if ((code = '"') or (code = 92)) or (code = '/') then
+                    writeByte(&~out, code);
+                else if code = 'x' then
+                    digits := 2 : Index;
+                else if code = 'u' then
+                    digits := 4 : Index;
+                else
+                    fail(&~state, 1, i);
+                    return size;
+                end if;
+                i := i + 2;
+                if digits > 0 then
+                    if (i + digits) > size then
+                        fail(&~state, 1, i);
+                        return size;
+                    end if;
+                    var point: Nat64 := 0;
+                    var k: Index := 0;
+                    while k < digits do
+                        let value: Nat64 := hexValue(text[i + k]);
+                        if value = 99 then
+                            fail(&~state, 1, i + k);
+                            return size;
+                        end if;
+                        point := (point * 16) + value;
+                        k := k + 1;
+                    end while;
+                    if ((point = 0) or ((point >= 55296) and (point <= 57343))) or ((digits = 2) and (point >= 128)) then
+                        fail(&~state, 1, i);
+                        return size;
+                    end if;
+                    putCodePoint(&~out, point);
+                    i := i + digits;
+                end if;
+            else
+                writeByte(&~out, byte);
+                i := i + 1;
+            end if;
+        end while;
+        fail(&~state, 1, at);
+        return size;
+    end;
+
+    -- A scalar in single quotes at at, where two quotes are one; the index
+    -- after the closing quote.
+    generic [R: Region, S: Region, B: Region]
+    function singleQuoted(text: Span[Nat8, R], state: &![State, S], at: Index, out: &![StringBuilder, B]): Index is
+        let size: Index := spanLength(text);
+        var i: Index := at + 1;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if byte = 39 then
+                if ((i + 1) < size) and (text[i + 1] = 39) then
+                    writeByte(&~out, byte);
+                    i := i + 2;
+                else
+                    return i + 1;
+                end if;
+            else if (byte = newline) or (byte = 13) then
+                fail(&~state, 1, i);
+                return size;
+            else
+                writeByte(&~out, byte);
+                i := i + 1;
+            end if;
+        end while;
+        fail(&~state, 1, at);
+        return size;
+    end;
+
+    generic [R: Region]
+    function isWord(text: Span[Nat8, R], word: Span[Nat8, Static]): Bool is
+        if spanLength(text) /= spanLength(word) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if text[i] /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    -- Whether text is a number as JSON writes one.
+    generic [R: Region]
+    function isJsonNumber(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        if (i < size) and (text[i] = '-') then
+            i := i + 1;
+        end if;
+        if i >= size then
+            return false;
+        end if;
+        if text[i] = '0' then
+            i := i + 1;
+        else if isDigit(text[i]) then
+            while (i < size) and isDigit(text[i]) do
+                i := i + 1;
+            end while;
+        else
+            return false;
+        end if;
+        if (i < size) and (text[i] = '.') then
+            i := i + 1;
+            if (i >= size) or (not isDigit(text[i])) then
+                return false;
+            end if;
+            while (i < size) and isDigit(text[i]) do
+                i := i + 1;
+            end while;
+        end if;
+        if (i < size) and ((text[i] = 'e') or (text[i] = 'E')) then
+            i := i + 1;
+            if (i < size) and ((text[i] = '+') or (text[i] = '-')) then
+                i := i + 1;
+            end if;
+            if (i >= size) or (not isDigit(text[i])) then
+                return false;
+            end if;
+            while (i < size) and isDigit(text[i]) do
+                i := i + 1;
+            end while;
+        end if;
+        return i = size;
+    end;
+
+    -- A plain scalar: null, a boolean, a number or a string.
+    generic [R: Region, W: Region]
+    function writePlain(writer: &![JsonWriter, W], value: Span[Nat8, R]): Unit is
+        if ((spanLength(value) = 0) or isWord(value, "~")) or ((isWord(value, "null") or isWord(value, "Null")) or isWord(value, "NULL")) then
+            writeNull(&~writer);
+        else if (isWord(value, "true") or isWord(value, "True")) or isWord(value, "TRUE") then
+            writeBool(&~writer, true);
+        else if (isWord(value, "false") or isWord(value, "False")) or isWord(value, "FALSE") then
+            writeBool(&~writer, false);
+        else if isJsonNumber(value) then
+            writeNumber(&~writer, value);
+        else
+            writeString(&~writer, value);
+        end if;
+        return nil;
+    end;
+
+    -- The end of a plain scalar of a block at at: before a comment, without
+    -- the spaces before it.
+    generic [R: Region]
+    function plainStop(text: Span[Nat8, R], at: Index): Index is
+        var stop: Index := lineStopOf(text, at);
+        var i: Index := at + 1;
+        while i < stop do
+            if (text[i] = '#') and (text[i - 1] = space) then
+                stop := i;
+            end if;
+            i := i + 1;
+        end while;
+        while (stop > at) and ((text[stop - 1] = space) or (text[stop - 1] = 13)) do
+            stop := stop - 1;
+        end while;
+        return stop;
+    end;
+
+    function isIndicator(byte: Nat8): Bool is
+        let reserved: Bool := ((byte = '@') or (byte = 96)) or (byte = '%');
+        let collections: Bool := ((byte = '[') or (byte = ']')) or ((byte = '{') or (byte = '}'));
+        let other: Bool := ((byte = ',') or (byte = '#')) or ((byte = '|') or (byte = '>'));
+        return (reserved or collections) or other;
+    end;
+
+    function isUnsupported(byte: Nat8): Bool is
+        return ((byte = '&') or (byte = '*')) or (byte = '!');
+    end;
+
+    ---
+    --- Flow collections on one line
+    ---
+
+    generic [R: Region]
+    function skipSpaces(text: Span[Nat8, R], at: Index, stop: Index): Index is
+        var i: Index := at;
+        while (i < stop) and (text[i] = space) do
+            i := i + 1;
+        end while;
+        return i;
+    end;
+
+    -- A plain scalar inside a flow collection: up to a comma, a bracket, a
+    -- brace, or a colon before a space when it is a key.
+    generic [R: Region]
+    function flowPlainStop(text: Span[Nat8, R], at: Index, stop: Index, key: Bool): Index is
+        var i: Index := at;
+        while i < stop do
+            let byte: Nat8 := text[i];
+            if ((byte = ',') or (byte = ']')) or ((byte = '}') or (byte = '#')) then
+                return i;
+            end if;
+            if key and ((byte = ':') and isBreak(text, i + 1)) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return stop;
+    end;
+
+    generic [R: Region]
+    function trimmedStop(text: Span[Nat8, R], at: Index, stop: Index): Index is
+        var last: Index := stop;
+        while (last > at) and (text[last - 1] = space) do
+            last := last - 1;
+        end while;
+        return last;
+    end;
+
+    -- A quoted scalar at at written as a string or a name; the index after.
+    generic [R: Region, S: Region, W: Region]
+    function quotedInto(text: Span[Nat8, R], state: &![State, S], writer: &![JsonWriter, W], at: Index, name: Bool): Index is
+        var out: StringBuilder := makeStringBuilder();
+        var after: Index := 0;
+        if text[at] = '"' then
+            after := doubleQuoted(text, &~state, at, &!out);
+        else
+            after := singleQuoted(text, &~state, at, &!out);
+        end if;
+        let value: String := finalize(out);
+        if not failed(&~state) then
+            if name then
+                writeName(&~writer, asSpan(&value));
+            else
+                writeString(&~writer, asSpan(&value));
+            end if;
+        end if;
+        destroyString(value);
+        return after;
+    end;
+
+    -- A value inside a flow collection, ending before stop; the index after.
+    generic [R: Region, S: Region, W: Region]
+    function flowValue(text: Span[Nat8, R], state: &![State, S], writer: &![JsonWriter, W], at: Index, stop: Index, depth: Index): Index is
+        let i: Index := skipSpaces(text, at, stop);
+        if failed(&~state) or (i >= stop) then
+            fail(&~state, 1, i);
+            return stop;
+        end if;
+        if depth > mostDepth then
+            fail(&~state, 3, i);
+            return stop;
+        end if;
+        let byte: Nat8 := text[i];
+        if byte = '[' then
+            beginArray(&~writer);
+            var k: Index := skipSpaces(text, i + 1, stop);
+            if (k < stop) and (text[k] = ']') then
+                endArray(&~writer);
+                return k + 1;
+            end if;
+            while not failed(&~state) do
+                k := skipSpaces(text, flowValue(text, &~state, &~writer, k, stop, depth + 1), stop);
+                if (k < stop) and (text[k] = ',') then
+                    k := k + 1;
+                else if (k < stop) and (text[k] = ']') then
+                    endArray(&~writer);
+                    return k + 1;
+                else
+                    fail(&~state, 1, k);
+                end if;
+            end while;
+            return stop;
+        end if;
+        if byte = '{' then
+            beginObject(&~writer);
+            var k: Index := skipSpaces(text, i + 1, stop);
+            if (k < stop) and (text[k] = '}') then
+                endObject(&~writer);
+                return k + 1;
+            end if;
+            while not failed(&~state) do
+                k := skipSpaces(text, k, stop);
+                if k >= stop then
+                    fail(&~state, 1, k);
+                    return stop;
+                end if;
+                if (text[k] = '"') or (text[k] = 39) then
+                    k := quotedInto(text, &~state, &~writer, k, true);
+                else
+                    let keyStop: Index := flowPlainStop(text, k, stop, true);
+                    writeName(&~writer, substring(text, k, trimmedStop(text, k, keyStop)));
+                    k := keyStop;
+                end if;
+                k := skipSpaces(text, k, stop);
+                if (k >= stop) or (text[k] /= ':') then
+                    fail(&~state, 1, k);
+                    return stop;
+                end if;
+                k := skipSpaces(text, flowValue(text, &~state, &~writer, k + 1, stop, depth + 1), stop);
+                if (k < stop) and (text[k] = ',') then
+                    k := k + 1;
+                else if (k < stop) and (text[k] = '}') then
+                    endObject(&~writer);
+                    return k + 1;
+                else
+                    fail(&~state, 1, k);
+                end if;
+            end while;
+            return stop;
+        end if;
+        if (byte = '"') or (byte = 39) then
+            return quotedInto(text, &~state, &~writer, i, false);
+        end if;
+        if isUnsupported(byte) then
+            fail(&~state, 2, i);
+            return stop;
+        end if;
+        let valueStop: Index := flowPlainStop(text, i, stop, false);
+        writePlain(&~writer, substring(text, i, trimmedStop(text, i, valueStop)));
+        return valueStop;
+    end;
+
+    ---
+    --- Block scalars
+    ---
+
+    -- A block scalar of a bar or an angle bracket at at, whose lines must be
+    -- indented to at least least; the start of the line after it.
+    generic [R: Region, S: Region, W: Region]
+    function blockScalar(text: Span[Nat8, R], state: &![State, S], writer: &![JsonWriter, W], at: Index, least: Index): Index is
+        let size: Index := spanLength(text);
+        let folded: Bool := text[at] = '>';
+        var i: Index := at + 1;
+        -- 0 clip, 1 strip, 2 keep.
+        var chomp: Index := 0;
+        if (i < size) and (text[i] = '-') then
+            chomp := 1 : Index;
+            i := i + 1;
+        else if (i < size) and (text[i] = '+') then
+            chomp := 2 : Index;
+            i := i + 1;
+        end if;
+        if (i < size) and isDigit(text[i]) then
+            fail(&~state, 2, i);
+            return size;
+        end if;
+        var line: Index := restOfLine(text, &~state, i);
+        var out: StringBuilder := makeStringBuilder();
+        var indent: Index := 0;
+        var breaks: Index := 0;
+        var started: Bool := false;
+        var going: Bool := true;
+        while going and (line < size) do
+            var k: Index := line;
+            while (k < size) and (text[k] = space) do
+                k := k + 1;
+            end while;
+            let stop: Index := lineStopOf(text, line);
+            let blank: Bool := (k >= stop) or (((k + 1) = stop) and (text[k] = 13));
+            if blank then
+                breaks := breaks + 1;
+                line := lineAfter(text, line);
+            else
+                let column: Index := k - line;
+                if not started then
+                    if column < least then
+                        going := false;
+                    else
+                        indent := column;
+                        started := true;
+                    end if;
+                else if column < indent then
+                    going := false;
+                end if;
+                if going then
+                    var b: Index := 0;
+                    while b < breaks do
+                        writeByte(&!out, newline);
+                        b := b + 1;
+                    end while;
+                    var lineStop: Index := stop;
+                    if (lineStop > line) and (text[lineStop - 1] = 13) then
+                        lineStop := lineStop - 1;
+                    end if;
+                    writeText(&!out, substring(text, line + indent, lineStop));
+                    writeByte(&!out, newline);
+                    breaks := 0 : Index;
+                    line := lineAfter(text, line);
+                end if;
+            end if;
+        end while;
+        let raw: String := finalize(out);
+        let value: String := chomped(asSpan(&raw), folded, chomp, breaks);
+        destroyString(raw);
+        writeString(&~writer, asSpan(&value));
+        destroyString(value);
+        return line;
+    end;
+
+    -- The lines of a block scalar, each with its line break, folded when
+    -- folded is true, with the final breaks as chomp says.
+    generic [R: Region]
+    function chomped(raw: Span[Nat8, R], folded: Bool, chomp: Index, extra: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        var stop: Index := spanLength(raw);
+        while (stop > 0) and (raw[stop - 1] = newline) do
+            stop := stop - 1;
+        end while;
+        let trailing: Index := spanLength(raw) - stop;
+        var i: Index := 0;
+        while i < stop do
+            let byte: Nat8 := raw[i];
+            if folded and (byte = newline) then
+                -- One break between two lines of text becomes a space;
+                -- where more stand together, one of them goes.
+                if ((i + 1) < stop) and (raw[i + 1] = newline) then
+                    i := i + 1;
+                    while (i < stop) and (raw[i] = newline) do
+                        writeByte(&!out, newline);
+                        i := i + 1;
+                    end while;
+                else
+                    writeByte(&!out, space);
+                    i := i + 1;
+                end if;
+            else
+                writeByte(&!out, byte);
+                i := i + 1;
+            end if;
+        end while;
+        if (chomp = 0) and (stop > 0) then
+            writeByte(&!out, newline);
+        else if chomp = 2 then
+            var k: Index := 0;
+            while k < (trailing + extra) do
+                writeByte(&!out, newline);
+                k := k + 1;
+            end while;
+        end if;
+        return finalize(out);
+    end;
+
+    ---
+    --- Blocks
+    ---
+
+    -- Whether the line at at begins with a key and its colon; the colon.
+    record Key: Free is
+        found: Bool;
+        colon: Index;
+    end;
+
+    generic [R: Region, S: Region]
+    function keyAt(text: Span[Nat8, R], state: &![State, S], at: Index): Key is
+        let stop: Index := lineStopOf(text, at);
+        let none: Key := Key(found => false, colon => noIndex);
+        var i: Index := at;
+        if (text[at] = '"') or (text[at] = 39) then
+            var scratch: StringBuilder := makeStringBuilder();
+            var probe: State := State(problem => noIndex, offset => noIndex);
+            if text[at] = '"' then
+                i := doubleQuoted(text, &!probe, at, &!scratch);
+            else
+                i := singleQuoted(text, &!probe, at, &!scratch);
+            end if;
+            let dropped: String := finalize(scratch);
+            destroyString(dropped);
+            if probe.problem /= 0 then
+                return none;
+            end if;
+            while (i < stop) and (text[i] = space) do
+                i := i + 1;
+            end while;
+            if ((i < stop) and (text[i] = ':')) and isBreak(text, i + 1) then
+                return Key(found => true, colon => i);
+            end if;
+            return none;
+        end if;
+        if isIndicator(text[at]) or isUnsupported(text[at]) then
+            return none;
+        end if;
+        while i < stop do
+            if (text[i] = '#') and ((i > at) and (text[i - 1] = space)) then
+                return none;
+            end if;
+            if (text[i] = ':') and isBreak(text, i + 1) then
+                return Key(found => true, colon => i);
+            end if;
+            i := i + 1;
+        end while;
+        return none;
+    end;
+
+    -- The key of a line, written as the name of a member.
+    generic [R: Region, S: Region, W: Region]
+    function writeKey(text: Span[Nat8, R], state: &![State, S], writer: &![JsonWriter, W], at: Index, colon: Index): Unit is
+        if (text[at] = '"') or (text[at] = 39) then
+            let after: Index := quotedInto(text, &~state, &~writer, at, true);
+        else
+            writeName(&~writer, substring(text, at, trimmedStop(text, at, colon)));
+        end if;
+        return nil;
+    end;
+
+    -- A value that starts on the line of its key or dash, at at; least is
+    -- the column its block scalar lines must reach.  The start of the line
+    -- after it.
+    generic [R: Region, S: Region, W: Region]
+    function inlineValue(text: Span[Nat8, R], state: &![State, S], writer: &![JsonWriter, W], at: Index, least: Index, depth: Index): Index is
+        let size: Index := spanLength(text);
+        let byte: Nat8 := text[at];
+        if (byte = '"') or (byte = 39) then
+            let after: Index := quotedInto(text, &~state, &~writer, at, false);
+            return restOfLine(text, &~state, after);
+        end if;
+        if (byte = '[') or (byte = '{') then
+            let after: Index := flowValue(text, &~state, &~writer, at, plainStop(text, at), depth);
+            return restOfLine(text, &~state, after);
+        end if;
+        if (byte = '|') or (byte = '>') then
+            return blockScalar(text, &~state, &~writer, at, least);
+        end if;
+        if isUnsupported(byte) then
+            fail(&~state, 2, at);
+            return size;
+        end if;
+        if ((byte = '@') or (byte = 96)) or ((byte = '%') or (byte = '#')) then
+            fail(&~state, 1, at);
+            return size;
+        end if;
+        let stop: Index := plainStop(text, at);
+        var i: Index := at;
+        while i < stop do
+            if (text[i] = ':') and isBreak(text, i + 1) then
+                fail(&~state, 1, i);
+                return size;
+            end if;
+            i := i + 1;
+        end while;
+        writePlain(&~writer, substring(text, at, stop));
+        return restOfLine(text, &~state, stop);
+    end;
+
+    -- A node at at: a sequence, a mapping or a scalar.  The start of the
+    -- line after it.
+    generic [R: Region, S: Region, W: Region]
+    function node(text: Span[Nat8, R], state: &![State, S], writer: &![JsonWriter, W], at: Index, least: Index, depth: Index): Index is
+        let size: Index := spanLength(text);
+        if failed(&~state) then
+            return size;
+        end if;
+        if depth > mostDepth then
+            fail(&~state, 3, at);
+            return size;
+        end if;
+        if isDash(text, at) then
+            return sequence(text, &~state, &~writer, at, depth);
+        end if;
+        let key: Key := keyAt(text, &~state, at);
+        if key.found then
+            return mapping(text, &~state, &~writer, at, depth);
+        end if;
+        return inlineValue(text, &~state, &~writer, at, least, depth);
+    end;
+
+    -- What follows a dash or a colon at after: a value on the same line, a
+    -- node on the lines below, or null.  col is the column of the dash or
+    -- the key; sameColumn says whether a sequence at that column belongs.
+    generic [R: Region, S: Region, W: Region]
+    function valueAfter(text: Span[Nat8, R], state: &![State, S], writer: &![JsonWriter, W], after: Index, col: Index, sameColumn: Bool, depth: Index): Index is
+        let size: Index := spanLength(text);
+        var i: Index := after;
+        while (i < size) and (text[i] = space) do
+            i := i + 1;
+        end while;
+        let atEnd: Bool := (i >= size) or (((text[i] = newline) or (text[i] = 13)) or (text[i] = '#'));
+        if not atEnd then
+            -- After a key the value stands on its line; after a dash it may
+            -- be a mapping or a sequence of its own.
+            if sameColumn then
+                return inlineValue(text, &~state, &~writer, i, col + 1, depth + 1);
+            end if;
+            return node(text, &~state, &~writer, i, col + 1, depth + 1);
+        end if;
+        let next: Index := nextContent(text, &~state, lineAfter(text, i));
+        if next < size then
+            let column: Index := columnOf(text, next);
+            if not isMarker(text, next) then
+                if (column > col) or (sameColumn and ((column = col) and isDash(text, next))) then
+                    return node(text, &~state, &~writer, next, col + 1, depth + 1);
+                end if;
+            end if;
+        end if;
+        writeNull(&~writer);
+        return startOrSize(text, next);
+    end;
+
+    generic [R: Region, S: Region, W: Region]
+    function sequence(text: Span[Nat8, R], state: &![State, S], writer: &![JsonWriter, W], at: Index, depth: Index): Index is
+        let size: Index := spanLength(text);
+        let col: Index := columnOf(text, at);
+        beginArray(&~writer);
+        var current: Index := at;
+        var going: Bool := true;
+        var result: Index := size;
+        while going and (not failed(&~state)) do
+            let after: Index := valueAfter(text, &~state, &~writer, current + 1, col, false, depth);
+            let next: Index := nextContent(text, &~state, after);
+            if (next >= size) or isMarker(text, next) then
+                going := false;
+                result := startOrSize(text, next);
+            else
+                let column: Index := columnOf(text, next);
+                if column < col then
+                    going := false;
+                    result := startOrSize(text, next);
+                else if column = col then
+                    if isDash(text, next) then
+                        current := next;
+                    else
+                        going := false;
+                        result := startOrSize(text, next);
+                    end if;
+                else
+                    fail(&~state, 1, next);
+                end if;
+            end if;
+        end while;
+        endArray(&~writer);
+        return result;
+    end;
+
+    generic [R: Region, S: Region, W: Region]
+    function mapping(text: Span[Nat8, R], state: &![State, S], writer: &![JsonWriter, W], at: Index, depth: Index): Index is
+        let size: Index := spanLength(text);
+        let col: Index := columnOf(text, at);
+        beginObject(&~writer);
+        var current: Index := at;
+        var going: Bool := true;
+        var result: Index := size;
+        while going and (not failed(&~state)) do
+            let key: Key := keyAt(text, &~state, current);
+            if not key.found then
+                fail(&~state, 1, current);
+            else
+                writeKey(text, &~state, &~writer, current, key.colon);
+                let after: Index := valueAfter(text, &~state, &~writer, key.colon + 1, col, true, depth);
+                let next: Index := nextContent(text, &~state, after);
+                if (next >= size) or isMarker(text, next) then
+                    going := false;
+                    result := startOrSize(text, next);
+                else
+                    let column: Index := columnOf(text, next);
+                    if column < col then
+                        going := false;
+                        result := startOrSize(text, next);
+                    else if column = col then
+                        current := next;
+                    else
+                        fail(&~state, 1, next);
+                    end if;
+                end if;
+            end if;
+        end while;
+        endObject(&~writer);
+        return result;
+    end;
+
+    ---
+    --- The document
+    ---
+
+    generic [R: Region]
+    function lineNumber(text: Span[Nat8, R], at: Index): Index is
+        var line: Index := 1;
+        var i: Index := 0;
+        while (i < at) and (i < spanLength(text)) do
+            if text[i] = newline then
+                line := line + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return line;
+    end;
+
+    function problemOf(code: Index): YamlProblem is
+        if code = 2 then
+            return YamlUnsupported();
+        else if code = 3 then
+            return YamlTooDeep();
+        else if code = 4 then
+            return YamlNotJson();
+        end if;
+        return NotYaml();
+    end;
+
+    generic [R: Region]
+    function yamlToJson(text: Span[Nat8, R]): Either[YamlError, String] is
+        let size: Index := spanLength(text);
+        var state: State := State(problem => noIndex, offset => noIndex);
+        var writer: JsonWriter := makeJsonWriter();
+        if not isValid(text) then
+            fail(&!state, 1, noIndex);
+        end if;
+        var at: Index := nextContent(text, &!state, 0);
+        if (at < size) and (text[at] = '%') then
+            fail(&!state, 2, at);
+        end if;
+        if (at < size) and isMarker(text, at) then
+            if text[at] = '.' then
+                fail(&!state, 1, at);
+            end if;
+            at := nextContent(text, &!state, lineAfter(text, at));
+        end if;
+        if failed(&!state) then
+            skip;
+        else if (at >= size) or isMarker(text, at) then
+            writeNull(&!writer);
+        else
+            let after: Index := node(text, &!state, &!writer, at, 0, 1);
+            at := nextContent(text, &!state, after);
+        end if;
+        if (not failed(&!state)) and (at < size) then
+            if isMarker(text, at) and (text[at] = '.') then
+                let rest: Index := nextContent(text, &!state, lineAfter(text, at));
+                if rest < size then
+                    fail(&!state, 2, rest);
+                end if;
+            else if isMarker(text, at) then
+                fail(&!state, 2, at);
+            else
+                fail(&!state, 1, at);
+            end if;
+        end if;
+        case finishJson(writer) of
+            when Some(value as json: String) do
+                if state.problem = 0 then
+                    let read: Either[YamlError, String] := Right(right => json);
+                    return read;
+                else
+                    destroyString(json);
+                end if;
+            when None do
+                fail(&!state, 4, size);
+        end case;
+        let refused: Either[YamlError, String] := Left(left => YamlError(problem => problemOf(state.problem), line => lineNumber(text, state.offset)));
+        return refused;
+    end;
+
+    generic [R: Region]
+    function readYaml(text: Span[Nat8, R]): Either[YamlError, Json] is
+        case yamlToJson(text) of
+            when Right(right as json: String) do
+                let parsed: Either[JsonError, Json] := readJson(asSpan(&json));
+                destroyString(json);
+                case parsed of
+                    when Right(right as document: Json) do
+                        let read: Either[YamlError, Json] := Right(right => document);
+                        return read;
+                    when Left(left as error: JsonError) do
+                        let refused: Either[YamlError, Json] := Left(left => YamlError(problem => YamlNotJson(), line => noIndex));
+                        return refused;
+                end case;
+            when Left(left as error: YamlError) do
+                let refused: Either[YamlError, Json] := Left(left => error);
+                return refused;
+        end case;
+    end;
+end module body.

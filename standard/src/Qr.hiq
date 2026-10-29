@@ -1,0 +1,1086 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  The steps are those of the standard: the bits of the
+-- segment, padded to the data codewords of the version; the codewords
+-- split into blocks, each with its Reed-Solomon codewords over GF(256)
+-- with the polynomial 0x11D, and interleaved; the function patterns drawn;
+-- the codewords placed in the zigzag of two columns; each mask tried and
+-- scored.  Hilde has no operators on bits, so a bit is a byte of 0 or 1,
+-- the exclusive or is computed bit by bit, and a grid is a string of one
+-- byte for each module.
+import Standard.String (
+    String,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    insertBack,
+    length as bufferLength,
+    lengthMut as bufferLengthMut,
+    nth,
+    nthMut,
+    storeNth as storeAt
+);
+import Standard.Png (
+    Image,
+    Gray,
+    makeImage
+);
+
+module body Standard.Qr is
+    constant noIndex: Index := 0;
+    constant zeroNat: Nat64 := 0;
+    constant fourteen: Index := 14;
+    constant seven: Index := 7;
+    constant zeroByte: Nat8 := 0;
+    constant oneByte: Nat8 := 1;
+
+    record QrCode: Linear is
+        version: Index;
+        size: Index;
+        mask: Index;
+        grid: String;
+        invariant (version >= 1) and (version <= 40);
+        invariant size = ((version * 4) + 17);
+        invariant mask <= 7;
+        invariant length(&grid) = (size * size);
+    end;
+
+    ---
+    --- Numbers
+    ---
+
+    function natOf(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    function natOfIndex(at: Index): Nat64 is
+        case toNat64(at) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                return zeroNat;
+        end case;
+    end;
+
+    function indexOfNat(wide: Nat64): Index is
+        case toIndex(wide) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.Qr: a number did not fit an Index");
+        end case;
+    end;
+
+    function byteOf(wide: Nat64): Nat8 is
+        case toNat8(wide) of
+            when Some(value as small: Nat8) do
+                return small;
+            when None do
+                abort("Standard.Qr: a byte did not fit a Nat8");
+                let zero: Nat8 := 0;
+                return zero;
+        end case;
+    end;
+
+    function remainder(number: Index, by: Index): Index is
+        return number - ((number / by) * by);
+    end;
+
+    -- The exclusive or of two numbers, bit by bit.
+    function exclusive(left: Nat64, right: Nat64): Nat64 is
+        var a: Nat64 := left;
+        var b: Nat64 := right;
+        var bit: Nat64 := 1;
+        var result: Nat64 := 0;
+        while (a > 0) or (b > 0) do
+            let lowA: Nat64 := a - ((a / 2) * 2);
+            let lowB: Nat64 := b - ((b / 2) * 2);
+            if lowA /= lowB then
+                result := result + bit;
+            end if;
+            a := a / 2;
+            b := b / 2;
+            bit := bit * 2;
+        end while;
+        return result;
+    end;
+
+    -- Bit i of number, from the least significant.
+    function bitOf(number: Nat64, i: Index): Bool is
+        var shifted: Nat64 := number;
+        var k: Index := 0;
+        while k < i do
+            shifted := shifted / 2;
+            k := k + 1;
+        end while;
+        return (shifted - ((shifted / 2) * 2)) = 1;
+    end;
+
+    ---
+    --- Tables of the standard
+    ---
+
+    function levelNumber(level: QrLevel): Index is
+        case level of
+            when QrLow do
+                return 0;
+            when QrMedium do
+                return 1;
+            when QrQuartile do
+                return 2;
+            when QrHigh do
+                return 3;
+        end case;
+    end;
+
+    -- The two bits of a level in the format information.
+    function levelBits(level: QrLevel): Nat64 is
+        case level of
+            when QrLow do
+                return 1;
+            when QrMedium do
+                return 0;
+            when QrQuartile do
+                return 3;
+            when QrHigh do
+                return 2;
+        end case;
+    end;
+
+    -- Entry version of a table of 41 numbers of two digits each.
+    function entry(table: Span[Nat8, Static], version: Index): Index is
+        let tens: Index := indexOfNat(natOf(table[version * 2] - '0'));
+        let ones: Index := indexOfNat(natOf(table[(version * 2) + 1] - '0'));
+        return (tens * 10) + ones;
+    end;
+
+    -- The error correction codewords of each block.
+    function eccPerBlock(level: QrLevel, version: Index): Index is
+        let low: Span[Nat8, Static] := "0007101520261820243018202426302224283028282828303026283030303030303030303030303030";
+        let medium: Span[Nat8, Static] := "0010162618241618222226302222242428282626262628282828282828282828282828282828282828";
+        let quartile: Span[Nat8, Static] := "0013221826182418222024282624203024282826302830303030283030303030303030303030303030";
+        let high: Span[Nat8, Static] := "0017282216222826262428242822242430282826283024303030303030303030303030303030303030";
+        case level of
+            when QrLow do
+                return entry(low, version);
+            when QrMedium do
+                return entry(medium, version);
+            when QrQuartile do
+                return entry(quartile, version);
+            when QrHigh do
+                return entry(high, version);
+        end case;
+    end;
+
+    -- The number of blocks.
+    function blockCount(level: QrLevel, version: Index): Index is
+        let low: Span[Nat8, Static] := "0001010101010202020204040404040606060607080809091012121213141516171819192021222425";
+        let medium: Span[Nat8, Static] := "0001010102020404040505050809091010111314161717182021232526282931333537384043454749";
+        let quartile: Span[Nat8, Static] := "0001010202040406060808081012161217161821202323252729343435384043454851535659626568";
+        let high: Span[Nat8, Static] := "0001010204040405060808111116161816192125252534303235374042454851545760636670747781";
+        case level of
+            when QrLow do
+                return entry(low, version);
+            when QrMedium do
+                return entry(medium, version);
+            when QrQuartile do
+                return entry(quartile, version);
+            when QrHigh do
+                return entry(high, version);
+        end case;
+    end;
+
+    -- The modules of a version that hold data and error correction.
+    function rawModules(version: Index): Index is
+        var result: Index := (((version * 16) + 128) * version) + 64;
+        if version >= 2 then
+            let aligns: Index := (version / 7) + 2;
+            result := result - ((((aligns * 25) - 10) * aligns) - 55);
+            if version >= 7 then
+                result := result - 36;
+            end if;
+        end if;
+        return result;
+    end;
+
+    function dataCodewords(level: QrLevel, version: Index): Index is
+        return (rawModules(version) / 8) - (eccPerBlock(level, version) * blockCount(level, version));
+    end;
+
+    ---
+    --- The segment
+    ---
+
+    -- 1 numeric, 2 alphanumeric, 4 bytes, as the mode indicator.
+    generic [R: Region]
+    function modeOf(text: Span[Nat8, R]): Index is
+        var numeric: Bool := true;
+        var alphanumeric: Bool := true;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            let byte: Nat8 := text[i];
+            if (byte < '0') or (byte > '9') then
+                numeric := false;
+            end if;
+            if alphanumericValue(byte) >= 45 then
+                alphanumeric := false;
+            end if;
+            i := i + 1;
+        end while;
+        if numeric then
+            return 1;
+        end if;
+        if alphanumeric then
+            return 2;
+        end if;
+        return 4;
+    end;
+
+    -- The value of byte in the alphanumeric mode, or 45 when it has none.
+    function alphanumericValue(byte: Nat8): Index is
+        let table: Span[Nat8, Static] := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+        var i: Index := 0;
+        while i < 45 do
+            if table[i] = byte then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return 45;
+    end;
+
+    function countBits(mode: Index, version: Index): Index is
+        var band: Index := 0;
+        if version >= 10 then
+            band := 1 : Index;
+        end if;
+        if version >= 27 then
+            band := 2 : Index;
+        end if;
+        if mode = 1 then
+            return (band * 2) + 10;
+        end if;
+        if mode = 2 then
+            return (band * 2) + 9;
+        end if;
+        if band = 0 then
+            return 8;
+        end if;
+        return 16;
+    end;
+
+    -- The bits of the data of the text in mode, after the count.
+    function dataBits(mode: Index, size: Index): Index is
+        if mode = 1 then
+            let rest: Index := remainder(size, 3);
+            var extra: Index := 0;
+            if rest = 1 then
+                extra := 4 : Index;
+            else if rest = 2 then
+                extra := 7 : Index;
+            end if;
+            return ((size / 3) * 10) + extra;
+        end if;
+        if mode = 2 then
+            return ((size / 2) * 11) + (remainder(size, 2) * 6);
+        end if;
+        return size * 8;
+    end;
+
+    generic [B: Region]
+    function putBits(bits: &![Buffer[Nat8], B], number: Nat64, count: Index): Unit is
+        var i: Index := count;
+        while i > 0 do
+            i := i - 1;
+            if bitOf(number, i) then
+                insertBack(&~bits, oneByte);
+            else
+                insertBack(&~bits, zeroByte);
+            end if;
+        end while;
+        return nil;
+    end;
+
+    -- The data codewords of text in mode at version and level.
+    generic [R: Region]
+    function codewordsOf(text: Span[Nat8, R], mode: Index, version: Index, level: QrLevel): Buffer[Nat8] is
+        var bits: Buffer[Nat8] := allocateEmpty();
+        let size: Index := spanLength(text);
+        putBits(&!bits, natOfIndex(mode), 4);
+        putBits(&!bits, natOfIndex(size), countBits(mode, version));
+        var i: Index := 0;
+        if mode = 1 then
+            while i < size do
+                var group: Nat64 := 0;
+                var digits: Index := 0;
+                while (digits < 3) and ((i + digits) < size) do
+                    group := (group * 10) + natOf(text[i + digits] - '0');
+                    digits := digits + 1;
+                end while;
+                putBits(&!bits, group, (digits * 3) + 1);
+                i := i + digits;
+            end while;
+        else if mode = 2 then
+            while i < size do
+                if (i + 1) < size then
+                    let pair: Index := (alphanumericValue(text[i]) * 45) + alphanumericValue(text[i + 1]);
+                    putBits(&!bits, natOfIndex(pair), 11);
+                    i := i + 2;
+                else
+                    putBits(&!bits, natOfIndex(alphanumericValue(text[i])), 6);
+                    i := i + 1;
+                end if;
+            end while;
+        else
+            while i < size do
+                putBits(&!bits, natOf(text[i]), 8);
+                i := i + 1;
+            end while;
+        end if;
+        let capacity: Index := dataCodewords(level, version) * 8;
+        var terminator: Index := 0;
+        while (terminator < 4) and (bufferLengthMut(&!bits) < capacity) do
+            insertBack(&!bits, zeroByte);
+            terminator := terminator + 1;
+        end while;
+        while remainder(bufferLengthMut(&!bits), 8) /= 0 do
+            insertBack(&!bits, zeroByte);
+        end while;
+        var pad: Bool := true;
+        while bufferLengthMut(&!bits) < capacity do
+            if pad then
+                putBits(&!bits, 236, 8);
+            else
+                putBits(&!bits, 17, 8);
+            end if;
+            pad := not pad;
+        end while;
+        var words: Buffer[Nat8] := allocateEmpty();
+        var w: Index := 0;
+        while w < (capacity / 8) do
+            var value: Nat64 := 0;
+            var k: Index := 0;
+            while k < 8 do
+                value := (value * 2) + natOf(nth(&bits, (w * 8) + k));
+                k := k + 1;
+            end while;
+            insertBack(&!words, byteOf(value));
+            w := w + 1;
+        end while;
+        destroyFree(bits);
+        return words;
+    end;
+
+    ---
+    --- Reed-Solomon
+    ---
+
+    -- The product in GF(256) with the polynomial 0x11D.
+    function multiply(x: Nat8, y: Nat8): Nat8 is
+        var z: Nat64 := 0;
+        var i: Index := 8;
+        while i > 0 do
+            i := i - 1;
+            z := z * 2;
+            if z >= 256 then
+                z := exclusive(z - 256, 29);
+            end if;
+            if bitOf(natOf(y), i) then
+                z := exclusive(z, natOf(x));
+            end if;
+        end while;
+        return byteOf(z);
+    end;
+
+    function xorBytes(left: Nat8, right: Nat8): Nat8 is
+        return byteOf(exclusive(natOf(left), natOf(right)));
+    end;
+
+    -- The generator polynomial of degree, its leading 1 left out.
+    function divisorOf(degree: Index): Buffer[Nat8] is
+        var result: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < (degree - 1) do
+            insertBack(&!result, zeroByte);
+            i := i + 1;
+        end while;
+        insertBack(&!result, oneByte);
+        var root: Nat8 := 1;
+        i := 0 : Index;
+        while i < degree do
+            var j: Index := 0;
+            while j < degree do
+                let product: Nat8 := multiply(nthMut(&!result, j), root);
+                storeAt(&!result, j, product);
+                if (j + 1) < degree then
+                    let next: Nat8 := nthMut(&!result, j + 1);
+                    let mixed: Nat8 := xorBytes(nthMut(&!result, j), next);
+                    storeAt(&!result, j, mixed);
+                end if;
+                j := j + 1;
+            end while;
+            root := multiply(root, 2);
+            i := i + 1;
+        end while;
+        return result;
+    end;
+
+    -- The error correction codewords of the data from start, count of them.
+    generic [D: Region, V: Region]
+    function eccOf(data: &[Buffer[Nat8], D], start: Index, count: Index, divisor: &[Buffer[Nat8], V]): Buffer[Nat8] is
+        let degree: Index := bufferLength(divisor);
+        var result: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < degree do
+            insertBack(&!result, zeroByte);
+            i := i + 1;
+        end while;
+        var k: Index := 0;
+        while k < count do
+            let factor: Nat8 := xorBytes(nth(data, start + k), nthMut(&!result, 0));
+            var j: Index := 0;
+            while (j + 1) < degree do
+                let next: Nat8 := nthMut(&!result, j + 1);
+                storeAt(&!result, j, next);
+                j := j + 1;
+            end while;
+            storeAt(&!result, degree - 1, zeroByte);
+            j := 0 : Index;
+            while j < degree do
+                let mixed: Nat8 := xorBytes(nthMut(&!result, j), multiply(nth(divisor, j), factor));
+                storeAt(&!result, j, mixed);
+                j := j + 1;
+            end while;
+            k := k + 1;
+        end while;
+        return result;
+    end;
+
+    -- The data split into blocks, each with its error correction, and
+    -- interleaved: the codewords in the order they are placed.
+    generic [D: Region]
+    function interleaved(data: &[Buffer[Nat8], D], version: Index, level: QrLevel): Buffer[Nat8] is
+        let blocks: Index := blockCount(level, version);
+        let eccLength: Index := eccPerBlock(level, version);
+        let total: Index := rawModules(version) / 8;
+        let shortBlocks: Index := blocks - remainder(total, blocks);
+        let shortLength: Index := total / blocks;
+        let divisor: Buffer[Nat8] := divisorOf(eccLength);
+        -- Every block as one row of shortLength + 1 bytes: its data, a pad
+        -- byte for a short block, its error correction.
+        let width: Index := shortLength + 1;
+        var rows: Buffer[Nat8] := allocateEmpty();
+        var start: Index := 0;
+        var b: Index := 0;
+        while b < blocks do
+            var dataLength: Index := shortLength - eccLength;
+            if b >= shortBlocks then
+                dataLength := dataLength + 1;
+            end if;
+            var k: Index := 0;
+            while k < dataLength do
+                insertBack(&!rows, nth(data, start + k));
+                k := k + 1;
+            end while;
+            if b < shortBlocks then
+                insertBack(&!rows, zeroByte);
+            end if;
+            let ecc: Buffer[Nat8] := eccOf(data, start, dataLength, &divisor);
+            k := 0 : Index;
+            while k < eccLength do
+                insertBack(&!rows, nth(&ecc, k));
+                k := k + 1;
+            end while;
+            destroyFree(ecc);
+            start := start + dataLength;
+            b := b + 1;
+        end while;
+        var result: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < width do
+            var j: Index := 0;
+            while j < blocks do
+                if (i /= (shortLength - eccLength)) or (j >= shortBlocks) then
+                    insertBack(&!result, nth(&rows, (j * width) + i));
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        destroyFree(rows);
+        destroyFree(divisor);
+        return result;
+    end;
+
+    ---
+    --- The grid
+    ---
+
+    -- The byte at at of a string held for writing.
+    generic [S: Region]
+    function byteAt(text: &![String, S], at: Index): Nat8 is
+        return nthByte(text: &[String, S], at);
+    end;
+
+    -- A grid holds 0 or 1 for each module; a second grid says which
+    -- modules belong to a function pattern.
+    generic [G: Region, F: Region]
+    function setFunction(grid: &![String, G], fixed: &![String, F], size: Index, x: Index, y: Index, dark: Bool): Unit is
+        if dark then
+            storeNth(&~grid, (y * size) + x, oneByte);
+        else
+            storeNth(&~grid, (y * size) + x, zeroByte);
+        end if;
+        storeNth(&~fixed, (y * size) + x, oneByte);
+        return nil;
+    end;
+
+    function distanceOf(a: Index, b: Index): Index is
+        if a >= b then
+            return a - b;
+        end if;
+        return b - a;
+    end;
+
+    function larger(a: Index, b: Index): Index is
+        if a >= b then
+            return a;
+        end if;
+        return b;
+    end;
+
+    -- A finder pattern centred at x and y, with its light border.
+    generic [G: Region, F: Region]
+    function drawFinder(grid: &![String, G], fixed: &![String, F], size: Index, x: Index, y: Index): Unit is
+        var dy: Index := 0;
+        while dy < 9 do
+            var dx: Index := 0;
+            while dx < 9 do
+                -- The module at x + dx - 4, y + dy - 4.
+                if ((x + dx) >= 4) and ((y + dy) >= 4) then
+                    let xx: Index := (x + dx) - 4;
+                    let yy: Index := (y + dy) - 4;
+                    if (xx < size) and (yy < size) then
+                        let reach: Index := larger(distanceOf(dx, 4), distanceOf(dy, 4));
+                        setFunction(&~grid, &~fixed, size, xx, yy, (reach /= 2) and (reach /= 4));
+                    end if;
+                end if;
+                dx := dx + 1;
+            end while;
+            dy := dy + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [G: Region, F: Region]
+    function drawAlignment(grid: &![String, G], fixed: &![String, F], size: Index, x: Index, y: Index): Unit is
+        var dy: Index := 0;
+        while dy < 5 do
+            var dx: Index := 0;
+            while dx < 5 do
+                let reach: Index := larger(distanceOf(dx, 2), distanceOf(dy, 2));
+                setFunction(&~grid, &~fixed, size, (x + dx) - 2, (y + dy) - 2, reach /= 1);
+                dx := dx + 1;
+            end while;
+            dy := dy + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The positions of the alignment patterns of version on one axis.
+    function alignmentPositions(version: Index): Buffer[Index] is
+        var result: Buffer[Index] := allocateEmpty();
+        if version > 1 then
+            let count: Index := (version / 7) + 2;
+            var step: Index := 26;
+            if version /= 32 then
+                step := ((((version * 4) + (count * 2)) + 1) / ((count * 2) - 2)) * 2;
+            end if;
+            let size: Index := (version * 4) + 17;
+            insertBack(&!result, 6 : Index);
+            var i: Index := 1;
+            while i < count do
+                insertBack(&!result, (size - 7) - (((count - 1) - i) * step));
+                i := i + 1;
+            end while;
+        end if;
+        return result;
+    end;
+
+    -- The fifteen bits of the format information of level and mask.
+    function formatBits(level: QrLevel, mask: Index): Nat64 is
+        let data: Nat64 := (levelBits(level) * 8) + natOfIndex(mask);
+        var rest: Nat64 := data;
+        var i: Index := 0;
+        while i < 10 do
+            rest := exclusive(rest * 2, (rest / 512) * 1335);
+            i := i + 1;
+        end while;
+        return exclusive((data * 1024) + rest, 21522);
+    end;
+
+    -- The eighteen bits of the version information.
+    function versionBits(version: Index): Nat64 is
+        let data: Nat64 := natOfIndex(version);
+        var rest: Nat64 := data;
+        var i: Index := 0;
+        while i < 12 do
+            rest := exclusive(rest * 2, (rest / 2048) * 7973);
+            i := i + 1;
+        end while;
+        return (data * 4096) + rest;
+    end;
+
+    generic [G: Region, F: Region]
+    function drawFormat(grid: &![String, G], fixed: &![String, F], size: Index, level: QrLevel, mask: Index): Unit is
+        let bits: Nat64 := formatBits(level, mask);
+        var i: Index := 0;
+        while i < 6 do
+            setFunction(&~grid, &~fixed, size, 8, i, bitOf(bits, i));
+            i := i + 1;
+        end while;
+        setFunction(&~grid, &~fixed, size, 8, 7, bitOf(bits, 6));
+        setFunction(&~grid, &~fixed, size, 8, 8, bitOf(bits, 7));
+        setFunction(&~grid, &~fixed, size, 7, 8, bitOf(bits, 8));
+        i := 9 : Index;
+        while i < 15 do
+            setFunction(&~grid, &~fixed, size, fourteen - i, 8, bitOf(bits, i));
+            i := i + 1;
+        end while;
+        i := 0 : Index;
+        while i < 8 do
+            setFunction(&~grid, &~fixed, size, (size - 1) - i, 8, bitOf(bits, i));
+            i := i + 1;
+        end while;
+        i := 8 : Index;
+        while i < 15 do
+            setFunction(&~grid, &~fixed, size, 8, (size - 15) + i, bitOf(bits, i));
+            i := i + 1;
+        end while;
+        setFunction(&~grid, &~fixed, size, 8, size - 8, true);
+        return nil;
+    end;
+
+    generic [G: Region, F: Region]
+    function drawPatterns(grid: &![String, G], fixed: &![String, F], size: Index, version: Index, level: QrLevel): Unit is
+        var i: Index := 0;
+        while i < size do
+            setFunction(&~grid, &~fixed, size, 6, i, remainder(i, 2) = 0);
+            setFunction(&~grid, &~fixed, size, i, 6, remainder(i, 2) = 0);
+            i := i + 1;
+        end while;
+        drawFinder(&~grid, &~fixed, size, 3, 3);
+        drawFinder(&~grid, &~fixed, size, size - 4, 3);
+        drawFinder(&~grid, &~fixed, size, 3, size - 4);
+        let positions: Buffer[Index] := alignmentPositions(version);
+        let count: Index := bufferLength(&positions);
+        var a: Index := 0;
+        while a < count do
+            var b: Index := 0;
+            while b < count do
+                let corner: Bool := (((a = 0) and (b = 0)) or ((a = 0) and (b = (count - 1)))) or ((a = (count - 1)) and (b = 0));
+                if not corner then
+                    drawAlignment(&~grid, &~fixed, size, nth(&positions, a), nth(&positions, b));
+                end if;
+                b := b + 1;
+            end while;
+            a := a + 1;
+        end while;
+        destroyFree(positions);
+        drawFormat(&~grid, &~fixed, size, level, 0);
+        if version >= 7 then
+            let bits: Nat64 := versionBits(version);
+            var k: Index := 0;
+            while k < 18 do
+                let far: Index := (size - 11) + remainder(k, 3);
+                let near: Index := k / 3;
+                setFunction(&~grid, &~fixed, size, far, near, bitOf(bits, k));
+                setFunction(&~grid, &~fixed, size, near, far, bitOf(bits, k));
+                k := k + 1;
+            end while;
+        end if;
+        return nil;
+    end;
+
+    -- The codewords placed in the zigzag of two columns from the bottom
+    -- right, skipping the function patterns and the vertical timing line.
+    generic [G: Region, F: Region, W: Region]
+    function placeCodewords(grid: &![String, G], fixed: &![String, F], size: Index, words: &[Buffer[Nat8], W]): Unit is
+        let bitCount: Index := bufferLength(words) * 8;
+        var i: Index := 0;
+        var right: Index := size - 1;
+        var going: Bool := true;
+        while going do
+            if right = 6 then
+                right := 5 : Index;
+            end if;
+            var vertical: Index := 0;
+            while vertical < size do
+                var j: Index := 0;
+                while j < 2 do
+                    let x: Index := right - j;
+                    let upward: Bool := remainder((right + 1) / 2, 2) = 0;
+                    var y: Index := vertical;
+                    if upward then
+                        y := (size - 1) - vertical;
+                    end if;
+                    let at: Index := (y * size) + x;
+                    if (byteAt(&~fixed, at) = 0) and (i < bitCount) then
+                        if bitOf(natOf(nth(words, i / 8)), seven - remainder(i, 8)) then
+                            storeNth(&~grid, at, oneByte);
+                        end if;
+                        i := i + 1;
+                    end if;
+                    j := j + 1;
+                end while;
+                vertical := vertical + 1;
+            end while;
+            if right >= 3 then
+                right := right - 2;
+            else
+                going := false;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    function masked(mask: Index, x: Index, y: Index): Bool is
+        if mask = 0 then
+            return remainder(x + y, 2) = 0;
+        else if mask = 1 then
+            return remainder(y, 2) = 0;
+        else if mask = 2 then
+            return remainder(x, 3) = 0;
+        else if mask = 3 then
+            return remainder(x + y, 3) = 0;
+        else if mask = 4 then
+            return remainder((x / 3) + (y / 2), 2) = 0;
+        else if mask = 5 then
+            return (remainder(x * y, 2) + remainder(x * y, 3)) = 0;
+        else if mask = 6 then
+            return remainder(remainder(x * y, 2) + remainder(x * y, 3), 2) = 0;
+        end if;
+        return remainder(remainder(x + y, 2) + remainder(x * y, 3), 2) = 0;
+    end;
+
+    -- The mask applied to the modules that are not of a pattern; applied
+    -- twice it is undone.
+    generic [G: Region, F: Region]
+    function applyMask(grid: &![String, G], fixed: &![String, F], size: Index, mask: Index): Unit is
+        var y: Index := 0;
+        while y < size do
+            var x: Index := 0;
+            while x < size do
+                let at: Index := (y * size) + x;
+                if (byteAt(&~fixed, at) = 0) and masked(mask, x, y) then
+                    if byteAt(&~grid, at) = 0 then
+                        storeNth(&~grid, at, oneByte);
+                    else
+                        storeNth(&~grid, at, zeroByte);
+                    end if;
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- The penalty of a mask
+    ---
+
+    -- The module at x, y, or at y, x when across is false.
+    generic [G: Region]
+    function cell(grid: &[String, G], size: Index, line: Index, k: Index, across: Bool): Nat8 is
+        if across then
+            return nthByte(grid, (line * size) + k);
+        end if;
+        return nthByte(grid, (k * size) + line);
+    end;
+
+    -- Whether the line holds at k the pattern of a finder, dark light dark
+    -- dark dark light dark, with four light modules on the side given.
+    generic [G: Region]
+    function finderLike(grid: &[String, G], size: Index, line: Index, k: Index, across: Bool, lightBefore: Bool): Bool is
+        if (k + 11) > size then
+            return false;
+        end if;
+        let pattern: Span[Nat8, Static] := "1011101";
+        var start: Index := k;
+        if lightBefore then
+            start := k + 4;
+        end if;
+        var i: Index := 0;
+        while i < 7 do
+            if cell(grid, size, line, start + i, across) /= (pattern[i] - '0') then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        var light: Index := k + 7;
+        if lightBefore then
+            light := k;
+        end if;
+        i := 0 : Index;
+        while i < 4 do
+            if cell(grid, size, line, light + i, across) /= 0 then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The penalties of rules 1 and 3 along one line.
+    generic [G: Region]
+    function linePenalty(grid: &[String, G], size: Index, line: Index, across: Bool): Index is
+        var penalty: Index := 0;
+        var run: Index := 1;
+        var k: Index := 1;
+        while k <= size do
+            if (k < size) and (cell(grid, size, line, k, across) = cell(grid, size, line, k - 1, across)) then
+                run := run + 1;
+            else
+                if run >= 5 then
+                    penalty := penalty + (run - 2);
+                end if;
+                run := 1 : Index;
+            end if;
+            k := k + 1;
+        end while;
+        k := 0 : Index;
+        while k < size do
+            if finderLike(grid, size, line, k, across, true) then
+                penalty := penalty + 40;
+            end if;
+            if finderLike(grid, size, line, k, across, false) then
+                penalty := penalty + 40;
+            end if;
+            k := k + 1;
+        end while;
+        return penalty;
+    end;
+
+    generic [G: Region]
+    function penaltyOf(grid: &[String, G], size: Index): Index is
+        var penalty: Index := 0;
+        var line: Index := 0;
+        while line < size do
+            penalty := penalty + linePenalty(grid, size, line, true);
+            penalty := penalty + linePenalty(grid, size, line, false);
+            line := line + 1;
+        end while;
+        var dark: Index := 0;
+        var y: Index := 0;
+        while y < size do
+            var x: Index := 0;
+            while x < size do
+                let here: Nat8 := nthByte(grid, (y * size) + x);
+                if here = 1 then
+                    dark := dark + 1;
+                end if;
+                if ((x + 1) < size) and ((y + 1) < size) then
+                    let right: Nat8 := nthByte(grid, ((y * size) + x) + 1);
+                    let below: Nat8 := nthByte(grid, ((y + 1) * size) + x);
+                    let corner: Nat8 := nthByte(grid, (((y + 1) * size) + x) + 1);
+                    let same: Bool := (here = right) and ((here = below) and (here = corner));
+                    if same then
+                        penalty := penalty + 3;
+                    end if;
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        -- Rule 4: ten for every five percent the dark modules are away
+        -- from half.
+        let total: Index := size * size;
+        let twice: Index := dark * 20;
+        let half: Index := total * 10;
+        var away: Index := 0;
+        if twice >= half then
+            away := twice - half;
+        else
+            away := half - twice;
+        end if;
+        let steps: Index := ((away + total) - 1) / total;
+        if steps > 0 then
+            penalty := penalty + ((steps - 1) * 10);
+        end if;
+        return penalty;
+    end;
+
+    ---
+    --- The code
+    ---
+
+    generic [R: Region]
+    function encodeQr(text: Span[Nat8, R], level: QrLevel): Option[QrCode] is
+        let mode: Index := modeOf(text);
+        let version: Index := versionFor(text, mode, level);
+        if version = 0 then
+            let none: Option[QrCode] := None();
+            return none;
+        end if;
+        let size: Index := (version * 4) + 17;
+        let data: Buffer[Nat8] := codewordsOf(text, mode, version, level);
+        let words: Buffer[Nat8] := interleaved(&data, version, level);
+        destroyFree(data);
+        var grid: String := makeString(size * size, 0);
+        var fixed: String := makeString(size * size, 0);
+        drawPatterns(&!grid, &!fixed, size, version, level);
+        placeCodewords(&!grid, &!fixed, size, &words);
+        destroyFree(words);
+        var best: Index := 0;
+        var lowest: Index := 0;
+        var mask: Index := 0;
+        while mask < 8 do
+            applyMask(&!grid, &!fixed, size, mask);
+            drawFormat(&!grid, &!fixed, size, level, mask);
+            let penalty: Index := penaltyOf(&grid, size);
+            if (mask = 0) or (penalty < lowest) then
+                best := mask;
+                lowest := penalty;
+            end if;
+            applyMask(&!grid, &!fixed, size, mask);
+            mask := mask + 1;
+        end while;
+        applyMask(&!grid, &!fixed, size, best);
+        drawFormat(&!grid, &!fixed, size, level, best);
+        destroyString(fixed);
+        let some: Option[QrCode] := Some(value => QrCode(version => version, size => size, mask => best, grid => grid));
+        return some;
+    end;
+
+    function bitValue(count: Index): Nat64 is
+        var result: Nat64 := 1;
+        var i: Index := 0;
+        while i < count do
+            result := result * 2;
+            i := i + 1;
+        end while;
+        return result;
+    end;
+
+    generic [R: Region]
+    function qrVersion(code: &[QrCode, R]): Index is
+        return code->version;
+    end;
+
+    generic [R: Region]
+    function qrSize(code: &[QrCode, R]): Index is
+        return code->size;
+    end;
+
+    generic [R: Region]
+    function qrMask(code: &[QrCode, R]): Index is
+        return code->mask;
+    end;
+
+    generic [R: Region]
+    function qrModule(code: &[QrCode, R], x: Index, y: Index): Bool is
+        if (x >= code->size) or (y >= code->size) then
+            return false;
+        end if;
+        return nthByte(&(code->grid), (y * code->size) + x) = 1;
+    end;
+
+    generic [R: Region]
+    function qrToImage(code: &[QrCode, R], scale: Index, border: Index): Option[Image] is
+        let side: Index := code->size + (border * 2);
+        if (scale = 0) or ((side * scale) > 16384) then
+            let none: Option[Image] := None();
+            return none;
+        end if;
+        let pixels: Index := side * scale;
+        var image: String := makeString(pixels * pixels, 255);
+        var y: Index := 0;
+        while y < pixels do
+            var x: Index := 0;
+            while x < pixels do
+                let mx: Index := x / scale;
+                let my: Index := y / scale;
+                if (mx >= border) and (my >= border) then
+                    if qrModule(code, mx - border, my - border) then
+                        storeNth(&!image, (y * pixels) + x, zeroByte);
+                    end if;
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        case makeImage(pixels, pixels, Gray(), image) of
+            when Right(right as made: Image) do
+                let some: Option[Image] := Some(value => made);
+                return some;
+            when Left(left as given: String) do
+                destroyString(given);
+                let none: Option[Image] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function qrCodewords(text: Span[Nat8, R], level: QrLevel): Option[String] is
+        let mode: Index := modeOf(text);
+        let version: Index := versionFor(text, mode, level);
+        if version = 0 then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let data: Buffer[Nat8] := codewordsOf(text, mode, version, level);
+        let words: Buffer[Nat8] := interleaved(&data, version, level);
+        destroyFree(data);
+        var out: String := makeString(bufferLength(&words), 0);
+        var i: Index := 0;
+        while i < bufferLength(&words) do
+            storeNth(&!out, i, nth(&words, i));
+            i := i + 1;
+        end while;
+        destroyFree(words);
+        let some: Option[String] := Some(value => out);
+        return some;
+    end;
+
+    -- The smallest version that holds text in mode at level, or 0.
+    generic [R: Region]
+    function versionFor(text: Span[Nat8, R], mode: Index, level: QrLevel): Index is
+        var v: Index := 1;
+        while v <= 40 do
+            let count: Index := countBits(mode, v);
+            let fitsCount: Bool := natOfIndex(spanLength(text)) < bitValue(count);
+            let needed: Index := (count + 4) + dataBits(mode, spanLength(text));
+            if fitsCount and (needed <= (dataCodewords(level, v) * 8)) then
+                return v;
+            end if;
+            v := v + 1;
+        end while;
+        return noIndex;
+    end;
+
+    function destroyQr(code: QrCode): Unit is
+        let { version: Index, size: Index, mask: Index, grid: String } := code;
+        destroyString(grid);
+        return nil;
+    end;
+end module body.

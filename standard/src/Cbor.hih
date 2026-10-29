@@ -1,0 +1,272 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+CBOR as RFC 8949 defines it, read strictly into a document and looked into by items.
+
+- An item is checked from its first byte to its last when it is read, and the document kept.
+- Only the shortest head of a number or a length is taken, as deterministic encoding asks.
+- Indefinite lengths, tags and simple values other than false, true, null and undefined are refused.
+- Nesting deeper than mostDepth and a map of more than mostEntries pairs are refused.
+- A key twice in one map is refused, compared by its encoded bytes.
+- Text strings are checked to be UTF-8.
+- Reading refuses rather than guesses, and a refusal names the fault and the byte offset.
+- Nothing here aborts on bad input; time linear in the length times mostEntries.
+
+    case readCbor(asSpan(&coseKey)) of
+        when Right(right as key: Cbor) do
+            let top: CborItem := rootOf(&key);
+            let entries: Option[Index] := countOf(&key, top);
+            destroyCbor(key);
+        when Left(left as refused: CborError) do
+            printLn(refused.offset);
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.String (
+    String
+);
+
+module Standard.Cbor is
+    """
+    Why a text was refused.
+    """
+    union CborFault: Free is
+        """
+        The bytes end inside an item, or a length is longer than the bytes left.
+        """
+        case Truncated;
+        """
+        The head of an item uses one of the additional values 28, 29 or 30.
+        """
+        case Malformed;
+        """
+        An item of indefinite length, or a break byte.
+        """
+        case Indefinite;
+        """
+        A number or a length written longer than it needs.
+        """
+        case NotShortest;
+        """
+        A tag, which this reader does not take.
+        """
+        case Tagged;
+        """
+        A simple value other than false, true, null and undefined.
+        """
+        case UnknownSimple;
+        """
+        Arrays and maps nested deeper than mostDepth.
+        """
+        case TooDeep;
+        """
+        A map with more than mostEntries pairs.
+        """
+        case TooLarge;
+        """
+        A key that the map holds already.
+        """
+        case DuplicateKey;
+        """
+        A text string that is not UTF-8.
+        """
+        case BadText;
+        """
+        Bytes after the item where readCbor wants the item alone.
+        """
+        case Trailing;
+    end;
+
+    """
+    A refusal: the fault and the offset of the byte where it was found.
+    """
+    record CborError: Free is
+        fault: CborFault;
+        offset: Index;
+    end;
+
+    """
+    What an item is.  CborUnsigned is a major type 0 number, CborNegative a
+    major type 1 number, CborFloat a half, single or double float.
+    """
+    union CborKind: Free is
+        case CborUnsigned;
+        case CborNegative;
+        case CborBytes;
+        case CborText;
+        case CborArray;
+        case CborMap;
+        case CborFalse;
+        case CborTrue;
+        case CborNull;
+        case CborUndefined;
+        case CborFloat;
+    end;
+
+    """
+    How deep arrays and maps may nest.
+    """
+    constant mostDepth: Index;
+
+    """
+    How many pairs one map may hold.
+    """
+    constant mostEntries: Index;
+
+    """
+    A document that was read: the bytes of one item, checked.
+    """
+    type Cbor: Linear;
+
+    """
+    One item inside a document, as rootOf and the functions that go into
+    arrays and maps give it.  An item belongs to the document it came
+    from; given to another, it reads that document's bytes at its place
+    and gives None where they make no item.
+    """
+    type CborItem: Free;
+
+    -- The readers return Either and the functions that look into a
+    -- document return Option: what they give depends on the bytes, so they
+    -- state no ensures.
+
+    """
+    Reads data as exactly one item.  Left names the fault and its offset;
+    bytes after the item are refused as Trailing.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function readCbor(data: Span[Nat8, R]): Either[CborError, Cbor];
+
+    """
+    Reads the first item of data and leaves what follows, as when a CBOR
+    item stands inside other bytes.  usedBytes then says where it ended.
+    No contract: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function readCborPrefix(data: Span[Nat8, R]): Either[CborError, Cbor];
+
+    """
+    Gives the document back.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyCbor(document: Cbor): Unit;
+
+    """
+    How many bytes the item of the document took.
+    """
+    generic [R: Region]
+    function usedBytes(document: &[Cbor, R]): Index
+        ensures result > 0;
+
+    """
+    The item the document is.
+    No contract: a value of its own type built from its arguments; no property cheaper than its type holds.
+    """
+    generic [R: Region]
+    function rootOf(document: &[Cbor, R]): CborItem;
+
+    """
+    What the item is.  None when there is no item at its place.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function kindOf(document: &[Cbor, R], item: CborItem): Option[CborKind];
+
+    """
+    The number of a CborUnsigned item.  None for any other item.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function unsignedOf(document: &[Cbor, R], item: CborItem): Option[Nat64];
+
+    """
+    The number of a CborUnsigned or CborNegative item.  None for any other
+    item and for a number outside Int64.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function integerOf(document: &[Cbor, R], item: CborItem): Option[Int64];
+
+    """
+    A copy of the bytes of a CborBytes item.  None for any other item.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function bytesOf(document: &[Cbor, R], item: CborItem): Option[String];
+
+    """
+    A copy of the text of a CborText item, UTF-8.  None for any other item.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function textOf(document: &[Cbor, R], item: CborItem): Option[String];
+
+    """
+    The value of a CborFalse or CborTrue item.  None for any other item.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function boolOf(document: &[Cbor, R], item: CborItem): Option[Bool];
+
+    """
+    How many items an array holds, or how many pairs a map holds.  None
+    for any other item.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function countOf(document: &[Cbor, R], item: CborItem): Option[Index];
+
+    """
+    The item at place n of an array, counted from 0.  None for any other
+    item and when n is not below its count.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function nthOf(document: &[Cbor, R], item: CborItem, n: Index): Option[CborItem];
+
+    """
+    The key of pair n of a map, counted from 0.  None for any other item
+    and when n is not below its count.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function keyOf(document: &[Cbor, R], item: CborItem, n: Index): Option[CborItem];
+
+    """
+    The value of pair n of a map, counted from 0.  None for any other item
+    and when n is not below its count.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function valueOf(document: &[Cbor, R], item: CborItem, n: Index): Option[CborItem];
+
+    """
+    The value under the text key name in a map.  None for any other item
+    and when the map has no such key.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function textKey(document: &[Cbor, R], item: CborItem, name: Span[Nat8, S]): Option[CborItem];
+
+    """
+    The value under the integer key in a map, as COSE keys use them.  None
+    for any other item and when the map has no such key.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function integerKey(document: &[Cbor, R], item: CborItem, key: Int64): Option[CborItem];
+
+    """
+    A copy of the encoded bytes of the item, head and content.  None when
+    there is no item at its place.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function encodedOf(document: &[Cbor, R], item: CborItem): Option[String];
+end module.

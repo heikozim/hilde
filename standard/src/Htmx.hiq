@@ -1,0 +1,144 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    length,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile
+);
+import Standard.FcgiServer (
+    isFieldValue,
+    isHeaderBlock,
+    cgiResponseWith
+);
+
+module body Standard.Htmx is
+    function requestVariable(): Span[Nat8, Static] is
+        return "HTTP_HX_REQUEST";
+    end;
+
+    generic [R: Region]
+    function isHtmxRequest(hxRequest: Span[Nat8, R]): Bool is
+        if spanLength(hxRequest) /= 4 then
+            return false;
+        end if;
+        return (((hxRequest[0] = 't') and (hxRequest[1] = 'r')) and (hxRequest[2] = 'u')) and (hxRequest[3] = 'e');
+    end;
+
+    function isEventByte(byte: Nat8): Bool is
+        if (byte >= 'a') and (byte <= 'z') then
+            return true;
+        end if;
+        if (byte >= 'A') and (byte <= 'Z') then
+            return true;
+        end if;
+        if (byte >= '0') and (byte <= '9') then
+            return true;
+        end if;
+        return (((byte = '-') or (byte = '_')) or (byte = ':')) or (byte = '.');
+    end;
+
+    generic [R: Region]
+    function isEventName(name: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(name);
+        if (size = 0) or (size > 128) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if not isEventByte(name[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function headerLine(name: Span[Nat8, Static], value: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, name);
+        writeString(&!out, ": ");
+        writeString(&!out, value);
+        writeString(&!out, "\r\n");
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function redirectHeader(url: Span[Nat8, R]): String is
+        return headerLine("HX-Redirect", url);
+    end;
+
+    generic [R: Region]
+    function triggerHeader(event: Span[Nat8, R]): String is
+        return headerLine("HX-Trigger", event);
+    end;
+
+    function varyHeader(): Span[Nat8, Static] is
+        return "Vary: HX-Request\r\n";
+    end;
+
+    generic [H: Region, B: Region]
+    function htmlResponse(status: Nat16, headers: Span[Nat8, H], content: Span[Nat8, B]): String is
+        var lines: StringBuilder := makeStringBuilder();
+        writeString(&!lines, varyHeader());
+        writeString(&!lines, headers);
+        let block: String := finalize(lines);
+        let output: String := cgiResponseWith(status, "text/html; charset=utf-8", asSpan(&block), content);
+        destroyString(block);
+        return output;
+    end;
+
+    function scriptLimit(): Index is
+        return 1048576;
+    end;
+
+    function emptyAnswer(status: Nat16): String is
+        return cgiResponseWith(status, "text/plain; charset=utf-8", "", "");
+    end;
+
+    generic [R: Region]
+    function scriptResponse(path: Span[Nat8, R]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case read of
+                    when Some(value as script: String) do
+                        var output: String := emptyAnswer(404);
+                        if closed and (length(&script) <= scriptLimit()) then
+                            destroyString(output);
+                            output := cgiResponseWith(200, "text/javascript; charset=utf-8",
+                                "Cache-Control: public, max-age=86400\r\n", asSpan(&script));
+                        else if closed then
+                            destroyString(output);
+                            output := emptyAnswer(500);
+                        end if;
+                        destroyString(script);
+                        return output;
+                    when None do
+                        return emptyAnswer(404);
+                end case;
+            when None do
+                return emptyAnswer(404);
+        end case;
+    end;
+end module body.

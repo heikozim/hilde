@@ -1,0 +1,1 @@
+Test that openAppend sets the mode only on a file it made: a file there at 0600 stays 0600 when opened with 0644, a new file gets 0640 whatever the umask, and a symbolic link at the path is refused and its target keeps its mode.

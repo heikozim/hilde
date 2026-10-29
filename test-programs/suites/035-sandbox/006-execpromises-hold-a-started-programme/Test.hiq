@@ -1,0 +1,223 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    closeFile,
+    readAll,
+    connectUnix,
+    Command,
+    makeCommand,
+    addArgument,
+    Process,
+    Running,
+    spawnProcess,
+    waitProcess,
+    ProcessStatus,
+    exitedNormally,
+    exitCode,
+    endedBySignal,
+    signalNumber
+);
+import Standard.Sandbox (
+    Policy,
+    Report,
+    makePolicy,
+    allowPromises,
+    allowExecPromises,
+    allowPath,
+    applyPolicy,
+    reportHas,
+    mechanismPledge,
+    mechanismExecPromises
+);
+
+module body Test is
+    -- Three programmes in one: the test starts a middle programme twice,
+    -- and each middle programme confines itself and starts the last one,
+    -- which opens a Unix socket.  With execpromises of stdio and rpath the
+    -- last one is held to them and stopped with the abort signal; without
+    -- them it runs free and its call fails only because the socket does
+    -- not exist.
+
+    -- The last programme: opens a Unix socket, which needs the promise
+    -- unix.
+    function last(): ExitCode is
+        let path: String := fromLiteral("/nonexistent-hilde-035/socket");
+        case connectUnix(asSpan(&path)) of
+            when Some(value as socket: FileDescriptor) do
+                closeFile(socket);
+            when None do
+                skip;
+        end case;
+        destroyString(path);
+        printLn("the call went through");
+        return ExitSuccess();
+    end;
+
+    -- Starts this programme with the one argument; the child's output and
+    -- how it ended.
+    generic [R: Region]
+    function start(mode: &[String, R]): Unit is
+        let self: String := fromLiteral(nthArgument(0));
+        let command: Command := addArgument(makeCommand(asSpan(&self)), asSpan(mode));
+        destroyString(self);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                var fromChild: FileDescriptor := output;
+                var saidBytes: Index := 0;
+                case readAll(&!fromChild) of
+                    when Some(value as text: String) do
+                        saidBytes := length(&text);
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                closeFile(fromChild);
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                -- The abort signal is 6 on both platforms this project
+                -- builds for.
+                if endedBySignal(status) and (signalNumber(status) = 6) then
+                    printLn("the call was stopped");
+                else
+                    if (exitedNormally(status) and (exitCode(status) = 0)) and (saidBytes > 0) then
+                        printLn("the call went through");
+                    else
+                        printLn("the last programme ended otherwise");
+                    end if;
+                end if;
+            when None do
+                printLn("the last programme did not start");
+        end case;
+        return nil;
+    end;
+
+    -- The middle programme: pledged to what starting a programme needs,
+    -- with the execpromises stdio and rpath when withExec is true, and the
+    -- whole file system unveiled to read and execute.
+    function middle(withExec: Bool): ExitCode is
+        let promises: String := fromLiteral("stdio rpath proc exec");
+        let later: String := fromLiteral("stdio rpath");
+        let root: String := fromLiteral("/");
+        let readExecute: String := fromLiteral("rx");
+        let devices: String := fromLiteral("/dev");
+        let readWrite: String := fromLiteral("rw");
+        var policy: Policy := allowPath(allowPath(allowPromises(makePolicy(), asSpan(&promises)),
+            asSpan(&root), asSpan(&readExecute)),
+            asSpan(&devices), asSpan(&readWrite));
+        if withExec then
+            policy := allowExecPromises(policy, asSpan(&later));
+        end if;
+        let report: Report := applyPolicy(policy);
+        destroyString(promises);
+        destroyString(later);
+        destroyString(root);
+        destroyString(readExecute);
+        destroyString(devices);
+        destroyString(readWrite);
+        if not reportHas(report, mechanismPledge) then
+            printLn("no pledge here");
+        else
+            if withExec and (not reportHas(report, mechanismExecPromises)) then
+                printLn("the execpromises were not taken");
+            else
+                let mode: String := fromLiteral("last");
+                start(&mode);
+                destroyString(mode);
+            end if;
+        end if;
+        return ExitSuccess();
+    end;
+
+    -- Runs a middle programme and returns what it printed.
+    generic [R: Region]
+    function said(mode: &[String, R]): String is
+        let self: String := fromLiteral(nthArgument(0));
+        let command: Command := addArgument(makeCommand(asSpan(&self)), asSpan(mode));
+        destroyString(self);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor,
+                    output: FileDescriptor, errors: FileDescriptor } := running;
+                closeFile(input);
+                var fromChild: FileDescriptor := output;
+                var text: String := fromLiteral("");
+                case readAll(&!fromChild) of
+                    when Some(value as got: String) do
+                        destroyString(text);
+                        text := got;
+                    when None do
+                        skip;
+                end case;
+                closeFile(fromChild);
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                return text;
+            when None do
+                return fromLiteral("");
+        end case;
+    end;
+
+    -- Whether text is exactly expected and one newline.
+    generic [R: Region]
+    function isLine(text: &[String, R], expected: Span[Nat8, Static]): Bool is
+        let want: String := fromLiteral(expected);
+        let size: Index := length(&want);
+        var same: Bool := length(text) = (size + 1);
+        if same then
+            for i from 0 to size - 1 do
+                if nthByte(text, i) /= nthByte(&want, i) then
+                    same := false;
+                end if;
+            end for;
+            if nthByte(text, size) /= '\n' then
+                same := false;
+            end if;
+        end if;
+        destroyString(want);
+        return same;
+    end;
+
+    function main(): ExitCode is
+        if argumentCount() > 1 then
+            let mode: String := fromLiteral(nthArgument(1));
+            let first: Nat8 := nthByte(&mode, 0);
+            let size: Index := length(&mode);
+            destroyString(mode);
+            if first = 'l' then
+                return last();
+            else
+                return middle(size = 4);
+            end if;
+        end if;
+        let held: String := fromLiteral("exec");
+        let plainMode: String := fromLiteral("plain");
+        let withExec: String := said(&held);
+        let without: String := said(&plainMode);
+        let pledgeHere: Bool := not isLine(&withExec, "no pledge here");
+        if (isLine(&withExec, "the call was stopped") and pledgeHere) or (not pledgeHere) then
+            printLn("with execpromises a started programme is held to them, where there is pledge");
+        else
+            printLn("a started programme was not held to the execpromises");
+        end if;
+        if isLine(&without, "the call went through") or isLine(&without, "no pledge here") then
+            printLn("without execpromises a started programme runs free");
+        else
+            printLn("a started programme was held without execpromises");
+        end if;
+        destroyString(held);
+        destroyString(plainMode);
+        destroyString(withExec);
+        destroyString(without);
+        return ExitSuccess();
+    end;
+end module body.

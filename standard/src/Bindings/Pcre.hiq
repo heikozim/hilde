@@ -1,0 +1,423 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Binds the 8-bit library of PCRE2 through the declarations of
+-- Bindings.C.Pcre2, generated from bindings/fixtures/pcre2.h, a copy of
+-- the declarations of pcre2.h that scripts/pcre/check-header.sh holds
+-- against the real header on each platform.  It hands addresses to C, so
+-- it is an unsafe module; Standard.Pcre is the safe module built on it.
+-- What goes in is a span or a String the caller holds, what comes out is
+-- a String or a Buffer of its own, and nothing of the memory of PCRE2 is
+-- handed out.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullPointer,
+    nullCheck,
+    allocateBuffer,
+    load,
+    store
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack
+);
+import Standard.String (
+    String,
+    length,
+    getSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Bindings.C.Pcre2 (
+    PCRE2_ERROR_NOMATCH,
+    PCRE2_INFO_CAPTURECOUNT,
+    PCRE2_JIT_COMPLETE,
+    PCRE2_CONFIG_JIT,
+    PCRE2_CONFIG_VERSION,
+    pcre2_config_8,
+    pcre2_jit_compile_8,
+    pcre2_jit_stack_create_8,
+    pcre2_jit_stack_assign_8,
+    pcre2_jit_stack_free_8,
+    pcre2_compile_8,
+    pcre2_code_free_8,
+    pcre2_pattern_info_8,
+    pcre2_match_data_create_from_pattern_8,
+    pcre2_match_8,
+    pcre2_match_data_free_8,
+    pcre2_get_ovector_pointer_8,
+    pcre2_match_context_create_8,
+    pcre2_match_context_free_8,
+    pcre2_set_match_limit_8,
+    pcre2_set_heap_limit_8,
+    pcre2_get_error_message_8
+);
+
+module body Bindings.Pcre is
+    -- Nothing here: an unset group, and no byte offset in a message.
+    constant noSlot: Index := 4294967295;
+    constant zero: Index := 0;
+    constant ten: Index := 10;
+    constant noOptions: Nat32 := 0;
+
+    -- The message buffer.  pcre2_get_error_message truncates to the size it
+    -- is given and says so with a negative result, never writes past it.
+    constant messageSize: Index := 256;
+
+    -- The stack of the searches through machine code of the JIT.  Without
+    -- one, PCRE2 takes 32 KiB of the machine stack, half of the stack of a
+    -- task; this one is mapped by openSearcher, given back by
+    -- closeSearcher, and grows up to its maximum only as far as a search
+    -- needs.  A search that needs more fails with the message of PCRE2 for
+    -- PCRE2_ERROR_JIT_STACKLIMIT.
+    constant jitStackStart: Index := 32768;
+    constant jitStackMax: Index := 67108864;
+
+    -- The memory in KiB the interpreter may take for the backtracking of
+    -- one search, 512 MiB.  Without it the limit of PCRE2 is about 19 GiB, so a
+    -- deep search fails with no more memory or with the depth limit,
+    -- depending on what the host lets a process have.  With it the search
+    -- fails with heap limit exceeded on every host, long before that.
+    constant heapLimit: Nat32 := 524288;
+
+    -- jit is true once jitCode made machine code for code.
+    record Code: Linear is
+        code: Address[Unit];
+        limit: Nat32;
+        groups: Index;
+        jit: Bool;
+    end;
+
+    ---
+    --- Addresses
+    ---
+
+    -- The first byte of a span, never null (an empty span points at an
+    -- empty string, of which PCRE2 reads nothing).
+    generic [R: Region]
+    function bytesOf(value: Span[Nat8, R]): Address[Nat8] is
+        if spanLength(value) = 0 then
+            return @embed(Address[Nat8], "(hilde_nat8_t*)\"\"");
+        end if;
+        return @embed(Address[Nat8], "(hilde_nat8_t*)($1).data", value);
+    end;
+
+    function isNull(address: Address[Unit]): Bool is
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[Unit]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function release(address: Address[Unit]): Unit is
+        @embed(Unit, "hilde_free($1)", address);
+        return nil;
+    end;
+
+    ---
+    --- Messages
+    ---
+
+    generic [B: Region]
+    function writeText(out: &![StringBuilder, B], text: Span[Nat8, Static]): Unit is
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        while i < size do
+            writeByte(&~out, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [B: Region]
+    function writeNumber(out: &![StringBuilder, B], value: Index): Unit is
+        if value >= ten then
+            writeNumber(&~out, value / ten);
+        end if;
+        let digit: Index := value - ((value / ten) * ten);
+        case toNat8(digit) of
+            when Some(value as d: Nat8) do
+                writeByte(&~out, d + '0');
+            when None do
+                abort("Standard.Pcre: digit");
+        end case;
+        return nil;
+    end;
+
+    -- "Standard.Pcre: " and the message of PCRE2, and " at byte " and the
+    -- offset when at is not noSlot.
+    function errorText(code: Int32, at: Index): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeText(&!out, "Standard.Pcre: ");
+        let buffer: Address[Nat8] := allocateBuffer(messageSize);
+        case nullCheck(buffer) of
+            when Some(value as p: Pointer[Nat8]) do
+                -- 0 is no error to PCRE2, whose message would say so;
+                -- pcre2_match answers it when the match data holds too few
+                -- pairs of offsets.
+                if code = 0 then
+                    writeText(&!out, "the match data held too few offsets");
+                else
+                    let written: Int32 := pcre2_get_error_message_8(code, buffer, messageSize);
+                    case toIndex(written) of
+                        when Some(value as size: Index) do
+                            var i: Index := 0;
+                            while i < size do
+                                writeByte(&!out, @embed(Nat8, "($1)[$2]", buffer, i));
+                                i := i + 1;
+                            end while;
+                        when None do
+                            -- Negative: PCRE2 knows no message for the code.
+                            writeText(&!out, "unknown error");
+                    end case;
+                end if;
+                @embed(Unit, "hilde_free($1)", buffer);
+            when None do
+                abort("Standard.Pcre: out of memory");
+        end case;
+        if at /= noSlot then
+            writeText(&!out, " at byte ");
+            writeNumber(&!out, at);
+        end if;
+        return finalize(out);
+    end;
+
+    ---
+    --- Compile
+    ---
+
+    generic [R: Region]
+    function compileCode(pattern: Span[Nat8, R], matchLimit: Nat32): Either[String, Code] is
+        let codeSlot: Address[Int32] := allocateBuffer(1);
+        let offsetSlot: Address[Index] := allocateBuffer(1);
+        case nullCheck(codeSlot) of
+            when Some(value as codeCell: Pointer[Int32]) do
+                case nullCheck(offsetSlot) of
+                    when Some(value as offsetCell: Pointer[Index]) do
+                        store(codeCell, 0);
+                        store(offsetCell, zero);
+                        let noContext: Address[Unit] := nullPointer();
+                        let code: Address[Unit] := pcre2_compile_8(bytesOf(pattern), spanLength(pattern),
+                            noOptions, codeSlot, offsetSlot, noContext);
+                        let errorCode: Int32 := load(codeCell);
+                        let offset: Index := load(offsetCell);
+                        @embed(Unit, "hilde_free($1)", codeSlot);
+                        @embed(Unit, "hilde_free($1)", offsetSlot);
+                        if isNull(code) then
+                            let left: Either[String, Code] := Left(left => errorText(errorCode, offset));
+                            return left;
+                        end if;
+                        let right: Either[String, Code] :=
+                            Right(right => Code(code => code, limit => matchLimit, groups => captureCount(code), jit => false));
+                        return right;
+                    when None do
+                        abort("Standard.Pcre: out of memory");
+                end case;
+            when None do
+                abort("Standard.Pcre: out of memory");
+        end case;
+    end;
+
+    function captureCount(code: Address[Unit]): Index is
+        let slot: Address[Nat32] := allocateBuffer(1);
+        case nullCheck(slot) of
+            when Some(value as cell: Pointer[Nat32]) do
+                store(cell, noOptions);
+                let rc: Int32 := pcre2_pattern_info_8(code, PCRE2_INFO_CAPTURECOUNT,
+                    @embed(Address[Unit], "(void*)$1", slot));
+                let count: Nat32 := load(cell);
+                @embed(Unit, "hilde_free($1)", slot);
+                if rc /= 0 then
+                    abort("Standard.Pcre: pcre2_pattern_info refused the capture count");
+                end if;
+                case toIndex(count) of
+                    when Some(value as groups: Index) do
+                        return groups;
+                    when None do
+                        abort("Standard.Pcre: capture count");
+                end case;
+            when None do
+                abort("Standard.Pcre: out of memory");
+        end case;
+    end;
+
+    function destroyCode(compiled: Code): Unit is
+        let { code: Address[Unit], limit: Nat32, groups: Index, jit: Bool } := compiled;
+        pcre2_code_free_8(code);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function codeGroups(compiled: &[Code, R]): Index is
+        return compiled->groups;
+    end;
+
+    ---
+    --- The JIT
+    ---
+
+    function jitBuiltIn(): Bool is
+        let slot: Address[Nat32] := allocateBuffer(1);
+        case nullCheck(slot) of
+            when Some(value as cell: Pointer[Nat32]) do
+                store(cell, noOptions);
+                let rc: Int32 := pcre2_config_8(PCRE2_CONFIG_JIT, @embed(Address[Unit], "(void*)$1", slot));
+                let built: Nat32 := load(cell);
+                @embed(Unit, "hilde_free($1)", slot);
+                if rc < 0 then
+                    abort("Standard.Pcre: pcre2_config refused PCRE2_CONFIG_JIT");
+                end if;
+                return built /= noOptions;
+            when None do
+                abort("Standard.Pcre: out of memory");
+        end case;
+    end;
+
+    -- PCRE2 changes the compiled code in place: it hangs the machine code
+    -- on it.  So this takes the pattern mutably, before any search shares it.
+    generic [R: Region]
+    function jitCode(compiled: &![Code, R]): Int32 is
+        let rc: Int32 := pcre2_jit_compile_8(compiled->code, PCRE2_JIT_COMPLETE);
+        if rc = 0 then
+            compiled->jit := true;
+        end if;
+        return rc;
+    end;
+
+    generic [R: Region]
+    function codeJit(compiled: &[Code, R]): Bool is
+        return compiled->jit;
+    end;
+
+    ---
+    --- Search
+    ---
+
+    -- What the searches of one pattern need besides the pattern: match
+    -- data sized for its groups, a match context with its limit, and, for
+    -- machine code of the JIT, a stack.  Made once and used for every
+    -- search of a find_all, so that a search costs no allocation; it
+    -- belongs to one caller, so the compiled pattern is only read.
+    record Searcher: Linear is
+        data: Address[Unit];
+        context: Address[Unit];
+        stack: Address[Unit];
+        jit: Bool;
+    end;
+
+    generic [R: Region]
+    function openSearcher(regex: &[Code, R]): Searcher is
+        let noContext: Address[Unit] := nullPointer();
+        let data: Address[Unit] := pcre2_match_data_create_from_pattern_8(regex->code, noContext);
+        if isNull(data) then
+            abort("Standard.Pcre: out of memory");
+        end if;
+        let context: Address[Unit] := pcre2_match_context_create_8(noContext);
+        if isNull(context) then
+            abort("Standard.Pcre: out of memory");
+        end if;
+        if pcre2_set_match_limit_8(context, regex->limit) /= 0 then
+            abort("Standard.Pcre: pcre2_set_match_limit refused the limit");
+        end if;
+        if pcre2_set_heap_limit_8(context, heapLimit) /= 0 then
+            abort("Standard.Pcre: pcre2_set_heap_limit refused the limit");
+        end if;
+        var stack: Address[Unit] := nullPointer();
+        if regex->jit then
+            stack := pcre2_jit_stack_create_8(jitStackStart, jitStackMax, noContext);
+            if isNull(stack) then
+                abort("Standard.Pcre: out of memory");
+            end if;
+            let noCallback: Address[Unit] := nullPointer();
+            pcre2_jit_stack_assign_8(context, noCallback, stack);
+        end if;
+        return Searcher(data => data, context => context, stack => stack, jit => regex->jit);
+    end;
+
+    function closeSearcher(searcher: Searcher): Unit is
+        let { data: Address[Unit], context: Address[Unit], stack: Address[Unit], jit: Bool } := searcher;
+        pcre2_match_context_free_8(context);
+        pcre2_match_data_free_8(data);
+        if jit then
+            pcre2_jit_stack_free_8(stack);
+        end if;
+        return nil;
+    end;
+
+    generic [Q: Region, R: Region, S: Region]
+    function searchWith(searcher: &![Searcher, Q], regex: &[Code, R], text: Span[Nat8, S], start: Index): Either[Int32, Option[Buffer[Index]]] is
+        let size: Index := spanLength(text);
+        let data: Address[Unit] := searcher->data;
+        let rc: Int32 := pcre2_match_8(regex->code, bytesOf(text), size, start, noOptions, data, searcher->context);
+        if rc > 0 then
+            var slots: Buffer[Index] := allocateEmpty();
+            let vector: Address[Index] := pcre2_get_ovector_pointer_8(data);
+            let count: Index := (regex->groups + 1) * 2;
+            var i: Index := 0;
+            while i < count do
+                let v: Index := @embed(Index, "($1)[$2]", vector, i);
+                if v > size then
+                    insertBack(&!slots, noSlot);
+                else
+                    insertBack(&!slots, v);
+                end if;
+                i := i + 1;
+            end while;
+            let found: Either[Int32, Option[Buffer[Index]]] := Right(right => Some(value => slots));
+            return found;
+        end if;
+        if rc = PCRE2_ERROR_NOMATCH then
+            let absent: Option[Buffer[Index]] := None();
+            let nothing: Either[Int32, Option[Buffer[Index]]] := Right(right => absent);
+            return nothing;
+        end if;
+        let failed: Either[Int32, Option[Buffer[Index]]] := Left(left => rc);
+        return failed;
+    end;
+
+    generic [R: Region, S: Region]
+    function search(regex: &[Code, R], text: Span[Nat8, S], start: Index): Either[Int32, Option[Buffer[Index]]] is
+        var searcher: Searcher := openSearcher(regex);
+        let result: Either[Int32, Option[Buffer[Index]]] := searchWith(&!searcher, regex, text, start);
+        closeSearcher(searcher);
+        return result;
+    end;
+
+    function libraryVersion(): String is
+        var out: StringBuilder := makeStringBuilder();
+        let buffer: Address[Nat8] := allocateBuffer(messageSize);
+        case nullCheck(buffer) of
+            when Some(value as p: Pointer[Nat8]) do
+                -- The answer counts the code units with the zero at the end.
+                let rc: Int32 := pcre2_config_8(PCRE2_CONFIG_VERSION, @embed(Address[Unit], "(void*)$1", buffer));
+                case toIndex(rc) of
+                    when Some(value as size: Index) do
+                        var i: Index := 0;
+                        while (i + 1) < size do
+                            writeByte(&!out, @embed(Nat8, "($1)[$2]", buffer, i));
+                            i := i + 1;
+                        end while;
+                    when None do
+                        skip;
+                end case;
+                @embed(Unit, "hilde_free($1)", buffer);
+            when None do
+                abort("Standard.Pcre: out of memory");
+        end case;
+        return finalize(out);
+    end;
+end module body.

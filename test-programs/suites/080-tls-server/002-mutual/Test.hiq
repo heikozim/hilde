@@ -1,0 +1,368 @@
+-- Standard.Tls with mutual TLS: certificates made at run time by
+-- scripts/tls/mutual-certificates.sh, a server of makeVerifyingServer that
+-- asks every client for a certificate of ca.pem, and four clients as
+-- tasks: one with the client certificate of ca.pem, whose subject and
+-- hash the server reads; one with no certificate; one with a certificate
+-- that signs itself; and the first again against a server whose CA came
+-- from memory.  Only the client of ca.pem gets its echo.
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    startsWith
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    TcpListener,
+    ConnectFailure,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    openRead,
+    readAll,
+    closeFile,
+    listenTcp,
+    tcpListenerPort,
+    acceptTcpWithin,
+    closeTcpListener,
+    connectTcp
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    closeScope,
+    spawn,
+    join
+);
+import Standard.Tls (
+    Client,
+    Server,
+    connectOver,
+    connectOverAs,
+    peerCertificateProvided,
+    peerSubject,
+    peerHash,
+    send,
+    receiveWithin,
+    closeClient,
+    makeVerifyingServer,
+    makeVerifyingServerFromMemory,
+    acceptOver,
+    closeServer
+);
+
+module body Test is
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        writeString(&!out, rest);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    function makeCertificates(): Bool is
+        let shell: String := fromLiteral("/bin/sh");
+        let script: String := inTree("/scripts/tls/mutual-certificates.sh");
+        let here: String := fromLiteral(".");
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&shell)), asSpan(&script)), asSpan(&here));
+        destroyString(shell);
+        destroyString(script);
+        destroyString(here);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                let closedInput: Bool := closeFile(input);
+                var out: FileDescriptor := output;
+                var err: FileDescriptor := errors;
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                case readAll(&!err) of
+                    when Some(value as text: String) do
+                        printText(&text);
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                let closedOut: Bool := closeFile(out);
+                let closedErr: Bool := closeFile(err);
+                let status: ProcessStatus := waitProcess(process);
+                return exitedNormally(status) and (exitCode(status) = 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function readFile(name: Span[Nat8, Static]): String is
+        case openRead(name) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var text: String := fromLiteral("");
+                case readAll(&!file) of
+                    when Some(value as read: String) do
+                        destroyString(text);
+                        text := read;
+                    when None do
+                        skip;
+                end case;
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return fromLiteral("");
+        end case;
+    end;
+
+    function loopback(): String is
+        var address: String := makeString(4, 0);
+        let first: Nat8 := 127;
+        let last: Nat8 := 1;
+        storeNth(&!address, 0, first);
+        storeNth(&!address, 3, last);
+        return address;
+    end;
+
+    -- After the handshake: a line sent, its echo read.  A server that
+    -- refused the certificate after the client's handshake ended shows up
+    -- here, as a read that fails or gets nothing.
+    function talk(opened: Client, label: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var client: Client := opened;
+        var echoed: Bool := false;
+        case send(&!client, "hello\n") of
+            when Right(right as sent: Unit) do
+                case receiveWithin(&!client, 1024, 5000) of
+                    when Right(right as got: String) do
+                        if length(&got) > 0 then
+                            echoed := true;
+                            writeString(&!out, label);
+                            writeString(&!out, ": received ");
+                            writeString(&!out, asSpan(&got));
+                        end if;
+                        destroyString(got);
+                    when Left(left as message: String) do
+                        destroyString(message);
+                end case;
+            when Left(left as message: String) do
+                destroyString(message);
+        end case;
+        closeClient(client);
+        if not echoed then
+            writeString(&!out, label);
+            writeString(&!out, ": no echo, the server refused it\n");
+        end if;
+        return finalize(out);
+    end;
+
+    -- The client's handshake over socket, with the certificate and key
+    -- when they are given, without a certificate when they are empty.
+    function handshake(socket: FileDescriptor, certificate: Span[Nat8, Static], key: Span[Nat8, Static]): Either[String, Client] is
+        if spanLength(certificate) > 0 then
+            return connectOverAs(socket, "localhost", "ca.pem", certificate, key, 5000);
+        else
+            return connectOver(socket, "localhost", "ca.pem", 5000);
+        end if;
+    end;
+
+    -- A client over a new TCP connection: with the certificate of name
+    -- when name is not empty, without one when it is.
+    function clientAs(port: Nat16, certificate: Span[Nat8, Static], key: Span[Nat8, Static], label: Span[Nat8, Static]): String is
+        let address: String := loopback();
+        var report: String := fromLiteral("");
+        case connectTcp(asSpan(&address), port, 5000) of
+            when Right(right as socket: FileDescriptor) do
+                case handshake(socket, certificate, key) of
+                    when Right(right as opened: Client) do
+                        destroyString(report);
+                        report := talk(opened, label);
+                    when Left(left as message: String) do
+                        destroyString(message);
+                        var out: StringBuilder := makeStringBuilder();
+                        writeString(&!out, label);
+                        writeString(&!out, ": no echo, the server refused it\n");
+                        destroyString(report);
+                        report := finalize(out);
+                end case;
+            when Left(left as failure: ConnectFailure) do
+                destroyString(report);
+                report := fromLiteral("connect failed\n");
+        end case;
+        destroyString(address);
+        return report;
+    end;
+
+    function member(port: Nat16): String is
+        return clientAs(port, "client.pem", "client-key.pem", "member");
+    end;
+
+    function anonymous(port: Nat16): String is
+        return clientAs(port, "", "", "anonymous");
+    end;
+
+    function stranger(port: Nat16): String is
+        return clientAs(port, "stranger.pem", "stranger-key.pem", "stranger");
+    end;
+
+    -- One connection: the handshake, then what the server knows of the
+    -- client's certificate, and the echo.
+    generic [L: Region, S: Region]
+    function serveOne(listener: &[TcpListener, L], server: &[Server, S]): Unit is
+        case acceptTcpWithin(listener, 5000) of
+            when Some(value as socket: FileDescriptor) do
+                case acceptOver(server, socket, 5000) of
+                    when Right(right as opened: Client) do
+                        var connection: Client := opened;
+                        print("server: the client presented a certificate: ");
+                        printLn(peerCertificateProvided(&connection));
+                        case peerSubject(&connection) of
+                            when Some(value as subject: String) do
+                                print("server: its subject: ");
+                                printText(&subject);
+                                printLn("");
+                                destroyString(subject);
+                            when None do
+                                printLn("server: no subject");
+                        end case;
+                        case peerHash(&connection) of
+                            when Some(value as hash: String) do
+                                print("server: its hash starts with SHA256: ");
+                                printLn(startsWith(asSpan(&hash), "SHA256:"));
+                                destroyString(hash);
+                            when None do
+                                printLn("server: no hash");
+                        end case;
+                        case receiveWithin(&!connection, 1024, 5000) of
+                            when Right(right as line: String) do
+                                var answer: StringBuilder := makeStringBuilder();
+                                writeString(&!answer, "echo: ");
+                                writeString(&!answer, asSpan(&line));
+                                let reply: String := finalize(answer);
+                                case send(&!connection, asSpan(&reply)) of
+                                    when Right(right as sent: Unit) do
+                                        skip;
+                                    when Left(left as message: String) do
+                                        destroyString(message);
+                                end case;
+                                destroyString(reply);
+                                destroyString(line);
+                            when Left(left as message: String) do
+                                printLn("server: the client went away");
+                                destroyString(message);
+                        end case;
+                        closeClient(connection);
+                    when Left(left as message: String) do
+                        printLn("server: the handshake was refused");
+                        destroyString(message);
+                end case;
+            when None do
+                printLn("server: nobody connected");
+        end case;
+        return nil;
+    end;
+
+    generic [K: Region, L: Region, S: Region]
+    function round(scope: &![Scope, K], listener: &[TcpListener, L], server: &[Server, S], port: Nat16, side: Fn[Nat16, String]): Unit is
+        case spawn(&~scope, side, port) of
+            when Right(right as task: Task[String]) do
+                serveOne(listener, server);
+                let report: String := join(task);
+                printText(&report);
+                destroyString(report);
+            when Left(left as back: Nat16) do
+                printLn("the client task did not start");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        if not makeCertificates() then
+            printLn("no certificates");
+            return ExitFailure();
+        end if;
+        let address: String := loopback();
+        case listenTcp(asSpan(&address), 0) of
+            when Some(value as listener: TcpListener) do
+                let port: Nat16 := tcpListenerPort(&listener);
+                case openScope() of
+                    when Some(value as opened: Scope) do
+                        var scope: Scope := opened;
+                        case makeVerifyingServer("server.pem", "server-key.pem", "ca.pem") of
+                            when Right(right as server: Server) do
+                                printLn("-- a server that verifies its clients against ca.pem");
+                                round(&!scope, &listener, &server, port, member);
+                                round(&!scope, &listener, &server, port, anonymous);
+                                round(&!scope, &listener, &server, port, stranger);
+                                closeServer(server);
+                            when Left(left as message: String) do
+                                printLn("makeVerifyingServer failed");
+                                destroyString(message);
+                        end case;
+                        let certificate: String := readFile("server.pem");
+                        let key: String := readFile("server-key.pem");
+                        let ca: String := readFile("ca.pem");
+                        case makeVerifyingServerFromMemory(asSpan(&certificate), asSpan(&key), asSpan(&ca)) of
+                            when Right(right as server: Server) do
+                                printLn("-- the same, its CA from memory");
+                                round(&!scope, &listener, &server, port, member);
+                                round(&!scope, &listener, &server, port, stranger);
+                                closeServer(server);
+                            when Left(left as message: String) do
+                                printLn("makeVerifyingServerFromMemory failed");
+                                destroyString(message);
+                        end case;
+                        destroyString(certificate);
+                        destroyString(key);
+                        destroyString(ca);
+                        closeScope(scope);
+                    when None do
+                        printLn("no scope");
+                end case;
+                print("listener closed: ");
+                printLn(closeTcpListener(listener));
+            when None do
+                printLn("listenTcp failed");
+        end case;
+        destroyString(address);
+        return ExitSuccess();
+    end;
+end module body.

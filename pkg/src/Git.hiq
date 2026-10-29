@@ -1,0 +1,322 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    fromLiteral,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nth,
+    insertBack,
+    destroyFree
+);
+import Standard.Text (
+    startsWith,
+    substring,
+    indexOfByte,
+    lines
+);
+import Standard.Order (
+    Ordering,
+    LessThan,
+    Equal,
+    GreaterThan,
+    TotalOrder,
+    compare
+);
+import Standard.Sort (
+    sort
+);
+import Standard.Semver (
+    Version,
+    parseVersion,
+    formatVersion
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf
+);
+import Pkg.Process (
+    Ran,
+    runProgram,
+    destroyRan
+);
+
+module body Pkg.Git is
+    generic [B: Region]
+    function add(words: &![Buffer[String], B], word: Span[Nat8, Static]): Unit is
+        insertBack(&~words, fromLiteral(word));
+        return nil;
+    end;
+
+    -- The arguments every call of git starts with: never ask for a
+    -- password.
+    function baseArguments(): Buffer[String] is
+        var words: Buffer[String] := allocateEmpty();
+        add(&!words, "-c");
+        add(&!words, "credential.interactive=never");
+        add(&!words, "-c");
+        add(&!words, "core.askPass=");
+        return words;
+    end;
+
+    -- The first line of what git said, for a message.
+    generic [R: Region]
+    function firstLine(text: Span[Nat8, R]): Span[Nat8, R] is
+        case indexOfByte(text, '\n') of
+            when Some(value as at: Index) do
+                return substring(text, 0, at);
+            when None do
+                return text;
+        end case;
+    end;
+
+    generic [W: Region, U: Region, E: Region]
+    function gitProblem(what: Span[Nat8, W], url: Span[Nat8, U], said: Span[Nat8, E]): Problem is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, what);
+        writeString(&!out, " ");
+        writeString(&!out, url);
+        if spanLength(said) > 0 then
+            writeString(&!out, ": git said: ");
+            writeString(&!out, firstLine(said));
+        end if;
+        return problemOf(1508, finalize(out), fromLiteral("check the git URL in hilde.toml and that the repository may be read"));
+    end;
+
+    -- The version of one line of ls-remote, sha, a tab and refs/tags/name.
+    generic [L: Region]
+    function versionOfLine(line: Span[Nat8, L]): Option[Version] is
+        case indexOfByte(line, '\t') of
+            when Some(value as at: Index) do
+                let reference: Span[Nat8, L] := substring(line, at + 1, spanLength(line));
+                if startsWith(reference, "refs/tags/") then
+                    return parseVersion(substring(reference, 10, spanLength(reference)));
+                end if;
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The sorted versions without repetitions.
+    function unique(sorted: Buffer[Version]): Buffer[Version] is
+        var out: Buffer[Version] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(&sorted) do
+            let v: Version := nth(&sorted, i);
+            var keep: Bool := true;
+            if bufferLength(&out) > 0 then
+                let last: Version := nth(&out, bufferLength(&out) - 1);
+                case compare(&last, &v) of
+                    when Equal do
+                        keep := false;
+                    when LessThan do
+                        skip;
+                    when GreaterThan do
+                        skip;
+                end case;
+            end if;
+            if keep then
+                insertBack(&!out, v);
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(sorted);
+        return out;
+    end;
+
+    generic [G: Region, U: Region]
+    function listTags(git: Span[Nat8, G], url: Span[Nat8, U]): Either[Problem, Buffer[Version]] is
+        var words: Buffer[String] := baseArguments();
+        add(&!words, "ls-remote");
+        add(&!words, "--tags");
+        add(&!words, "--refs");
+        add(&!words, "--");
+        insertBack(&!words, fromSpanOf(url));
+        let ran: Either[Problem, Ran] := runProgram(git, &words);
+        destroyArguments(words);
+        case ran of
+            when Right(right as r: Ran) do
+                let { exitCode: Int32, output: String, errors: String } := r;
+                if exitCode /= 0 then
+                    let p: Problem := gitProblem("git cannot list the tags of", url, asSpan(&errors));
+                    destroyString(output);
+                    destroyString(errors);
+                    return Left(left => p);
+                end if;
+                let found: Buffer[Version] := versionsOf(asSpan(&output));
+                destroyString(output);
+                destroyString(errors);
+                return Right(right => unique(sort(found)));
+            when Left(left as p: Problem) do
+                return Left(left => p);
+        end case;
+    end;
+
+    generic [O: Region]
+    function versionsOf(output: Span[Nat8, O]): Buffer[Version] is
+        let all: Buffer[Span[Nat8, O]] := lines(output);
+        var found: Buffer[Version] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            case versionOfLine(nth(&all, i)) of
+                when Some(value as v: Version) do
+                    insertBack(&!found, v);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return found;
+    end;
+
+    generic [U: Region]
+    function fromSpanOf(url: Span[Nat8, U]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, url);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function hasVersion(tags: &[Buffer[Version], R], want: Version): Bool is
+        var i: Index := 0;
+        while i < bufferLength(tags) do
+            let v: Version := nth(tags, i);
+            case compare(&v, &want) of
+                when Equal do
+                    return true;
+                when LessThan do
+                    skip;
+                when GreaterThan do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [B: Region]
+    function writeVersionText(out: &![StringBuilder, B], v: Version): Unit is
+        let text: String := formatVersion(v);
+        writeString(&~out, asSpan(&text));
+        destroyString(text);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function nearestTags(tags: &[Buffer[Version], R], want: Version): String is
+        var out: StringBuilder := makeStringBuilder();
+        let n: Index := bufferLength(tags);
+        var below: Index := n;
+        var above: Index := n;
+        var i: Index := 0;
+        while i < n do
+            let v: Version := nth(tags, i);
+            case compare(&v, &want) of
+                when LessThan do
+                    below := i;
+                when Equal do
+                    skip;
+                when GreaterThan do
+                    if above = n then
+                        above := i;
+                    end if;
+            end case;
+            i := i + 1;
+        end while;
+        if below < n then
+            writeVersionText(&!out, nth(tags, below));
+        end if;
+        if above < n then
+            if below < n then
+                writeString(&!out, ", ");
+            end if;
+            writeVersionText(&!out, nth(tags, above));
+        end if;
+        if (n > 0) and (above /= (n - 1)) then
+            if (below < n) or (above < n) then
+                writeString(&!out, ", ");
+            end if;
+            writeVersionText(&!out, nth(tags, n - 1));
+        end if;
+        return finalize(out);
+    end;
+
+    generic [G: Region, U: Region, D: Region]
+    function cloneTag(git: Span[Nat8, G], url: Span[Nat8, U], version: Version, directory: Span[Nat8, D]): Either[Problem, Unit] is
+        case listTags(git, url) of
+            when Right(right as tags: Buffer[Version]) do
+                if not hasVersion(&tags, version) then
+                    var message: StringBuilder := makeStringBuilder();
+                    writeString(&!message, "the repository ");
+                    writeString(&!message, url);
+                    writeString(&!message, " has no tag ");
+                    writeVersionText(&!message, version);
+                    let near: String := nearestTags(&tags, version);
+                    destroyFree(tags);
+                    var hint: StringBuilder := makeStringBuilder();
+                    if length(&near) > 0 then
+                        writeString(&!hint, "the tags nearest to it are ");
+                        writeString(&!hint, asSpan(&near));
+                    else
+                        writeString(&!hint, "the repository has no tag vX.Y.Z; tag a release first");
+                    end if;
+                    destroyString(near);
+                    return Left(left => problemOf(1509, finalize(message), finalize(hint)));
+                end if;
+                destroyFree(tags);
+            when Left(left as p: Problem) do
+                return Left(left => p);
+        end case;
+        var words: Buffer[String] := baseArguments();
+        add(&!words, "-c");
+        add(&!words, "advice.detachedHead=false");
+        add(&!words, "clone");
+        add(&!words, "--quiet");
+        add(&!words, "--depth");
+        add(&!words, "1");
+        add(&!words, "--branch");
+        insertBack(&!words, formatVersion(version));
+        add(&!words, "--");
+        insertBack(&!words, fromSpanOf(url));
+        insertBack(&!words, fromSpanOf(directory));
+        let ran: Either[Problem, Ran] := runProgram(git, &words);
+        destroyArguments(words);
+        case ran of
+            when Right(right as r: Ran) do
+                let { exitCode: Int32, output: String, errors: String } := r;
+                destroyString(output);
+                if exitCode /= 0 then
+                    let p: Problem := gitProblem("git cannot clone", url, asSpan(&errors));
+                    destroyString(errors);
+                    return Left(left => p);
+                end if;
+                destroyString(errors);
+                return Right(right => nil);
+            when Left(left as p: Problem) do
+                return Left(left => p);
+        end case;
+    end;
+end module body.

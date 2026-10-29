@@ -1,0 +1,564 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nth,
+    nthRef,
+    insertBack,
+    removeFirst,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.Text (
+    startsWith,
+    endsWith,
+    indexOfByte,
+    substring,
+    lines
+);
+import Standard.Order (
+    Ordering,
+    LessThan,
+    Equal,
+    GreaterThan,
+    compare
+);
+import Standard.Semver (
+    Version,
+    parseVersion,
+    formatVersion,
+    sameMajor
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf,
+    describeProblem,
+    destroyProblem
+);
+import Pkg.Manifest (
+    Manifest,
+    Requirement,
+    readManifest,
+    destroyManifest
+);
+import Pkg.Files (
+    readText,
+    joinPath
+);
+import Pkg.Tree (
+    treeFiles
+);
+import Pkg.Process (
+    Ran,
+    findProgram,
+    runProgram,
+    destroyRan
+);
+import Pkg.Git (
+    listTags
+);
+import Pkg.Targets (
+    Reach,
+    reachTargets,
+    packageDirs,
+    allowedText,
+    destroyReach
+);
+import Pkg.Get (
+    Got,
+    Wanted,
+    getPackages,
+    destroyGot
+);
+
+module body Pkg.Update is
+    -- One raise: the prefix and its old and new version.
+    record Raise: Linear is
+        prefix: String;
+        old: Version;
+        new: Version;
+    end;
+
+    function destroyRaise(r: Raise): Unit is
+        let { prefix: String, old: Version, new: Version } := r;
+        destroyString(prefix);
+        return nil;
+    end;
+
+    function destroyRaises(steps: Buffer[Raise]): Unit is
+        var rest: Buffer[Raise] := steps;
+        while bufferLength(&rest) > 0 do
+            destroyRaise(removeFirst(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function gotWith(problem: Problem): Got is
+        var problems: Buffer[Problem] := allocateEmpty();
+        insertBack(&!problems, problem);
+        return Got(count => 0, summary => makeEmpty(), problems => problems);
+    end;
+
+    function isNewer(a: Version, b: Version): Bool is
+        case compare(&a, &b) of
+            when GreaterThan do
+                return true;
+            when Equal do
+                return false;
+            when LessThan do
+                return false;
+        end case;
+    end;
+
+    -- The newest tag of the same major that is newer than the version, or
+    -- the version itself.
+    generic [T: Region]
+    function newestOf(tags: &[Buffer[Version], T], version: Version): Version is
+        var best: Version := version;
+        var i: Index := 0;
+        while i < bufferLength(tags) do
+            let v: Version := nth(tags, i);
+            if sameMajor(v, version) and isNewer(v, best) then
+                best := v;
+            end if;
+            i := i + 1;
+        end while;
+        return best;
+    end;
+
+    -- The raises there are, or the first problem git gave.
+    generic [G: Region, M: Region]
+    function plan(git: Span[Nat8, G], manifest: &[Manifest, M]): Either[Problem, Buffer[Raise]] is
+        let needs: &[Buffer[Requirement], M] := &(manifest->needs);
+        var out: Buffer[Raise] := allocateEmpty();
+        var i: Index := 0;
+        while i < bufferLength(needs) do
+            let r: &[Requirement, M] := nthRef(needs, i);
+            case listTags(git, asSpan(&(r->git))) of
+                when Right(right as tags: Buffer[Version]) do
+                    let best: Version := newestOf(&tags, r->version);
+                    destroyFree(tags);
+                    if isNewer(best, r->version) then
+                        insertBack(&!out, Raise(prefix => fromSpan(asSpan(&(r->prefix))), old => r->version, new => best));
+                    end if;
+                when Left(left as p: Problem) do
+                    destroyRaises(out);
+                    return Left(left => p);
+            end case;
+            i := i + 1;
+        end while;
+        return Right(right => out);
+    end;
+
+    generic [B: Region, R: Region]
+    function writeRaise(out: &![StringBuilder, B], r: &[Raise, R]): Unit is
+        writeString(&~out, asSpan(&(r->prefix)));
+        writeByte(&~out, ' ');
+        let a: String := formatVersion(r->old);
+        writeString(&~out, asSpan(&a));
+        destroyString(a);
+        writeString(&~out, " -> ");
+        let b: String := formatVersion(r->new);
+        writeString(&~out, asSpan(&b));
+        destroyString(b);
+        return nil;
+    end;
+
+    -- Runs the compiler with the words and says whether it ended with 0.
+    generic [C: Region, W: Region]
+    function passes(compiler: Span[Nat8, C], words: &[Buffer[String], W]): Bool is
+        case runProgram(compiler, words) of
+            when Right(right as r: Ran) do
+                let good: Bool := r.exitCode = 0;
+                destroyRan(r);
+                return good;
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                return false;
+        end case;
+    end;
+
+    -- hilde test src and hilde guard over every module of src.
+    generic [C: Region]
+    function stillGood(compiler: Span[Nat8, C]): Bool is
+        var test: Buffer[String] := allocateEmpty();
+        insertBack(&!test, fromLiteral("test"));
+        insertBack(&!test, fromLiteral("src"));
+        let tested: Bool := passes(compiler, &test);
+        destroyArguments(test);
+        if not tested then
+            return false;
+        end if;
+        case treeFiles("src") of
+            when Right(right as files: Buffer[String]) do
+                var guard: Buffer[String] := allocateEmpty();
+                insertBack(&!guard, fromLiteral("guard"));
+                addPairs(&files, &!guard);
+                destroyArguments(files);
+                let guarded: Bool := passes(compiler, &guard);
+                destroyArguments(guard);
+                return guarded;
+            when Left(left as p: Problem) do
+                destroyProblem(p);
+                return false;
+        end case;
+    end;
+
+    generic [F: Region, B: Region]
+    function addPairs(files: &[Buffer[String], F], out: &![Buffer[String], B]): Unit is
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            if endsWith(file, ".hih") then
+                let stem: Span[Nat8, F] := substring(file, 0, spanLength(file) - 4);
+                var pair: StringBuilder := makeStringBuilder();
+                writeString(&!pair, "src/");
+                writeString(&!pair, stem);
+                writeString(&!pair, ".hih,src/");
+                writeString(&!pair, stem);
+                writeString(&!pair, ".hiq");
+                insertBack(&~out, finalize(pair));
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The version of a changelog heading, name (X.Y.Z) and the rest.
+    generic [L: Region]
+    function headingVersion(line: Span[Nat8, L]): Option[Version] is
+        if (spanLength(line) = 0) or (line[0] = ' ') then
+            return None();
+        end if;
+        case indexOfByte(line, '(') of
+            when Some(value as open: Index) do
+                case indexOfByte(line, ')') of
+                    when Some(value as close: Index) do
+                        if close > (open + 1) then
+                            var text: StringBuilder := makeStringBuilder();
+                            writeByte(&!text, 'v');
+                            writeString(&!text, substring(line, open + 1, close));
+                            let v: String := finalize(text);
+                            let read: Option[Version] := parseVersion(asSpan(&v));
+                            destroyString(v);
+                            return read;
+                        end if;
+                        return None();
+                    when None do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The entries of the vendored changelog of the raise, newer than the
+    -- old version and not newer than the new one.
+    generic [R: Region, B: Region]
+    function writeChangelog(r: &[Raise, R], out: &![StringBuilder, B]): Unit is
+        var path: StringBuilder := makeStringBuilder();
+        writeString(&!path, "vendor/");
+        writeString(&!path, asSpan(&(r->prefix)));
+        writeString(&!path, "/CHANGELOG");
+        let file: String := finalize(path);
+        case readText(asSpan(&file)) of
+            when Some(value as text: String) do
+                writeEntries(asSpan(&text), r->old, r->new, &~out);
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        destroyString(file);
+        return nil;
+    end;
+
+    generic [T: Region, B: Region]
+    function writeEntries(text: Span[Nat8, T], old: Version, new: Version, out: &![StringBuilder, B]): Unit is
+        let all: Buffer[Span[Nat8, T]] := lines(text);
+        var taking: Bool := false;
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let line: Span[Nat8, T] := nth(&all, i);
+            case headingVersion(line) of
+                when Some(value as v: Version) do
+                    taking := isNewer(v, old) and (not isNewer(v, new));
+                when None do
+                    if taking and startsWith(line, "  * ") then
+                        writeString(&~out, line);
+                        writeByte(&~out, '\n');
+                    end if;
+            end case;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return nil;
+    end;
+
+    -- The capabilities the vendored tree of the prefix declares, as one
+    -- text with a blank after each; empty when it has none or no tree.
+    generic [P: Region]
+    function capabilitiesOf(prefix: Span[Nat8, P]): String is
+        var path: StringBuilder := makeStringBuilder();
+        writeString(&!path, "vendor/");
+        writeString(&!path, prefix);
+        writeString(&!path, "/hilde.toml");
+        let file: String := finalize(path);
+        let text: Option[String] := readText(asSpan(&file));
+        destroyString(file);
+        var out: StringBuilder := makeStringBuilder();
+        case text of
+            when Some(value as toml: String) do
+                case readManifest(asSpan(&toml)) of
+                    when Right(right as m: Manifest) do
+                        writeCapabilities(&m, &!out);
+                        destroyManifest(m);
+                    when Left(left as p: Problem) do
+                        destroyProblem(p);
+                end case;
+                destroyString(toml);
+            when None do
+                skip;
+        end case;
+        return finalize(out);
+    end;
+
+    generic [M: Region, B: Region]
+    function writeCapabilities(m: &[Manifest, M], out: &![StringBuilder, B]): Unit is
+        let caps: &[Buffer[String], M] := &(m->capabilities);
+        var i: Index := 0;
+        while i < bufferLength(caps) do
+            writeString(&~out, asSpan(nthRef(caps, i)));
+            writeByte(&~out, ' ');
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Whether every word of after, each followed by a blank, is in before.
+    generic [A: Region, B: Region]
+    function noneAdded(before: Span[Nat8, A], after: Span[Nat8, B]): Bool is
+        var start: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(after) do
+            if after[i] = ' ' then
+                var word: StringBuilder := makeStringBuilder();
+                writeString(&!word, substring(after, start, i + 1));
+                let w: String := finalize(word);
+                let there: Bool := containsWord(before, asSpan(&w));
+                destroyString(w);
+                if not there then
+                    return false;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [A: Region, W: Region]
+    function containsWord(text: Span[Nat8, A], word: Span[Nat8, W]): Bool is
+        var i: Index := 0;
+        while (i + spanLength(word)) <= spanLength(text) do
+            if ((i = 0) or (text[i - 1] = ' ')) and startsWith(substring(text, i, spanLength(text)), word) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The targets the package at root can be built for now, each followed
+    -- by a blank, with the standard library beside the compiler.
+    generic [R: Region, C: Region]
+    function allowedNow(root: Span[Nat8, R], compiler: Span[Nat8, C]): String is
+        var at: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(compiler) do
+            if compiler[i] = '/' then
+                at := i;
+            end if;
+            i := i + 1;
+        end while;
+        var library: StringBuilder := makeStringBuilder();
+        writeString(&!library, substring(compiler, 0, at));
+        writeString(&!library, "/standard/src");
+        let lib: String := finalize(library);
+        let dirs: Buffer[String] := packageDirs(root, asSpan(&lib));
+        destroyString(lib);
+        let reach: Reach := reachTargets(&dirs);
+        destroyArguments(dirs);
+        let text: String := allowedText(&reach);
+        destroyReach(reach);
+        return text;
+    end;
+
+    -- The words of before, each followed by a blank, that after lacks.
+    generic [A: Region, B: Region]
+    function missingWords(before: Span[Nat8, A], after: Span[Nat8, B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var start: Index := 0;
+        var i: Index := 0;
+        while i < spanLength(before) do
+            if before[i] = ' ' then
+                let word: Span[Nat8, A] := substring(before, start, i + 1);
+                if not containsWord(after, word) then
+                    writeString(&!out, word);
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Tries each raise alone; the text of what was kept and of what was not.
+    generic [R: Region, C: Region, S: Region]
+    function apply(root: Span[Nat8, R], compiler: Span[Nat8, C], steps: &[Buffer[Raise], S]): Got is
+        var kept: StringBuilder := makeStringBuilder();
+        var log: StringBuilder := makeStringBuilder();
+        var back: StringBuilder := makeStringBuilder();
+        var count: Index := 0;
+        var i: Index := 0;
+        while i < bufferLength(steps) do
+            let r: &[Raise, S] := nthRef(steps, i);
+            let before: String := capabilitiesOf(asSpan(&(r->prefix)));
+            let targetsBefore: String := allowedNow(root, compiler);
+            let got: Got := getPackages(root, Some(value => Wanted(prefix => fromSpan(asSpan(&(r->prefix))), version => r->new, git => makeEmpty())));
+            let fetched: Bool := bufferLength(gotProblems(&got)) = 0;
+            destroyGot(got);
+            let after: String := capabilitiesOf(asSpan(&(r->prefix)));
+            let same: Bool := noneAdded(asSpan(&before), asSpan(&after));
+            destroyString(before);
+            destroyString(after);
+            if (fetched and same) and stillGood(compiler) then
+                writeString(&!kept, "    ");
+                writeRaise(&!kept, r);
+                let targetsAfter: String := allowedNow(root, compiler);
+                let dropped: String := missingWords(asSpan(&targetsBefore), asSpan(&targetsAfter));
+                if length(&dropped) > 0 then
+                    writeString(&!kept, ", drops the targets ");
+                    writeString(&!kept, asSpan(&dropped));
+                end if;
+                destroyString(dropped);
+                destroyString(targetsAfter);
+                writeByte(&!kept, '\n');
+                writeChangelog(r, &!log);
+                count := count + 1;
+            else
+                let undone: Got := getPackages(root, Some(value => Wanted(prefix => fromSpan(asSpan(&(r->prefix))), version => r->old, git => makeEmpty())));
+                destroyGot(undone);
+                writeString(&!back, "    ");
+                writeRaise(&!back, r);
+                writeString(&!back, ", taken back: get, the tests or guard failed, or it declares a capability more\n");
+            end if;
+            destroyString(targetsBefore);
+            i := i + 1;
+        end while;
+        let keptText: String := finalize(kept);
+        let logText: String := finalize(log);
+        let backText: String := finalize(back);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "hilde update: the commit text\n\ndeps: raise the packages within their major\n\n");
+        writeString(&!out, asSpan(&keptText));
+        if length(&logText) > 0 then
+            writeString(&!out, "\nFrom their changelogs:\n");
+            writeString(&!out, asSpan(&logText));
+        end if;
+        if length(&backText) > 0 then
+            writeString(&!out, "\nNot raised:\n");
+            writeString(&!out, asSpan(&backText));
+        end if;
+        destroyString(keptText);
+        destroyString(logText);
+        destroyString(backText);
+        return Got(count => count, summary => finalize(out), problems => allocateEmpty());
+    end;
+
+    generic [G: Region]
+    function gotProblems(got: &[Got, G]): &[Buffer[Problem], G] is
+        return &(got->problems);
+    end;
+
+    generic [R: Region, C: Region]
+    function updatePackages(root: Span[Nat8, R], check: Bool, compiler: Span[Nat8, C]): Got is
+        let path: String := joinPath(root, "hilde.toml");
+        let text: Option[String] := readText(asSpan(&path));
+        destroyString(path);
+        case text of
+            when Some(value as toml: String) do
+                let read: Either[Problem, Manifest] := readManifest(asSpan(&toml));
+                destroyString(toml);
+                case read of
+                    when Right(right as manifest: Manifest) do
+                        case findProgram("git") of
+                            when Some(value as git: String) do
+                                let planned: Either[Problem, Buffer[Raise]] := plan(asSpan(&git), &manifest);
+                                destroyString(git);
+                                destroyManifest(manifest);
+                                case planned of
+                                    when Right(right as steps: Buffer[Raise]) do
+                                        if check then
+                                            var out: StringBuilder := makeStringBuilder();
+                                            writeString(&!out, "hilde update --check: ");
+                                            if bufferLength(&steps) = 0 then
+                                                writeString(&!out, "every requirement is at the newest tag of its major");
+                                            else
+                                                writeString(&!out, "these would be raised:\n");
+                                                var i: Index := 0;
+                                                while i < bufferLength(&steps) do
+                                                    writeString(&!out, "    ");
+                                                    writeRaise(&!out, nthRef(&steps, i));
+                                                    writeByte(&!out, '\n');
+                                                    i := i + 1;
+                                                end while;
+                                            end if;
+                                            let n: Index := bufferLength(&steps);
+                                            destroyRaises(steps);
+                                            return Got(count => n, summary => finalize(out), problems => allocateEmpty());
+                                        end if;
+                                        let done: Got := apply(root, compiler, &steps);
+                                        destroyRaises(steps);
+                                        return done;
+                                    when Left(left as p: Problem) do
+                                        return gotWith(p);
+                                end case;
+                            when None do
+                                destroyManifest(manifest);
+                                return gotWith(problemOf(1507, fromLiteral("git is not on PATH, and hilde update reads the tags with git"), fromLiteral("install git")));
+                        end case;
+                    when Left(left as p: Problem) do
+                        return gotWith(p);
+                end case;
+            when None do
+                return gotWith(problemOf(1501, fromLiteral("no hilde.toml here"), fromLiteral("run hilde update in the directory of the package")));
+        end case;
+    end;
+end module body.

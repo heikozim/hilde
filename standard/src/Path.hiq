@@ -1,0 +1,224 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    makeEmpty,
+    makeString,
+    length,
+    nthByte,
+    storeNth,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+
+module body Standard.Path is
+    constant separator: Nat8 := '/';
+    constant dot: Nat8 := '.';
+
+    ---
+    --- Internal
+    ---
+
+    -- The bytes from start up to but not including stop, as a new
+    -- string.  An empty range gives an empty string rather than a trap: the
+    -- callers below reach it for a/b/, where the base name really is
+    -- empty.
+    generic [R: Region]
+    function sliceOf(path: Span[Nat8, R], start: Index, stop: Index): String is
+        if stop <= start then
+            return makeEmpty();
+        end if;
+        let size: Index := stop - start;
+        var out: String := makeString(size, 0);
+        for i from 0 to size - 1 do
+            storeNth(&!out, i, path[start + i]);
+        end for;
+        return out;
+    end;
+
+    -- Where the last separator is, if there is one.  The loop has no early
+    -- exit and runs to the end on purpose: it is looking for the last one,
+    -- and a backwards loop over an Index has to guard against going below
+    -- zero, which traps.
+    generic [R: Region]
+    function lastSeparator(path: Span[Nat8, R]): Option[Index] is
+        let size: Index := spanLength(path);
+        var found: Bool := false;
+        var at: Index := 0;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if path[i] = separator then
+                    found := true;
+                    at := i;
+                end if;
+            end for;
+        end if;
+        if found then
+            let some: Option[Index] := Some(value => at);
+            return some;
+        else
+            let none: Option[Index] := None();
+            return none;
+        end if;
+    end;
+
+    -- Is the range [start, stop) exactly two dots?
+    generic [R: Region]
+    function rangeIsParent(path: Span[Nat8, R], start: Index,
+        stop: Index): Bool is
+        if stop <= start then
+            return false;
+        end if;
+        if (stop - start) /= 2 then
+            return false;
+        end if;
+        if path[start] /= dot then
+            return false;
+        end if;
+        return path[start + 1] = dot;
+    end;
+
+    ---
+    --- Asking
+    ---
+
+    generic [R: Region]
+    function isAbsolute(path: Span[Nat8, R]): Bool is
+        if spanLength(path) = 0 then
+            return false;
+        end if;
+        return path[0] = separator;
+    end;
+
+    generic [R: Region]
+    function hasParentComponent(path: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(path);
+        if size = 0 then
+            return false;
+        end if;
+        var start: Index := 0;
+        var found: Bool := false;
+        for i from 0 to size - 1 do
+            if path[i] = separator then
+                if rangeIsParent(path, start, i) then
+                    found := true;
+                end if;
+                start := i + 1;
+            end if;
+        end for;
+        -- The last component has no separator after it, so it is tested
+        -- here rather than in the loop.  Forgetting this is how a/..
+        -- passes a check that a/../b fails.
+        if rangeIsParent(path, start, size) then
+            found := true;
+        end if;
+        return found;
+    end;
+
+    ---
+    --- Taking apart
+    ---
+
+    generic [R: Region]
+    function baseName(path: Span[Nat8, R]): String is
+        case lastSeparator(path) of
+            when Some(value as at: Index) do
+                return sliceOf(path, at + 1, spanLength(path));
+            when None do
+                return sliceOf(path, 0, spanLength(path));
+        end case;
+    end;
+
+    generic [R: Region]
+    function directoryName(path: Span[Nat8, R]): String is
+        case lastSeparator(path) of
+            when Some(value as at: Index) do
+                if at = 0 then
+                    -- /a: the directory is the root, and the root is one
+                    -- byte long.  Slicing [0, 0) would give the empty
+                    -- string, which is a different path.
+                    var root: String := makeString(1, separator);
+                    return root;
+                else
+                    return sliceOf(path, 0, at);
+                end if;
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    generic [R: Region]
+    function extension(path: Span[Nat8, R]): Option[String] is
+        var base: String := baseName(path);
+        let size: Index := length(&base);
+        var found: Bool := false;
+        var at: Index := 0;
+        if size > 0 then
+            for i from 0 to size - 1 do
+                if nthByte(&base, i) = dot then
+                    found := true;
+                    at := i;
+                end if;
+            end for;
+        end if;
+        -- Three conditions, nested rather than joined with and: a dot
+        -- exists, it is not the first byte of the name, and something
+        -- follows it.
+        var take: Bool := false;
+        if found then
+            if at > 0 then
+                if (at + 1) < size then
+                    take := true;
+                end if;
+            end if;
+        end if;
+        if take then
+            let ext: String := sliceOf(asSpan(&base), at + 1, size);
+            destroyString(base);
+            let some: Option[String] := Some(value => ext);
+            return some;
+        else
+            destroyString(base);
+            let none: Option[String] := None();
+            return none;
+        end if;
+    end;
+
+    ---
+    --- Putting together
+    ---
+
+    generic [R: Region, S: Region]
+    function joinPath(left: Span[Nat8, R], right: Span[Nat8, S]): String is
+        let leftSize: Index := spanLength(left);
+        var takeRight: Bool := false;
+        if leftSize = 0 then
+            takeRight := true;
+        end if;
+        if isAbsolute(right) then
+            takeRight := true;
+        end if;
+        if takeRight then
+            return sliceOf(right, 0, spanLength(right));
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, left);
+        if left[leftSize - 1] /= separator then
+            writeByte(&!out, separator);
+        end if;
+        writeString(&!out, right);
+        return finalize(out);
+    end;
+end module body.

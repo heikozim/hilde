@@ -1,0 +1,911 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Binds libtls through the declarations of Bindings.C.Tls, generated from
+-- bindings/fixtures/tls.h, which scripts/tls/check-header.sh holds against
+-- the real tls.h on each platform.  It hands addresses to C, so it is an
+-- unsafe module; Standard.Tls is the safe module built on it.  What goes
+-- in is a span or a String the caller holds, what comes out is a String
+-- of its own.
+--
+-- A client made by connect has the blocking socket tls_connect made; libtls
+-- asks to be called again on it at times as well, and the next call blocks
+-- until there is more.  A client made by
+-- connectSocket has a socket of the caller's, set to non-blocking: libtls
+-- then answers TLS_WANT_POLLIN or TLS_WANT_POLLOUT whenever the socket has
+-- nothing to give or take, and the call waits for the socket with poll(2)
+-- as long as its time allows and asks again.  So a time limit holds for
+-- the whole call, however the server paces its bytes; a limit on each
+-- read(2) of the socket would not, since one TLS record is read with many.
+pragma Unsafe_Module;
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullPointer,
+    nullCheck,
+    allocateBuffer,
+    store,
+    positiveOffset,
+    load,
+    deallocate
+);
+import Standard.String (
+    String,
+    makeString,
+    storeNth,
+    length,
+    getSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Bindings.C.Tls (
+    TLS_WANT_POLLIN,
+    TLS_WANT_POLLOUT,
+    TLS_PROTOCOL_TLSv1_3,
+    tls_init,
+    tls_config_error,
+    tls_error,
+    tls_config_new,
+    tls_config_free,
+    tls_config_set_ca_file,
+    tls_config_set_protocols,
+    tls_client,
+    tls_configure,
+    tls_free,
+    tls_handshake,
+    tls_read,
+    tls_write,
+    tls_close,
+    tls_config_set_keypair_file,
+    tls_config_set_keypair_mem,
+    tls_server,
+    tls_config_set_ca_mem,
+    tls_config_verify_client,
+    tls_peer_cert_provided,
+    tls_peer_cert_hash,
+    tls_peer_cert_subject
+);
+
+module body Bindings.Tls is
+    record Client: Linear is
+        context: Address[Unit];
+        config: Address[Unit];
+        -- The socket connectSocket was given, or -1 for one connect opened.
+        number: Int32;
+        -- The socket connect opened for host and port, which closeClient
+        -- closes, or -1.
+        owned: Int32;
+    end;
+
+    -- Closes a socket this module opened; a number below 0 is none.
+    function closeOwned(owned: Int32): Unit is
+        if owned >= 0 then
+            let closed: Int32 := @embed(Int32, "close($1)", owned);
+        end if;
+        return nil;
+    end;
+
+    ---
+    --- C strings and messages
+    ---
+
+    -- A copy of text with a zero byte after it, for a C string.
+    generic [R: Region]
+    function cString(text: Span[Nat8, R]): Pointer[Nat8] is
+        let size: Index := spanLength(text);
+        let room: Address[Nat8] := allocateBuffer(size + 1);
+        case nullCheck(room) of
+            when Some(value as buffer: Pointer[Nat8]) do
+                var i: Index := 0;
+                while i < size do
+                    store(positiveOffset(buffer, i), text[i]);
+                    i := i + 1;
+                end while;
+                let terminator: Nat8 := 0;
+                store(positiveOffset(buffer, size), terminator);
+                return buffer;
+            when None do
+                abort("Standard.Tls: out of memory");
+        end case;
+    end;
+
+    function addressOf(pointer: Pointer[Nat8]): Address[Nat8] is
+        return @embed(Address[Nat8], "$1", pointer);
+    end;
+
+    function isNull(address: Address[Unit]): Bool is
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[Unit]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [B: Region]
+    function writeText(out: &![StringBuilder, B], text: Span[Nat8, Static]): Unit is
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        while i < size do
+            writeByte(&~out, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- "Standard.Tls: " and the C string at message, or fallback when
+    -- libtls has none.
+    function failure(message: Address[Nat8], fallback: Span[Nat8, Static]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeText(&!out, "Standard.Tls: ");
+        case nullCheck(message) of
+            when Some(value as text: Pointer[Nat8]) do
+                var i: Index := 0;
+                var byte: Nat8 := @embed(Nat8, "($1)[$2]", message, i);
+                while byte /= 0 do
+                    writeByte(&!out, byte);
+                    i := i + 1;
+                    byte := @embed(Nat8, "($1)[$2]", message, i);
+                end while;
+            when None do
+                writeText(&!out, fallback);
+        end case;
+        return finalize(out);
+    end;
+
+    -- "Standard.Tls: " and text.
+    function plainFailure(text: Span[Nat8, Static]): String is
+        let noMessage: Address[Nat8] := nullPointer();
+        return failure(noMessage, text);
+    end;
+
+    ---
+    --- Waiting for the socket, see lib/prelude.c
+    ---
+
+    pragma Foreign_Import(External_Name => "hilde_socket_nonblocking");
+    function cSocketNonblocking(number: Int32): Int32 is
+    end;
+
+    pragma Foreign_Import(External_Name => "hilde_socket_wait");
+    function cSocketWait(number: Int32, writing: Int32, milliseconds: Int32): Int32 is
+    end;
+
+    pragma Foreign_Import(External_Name => "hilde_time_monotonic_nanos");
+    function cMonotonicNanos(): Int64 is
+    end;
+
+    -- When a call must be done.  Without a limit it waits as long as it
+    -- takes; where the build has no monotonic clock, each wait gets the
+    -- whole time instead of what is left of it.
+    record Deadline: Free is
+        limited: Bool;
+        clocked: Bool;
+        at: Int64;
+        milliseconds: Int32;
+    end;
+
+    constant nanosPerMilli: Int64 := 1000000;
+    constant noLimit: Int32 := -1;
+    constant timeUp: Int32 := 0;
+
+    function unlimited(): Deadline is
+        let zero: Int64 := 0;
+        let deadline: Deadline := Deadline(limited => false, clocked => false, at => zero, milliseconds => noLimit);
+        return deadline;
+    end;
+
+    function deadlineIn(milliseconds: Nat32): Deadline is
+        let largest: Nat32 := 2147483647;
+        var bounded: Nat32 := milliseconds;
+        if bounded > largest then
+            bounded := largest;
+        end if;
+        case toInt32(bounded) of
+            when Some(value as ms: Int32) do
+                case toInt64(ms) of
+                    when Some(value as wide: Int64) do
+                        let now: Int64 := cMonotonicNanos();
+                        let deadline: Deadline := Deadline(limited => true, clocked => now >= 0, at => now + (wide * nanosPerMilli), milliseconds => ms);
+                        return deadline;
+                    when None do
+                        abort("Standard.Tls: an Int32 did not fit an Int64");
+                end case;
+            when None do
+                abort("Standard.Tls: a bounded Nat32 did not fit an Int32");
+        end case;
+    end;
+
+    -- The milliseconds the next wait may take, rounded up: -1 for no
+    -- limit, 0 when the time is up.
+    function waitMillis(deadline: Deadline): Int32 is
+        if not deadline.limited then
+            return noLimit;
+        end if;
+        if not deadline.clocked then
+            return deadline.milliseconds;
+        end if;
+        let now: Int64 := cMonotonicNanos();
+        if now >= deadline.at then
+            return timeUp;
+        end if;
+        let left: Int64 := ((deadline.at - now) + (nanosPerMilli - 1)) / nanosPerMilli;
+        case toInt32(left) of
+            when Some(value as ms: Int32) do
+                return ms;
+            when None do
+                return deadline.milliseconds;
+        end case;
+    end;
+
+    -- After libtls answered a wanted read or write: wait for the socket.
+    -- None when the call may ask again, the Left's text otherwise.
+    function waitFor(number: Int32, answer: Int64, deadline: Deadline): Option[String] is
+        if number < 0 then
+            -- The blocking socket of tls_connect.  libtls answers a wanted
+            -- read on it too: taken as a failure, an echo over such a socket
+            -- failed.  The next call blocks in the kernel until the socket
+            -- has something, so asking again does not spin.
+            let again: Option[String] := None();
+            return again;
+        end if;
+        let ms: Int32 := waitMillis(deadline);
+        if ms = timeUp then
+            let late: Option[String] := Some(value => plainFailure("the time limit ran out"));
+            return late;
+        end if;
+        var writing: Int32 := 0;
+        if answer = TLS_WANT_POLLOUT then
+            writing := 1;
+        end if;
+        let ready: Int32 := cSocketWait(number, writing, ms);
+        if ready = 0 then
+            let late: Option[String] := Some(value => plainFailure("the time limit ran out"));
+            return late;
+        end if;
+        if ready < 0 then
+            let failed: Option[String] := Some(value => plainFailure("waiting for the socket failed"));
+            return failed;
+        end if;
+        let again: Option[String] := None();
+        return again;
+    end;
+
+    function wanted(answer: Int64): Bool is
+        return (answer = TLS_WANT_POLLIN) or (answer = TLS_WANT_POLLOUT);
+    end;
+
+    -- The count of bytes an answer of tls_write wrote, None for anything
+    -- that is not a count above zero: an error, a want, or zero.
+    function written(answer: Int64): Option[Index] is
+        if answer <= 0 then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        return toIndex(answer);
+    end;
+
+    function widened(answer: Int32): Int64 is
+        case toInt64(answer) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Standard.Tls: an Int32 did not fit an Int64");
+        end case;
+    end;
+
+    ---
+    --- Connect
+    ---
+
+    -- Limits config to TLS 1.3; 0 when libtls took it.
+    function limitToTls13(config: Address[Unit]): Int32 is
+        case toNat32(TLS_PROTOCOL_TLSv1_3) of
+            when Some(value as protocols: Nat32) do
+                return tls_config_set_protocols(config, protocols);
+            when None do
+                return -1;
+        end case;
+    end;
+
+    -- A client context configured to verify against the certificates in
+    -- caFile and, when certificateFile is not empty, to present that
+    -- certificate with the key in keyFile; not connected yet; number is the
+    -- socket it will use.
+    generic [C: Region, E: Region, K: Region]
+    function prepared(caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], number: Int32, onlyTls13: Bool): Either[String, Client] is
+        if tls_init() /= 0 then
+            let left: Either[String, Client] := Left(left => plainFailure("tls_init failed"));
+            return left;
+        end if;
+        let config: Address[Unit] := tls_config_new();
+        if isNull(config) then
+            let left: Either[String, Client] := Left(left => plainFailure("out of memory"));
+            return left;
+        end if;
+        if onlyTls13 and (limitToTls13(config) /= 0) then
+            let message: String := failure(tls_config_error(config), "TLS 1.3 could not be required");
+            tls_config_free(config);
+            let left: Either[String, Client] := Left(left => message);
+            return left;
+        end if;
+        let ca: Pointer[Nat8] := cString(caFile);
+        let caSet: Int32 := tls_config_set_ca_file(config, addressOf(ca));
+        deallocate(ca);
+        if caSet /= 0 then
+            let message: String := failure(tls_config_error(config), "the CA file was refused");
+            tls_config_free(config);
+            let left: Either[String, Client] := Left(left => message);
+            return left;
+        end if;
+        if spanLength(certificateFile) > 0 then
+            let certificate: Pointer[Nat8] := cString(certificateFile);
+            let key: Pointer[Nat8] := cString(keyFile);
+            let pairSet: Int32 := tls_config_set_keypair_file(config, addressOf(certificate), addressOf(key));
+            deallocate(certificate);
+            deallocate(key);
+            if pairSet /= 0 then
+                let message: String := failure(tls_config_error(config), "the client's key pair was refused");
+                tls_config_free(config);
+                let left: Either[String, Client] := Left(left => message);
+                return left;
+            end if;
+        end if;
+        let context: Address[Unit] := tls_client();
+        if isNull(context) then
+            tls_config_free(config);
+            let left: Either[String, Client] := Left(left => plainFailure("out of memory"));
+            return left;
+        end if;
+        if tls_configure(context, config) /= 0 then
+            return refused(context, config, "the configuration was refused");
+        end if;
+        let right: Either[String, Client] := Right(right => Client(context => context, config => config, number => number, owned => -1));
+        return right;
+    end;
+
+    generic [H: Region, P: Region, C: Region]
+    function connect(host: Span[Nat8, H], port: Span[Nat8, P], caFile: Span[Nat8, C]): Either[String, Client] is
+        return connectAs(host, port, caFile, "", "");
+    end;
+
+    generic [H: Region, P: Region, C: Region, E: Region, K: Region]
+    function connectAs(host: Span[Nat8, H], port: Span[Nat8, P], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K]): Either[String, Client] is
+        case prepared(caFile, certificateFile, keyFile, -1, false) of
+            when Left(left as message: String) do
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as client: Client) do
+                let { context: Address[Unit], config: Address[Unit], number: Int32, owned as none: Int32 } := client;
+                let name: Pointer[Nat8] := cString(host);
+                let service: Pointer[Nat8] := cString(port);
+                -- The runtime opens the socket as tls_connect would, so that
+                -- libtls writes it with the runtime's send and a peer that
+                -- closed is an error, not a signal that ends the programme.
+                let socket: Int32 := @embed(Int32, "hilde_tls_tcp_connect((const char*) $1, (const char*) $2)", addressOf(name), addressOf(service));
+                deallocate(service);
+                if socket < 0 then
+                    deallocate(name);
+                    return refused(context, config, "the connection failed");
+                end if;
+                let over: Int32 := @embed(Int32, "hilde_tls_connect_socket($1, $2, (const char*) $3)", context, socket, addressOf(name));
+                deallocate(name);
+                if over /= 0 then
+                    closeOwned(socket);
+                    return refused(context, config, "the connection failed");
+                end if;
+                -- The socket blocks.  libtls may still answer that it wants
+                -- to read or write; the handshake is then asked again, and the
+                -- call blocks in the kernel until the socket has something.
+                -- Only 0 is a handshake that holds.
+                var shaken: Int64 := widened(tls_handshake(context));
+                while wanted(shaken) do
+                    shaken := widened(tls_handshake(context));
+                end while;
+                if shaken /= 0 then
+                    closeOwned(socket);
+                    return refused(context, config, "the handshake failed");
+                end if;
+                let right: Either[String, Client] := Right(right => Client(context => context, config => config, number => number, owned => socket));
+                return right;
+        end case;
+    end;
+
+    generic [H: Region, C: Region]
+    function connectSocket(number: Int32, host: Span[Nat8, H], caFile: Span[Nat8, C], milliseconds: Nat32): Either[String, Client] is
+        return connectSocketAs(number, host, caFile, "", "", milliseconds);
+    end;
+
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function connectSocketAs(number: Int32, host: Span[Nat8, H], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], milliseconds: Nat32): Either[String, Client] is
+        return connectSocketWith(number, host, caFile, certificateFile, keyFile, milliseconds, false);
+    end;
+
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function connectSocketAsTls13(number: Int32, host: Span[Nat8, H], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], milliseconds: Nat32): Either[String, Client] is
+        return connectSocketWith(number, host, caFile, certificateFile, keyFile, milliseconds, true);
+    end;
+
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function connectSocketWith(number: Int32, host: Span[Nat8, H], caFile: Span[Nat8, C], certificateFile: Span[Nat8, E], keyFile: Span[Nat8, K], milliseconds: Nat32, onlyTls13: Bool): Either[String, Client] is
+        let deadline: Deadline := deadlineIn(milliseconds);
+        if (number < 0) or (cSocketNonblocking(number) /= 1) then
+            let left: Either[String, Client] := Left(left => plainFailure("the socket could not be made non-blocking"));
+            return left;
+        end if;
+        case prepared(caFile, certificateFile, keyFile, number, onlyTls13) of
+            when Left(left as message: String) do
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as client: Client) do
+                let { context: Address[Unit], config: Address[Unit], number as socket: Int32, owned as none: Int32 } := client;
+                let name: Pointer[Nat8] := cString(host);
+                let over: Int32 := @embed(Int32, "hilde_tls_connect_socket($1, $2, (const char*) $3)", context, socket, addressOf(name));
+                deallocate(name);
+                if over /= 0 then
+                    return refused(context, config, "the connection failed");
+                end if;
+                var answer: Int64 := widened(tls_handshake(context));
+                while wanted(answer) do
+                    case waitFor(socket, answer, deadline) of
+                        when Some(value as message: String) do
+                            tls_free(context);
+                            tls_config_free(config);
+                            let late: Either[String, Client] := Left(left => message);
+                            return late;
+                        when None do
+                            answer := widened(tls_handshake(context));
+                    end case;
+                end while;
+                if answer /= 0 then
+                    return refused(context, config, "the handshake failed");
+                end if;
+                let right: Either[String, Client] := Right(right => Client(context => context, config => config, number => socket, owned => -1));
+                return right;
+        end case;
+    end;
+
+    -- The Left of a connect that failed after the context existed: its
+    -- message first, then both given back.
+    function refused(context: Address[Unit], config: Address[Unit], fallback: Span[Nat8, Static]): Either[String, Client] is
+        let message: String := failure(tls_error(context), fallback);
+        tls_free(context);
+        tls_config_free(config);
+        let left: Either[String, Client] := Left(left => message);
+        return left;
+    end;
+
+    ---
+    --- Send and receive
+    ---
+
+    generic [R: Region, S: Region]
+    function send(client: &![Client, R], data: Span[Nat8, S]): Either[String, Unit] is
+        return sendUntil(&~client, data, unlimited());
+    end;
+
+    -- A time limit is kept by waiting for the socket, and the blocking
+    -- socket of tls_connect is never waited for: it would block as long as
+    -- the server takes.  So a limit on such a client is refused, not
+    -- ignored.
+    generic [R: Region, S: Region]
+    function sendWithin(client: &![Client, R], data: Span[Nat8, S], milliseconds: Nat32): Either[String, Unit] is
+        if client->number < 0 then
+            let refusedLimit: Either[String, Unit] := Left(left => plainFailure("a time limit needs a client made over a socket"));
+            return refusedLimit;
+        end if;
+        return sendUntil(&~client, data, deadlineIn(milliseconds));
+    end;
+
+    generic [R: Region, S: Region]
+    function sendUntil(client: &![Client, R], data: Span[Nat8, S], deadline: Deadline): Either[String, Unit] is
+        let size: Index := spanLength(data);
+        if size = 0 then
+            let done: Either[String, Unit] := Right(right => nil);
+            return done;
+        end if;
+        let bytes: Span[Nat8, S] := data;
+        let context: Address[Unit] := client->context;
+        let number: Int32 := client->number;
+        var sent: Index := 0;
+        while sent < size do
+            let at: Address[Unit] := @embed(Address[Unit], "(void*)(((hilde_nat8_t*)($1).data) + $2)", bytes, sent);
+            let n: Int64 := tls_write(context, at, size - sent);
+            if wanted(n) then
+                case waitFor(number, n, deadline) of
+                    when Some(value as message: String) do
+                        let late: Either[String, Unit] := Left(left => message);
+                        return late;
+                    when None do
+                        skip;
+                end case;
+            else
+                -- Only a count above zero is progress: libtls answers 0 when
+                -- the peer has closed, and the loop would not end on it.
+                case written(n) of
+                    when Some(value as count: Index) do
+                        sent := sent + count;
+                    when None do
+                        let failed: Either[String, Unit] := Left(left => failure(tls_error(context), "tls_write failed"));
+                        return failed;
+                end case;
+            end if;
+        end while;
+        let done: Either[String, Unit] := Right(right => nil);
+        return done;
+    end;
+
+    generic [R: Region]
+    function receive(client: &![Client, R], most: Index): Either[String, String] is
+        return receiveUntil(&~client, most, unlimited());
+    end;
+
+    generic [R: Region]
+    function receiveWithin(client: &![Client, R], most: Index, milliseconds: Nat32): Either[String, String] is
+        if client->number < 0 then
+            let refusedLimit: Either[String, String] := Left(left => plainFailure("a time limit needs a client made over a socket"));
+            return refusedLimit;
+        end if;
+        return receiveUntil(&~client, most, deadlineIn(milliseconds));
+    end;
+
+    -- The most bytes one receive asks the library for.  A caller may ask
+    -- for more, a count taken from the peer for instance; it then gets at
+    -- most this many, which keeps "at most most" and never sizes a buffer
+    -- by a number that does not fit memory or overflows when one is added.
+    constant receiveCeiling: Index := 16777216;
+
+    generic [R: Region]
+    function receiveUntil(client: &![Client, R], asked: Index, deadline: Deadline): Either[String, String] is
+        let context: Address[Unit] := client->context;
+        let number: Int32 := client->number;
+        var most: Index := asked;
+        if most > receiveCeiling then
+            most := receiveCeiling;
+        end if;
+        let room: Address[Nat8] := allocateBuffer(most + 1);
+        if @embed(Bool, "($1 == NULL)", room) then
+            let noRoom: Either[String, String] := Left(left => plainFailure("no memory for the bytes to receive"));
+            return noRoom;
+        end if;
+        var answer: Int64 := tls_read(context, @embed(Address[Unit], "(void*)$1", room), most);
+        while wanted(answer) do
+            case waitFor(number, answer, deadline) of
+                when Some(value as message: String) do
+                    @embed(Unit, "hilde_free($1)", room);
+                    let late: Either[String, String] := Left(left => message);
+                    return late;
+                when None do
+                    answer := tls_read(context, @embed(Address[Unit], "(void*)$1", room), most);
+            end case;
+        end while;
+        case toIndex(answer) of
+            when Some(value as got: Index) do
+                var out: String := makeString(got, 0);
+                var i: Index := 0;
+                while i < got do
+                    storeNth(&!out, i, @embed(Nat8, "($1)[$2]", room, i));
+                    i := i + 1;
+                end while;
+                @embed(Unit, "hilde_free($1)", room);
+                let right: Either[String, String] := Right(right => out);
+                return right;
+            when None do
+                @embed(Unit, "hilde_free($1)", room);
+                let left: Either[String, String] := Left(left => failure(tls_error(context), "tls_read failed"));
+                return left;
+        end case;
+    end;
+
+    function closeClient(client: Client): Unit is
+        let { context: Address[Unit], config: Address[Unit], number: Int32, owned: Int32 } := client;
+        -- The close notification is sent once.  Its answer is not waited
+        -- for: on a non-blocking socket libtls may ask to be called again,
+        -- and the socket is closed after this either way.  A connection a
+        -- server accepted has no configuration of its own, and
+        -- tls_config_free takes the null pointer it holds instead.  libtls
+        -- does not close a socket it was given through callbacks, so the
+        -- one connect opened is closed here.
+        let closed: Int32 := tls_close(context);
+        tls_free(context);
+        tls_config_free(config);
+        closeOwned(owned);
+        return nil;
+    end;
+
+    ---
+    --- The server side
+    ---
+
+    record Server: Linear is
+        context: Address[Unit];
+        config: Address[Unit];
+    end;
+
+    -- A server context with the key pair config holds, or the Left with
+    -- the library's words.  config is freed on a failure.
+    function serverOf(config: Address[Unit]): Either[String, Server] is
+        let context: Address[Unit] := tls_server();
+        if isNull(context) then
+            tls_config_free(config);
+            let left: Either[String, Server] := Left(left => plainFailure("out of memory"));
+            return left;
+        end if;
+        if tls_configure(context, config) /= 0 then
+            let message: String := failure(tls_error(context), "the configuration was refused");
+            tls_free(context);
+            tls_config_free(config);
+            let left: Either[String, Server] := Left(left => message);
+            return left;
+        end if;
+        let right: Either[String, Server] := Right(right => Server(context => context, config => config));
+        return right;
+    end;
+
+    -- A new configuration, or the Left.
+    function newConfig(): Either[String, Address[Unit]] is
+        if tls_init() /= 0 then
+            let left: Either[String, Address[Unit]] := Left(left => plainFailure("tls_init failed"));
+            return left;
+        end if;
+        let config: Address[Unit] := tls_config_new();
+        if isNull(config) then
+            let left: Either[String, Address[Unit]] := Left(left => plainFailure("out of memory"));
+            return left;
+        end if;
+        let right: Either[String, Address[Unit]] := Right(right => config);
+        return right;
+    end;
+
+    generic [C: Region, K: Region]
+    function makeServer(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K]): Either[String, Server] is
+        case newConfig() of
+            when Left(left as message: String) do
+                let failed: Either[String, Server] := Left(left => message);
+                return failed;
+            when Right(right as config: Address[Unit]) do
+                let certificate: Pointer[Nat8] := cString(certificateFile);
+                let key: Pointer[Nat8] := cString(keyFile);
+                let set: Int32 := tls_config_set_keypair_file(config, addressOf(certificate), addressOf(key));
+                deallocate(certificate);
+                deallocate(key);
+                if set /= 0 then
+                    let message: String := failure(tls_config_error(config), "the key pair was refused");
+                    tls_config_free(config);
+                    let left: Either[String, Server] := Left(left => message);
+                    return left;
+                end if;
+                return serverOf(config);
+        end case;
+    end;
+
+    generic [C: Region, K: Region]
+    function makeServerFromMemory(certificate: Span[Nat8, C], key: Span[Nat8, K]): Either[String, Server] is
+        if (spanLength(certificate) = 0) or (spanLength(key) = 0) then
+            let empty: Either[String, Server] := Left(left => plainFailure("the key pair is empty"));
+            return empty;
+        end if;
+        case newConfig() of
+            when Left(left as message: String) do
+                let failed: Either[String, Server] := Left(left => message);
+                return failed;
+            when Right(right as config: Address[Unit]) do
+                -- libtls copies both, so the spans need not outlive the call.
+                let set: Int32 := tls_config_set_keypair_mem(config,
+                    @embed(Address[Nat8], "((hilde_nat8_t*)($1).data)", certificate), spanLength(certificate),
+                    @embed(Address[Nat8], "((hilde_nat8_t*)($1).data)", key), spanLength(key));
+                if set /= 0 then
+                    let message: String := failure(tls_config_error(config), "the key pair was refused");
+                    tls_config_free(config);
+                    let left: Either[String, Server] := Left(left => message);
+                    return left;
+                end if;
+                return serverOf(config);
+        end case;
+    end;
+
+    -- config asks every client for a certificate and verifies it against
+    -- the certificates in caFile; config is freed on a failure.
+    generic [C: Region]
+    function verifyingFile(config: Address[Unit], caFile: Span[Nat8, C]): Either[String, Server] is
+        let ca: Pointer[Nat8] := cString(caFile);
+        let set: Int32 := tls_config_set_ca_file(config, addressOf(ca));
+        deallocate(ca);
+        if set /= 0 then
+            let message: String := failure(tls_config_error(config), "the CA file of the clients was refused");
+            tls_config_free(config);
+            let left: Either[String, Server] := Left(left => message);
+            return left;
+        end if;
+        tls_config_verify_client(config);
+        return serverOf(config);
+    end;
+
+    -- As verifyingFile, with the certificates as PEM text; libtls copies
+    -- them.
+    generic [C: Region]
+    function verifyingMemory(config: Address[Unit], ca: Span[Nat8, C]): Either[String, Server] is
+        let set: Int32 := tls_config_set_ca_mem(config, @embed(Address[Nat8], "((hilde_nat8_t*)($1).data)", ca), spanLength(ca));
+        if set /= 0 then
+            let message: String := failure(tls_config_error(config), "the CA of the clients was refused");
+            tls_config_free(config);
+            let left: Either[String, Server] := Left(left => message);
+            return left;
+        end if;
+        tls_config_verify_client(config);
+        return serverOf(config);
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServer(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K], clientCaFile: Span[Nat8, A]): Either[String, Server] is
+        return verifyingServerWith(certificateFile, keyFile, clientCaFile, false);
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServerTls13(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K], clientCaFile: Span[Nat8, A]): Either[String, Server] is
+        return verifyingServerWith(certificateFile, keyFile, clientCaFile, true);
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function verifyingServerWith(certificateFile: Span[Nat8, C], keyFile: Span[Nat8, K], clientCaFile: Span[Nat8, A], onlyTls13: Bool): Either[String, Server] is
+        case newConfig() of
+            when Left(left as message: String) do
+                let failed: Either[String, Server] := Left(left => message);
+                return failed;
+            when Right(right as config: Address[Unit]) do
+                if onlyTls13 and (limitToTls13(config) /= 0) then
+                    let message: String := failure(tls_config_error(config), "TLS 1.3 could not be required");
+                    tls_config_free(config);
+                    let left: Either[String, Server] := Left(left => message);
+                    return left;
+                end if;
+                let certificate: Pointer[Nat8] := cString(certificateFile);
+                let key: Pointer[Nat8] := cString(keyFile);
+                let set: Int32 := tls_config_set_keypair_file(config, addressOf(certificate), addressOf(key));
+                deallocate(certificate);
+                deallocate(key);
+                if set /= 0 then
+                    let message: String := failure(tls_config_error(config), "the key pair was refused");
+                    tls_config_free(config);
+                    let left: Either[String, Server] := Left(left => message);
+                    return left;
+                end if;
+                return verifyingFile(config, clientCaFile);
+        end case;
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServerFromMemory(certificate: Span[Nat8, C], key: Span[Nat8, K], clientCa: Span[Nat8, A]): Either[String, Server] is
+        if ((spanLength(certificate) = 0) or (spanLength(key) = 0)) or (spanLength(clientCa) = 0) then
+            let empty: Either[String, Server] := Left(left => plainFailure("the key pair or the CA is empty"));
+            return empty;
+        end if;
+        case newConfig() of
+            when Left(left as message: String) do
+                let failed: Either[String, Server] := Left(left => message);
+                return failed;
+            when Right(right as config: Address[Unit]) do
+                let set: Int32 := tls_config_set_keypair_mem(config,
+                    @embed(Address[Nat8], "((hilde_nat8_t*)($1).data)", certificate), spanLength(certificate),
+                    @embed(Address[Nat8], "((hilde_nat8_t*)($1).data)", key), spanLength(key));
+                if set /= 0 then
+                    let message: String := failure(tls_config_error(config), "the key pair was refused");
+                    tls_config_free(config);
+                    let left: Either[String, Server] := Left(left => message);
+                    return left;
+                end if;
+                return verifyingMemory(config, clientCa);
+        end case;
+    end;
+
+    ---
+    --- The peer's certificate
+    ---
+
+    -- The C string at text, or None for the null pointer.
+    function cText(text: Address[Nat8]): Option[String] is
+        case nullCheck(text) of
+            when Some(value as start: Pointer[Nat8]) do
+                var out: StringBuilder := makeStringBuilder();
+                var i: Index := 0;
+                var byte: Nat8 := @embed(Nat8, "($1)[$2]", text, i);
+                while byte /= 0 do
+                    writeByte(&!out, byte);
+                    i := i + 1;
+                    byte := @embed(Nat8, "($1)[$2]", text, i);
+                end while;
+                let some: Option[String] := Some(value => finalize(out));
+                return some;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function peerCertificateProvided(client: &[Client, R]): Bool is
+        return tls_peer_cert_provided((client->context)) = 1;
+    end;
+
+    generic [R: Region]
+    function peerSubject(client: &[Client, R]): Option[String] is
+        if not peerCertificateProvided(client) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        return cText(tls_peer_cert_subject((client->context)));
+    end;
+
+    generic [R: Region]
+    function peerHash(client: &[Client, R]): Option[String] is
+        if not peerCertificateProvided(client) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        return cText(tls_peer_cert_hash((client->context)));
+    end;
+
+    function slotOf(): Pointer[Address[Unit]] is
+        let address: Address[Address[Unit]] := allocateBuffer(1);
+        case nullCheck(address) of
+            when Some(value as pointer: Pointer[Address[Unit]]) do
+                return pointer;
+            when None do
+                abort("Standard.Tls: out of memory");
+        end case;
+    end;
+
+    generic [R: Region]
+    function acceptSocket(server: &[Server, R], number: Int32, milliseconds: Nat32): Either[String, Client] is
+        let deadline: Deadline := deadlineIn(milliseconds);
+        if (number < 0) or (cSocketNonblocking(number) /= 1) then
+            let left: Either[String, Client] := Left(left => plainFailure("the socket could not be made non-blocking"));
+            return left;
+        end if;
+        let context: Address[Unit] := server->context;
+        let slot: Pointer[Address[Unit]] := slotOf();
+        store(slot, @embed(Address[Unit], "NULL"));
+        let accepted: Int32 := @embed(Int32, "hilde_tls_accept_socket($1, (void**) $2, $3)", context, @embed(Address[Address[Unit]], "$1", slot), number);
+        let connection: Address[Unit] := load(slot);
+        deallocate(slot);
+        if (accepted /= 0) or isNull(connection) then
+            let message: String := failure(tls_error(context), "the connection was not accepted");
+            tls_free(connection);
+            let left: Either[String, Client] := Left(left => message);
+            return left;
+        end if;
+        let noConfig: Address[Unit] := @embed(Address[Unit], "NULL");
+        var answer: Int64 := widened(tls_handshake(connection));
+        while wanted(answer) do
+            case waitFor(number, answer, deadline) of
+                when Some(value as message: String) do
+                    tls_free(connection);
+                    let late: Either[String, Client] := Left(left => message);
+                    return late;
+                when None do
+                    answer := widened(tls_handshake(connection));
+            end case;
+        end while;
+        if answer /= 0 then
+            return refused(connection, noConfig, "the handshake failed");
+        end if;
+        let right: Either[String, Client] := Right(right => Client(context => connection, config => noConfig, number => number, owned => -1));
+        return right;
+    end;
+
+    function closeServer(server: Server): Unit is
+        let { context: Address[Unit], config: Address[Unit] } := server;
+        tls_free(context);
+        tls_config_free(config);
+        return nil;
+    end;
+end module body.

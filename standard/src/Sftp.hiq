@@ -1,0 +1,1078 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: every byte goes through the descriptors of Standard.File
+-- and the strings of Standard.String; nothing here touches C.  The packets
+-- are built and read here, in Hilde.
+import Standard.String (
+    String,
+    makeEmpty,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    insertBack,
+    removeFirst,
+    length as bufferLength
+);
+import Standard.File (
+    Command,
+    Process,
+    Running,
+    ProcessStatus,
+    FileDescriptor,
+    WaitFailure,
+    WaitTimedOut,
+    WaitFailed,
+    spawnProcess,
+    waitProcess,
+    terminateProcess,
+    closeFile,
+    makeNonblocking,
+    readWithin,
+    writeWithin
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Sort (
+    sort
+);
+
+module body Standard.Sftp is
+    constant serverGone: Int32 := -1;
+    constant badReply: Int32 := -2;
+    constant sessionSpoiled: Int32 := -3;
+    constant requestTooLong: Int32 := -4;
+    constant requestIdsUsedUp: Int32 := -5;
+    constant timedOut: Int32 := -6;
+
+    constant zero32: Nat32 := 0;
+    constant nanosPerMilli: Nat64 := 1000000;
+
+    -- What one read of the child's output takes while the session is ended.
+    constant drainSize: Index := 4096;
+
+    -- The most the child's output may be when it is thrown away at the end.
+    constant drainMost: Index := 1048576;
+
+    -- The largest number four bytes on the wire hold.
+    constant largestWord: Nat64 := 4294967295;
+
+    -- What one read or write request moves: the size of OpenSSH's own client.
+    constant chunk: Index := 32768;
+
+    -- The longest reply taken: SFTP_MAX_MSG_LENGTH of OpenSSH's server.
+    constant longestReply: Nat64 := 262144;
+
+    -- The packet types this client sends and reads (version 3).
+    constant typeInit: Nat8 := 1;
+    constant typeVersion: Nat8 := 2;
+    constant typeOpen: Nat8 := 3;
+    constant typeClose: Nat8 := 4;
+    constant typeRead: Nat8 := 5;
+    constant typeWrite: Nat8 := 6;
+    constant typeOpenDir: Nat8 := 11;
+    constant typeReadDir: Nat8 := 12;
+    constant typeRemove: Nat8 := 13;
+    constant typeMakeDir: Nat8 := 14;
+    constant typeRemoveDir: Nat8 := 15;
+    constant typeStat: Nat8 := 17;
+    constant typeRename: Nat8 := 18;
+    constant typeStatus: Nat8 := 101;
+    constant typeHandle: Nat8 := 102;
+    constant typeData: Nat8 := 103;
+    constant typeName: Nat8 := 104;
+    constant typeAttrs: Nat8 := 105;
+
+    -- Status codes.
+    constant statusOk: Int32 := 0;
+    constant statusEof: Int32 := 1;
+
+    -- The flags of an open request and of the attributes of a file.
+    constant openRead: Nat64 := 1;
+    constant openWriteCreateTruncate: Nat64 := 26;
+    constant attrSize: Nat64 := 1;
+    constant attrOwner: Nat64 := 2;
+    constant attrPermissions: Nat64 := 4;
+    constant attrTimes: Nat64 := 8;
+    constant attrExtended: Nat64 := 2147483648;
+
+    record Session: Linear is
+        process: Process;
+        input: FileDescriptor;
+        output: FileDescriptor;
+        errors: FileDescriptor;
+        nextId: Nat64;
+        spoiled: Bool;
+        -- The most one exchange may last, in milliseconds.
+        limit: Nat32;
+        -- When the exchange under way must be done, on the monotonic clock;
+        -- None without such a clock, and then every wait gets the whole limit.
+        deadline: Option[Nat64];
+    end;
+
+    function describe(error: SftpError): Span[Nat8, Static] is
+        let c: Int32 := error.code;
+        if c = 1 then
+            return "end of file";
+        end if;
+        if c = 2 then
+            return "no such file";
+        end if;
+        if c = 3 then
+            return "permission denied";
+        end if;
+        if c = 4 then
+            return "failure";
+        end if;
+        if c = 5 then
+            return "bad message";
+        end if;
+        if c = 6 then
+            return "no connection";
+        end if;
+        if c = 7 then
+            return "connection lost";
+        end if;
+        if c = 8 then
+            return "operation not supported";
+        end if;
+        if c = serverGone then
+            return "the server went away";
+        end if;
+        if c = badReply then
+            return "a reply that does not parse, or answers another request";
+        end if;
+        if c = sessionSpoiled then
+            return "an earlier failure spoiled the session";
+        end if;
+        if c = requestTooLong then
+            return "a request longer than four-byte lengths can say";
+        end if;
+        if c = requestIdsUsedUp then
+            return "the session has used up its request ids";
+        end if;
+        if c = timedOut then
+            return "the server did not answer in time";
+        end if;
+        return "a status code this client does not know";
+    end;
+
+    function failure(code: Int32): SftpError is
+        return SftpError(code => code);
+    end;
+
+    ---
+    --- Numbers on the wire: big-endian, as the protocol has them
+    ---
+
+    constant byteModulus: Nat64 := 256;
+
+    -- The low byte of value.  A number wider than its field comes out cut;
+    -- such a request is longer than 4 GiB, and exchangeNow refuses it by
+    -- its length before anything is sent.
+    function byteOfNat(value: Nat64): Nat8 is
+        case toNat8(rem(value, byteModulus)) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function natOfByte(b: Nat8): Nat64 is
+        case toNat64(b) of
+            when Some(value as n: Nat64) do
+                return n;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function natOfIndex(i: Index): Nat64 is
+        case toNat64(i) of
+            when Some(value as n: Nat64) do
+                return n;
+            when None do
+                abort("Standard.Sftp: an Index did not fit in a Nat64");
+        end case;
+    end;
+
+    function indexOfNat(n: Nat64): Index is
+        case toIndex(n) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                abort("Standard.Sftp: a length did not fit in an Index");
+        end case;
+    end;
+
+    function int32OfNat(n: Nat64): Int32 is
+        case toInt32(n) of
+            when Some(value as i: Int32) do
+                return i;
+            when None do
+                return badReply;
+        end case;
+    end;
+
+    -- value as width bytes, most significant first.
+    generic [R: Region]
+    function putNumber(out: &![StringBuilder, R], value: Nat64, width: Index): Unit is
+        var scale: Nat64 := 1;
+        var i: Index := 1;
+        while i < width do
+            scale := scale * byteModulus;
+            i := i + 1;
+        end while;
+        var rest: Nat64 := value;
+        while scale > 0 do
+            let digit: Nat64 := rest / scale;
+            writeByte(&~out, byteOfNat(digit));
+            rest := rest - (digit * scale);
+            scale := scale / byteModulus;
+        end while;
+        return nil;
+    end;
+
+    -- A string: its length as four bytes, then the bytes.
+    generic [R: Region, S: Region]
+    function putString(out: &![StringBuilder, R], text: Span[Nat8, S]): Unit is
+        putNumber(&~out, natOfIndex(spanLength(text)), 4);
+        writeString(&~out, text);
+        return nil;
+    end;
+
+    -- count bytes of text from start, as a string.
+    generic [R: Region, S: Region]
+    function putPiece(out: &![StringBuilder, R], text: Span[Nat8, S], start: Index, count: Index): Unit is
+        putNumber(&~out, natOfIndex(count), 4);
+        var i: Index := 0;
+        while i < count do
+            writeByte(&~out, text[start + i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- width bytes at the position at, most significant first.  The caller has
+    -- checked that they are there.
+    generic [R: Region]
+    function numberAt(bytes: Span[Nat8, R], at: Index, width: Index): Nat64 is
+        var total: Nat64 := 0;
+        var i: Index := 0;
+        while i < width do
+            total := (total * byteModulus) + natOfByte(bytes[at + i]);
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    -- Are there count bytes from the position at?
+    generic [R: Region]
+    function has(bytes: Span[Nat8, R], at: Index, count: Index): Bool is
+        -- Split, so that length - at is computed only where it cannot go
+        -- below zero.
+        if at > spanLength(bytes) then
+            return false;
+        end if;
+        return count <= (spanLength(bytes) - at);
+    end;
+
+    -- The string at the position at as a new String, and where it ends;
+    -- None when it runs past the end.
+    generic [R: Region]
+    function stringAt(bytes: Span[Nat8, R], at: Index): Option[String] is
+        if not has(bytes, at, 4) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        let size: Index := indexOfNat(numberAt(bytes, at, 4));
+        if not has(bytes, at + 4, size) then
+            let none: Option[String] := None();
+            return none;
+        end if;
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < size do
+            writeByte(&!out, bytes[(at + 4) + i]);
+            i := i + 1;
+        end while;
+        let some: Option[String] := Some(value => finalize(out));
+        return some;
+    end;
+
+    ---
+    --- The pipes, each through a reborrow of the session
+    ---
+
+    function wide(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.Sftp: a Nat32 did not fit a Nat64");
+                let none: Nat64 := 0;
+                return none;
+        end case;
+    end;
+
+    -- The reading of the monotonic clock at which limit milliseconds from
+    -- now are up; None without such a clock.
+    function deadlineAfter(limit: Nat32): Option[Nat64] is
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                let some: Option[Nat64] := Some(value => now + (wide(limit) * nanosPerMilli));
+                return some;
+            when None do
+                let none: Option[Nat64] := None();
+                return none;
+        end case;
+    end;
+
+    -- The milliseconds left until deadline, rounded up; 0 when it has passed.
+    -- With no deadline, or no clock to read, the whole limit.
+    function millisUntil(deadline: Option[Nat64], limit: Nat32): Nat32 is
+        case deadline of
+            when None do
+                return limit;
+            when Some(value as at: Nat64) do
+                case monotonicNanos() of
+                    when None do
+                        return limit;
+                    when Some(value as now: Nat64) do
+                        if now >= at then
+                            return zero32;
+                        end if;
+                        case toNat32(((at - now) + (nanosPerMilli - 1)) / nanosPerMilli) of
+                            when Some(value as left: Nat32) do
+                                return left;
+                            when None do
+                                return limit;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- Starts the time of one exchange.
+    generic [R: Region]
+    function startStep(session: &![Session, R]): Unit is
+        session->deadline := deadlineAfter(session->limit);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function millisLeft(session: &![Session, R]): Nat32 is
+        return millisUntil(session->deadline, session->limit);
+    end;
+
+    -- The code for a wait that did not finish.
+    function waitCode(why: WaitFailure): Int32 is
+        case why of
+            when WaitTimedOut do
+                return timedOut;
+            when WaitFailed do
+                return serverGone;
+        end case;
+    end;
+
+    -- The whole packet to the server within what is left of the exchange's
+    -- time: 0, or the code of the failure.
+    generic [R: Region, S: Region]
+    function sendBytes(session: &![Session, R], packet: Span[Nat8, S]): Int32 is
+        let budget: Nat32 := millisLeft(&~session);
+        case writeWithin(&!(session->input), packet, budget) of
+            when Right(right as done: Unit) do
+                return 0;
+            when Left(left as why: WaitFailure) do
+                return waitCode(why);
+        end case;
+    end;
+
+    -- At most most bytes from the server within what is left of the
+    -- exchange's time; an empty string when the server closed its output.
+    generic [R: Region]
+    function readSome(session: &![Session, R], most: Index): Either[WaitFailure, String] is
+        let budget: Nat32 := millisLeft(&~session);
+        return readWithin(&!(session->output), most, budget);
+    end;
+
+    -- Exactly count bytes from the server within what is left of the
+    -- exchange's time.  Left timedOut when the time ran out, Left serverGone
+    -- when the server closed its output or the read failed.
+    generic [R: Region]
+    function readBytes(session: &![Session, R], count: Index): Either[Int32, String] is
+        var out: StringBuilder := makeStringBuilder();
+        var have: Index := 0;
+        var code: Int32 := 0;
+        while (code = 0) and (have < count) do
+            -- At most one chunk a time: a read allocates what it may take.
+            var want: Index := count - have;
+            if want > chunk then
+                want := chunk;
+            end if;
+            case readSome(&~session, want) of
+                when Right(right as piece: String) do
+                    let got: Index := stringLength(&piece);
+                    if got = 0 then
+                        code := serverGone;
+                    else
+                        writeString(&!out, asSpan(&piece));
+                        have := have + got;
+                    end if;
+                    destroyString(piece);
+                when Left(left as why: WaitFailure) do
+                    code := waitCode(why);
+            end case;
+        end while;
+        let text: String := finalize(out);
+        if code = 0 then
+            return Right(right => text);
+        else
+            destroyString(text);
+            return Left(left => code);
+        end if;
+    end;
+
+    generic [R: Region]
+    function spoil(session: &![Session, R]): Unit is
+        session->spoiled := true;
+        return nil;
+    end;
+
+    -- An exchange failed with code: the session is spoiled, and when the
+    -- server did not answer in time its child is told to end, so that
+    -- endSession does not wait for a server that has stalled.
+    generic [R: Region]
+    function noteFailure(session: &![Session, R], code: Int32): Unit is
+        spoil(&~session);
+        endIfStalled(&(session->process), code);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function endIfStalled(process: &[Process, R], code: Int32): Unit is
+        if code = timedOut then
+            let told: Bool := terminateProcess(process);
+        end if;
+        return nil;
+    end;
+
+    -- A packet: its length as four bytes, then the body.
+    function framed(payload: String): String is
+        var out: StringBuilder := makeStringBuilder();
+        putNumber(&!out, natOfIndex(stringLength(&payload)), 4);
+        writeString(&!out, asSpan(&payload));
+        destroyString(payload);
+        return finalize(out);
+    end;
+
+    -- The next packet from the server, without its length.  Left with the
+    -- code of the failure: timedOut, or serverGone when the server went away
+    -- or announced no packet or more than the longest reply.
+    generic [R: Region]
+    function receive(session: &![Session, R]): Either[Int32, String] is
+        let head: String := readBytes(&~session, 4)?;
+        let size: Nat64 := numberAt(asSpan(&head), 0, 4);
+        destroyString(head);
+        if (size = 0) or (size > longestReply) then
+            return Left(left => serverGone);
+        end if;
+        return readBytes(&~session, indexOfNat(size));
+    end;
+
+    -- One request and its reply: the type, a fresh id, then payload.
+    -- The reply is checked to answer this id; a failure spoils the
+    -- session, and a spoiled session writes nothing more.
+    generic [R: Region]
+    function exchange(session: &![Session, R], kind: Nat8, payload: String): Either[SftpError, String] is
+        if session->spoiled then
+            destroyString(payload);
+            return Left(left => failure(sessionSpoiled));
+        else
+            return exchangeNow(&~session, kind, payload);
+        end if;
+    end;
+
+    generic [R: Region]
+    function exchangeNow(session: &![Session, R], kind: Nat8, payload: String): Either[SftpError, String] is
+        -- The packet is its length, the type, the id and the payload; the
+        -- length counts the type, the id and the payload, and must fit four
+        -- bytes.  A longer request is not sent.
+        if natOfIndex(stringLength(&payload)) > (largestWord - 5) then
+            destroyString(payload);
+            return Left(left => failure(requestTooLong));
+        else
+            return exchangeNumbered(&~session, kind, payload);
+        end if;
+    end;
+
+    -- The request sent under the session's next id, which must fit the four
+    -- bytes of the id; a session that has used them all up is spoiled.
+    generic [R: Region]
+    function exchangeNumbered(session: &![Session, R], kind: Nat8, payload: String): Either[SftpError, String] is
+        let id: Nat64 := session->nextId;
+        if id > largestWord then
+            destroyString(payload);
+            spoil(&~session);
+            return Left(left => failure(requestIdsUsedUp));
+        else
+            return exchangeWithId(&~session, kind, payload, id);
+        end if;
+    end;
+
+    generic [R: Region]
+    function exchangeWithId(session: &![Session, R], kind: Nat8, payload: String, id: Nat64): Either[SftpError, String] is
+        session->nextId := id + 1;
+        startStep(&~session);
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, kind);
+        putNumber(&!out, id, 4);
+        writeString(&!out, asSpan(&payload));
+        destroyString(payload);
+        let packet: String := framed(finalize(out));
+        let sent: Int32 := sendBytes(&~session, asSpan(&packet));
+        destroyString(packet);
+        if not (sent = 0) then
+            noteFailure(&~session, sent);
+            return Left(left => failure(sent));
+        end if;
+        case receive(&~session) of
+            when Left(left as code: Int32) do
+                noteFailure(&~session, code);
+                return Left(left => failure(code));
+            when Right(right as reply: String) do
+                var answers: Bool := false;
+                if has(asSpan(&reply), 0, 5) then
+                    answers := numberAt(asSpan(&reply), 1, 4) = id;
+                end if;
+                if answers then
+                    return Right(right => reply);
+                else
+                    destroyString(reply);
+                    spoil(&~session);
+                    return Left(left => failure(badReply));
+                end if;
+        end case;
+    end;
+
+    -- The code of a status reply, or badReply for any other reply.  It
+    -- consumes the reply.
+    function statusOf(reply: String): Int32 is
+        var code: Int32 := badReply;
+        if nthByte(&reply, 0) = typeStatus then
+            if has(asSpan(&reply), 5, 4) then
+                code := int32OfNat(numberAt(asSpan(&reply), 5, 4));
+            end if;
+        end if;
+        destroyString(reply);
+        return code;
+    end;
+
+    -- A reply that must be a status reply with the code for success.
+    function expectOk(reply: Either[SftpError, String]): Either[SftpError, Unit] is
+        let bytes: String := reply?;
+        let code: Int32 := statusOf(bytes);
+        if code = statusOk then
+            return Right(right => nil);
+        end if;
+        return Left(left => failure(code));
+    end;
+
+    -- A reply that must be a handle reply: the handle.
+    function handleOf(reply: Either[SftpError, String]): Either[SftpError, String] is
+        let bytes: String := reply?;
+        if nthByte(&bytes, 0) = typeHandle then
+            let handle: Option[String] := stringAt(asSpan(&bytes), 5);
+            destroyString(bytes);
+            case handle of
+                when Some(value as h: String) do
+                    return Right(right => h);
+                when None do
+                    return Left(left => failure(badReply));
+            end case;
+        else
+            return Left(left => failure(statusOf(bytes)));
+        end if;
+    end;
+
+    -- The body of a request that names one path.
+    generic [R: Region]
+    function pathBody(path: Span[Nat8, R]): StringBuilder is
+        var out: StringBuilder := makeStringBuilder();
+        putString(&!out, path);
+        return out;
+    end;
+
+    generic [R: Region]
+    function closeHandle(session: &![Session, R], handle: String): Either[SftpError, Unit] is
+        let payload: StringBuilder := pathBody(asSpan(&handle));
+        destroyString(handle);
+        return expectOk(exchange(session, typeClose, finalize(payload)));
+    end;
+
+    -- The first failure of a transfer and the close request after it: the
+    -- failure of the transfer wins, the failure of the close counts when
+    -- there was none.
+    function afterClose(code: Int32, closed: Either[SftpError, Unit]): Int32 is
+        if code /= statusOk then
+            return code;
+        end if;
+        case closed of
+            when Left(left as error: SftpError) do
+                return error.code;
+            when Right(right as done: Unit) do
+                return statusOk;
+        end case;
+    end;
+
+    ---
+    --- Starting and ending
+    ---
+
+    -- Both pipes the session waits on are made non-blocking, so that a wait
+    -- can end with the time.
+    generic [R: Region]
+    function unblock(session: &![Session, R]): Bool is
+        let a: Bool := unblockInput(&~session);
+        let b: Bool := unblockOutput(&~session);
+        return a and b;
+    end;
+
+    generic [R: Region]
+    function endChild(session: &![Session, R]): Unit is
+        let told: Bool := terminateProcess(&(session->process));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function unblockInput(session: &![Session, R]): Bool is
+        return makeNonblocking(&!(session->input));
+    end;
+
+    generic [R: Region]
+    function unblockOutput(session: &![Session, R]): Bool is
+        return makeNonblocking(&!(session->output));
+    end;
+
+    function startSession(command: Command, milliseconds: Nat32): Option[Session] is
+        case spawnProcess(command) of
+            when None do
+                let none: Option[Session] := None();
+                return none;
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let first: Nat64 := 1;
+                let noDeadline: Option[Nat64] := None();
+                var session: Session := Session(process => process, input => input, output => output,
+                    errors => errors, nextId => first, spoiled => false,
+                    limit => milliseconds, deadline => noDeadline);
+                var agreed: Bool := false;
+                if unblock(&!session) then
+                    agreed := hello(&!session);
+                else
+                    -- A pipe that stays blocking cannot be waited on with a
+                    -- limit: the child is ended before it is waited for.
+                    endChild(&!session);
+                end if;
+                if agreed then
+                    let some: Option[Session] := Some(value => session);
+                    return some;
+                else
+                    let status: ProcessStatus := endSession(session);
+                    let none: Option[Session] := None();
+                    return none;
+                end if;
+        end case;
+    end;
+
+    -- An init request with version 3, and a version reply that says 3.
+    generic [R: Region]
+    function hello(session: &![Session, R]): Bool is
+        startStep(&~session);
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, typeInit);
+        putNumber(&!out, 3, 4);
+        let packet: String := framed(finalize(out));
+        let sent: Int32 := sendBytes(&~session, asSpan(&packet));
+        destroyString(packet);
+        if not (sent = 0) then
+            noteFailure(&~session, sent);
+            return false;
+        end if;
+        case receive(&~session) of
+            when Left(left as code: Int32) do
+                noteFailure(&~session, code);
+                return false;
+            when Right(right as reply: String) do
+                var agreed: Bool := false;
+                if has(asSpan(&reply), 0, 5) then
+                    if nthByte(&reply, 0) = typeVersion then
+                        agreed := numberAt(asSpan(&reply), 1, 4) = 3;
+                    end if;
+                end if;
+                destroyString(reply);
+                return agreed;
+        end case;
+    end;
+
+    -- True when the child closed its output within limit milliseconds,
+    -- which it does when it ends: what it still had to say is read and
+    -- thrown away.  False when the time ran out or a read failed.
+    generic [R: Region]
+    function drained(output: &![FileDescriptor, R], limit: Nat32): Bool is
+        let deadline: Option[Nat64] := deadlineAfter(limit);
+        var ended: Bool := false;
+        var stopped: Bool := false;
+        var taken: Index := 0;
+        while (not ended) and (not stopped) do
+            let budget: Nat32 := millisUntil(deadline, limit);
+            case readWithin(&~output, drainSize, budget) of
+                when Right(right as piece: String) do
+                    let got: Index := stringLength(&piece);
+                    if got = 0 then
+                        ended := true;
+                    end if;
+                    taken := taken + got;
+                    destroyString(piece);
+                when Left(left as why: WaitFailure) do
+                    stopped := true;
+            end case;
+            -- Without a clock the time never runs out, so what is thrown away
+            -- is limited as well.
+            if (millisUntil(deadline, limit) = zero32) or (taken > drainMost) then
+                stopped := true;
+            end if;
+        end while;
+        return ended;
+    end;
+
+    function endSession(session: Session): ProcessStatus is
+        let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor, nextId: Nat64, spoiled: Bool, limit: Nat32, deadline: Option[Nat64] } := session;
+        let a: Bool := closeFile(input);
+        var reading: FileDescriptor := output;
+        let ended: Bool := drained(&!reading, limit);
+        if not ended then
+            let told: Bool := terminateProcess(&process);
+        end if;
+        let b: Bool := closeFile(reading);
+        let c: Bool := closeFile(errors);
+        return waitProcess(process);
+    end;
+
+    ---
+    --- Whole files
+    ---
+
+    generic [R: Region, S: Region]
+    function readFile(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, String] is
+        var payload: StringBuilder := pathBody(path);
+        putNumber(&!payload, openRead, 4);
+        putNumber(&!payload, 0, 4);
+        let handle: String := handleOf(exchange(&~session, typeOpen, finalize(payload)))?;
+        var data: StringBuilder := makeStringBuilder();
+        var offset: Nat64 := 0;
+        var code: Int32 := statusOk;
+        var reading: Bool := true;
+        while reading do
+            var request: StringBuilder := makeStringBuilder();
+            putString(&!request, asSpan(&handle));
+            putNumber(&!request, offset, 8);
+            putNumber(&!request, natOfIndex(chunk), 4);
+            case exchange(&~session, typeRead, finalize(request)) of
+                when Left(left as error: SftpError) do
+                    code := error.code;
+                    reading := false;
+                when Right(right as reply: String) do
+                    if nthByte(&reply, 0) = typeData then
+                        case stringAt(asSpan(&reply), 5) of
+                            when Some(value as piece: String) do
+                                let got: Index := stringLength(&piece);
+                                if got = 0 then
+                                    code := badReply;
+                                    reading := false;
+                                else
+                                    writeString(&!data, asSpan(&piece));
+                                    offset := offset + natOfIndex(got);
+                                end if;
+                                destroyString(piece);
+                            when None do
+                                code := badReply;
+                                reading := false;
+                        end case;
+                        destroyString(reply);
+                    else
+                        let status: Int32 := statusOf(reply);
+                        if status /= statusEof then
+                            code := status;
+                        end if;
+                        reading := false;
+                    end if;
+            end case;
+        end while;
+        let outcome: Int32 := afterClose(code, closeHandle(&~session, handle));
+        let whole: String := finalize(data);
+        if outcome /= statusOk then
+            destroyString(whole);
+            return Left(left => failure(outcome));
+        else
+            return Right(right => whole);
+        end if;
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function writeFile(session: &![Session, R], path: Span[Nat8, S], data: Span[Nat8, T]): Either[SftpError, Unit] is
+        var payload: StringBuilder := pathBody(path);
+        putNumber(&!payload, openWriteCreateTruncate, 4);
+        putNumber(&!payload, attrPermissions, 4);
+        putNumber(&!payload, 384, 4);
+        let handle: String := handleOf(exchange(&~session, typeOpen, finalize(payload)))?;
+        let size: Index := spanLength(data);
+        var offset: Index := 0;
+        var code: Int32 := statusOk;
+        while (code = statusOk) and (offset < size) do
+            var piece: Index := size - offset;
+            if piece > chunk then
+                piece := chunk;
+            end if;
+            var request: StringBuilder := makeStringBuilder();
+            putString(&!request, asSpan(&handle));
+            putNumber(&!request, natOfIndex(offset), 8);
+            putPiece(&!request, data, offset, piece);
+            case expectOk(exchange(&~session, typeWrite, finalize(request))) of
+                when Left(left as error: SftpError) do
+                    code := error.code;
+                when Right(right as done: Unit) do
+                    offset := offset + piece;
+            end case;
+        end while;
+        let closed: Either[SftpError, Unit] := closeHandle(&~session, handle);
+        if code /= statusOk then
+            return Left(left => failure(code));
+        end if;
+        return closed;
+    end;
+
+    ---
+    --- Directories and names
+    ---
+
+    -- Is it the name . or the name ..?
+    generic [R: Region]
+    function isDots(name: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(name);
+        if (size = 1) and (name[0] = '.') then
+            return true;
+        end if;
+        return (size = 2) and ((name[0] = '.') and (name[1] = '.'));
+    end;
+
+    -- Where the attributes at the position at end; None when they run past
+    -- the reply.
+    generic [R: Region]
+    function skipAttributes(bytes: Span[Nat8, R], at: Index): Option[Index] is
+        if not has(bytes, at, 4) then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        let flags: Nat64 := numberAt(bytes, at, 4);
+        var size: Index := 4;
+        if bitwiseAnd(flags, attrSize) /= 0 then
+            size := size + 8;
+        end if;
+        if bitwiseAnd(flags, attrOwner) /= 0 then
+            size := size + 8;
+        end if;
+        if bitwiseAnd(flags, attrPermissions) /= 0 then
+            size := size + 4;
+        end if;
+        if bitwiseAnd(flags, attrTimes) /= 0 then
+            size := size + 8;
+        end if;
+        if not has(bytes, at, size) then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        var past: Index := at + size;
+        if bitwiseAnd(flags, attrExtended) /= 0 then
+            if not has(bytes, past, 4) then
+                let none: Option[Index] := None();
+                return none;
+            end if;
+            let pairs: Index := indexOfNat(numberAt(bytes, past, 4));
+            past := past + 4;
+            var k: Index := 0;
+            while k < (pairs * 2) do
+                if not has(bytes, past, 4) then
+                    let none: Option[Index] := None();
+                    return none;
+                end if;
+                let length: Index := indexOfNat(numberAt(bytes, past, 4));
+                if not has(bytes, past + 4, length) then
+                    let none: Option[Index] := None();
+                    return none;
+                end if;
+                past := (past + 4) + length;
+                k := k + 1;
+            end while;
+        end if;
+        let some: Option[Index] := Some(value => past);
+        return some;
+    end;
+
+    -- The names of one name reply into the list; false when it does not
+    -- parse.
+    generic [R: Region, S: Region]
+    function takeNames(reply: Span[Nat8, R], names: &![Buffer[String], S]): Bool is
+        if not has(reply, 5, 4) then
+            return false;
+        end if;
+        let count: Index := indexOfNat(numberAt(reply, 5, 4));
+        var at: Index := 9;
+        var k: Index := 0;
+        while k < count do
+            case stringAt(reply, at) of
+                when None do
+                    return false;
+                when Some(value as name: String) do
+                    let afterName: Index := (at + 4) + stringLength(&name);
+                    if isDots(asSpan(&name)) then
+                        destroyString(name);
+                    else
+                        insertBack(&~names, name);
+                    end if;
+                    -- the long name, then the attributes
+                    if not has(reply, afterName, 4) then
+                        return false;
+                    end if;
+                    let longName: Index := indexOfNat(numberAt(reply, afterName, 4));
+                    if not has(reply, afterName + 4, longName) then
+                        return false;
+                    end if;
+                    case skipAttributes(reply, (afterName + 4) + longName) of
+                        when None do
+                            return false;
+                        when Some(value as next: Index) do
+                            at := next;
+                    end case;
+            end case;
+            k := k + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function listDirectory(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Buffer[String]] is
+        let payload: StringBuilder := pathBody(path);
+        let handle: String := handleOf(exchange(&~session, typeOpenDir, finalize(payload)))?;
+        var names: Buffer[String] := allocateEmpty();
+        var code: Int32 := statusOk;
+        var reading: Bool := true;
+        while reading do
+            var request: StringBuilder := makeStringBuilder();
+            putString(&!request, asSpan(&handle));
+            case exchange(&~session, typeReadDir, finalize(request)) of
+                when Left(left as error: SftpError) do
+                    code := error.code;
+                    reading := false;
+                when Right(right as reply: String) do
+                    if nthByte(&reply, 0) = typeName then
+                        if not takeNames(asSpan(&reply), &!names) then
+                            code := badReply;
+                            reading := false;
+                        end if;
+                        destroyString(reply);
+                    else
+                        let status: Int32 := statusOf(reply);
+                        if status /= statusEof then
+                            code := status;
+                        end if;
+                        reading := false;
+                    end if;
+            end case;
+        end while;
+        let outcome: Int32 := afterClose(code, closeHandle(&~session, handle));
+        if outcome /= statusOk then
+            destroyNames(names);
+            return Left(left => failure(outcome));
+        else
+            return Right(right => sort(names));
+        end if;
+    end;
+
+    function destroyNames(names: Buffer[String]): Unit is
+        var list: Buffer[String] := names;
+        while bufferLength(&list) > 0 do
+            destroyString(removeFirst(&!list));
+        end while;
+        destroyEmpty(list);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function sizeOf(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Nat64] is
+        let payload: StringBuilder := pathBody(path);
+        let reply: String := exchange(&~session, typeStat, finalize(payload))?;
+        if nthByte(&reply, 0) = typeAttrs then
+            var result: Either[SftpError, Nat64] := Left(left => failure(badReply));
+            if has(asSpan(&reply), 5, 12) then
+                if bitwiseAnd(numberAt(asSpan(&reply), 5, 4), attrSize) /= 0 then
+                    let found: Either[SftpError, Nat64] := Right(right => numberAt(asSpan(&reply), 9, 8));
+                    result := found;
+                end if;
+            end if;
+            destroyString(reply);
+            return result;
+        else
+            return Left(left => failure(statusOf(reply)));
+        end if;
+    end;
+
+    generic [R: Region, S: Region]
+    function makeDirectory(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Unit] is
+        var payload: StringBuilder := pathBody(path);
+        putNumber(&!payload, attrPermissions, 4);
+        putNumber(&!payload, 448, 4);
+        return expectOk(exchange(session, typeMakeDir, finalize(payload)));
+    end;
+
+    generic [R: Region, S: Region]
+    function deleteFile(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Unit] is
+        let payload: StringBuilder := pathBody(path);
+        return expectOk(exchange(session, typeRemove, finalize(payload)));
+    end;
+
+    generic [R: Region, S: Region]
+    function deleteDirectory(session: &![Session, R], path: Span[Nat8, S]): Either[SftpError, Unit] is
+        let payload: StringBuilder := pathBody(path);
+        return expectOk(exchange(session, typeRemoveDir, finalize(payload)));
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function renamePath(session: &![Session, R], oldPath: Span[Nat8, S], newPath: Span[Nat8, T]): Either[SftpError, Unit] is
+        var payload: StringBuilder := pathBody(oldPath);
+        putString(&!payload, newPath);
+        return expectOk(exchange(session, typeRename, finalize(payload)));
+    end;
+end module body.

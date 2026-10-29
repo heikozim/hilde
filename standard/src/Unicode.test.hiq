@@ -1,0 +1,280 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The expected answers of single texts were computed by Python's str
+-- methods, which carry Unicode 15.1.0; the tables come from 17.0.0, and
+-- the two agree on every code point Python knows except four that gained
+-- a capital letter since, one of which a test below takes.  The digests
+-- are computed by the generator from the 17.0.0 files.  Text is written
+-- as UTF-8 in hexadecimal, since a source file holds ASCII only.
+import Standard.Testing (
+    assertTrue,
+    assertFalse,
+    assertSuccess,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    finalize
+);
+import Standard.Text (
+    hexToBytes
+);
+import Standard.Utf8 (
+    CodePoint,
+    makeCodePoint,
+    appendCodePoint
+);
+import Standard.Unicode (
+    toUpper,
+    toLower,
+    foldCase,
+    equalIgnoringCase,
+    hasCase
+);
+
+module body Standard.Unicode.Test is
+    ---
+    --- Helpers
+    ---
+
+    function bytesOf(hex: Span[Nat8, Static]): String is
+        case hexToBytes(hex) of
+            when Some(value as bytes: String) do
+                return bytes;
+            when None do
+                abort("Standard.Unicode.Test: a test text is not hexadecimal");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(left: &[String, R], right: &[String, S]): Bool is
+        let size: Index := stringLength(left);
+        if size /= stringLength(right) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            if nthByte(left, i) /= nthByte(right, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- 0 upper, 1 lower, 2 fold.
+    generic [R: Region]
+    function mapped(kind: Int32, text: Span[Nat8, R]): Option[String] is
+        if kind = 0 then
+            return toUpper(text);
+        end if;
+        if kind = 1 then
+            return toLower(text);
+        end if;
+        return foldCase(text);
+    end;
+
+    -- Whether kind maps the UTF-8 of input to that of expected.
+    function mapsTo(kind: Int32, input: Span[Nat8, Static], expected: Span[Nat8, Static]): Bool is
+        let text: String := bytesOf(input);
+        let wanted: String := bytesOf(expected);
+        let result: Option[String] := mapped(kind, asSpan(&text));
+        destroyString(text);
+        case result of
+            when Some(value as got: String) do
+                let same: Bool := sameBytes(&got, &wanted);
+                destroyString(got);
+                destroyString(wanted);
+                return same;
+            when None do
+                destroyString(wanted);
+                return false;
+        end case;
+    end;
+
+    function equalHex(left: Span[Nat8, Static], right: Span[Nat8, Static]): Bool is
+        let a: String := bytesOf(left);
+        let b: String := bytesOf(right);
+        let same: Bool := equalIgnoringCase(asSpan(&a), asSpan(&b));
+        destroyString(a);
+        destroyString(b);
+        return same;
+    end;
+
+    function pointOf(scalar: Nat32): CodePoint is
+        case makeCodePoint(scalar) of
+            when Some(value as point: CodePoint) do
+                return point;
+            when None do
+                abort("Standard.Unicode.Test: not a scalar value");
+        end case;
+    end;
+
+    -- The FNV-1a hash of the mapping by kind of every scalar value below
+    -- U+20000, each alone, as scripts/unicode/make-case-tables.py
+    -- --digests computes it; and how many of them change.
+    record Digest: Free is
+        hash: Nat32;
+        changed: Nat32;
+    end;
+
+    function digest(kind: Int32): Digest is
+        let prime: Nat32 := 16777619;
+        let surrogatesFrom: Nat32 := 55296;
+        let surrogatesTo: Nat32 := 57343;
+        let limit: Nat32 := 131072;
+        var hash: Nat32 := 2166136261;
+        var changed: Nat32 := 0;
+        var scalar: Nat32 := 0;
+        while scalar < limit do
+            if (scalar < surrogatesFrom) or (scalar > surrogatesTo) then
+                var builder: StringBuilder := makeStringBuilder();
+                appendCodePoint(&!builder, pointOf(scalar));
+                let text: String := finalize(builder);
+                case mapped(kind, asSpan(&text)) of
+                    when Some(value as got: String) do
+                        if not sameBytes(&got, &text) then
+                            changed := changed + 1;
+                        end if;
+                        let size: Index := stringLength(&got);
+                        var i: Index := 0;
+                        while i < size do
+                            case toNat32(nthByte(&got, i)) of
+                                when Some(value as byte: Nat32) do
+                                    hash := modularMultiply(bitwiseXor(hash, byte), prime);
+                                when None do
+                                    abort("Standard.Unicode.Test: a byte did not fit a Nat32");
+                            end case;
+                            i := i + 1;
+                        end while;
+                        destroyString(got);
+                    when None do
+                        abort("Standard.Unicode.Test: a scalar value was refused");
+                end case;
+                destroyString(text);
+            end if;
+            scalar := scalar + 1;
+        end while;
+        let made: Digest := Digest(hash => hash, changed => changed);
+        return made;
+    end;
+
+    ---
+    --- Tests
+    ---
+
+    function testUpper(): Unit is
+        assertTrue(mapsTo(0, "68656c6c6f2c20576f726c6421", "48454c4c4f2c20574f524c4421"), "ASCII");
+        assertTrue(mapsTo(0, "73747261c39f65", "53545241535345"), "sharp s to SS");
+        assertTrue(mapsTo(0, "c786", "c784"), "dz digraph");
+        assertTrue(mapsTo(0, "efac81", "4649"), "fi ligature to two letters");
+        assertTrue(mapsTo(0, "ce90", "ce99cc88cc81"), "iota with dialytika and tonos to three code points");
+        assertTrue(mapsTo(0, "e18390", "e1b290"), "Georgian to Mtavruli");
+        assertTrue(mapsTo(0, "f09090a8", "f0909080"), "Deseret, beyond the first plane");
+        assertTrue(mapsTo(0, "c589", "cabc4e"), "n preceded by apostrophe");
+        assertTrue(mapsTo(0, "c3bf", "c5b8"), "y with diaeresis to another block");
+        -- The capital of lambda with stroke is newer than Python's data,
+        -- which leaves the small letter as it is.
+        assertTrue(mapsTo(0, "c69b", "ea9f9c"), "lambda with stroke to its capital");
+        assertTrue(mapsTo(1, "ea9f9c", "c69b"), "and back");
+        assertTrue(mapsTo(0, "", ""), "empty text");
+        return nil;
+    end;
+
+    function testLower(): Unit is
+        assertTrue(mapsTo(1, "48454c4c4f", "68656c6c6f"), "ASCII");
+        assertTrue(mapsTo(1, "c4b0", "69cc87"), "capital I with dot above to i and a combining dot");
+        assertTrue(mapsTo(1, "c784", "c786"), "DZ digraph");
+        assertTrue(mapsTo(1, "f0909080", "f09090a8"), "Deseret");
+        assertTrue(mapsTo(1, "e284aa", "6b"), "Kelvin sign to k");
+        assertTrue(mapsTo(1, "cea3", "cf83"), "capital sigma alone");
+        -- Python gives cf83ceb1cf82 here, the final sigma by the rule that
+        -- looks at the neighbours; this module maps each code point alone.
+        assertTrue(mapsTo(1, "cea3ce91cea3", "cf83ceb1cf83"), "a capital sigma at the end, without the final sigma rule");
+        return nil;
+    end;
+
+    function testFold(): Unit is
+        assertTrue(mapsTo(2, "53747261c39f65", "73747261737365"), "sharp s folds to ss");
+        assertTrue(mapsTo(2, "c785", "c786"), "title case dz");
+        assertTrue(mapsTo(2, "c5bf", "73"), "long s");
+        assertTrue(mapsTo(2, "e1ba9e", "7373"), "capital sharp s");
+        assertTrue(mapsTo(2, "eaadb0", "e18ea0"), "Cherokee small letter to capital");
+        assertTrue(mapsTo(2, "cf82", "cf83"), "final sigma folds to sigma");
+        return nil;
+    end;
+
+    function testEqualIgnoringCase(): Unit is
+        assertTrue(equalHex("53747261c39f65", "53545241535345"), "Strasse with sharp s and STRASSE");
+        assertTrue(equalHex("c785", "c786"), "title case and small dz");
+        assertTrue(equalHex("e284aa", "6b"), "Kelvin sign and k");
+        assertFalse(equalHex("48656c6c6f", "48656c70"), "Hello and Help");
+        assertFalse(equalHex("c3", "c3"), "a text that is not UTF-8 equals nothing, not even itself");
+        return nil;
+    end;
+
+    function testRefused(): Unit is
+        let broken: String := bytesOf("41c3");
+        case toUpper(asSpan(&broken)) of
+            when Some(value as got: String) do
+                destroyString(got);
+                assertFailure("a cut sequence is refused");
+            when None do
+                assertSuccess("a cut sequence is refused");
+        end case;
+        destroyString(broken);
+        let surrogate: String := bytesOf("eda080");
+        case foldCase(asSpan(&surrogate)) of
+            when Some(value as got: String) do
+                destroyString(got);
+                assertFailure("an encoded surrogate is refused");
+            when None do
+                assertSuccess("an encoded surrogate is refused");
+        end case;
+        destroyString(surrogate);
+        return nil;
+    end;
+
+    function testHasCase(): Unit is
+        assertTrue(hasCase(pointOf(65)), "A has case");
+        assertTrue(hasCase(pointOf(223)), "the sharp s has case");
+        assertFalse(hasCase(pointOf(49)), "a digit has none");
+        assertFalse(hasCase(pointOf(131072)), "U+20000 has none");
+        return nil;
+    end;
+
+    -- Every scalar value below U+20000 against the generator's answer from
+    -- the Unicode data files, as a digest: no mapping lies beyond, measured
+    -- by the generator.
+    function testEveryCodePoint(): Unit is
+        let upper: Digest := digest(0);
+        let lower: Digest := digest(1);
+        let fold: Digest := digest(2);
+        let upperHash: Nat32 := 2435520832;
+        let lowerHash: Nat32 := 3604846444;
+        let foldHash: Nat32 := 10796044;
+        let upperChanged: Nat32 := 1580;
+        let lowerChanged: Nat32 := 1488;
+        let foldChanged: Nat32 := 1585;
+        assertTrue(upper.changed = upperChanged, "1580 code points change in upper case");
+        assertTrue(upper.hash = upperHash, "every upper case mapping as the data gives it");
+        assertTrue(lower.changed = lowerChanged, "1488 code points change in lower case");
+        assertTrue(lower.hash = lowerHash, "every lower case mapping as the data gives it");
+        assertTrue(fold.changed = foldChanged, "1585 code points change when folded");
+        assertTrue(fold.hash = foldHash, "every folding as the data gives it");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,734 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The steps run in order and the first that fails ends the export: the
+-- test files, the tests, their coverage of the exported functions, the
+-- version against the newest tag, then the files written from the
+-- interfaces, the signature of the tree, and the archive.  Each step is a
+-- function that gives back the problem that stops it, or None.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nth,
+    nthRef,
+    insertBack,
+    destroyFree
+);
+import Standard.Text (
+    equal,
+    startsWith,
+    endsWith,
+    contains,
+    substring,
+    trim,
+    lines
+);
+import Standard.Order (
+    Ordering,
+    LessThan,
+    Equal,
+    GreaterThan,
+    compare
+);
+import Standard.Semver (
+    Version,
+    formatVersion,
+    nextPatch,
+    nextMinor,
+    nextMajor,
+    sameMajor
+);
+import Standard.Signify (
+    signMessage
+);
+import Standard.Archive (
+    ArchiveFormat,
+    TarGz,
+    ArchiveWriter,
+    makeArchiveWriter,
+    addFile,
+    finishArchive
+);
+import Standard.Platform (
+    systemName
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf,
+    destroyProblem
+);
+import Pkg.Manifest (
+    Manifest,
+    readManifest,
+    nameOf,
+    destroyManifest
+);
+import Pkg.Tree (
+    treeFiles,
+    treeSum,
+    removeTree
+);
+import Pkg.Files (
+    readText,
+    writeText,
+    isThere,
+    joinPath,
+    makeDirectories
+);
+import Pkg.Process (
+    Ran,
+    findProgram,
+    runProgram
+);
+import Pkg.Git (
+    listTags,
+    cloneTag
+);
+import Pkg.Api (
+    Declaration,
+    ApiDiff,
+    declarationsIn,
+    diffTrees,
+    levelName,
+    destroyDeclarations,
+    destroyDiff
+);
+import Pkg.Doc (
+    llmsText,
+    moduleNames,
+    manualPage,
+    mdocDate
+);
+import Pkg.Get (
+    Got
+);
+
+module body Pkg.Export is
+    function gotWith(problem: Problem): Got is
+        var problems: Buffer[Problem] := allocateEmpty();
+        insertBack(&!problems, problem);
+        return Got(count => 0, summary => makeEmpty(), problems => problems);
+    end;
+
+    generic [A: Region, B: Region, C: Region]
+    function said(a: Span[Nat8, A], b: Span[Nat8, B], c: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        writeString(&!out, c);
+        return finalize(out);
+    end;
+
+    generic [A: Region, B: Region, C: Region, D: Region, E: Region, F: Region]
+    function said6(a: Span[Nat8, A], b: Span[Nat8, B], c: Span[Nat8, C], d: Span[Nat8, D], e: Span[Nat8, E], f: Span[Nat8, F]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        writeString(&!out, c);
+        writeString(&!out, d);
+        writeString(&!out, e);
+        writeString(&!out, f);
+        return finalize(out);
+    end;
+
+    generic [N: Region]
+    function lowerOf(name: Span[Nat8, N]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(name) do
+            let byte: Nat8 := name[i];
+            if byte = '.' then
+                writeByte(&!out, '-');
+            else if (byte >= 'A') and (byte <= 'Z') then
+                writeByte(&!out, byte + 32);
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [M: Region]
+    function versionOf(manifest: &[Manifest, M]): Version is
+        return manifest->version;
+    end;
+
+    -- Every interface below src has its test file.
+    generic [F: Region]
+    function missingTests(files: &[Buffer[String], F]): Option[Problem] is
+        var out: StringBuilder := makeStringBuilder();
+        var missing: Index := 0;
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            if endsWith(file, ".hih") then
+                let test: String := said("src/", substring(file, 0, spanLength(file) - 4), ".test.hiq");
+                if not isThere(asSpan(&test)) then
+                    if missing > 0 then
+                        writeString(&!out, ", ");
+                    end if;
+                    writeString(&!out, asSpan(&test));
+                    missing := missing + 1;
+                end if;
+                destroyString(test);
+            end if;
+            i := i + 1;
+        end while;
+        let list: String := finalize(out);
+        if missing = 0 then
+            destroyString(list);
+            return None();
+        end if;
+        let p: Problem := problemOf(1531, said("a release needs a test file for each module, and these are missing: ", asSpan(&list), ""), fromLiteral("write them; hilde new module writes one with each module"));
+        destroyString(list);
+        return Some(value => p);
+    end;
+
+    -- hilde test src passes.
+    generic [C: Region]
+    function testsPass(compiler: Span[Nat8, C]): Option[Problem] is
+        var words: Buffer[String] := allocateEmpty();
+        insertBack(&!words, fromLiteral("test"));
+        insertBack(&!words, fromLiteral("src"));
+        let ran: Either[Problem, Ran] := runProgram(compiler, &words);
+        destroyArguments(words);
+        case ran of
+            when Right(right as r: Ran) do
+                let { exitCode: Int32, output: String, errors: String } := r;
+                destroyString(errors);
+                if exitCode = 0 then
+                    destroyString(output);
+                    return None();
+                end if;
+                let last: String := lastLine(asSpan(&output));
+                destroyString(output);
+                let p: Problem := problemOf(1532, said("the tests of the package do not pass: ", asSpan(&last), ""), fromLiteral("run hilde test src and make them pass"));
+                destroyString(last);
+                return Some(value => p);
+            when Left(left as p: Problem) do
+                return Some(value => p);
+        end case;
+    end;
+
+    generic [T: Region]
+    function lastLine(text: Span[Nat8, T]): String is
+        let all: Buffer[Span[Nat8, T]] := lines(text);
+        var out: String := makeEmpty();
+        if bufferLength(&all) > 0 then
+            destroyString(out);
+            out := fromSpan(trim(nth(&all, bufferLength(&all) - 1)));
+        end if;
+        destroyFree(all);
+        return out;
+    end;
+
+    -- The texts of every test file below src, one after the other.
+    generic [F: Region]
+    function testTexts(files: &[Buffer[String], F]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            if endsWith(file, ".test.hiq") then
+                let path: String := joinPath("src", file);
+                case readText(asSpan(&path)) of
+                    when Some(value as text: String) do
+                        writeString(&!out, asSpan(&text));
+                        writeByte(&!out, '\n');
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                destroyString(path);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- Every exported function is called in a test: its name and a
+    -- parenthesis stand in a test file.
+    generic [D: Region, T: Region]
+    function uncovered(declarations: &[Buffer[Declaration], D], tests: Span[Nat8, T]): Option[Problem] is
+        var out: StringBuilder := makeStringBuilder();
+        var missing: Index := 0;
+        var i: Index := 0;
+        while i < bufferLength(declarations) do
+            let d: &[Declaration, D] := nthRef(declarations, i);
+            if contains(asSpan(&(d->key)), " function ") then
+                let call: String := said(asSpan(&(d->name)), "(", "");
+                if not contains(tests, asSpan(&call)) then
+                    if missing > 0 then
+                        writeString(&!out, ", ");
+                    end if;
+                    writeString(&!out, asSpan(&(d->name)));
+                    missing := missing + 1;
+                end if;
+                destroyString(call);
+            end if;
+            i := i + 1;
+        end while;
+        let list: String := finalize(out);
+        if missing = 0 then
+            destroyString(list);
+            return None();
+        end if;
+        let p: Problem := problemOf(1533, said("every exported function must be called in a test, and these are not: ", asSpan(&list), ""), fromLiteral("call each in a .test.hiq file"));
+        destroyString(list);
+        return Some(value => p);
+    end;
+
+    function isNewer(a: Version, b: Version): Bool is
+        case compare(&a, &b) of
+            when GreaterThan do
+                return true;
+            when Equal do
+                return false;
+            when LessThan do
+                return false;
+        end case;
+    end;
+
+    -- The version against the newest tag: the line that says what it is,
+    -- or the problem that refuses it.
+    generic [G: Region, R: Region, M: Region]
+    function checkVersion(git: Span[Nat8, G], root: Span[Nat8, R], manifest: &[Manifest, M]): Either[Problem, String] is
+        let want: Version := versionOf(manifest);
+        let wantText: String := formatVersion(want);
+        case listTags(git, root) of
+            when Right(right as tags: Buffer[Version]) do
+                if bufferLength(&tags) = 0 then
+                    destroyFree(tags);
+                    let line: String := said(asSpan(&wantText), ", the first release", "");
+                    destroyString(wantText);
+                    return Right(right => line);
+                end if;
+                let newest: Version := nth(&tags, bufferLength(&tags) - 1);
+                destroyFree(tags);
+                let newestText: String := formatVersion(newest);
+                if not isNewer(want, newest) then
+                    let p: Problem := problemOf(1534, said6("hilde.toml says ", asSpan(&wantText), ", and the newest tag is ", asSpan(&newestText), "", ""), fromLiteral("raise the version in hilde.toml to the one hilde export proposes"));
+                    destroyString(wantText);
+                    destroyString(newestText);
+                    return Left(left => p);
+                end if;
+                let old: String := joinPath(root, ".hilde-cache/export-old");
+                let cleared: Either[Problem, Unit] := removeTree(asSpan(&old));
+                case cleared of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as p: Problem) do
+                        destroyProblem(p);
+                end case;
+                case cloneTag(git, root, newest, asSpan(&old)) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as p: Problem) do
+                        destroyString(old);
+                        destroyString(wantText);
+                        destroyString(newestText);
+                        return Left(left => p);
+                end case;
+                let oldSrc: String := joinPath(asSpan(&old), "src");
+                let newSrc: String := joinPath(root, "src");
+                let diff: Either[Problem, ApiDiff] := diffTrees(asSpan(&oldSrc), asSpan(&newSrc), "");
+                destroyString(oldSrc);
+                destroyString(newSrc);
+                let removed: Either[Problem, Unit] := removeTree(asSpan(&old));
+                case removed of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as p: Problem) do
+                        destroyProblem(p);
+                end case;
+                destroyString(old);
+                case diff of
+                    when Right(right as d: ApiDiff) do
+                        let level: Nat8 := d.level;
+                        destroyDiff(d);
+                        var proposed: Version := nextPatch(newest);
+                        if level = 2 then
+                            proposed := nextMajor(newest);
+                        else if level = 1 then
+                            proposed := nextMinor(newest);
+                        end if;
+                        let proposedText: String := formatVersion(proposed);
+                        -- The version must be at least the one proposed.
+                        if isNewer(proposed, want) then
+                            let p: Problem := problemOf(1530, said6("the interface changed as a ", levelName(level), " release does since ", asSpan(&newestText), ", and hilde.toml says ", asSpan(&wantText)), said("set the version to ", asSpan(&proposedText), " or higher"));
+                            destroyString(proposedText);
+                            destroyString(wantText);
+                            destroyString(newestText);
+                            return Left(left => p);
+                        end if;
+                        let head: String := said6(asSpan(&wantText), ", a ", levelName(level), " release after ", asSpan(&newestText), ", proposed ");
+                        let line: String := said(asSpan(&head), asSpan(&proposedText), "");
+                        destroyString(head);
+                        destroyString(proposedText);
+                        destroyString(wantText);
+                        destroyString(newestText);
+                        return Right(right => line);
+                    when Left(left as p: Problem) do
+                        destroyString(wantText);
+                        destroyString(newestText);
+                        return Left(left => p);
+                end case;
+            when Left(left as p: Problem) do
+                destroyString(wantText);
+                return Left(left => p);
+        end case;
+    end;
+
+    -- llms.txt and a manual page of each module.
+    generic [R: Region, D: Region, N: Region, V: Region]
+    function writeDocs(root: Span[Nat8, R], declarations: &[Buffer[Declaration], D], name: Span[Nat8, N], version: Span[Nat8, V], seconds: Int64): Option[Problem] is
+        let llms: String := llmsText(declarations, name, version);
+        let llmsPath: String := joinPath(root, "llms.txt");
+        var good: Bool := writeText(asSpan(&llmsPath), asSpan(&llms));
+        destroyString(llms);
+        destroyString(llmsPath);
+        let man3: String := joinPath(root, "man/man3");
+        good := good and makeDirectories(asSpan(&man3));
+        let date: String := mdocDate(seconds);
+        let modules: Buffer[String] := moduleNames(declarations);
+        good := good and writePages(asSpan(&man3), declarations, &modules, asSpan(&date));
+        destroyArguments(modules);
+        destroyString(date);
+        destroyString(man3);
+        if good then
+            return None();
+        end if;
+        return Some(value => problemOf(1519, said("llms.txt or man/man3 cannot be written in ", root, ""), fromLiteral("check that the package may be written")));
+    end;
+
+    generic [P: Region, D: Region, M: Region, T: Region]
+    function writePages(man3: Span[Nat8, P], declarations: &[Buffer[Declaration], D], modules: &[Buffer[String], M], date: Span[Nat8, T]): Bool is
+        var good: Bool := true;
+        var i: Index := 0;
+        while i < bufferLength(modules) do
+            let m: Span[Nat8, M] := asSpan(nthRef(modules, i));
+            case manualPage(declarations, m, date) of
+                when Some(value as page: String) do
+                    let file: String := said(m, ".3", "");
+                    let path: String := joinPath(man3, asSpan(&file));
+                    good := good and writeText(asSpan(&path), asSpan(&page));
+                    destroyString(path);
+                    destroyString(file);
+                    destroyString(page);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return good;
+    end;
+
+    -- The generated C of every module of src, for this system.
+    generic [R: Region, C: Region, F: Region, L: Region]
+    function writeC(root: Span[Nat8, R], compiler: Span[Nat8, C], files: &[Buffer[String], F], lower: Span[Nat8, L]): Option[Problem] is
+        let dir: String := said(root, "/c/", systemName());
+        if not makeDirectories(asSpan(&dir)) then
+            let p: Problem := problemOf(1519, said("the directory cannot be made: ", asSpan(&dir), ""), fromLiteral("check that the package may be written"));
+            destroyString(dir);
+            return Some(value => p);
+        end if;
+        var words: Buffer[String] := allocateEmpty();
+        insertBack(&!words, fromLiteral("compile"));
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            if endsWith(file, ".hih") then
+                let stem: Span[Nat8, F] := substring(file, 0, spanLength(file) - 4);
+                var pair: StringBuilder := makeStringBuilder();
+                writeString(&!pair, "src/");
+                writeString(&!pair, stem);
+                writeString(&!pair, ".hih,src/");
+                writeString(&!pair, stem);
+                writeString(&!pair, ".hiq");
+                insertBack(&!words, finalize(pair));
+            end if;
+            i := i + 1;
+        end while;
+        insertBack(&!words, fromLiteral("--target-type=c"));
+        insertBack(&!words, fromLiteral("--no-entrypoint"));
+        insertBack(&!words, said6("--output=", asSpan(&dir), "/", lower, ".c", ""));
+        destroyString(dir);
+        let ran: Either[Problem, Ran] := runProgram(compiler, &words);
+        destroyArguments(words);
+        case ran of
+            when Right(right as r: Ran) do
+                let { exitCode: Int32, output: String, errors: String } := r;
+                destroyString(output);
+                if exitCode /= 0 then
+                    let p: Problem := problemOf(1532, said("the compiler did not write the C of the package: ", asSpan(&errors), ""), fromLiteral("run hilde check over src"));
+                    destroyString(errors);
+                    return Some(value => p);
+                end if;
+                destroyString(errors);
+                return None();
+            when Left(left as p: Problem) do
+                return Some(value => p);
+        end case;
+    end;
+
+    -- The archive of the tree under the directory name-X.Y.Z, and the
+    -- signature of the tree inside it.
+    generic [R: Region, F: Region, P: Region, S: Region, T: Region]
+    function makeArchive(root: Span[Nat8, R], files: &[Buffer[String], F], prefix: Span[Nat8, P], signatureName: Span[Nat8, S], signature: Span[Nat8, T]): Option[String] is
+        var writer: ArchiveWriter := makeArchiveWriter(TarGz(), false);
+        var good: Bool := true;
+        var i: Index := 0;
+        while i < bufferLength(files) do
+            let file: Span[Nat8, F] := asSpan(nthRef(files, i));
+            let path: String := joinPath(root, file);
+            case readText(asSpan(&path)) of
+                when Some(value as content: String) do
+                    let name: String := said(prefix, "/", file);
+                    var mode: Nat32 := 420;
+                    if startsWith(file, "packaging/") then
+                        mode := 493;
+                    end if;
+                    good := good and addFile(&!writer, asSpan(&name), asSpan(&content), mode);
+                    destroyString(name);
+                    destroyString(content);
+                when None do
+                    good := false;
+            end case;
+            destroyString(path);
+            i := i + 1;
+        end while;
+        let sigName: String := said(prefix, "/signatures/", signatureName);
+        good := good and addFile(&!writer, asSpan(&sigName), signature, 420);
+        destroyString(sigName);
+        let bytes: String := finishArchive(writer);
+        if good then
+            return Some(value => bytes);
+        end if;
+        destroyString(bytes);
+        return None();
+    end;
+
+    generic [R: Region, K: Region, M: Region, F: Region]
+    function signAndPack(root: Span[Nat8, R], keyPath: Span[Nat8, K], manifest: &[Manifest, M], files: &[Buffer[String], F]): Either[Problem, Index] is
+        case readText(keyPath) of
+            when Some(value as key: String) do
+                case treeSum(root) of
+                    when Right(right as sum: String) do
+                        let name: Span[Nat8, M] := nameOf(manifest);
+                        let lower: String := lowerOf(name);
+                        let v: String := formatVersion(versionOf(manifest));
+                        let message: String := said(asSpan(&sum), "\n", "");
+                        let comment: String := said("verify with ", asSpan(&lower), ".pub");
+                        destroyString(sum);
+                        case signMessage(asSpan(&key), asSpan(&message), asSpan(&comment)) of
+                            when Some(value as treeSig: String) do
+                                destroyString(message);
+                                let sigName: String := said(asSpan(&v), ".sig", "");
+                                let sigDir: String := joinPath(root, "signatures");
+                                let sigPath: String := joinPath(asSpan(&sigDir), asSpan(&sigName));
+                                var good: Bool := makeDirectories(asSpan(&sigDir)) and writeText(asSpan(&sigPath), asSpan(&treeSig));
+                                destroyString(sigDir);
+                                destroyString(sigPath);
+                                -- The tree of name-X.Y.Z, without the v.
+                                let prefix: String := said(asSpan(&lower), "-", substring(asSpan(&v), 1, length(&v)));
+                                let packed: Option[String] := makeArchive(root, files, asSpan(&prefix), asSpan(&sigName), asSpan(&treeSig));
+                                destroyString(sigName);
+                                destroyString(treeSig);
+                                case packed of
+                                    when Some(value as bytes: String) do
+                                        let dist: String := joinPath(root, "dist");
+                                        let archive: String := said6(asSpan(&dist), "/", asSpan(&prefix), ".tar.gz", "", "");
+                                        good := good and makeDirectories(asSpan(&dist));
+                                        good := good and writeText(asSpan(&archive), asSpan(&bytes));
+                                        case signMessage(asSpan(&key), asSpan(&bytes), asSpan(&comment)) of
+                                            when Some(value as archiveSig: String) do
+                                                let archiveSigPath: String := said(asSpan(&archive), ".sig", "");
+                                                good := good and writeText(asSpan(&archiveSigPath), asSpan(&archiveSig));
+                                                destroyString(archiveSigPath);
+                                                destroyString(archiveSig);
+                                            when None do
+                                                good := false;
+                                        end case;
+                                        destroyString(archive);
+                                        destroyString(dist);
+                                        destroyString(bytes);
+                                    when None do
+                                        good := false;
+                                end case;
+                                destroyString(prefix);
+                                destroyString(comment);
+                                destroyString(lower);
+                                destroyString(v);
+                                destroyString(key);
+                                if not good then
+                                    return Left(left => problemOf(1519, said("the signature or the archive cannot be written in ", root, ""), fromLiteral("check that the package may be written")));
+                                end if;
+                                return Right(right => bufferLength(files));
+                            when None do
+                                destroyString(message);
+                                destroyString(comment);
+                                destroyString(lower);
+                                destroyString(v);
+                                destroyString(key);
+                                return Left(left => problemOf(1513, said(keyPath, " is not a secret key of signify without a passphrase", ""), fromLiteral("make one with signify -G -n -p name.pub -s name.sec; hilde reads no key with a passphrase")));
+                        end case;
+                    when Left(left as p: Problem) do
+                        destroyString(key);
+                        return Left(left => p);
+                end case;
+            when None do
+                return Left(left => problemOf(1513, said("the secret key cannot be read: ", keyPath, ""), fromLiteral("name it with --secret-key=path")));
+        end case;
+    end;
+
+    generic [R: Region, K: Region, C: Region, M: Region]
+    function exportWith(root: Span[Nat8, R], keyPath: Span[Nat8, K], withC: Bool, compiler: Span[Nat8, C], manifest: &[Manifest, M], seconds: Int64): Got is
+        let src: String := joinPath(root, "src");
+        case treeFiles(asSpan(&src)) of
+            when Right(right as files: Buffer[String]) do
+                destroyString(src);
+                case missingTests(&files) of
+                    when Some(value as p: Problem) do
+                        destroyArguments(files);
+                        return gotWith(p);
+                    when None do
+                        skip;
+                end case;
+                case testsPass(compiler) of
+                    when Some(value as p: Problem) do
+                        destroyArguments(files);
+                        return gotWith(p);
+                    when None do
+                        skip;
+                end case;
+                let tests: String := testTexts(&files);
+                case declarationsIn("src") of
+                    when Right(right as declarations: Buffer[Declaration]) do
+                        let gap: Option[Problem] := uncovered(&declarations, asSpan(&tests));
+                        destroyString(tests);
+                        case gap of
+                            when Some(value as p: Problem) do
+                                destroyDeclarations(declarations);
+                                destroyArguments(files);
+                                return gotWith(p);
+                            when None do
+                                skip;
+                        end case;
+                        let result: Got := afterTests(root, keyPath, withC, compiler, manifest, &declarations, &files, seconds);
+                        destroyDeclarations(declarations);
+                        destroyArguments(files);
+                        return result;
+                    when Left(left as p: Problem) do
+                        destroyString(tests);
+                        destroyArguments(files);
+                        return gotWith(p);
+                end case;
+            when Left(left as p: Problem) do
+                destroyString(src);
+                return gotWith(p);
+        end case;
+    end;
+
+    generic [R: Region, K: Region, C: Region, M: Region, D: Region, F: Region]
+    function afterTests(root: Span[Nat8, R], keyPath: Span[Nat8, K], withC: Bool, compiler: Span[Nat8, C], manifest: &[Manifest, M], declarations: &[Buffer[Declaration], D], srcFiles: &[Buffer[String], F], seconds: Int64): Got is
+        case findProgram("git") of
+            when Some(value as git: String) do
+                let checked: Either[Problem, String] := checkVersion(asSpan(&git), root, manifest);
+                destroyString(git);
+                case checked of
+                    when Right(right as line: String) do
+                        let v: String := formatVersion(versionOf(manifest));
+                        let docs: Option[Problem] := writeDocs(root, declarations, nameOf(manifest), asSpan(&v), seconds);
+                        destroyString(v);
+                        case docs of
+                            when Some(value as p: Problem) do
+                                destroyString(line);
+                                return gotWith(p);
+                            when None do
+                                skip;
+                        end case;
+                        if withC then
+                            let lower: String := lowerOf(nameOf(manifest));
+                            let c: Option[Problem] := writeC(root, compiler, srcFiles, asSpan(&lower));
+                            destroyString(lower);
+                            case c of
+                                when Some(value as p: Problem) do
+                                    destroyString(line);
+                                    return gotWith(p);
+                                when None do
+                                    skip;
+                            end case;
+                        end if;
+                        case treeFiles(root) of
+                            when Right(right as files: Buffer[String]) do
+                                let packed: Either[Problem, Index] := signAndPack(root, keyPath, manifest, &files);
+                                destroyArguments(files);
+                                case packed of
+                                    when Right(right as count: Index) do
+                                        let summary: String := said("hilde export: ", asSpan(&line), "; dist/ holds the archive and its signature; next: git add -A; git commit; git tag the version");
+                                        destroyString(line);
+                                        return Got(count => count, summary => summary, problems => allocateEmpty());
+                                    when Left(left as p: Problem) do
+                                        destroyString(line);
+                                        return gotWith(p);
+                                end case;
+                            when Left(left as p: Problem) do
+                                destroyString(line);
+                                return gotWith(p);
+                        end case;
+                    when Left(left as p: Problem) do
+                        return gotWith(p);
+                end case;
+            when None do
+                return gotWith(problemOf(1507, fromLiteral("git is not on PATH, and hilde export reads the tags with git"), fromLiteral("install git")));
+        end case;
+    end;
+
+    generic [R: Region, K: Region, C: Region]
+    function exportPackage(root: Span[Nat8, R], keyPath: Span[Nat8, K], withC: Bool, compiler: Span[Nat8, C], seconds: Int64): Got is
+        let path: String := joinPath(root, "hilde.toml");
+        let text: Option[String] := readText(asSpan(&path));
+        destroyString(path);
+        case text of
+            when Some(value as toml: String) do
+                let read: Either[Problem, Manifest] := readManifest(asSpan(&toml));
+                destroyString(toml);
+                case read of
+                    when Right(right as manifest: Manifest) do
+                        let made: Got := exportWith(root, keyPath, withC, compiler, &manifest, seconds);
+                        destroyManifest(manifest);
+                        return made;
+                    when Left(left as p: Problem) do
+                        return gotWith(p);
+                end case;
+            when None do
+                return gotWith(problemOf(1501, said("no hilde.toml in ", root, ""), fromLiteral("run hilde export in the directory of the package")));
+        end case;
+    end;
+end module body.

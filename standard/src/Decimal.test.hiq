@@ -1,0 +1,391 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Tests for Standard.Decimal: 0.1 plus 0.2 is 0.3, the rule of rounding
+-- on both sides of zero, the four operations at their edges, and every
+-- text that is not a number.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    nth,
+    length,
+    destroyFree
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    constantTimeEqual
+);
+import Standard.Decimal (
+    Decimal,
+    mostScale,
+    makeDecimal,
+    parseDecimal,
+    decimalToString,
+    decimalUnits,
+    decimalScale,
+    addDecimal,
+    subtractDecimal,
+    multiplyDecimal,
+    divideDecimal,
+    roundDecimal,
+    equalDecimal,
+    lessDecimal
+);
+
+module body Standard.Decimal.Test is
+    ---
+    --- Helpers
+    ---
+
+    -- The number a text writes; a text that is none stops the test.
+    generic [R: Region]
+    function number(text: Span[Nat8, R]): Decimal is
+        case parseDecimal(text) of
+            when Some(value as found: Decimal) do
+                return found;
+            when None do
+                assertTrue(false, "a number in a test is read");
+                case makeDecimal(0, 0) of
+                    when Some(value as zero: Decimal) do
+                        return zero;
+                    when None do
+                        abort("zero is a number");
+                end case;
+        end case;
+    end;
+
+    generic [S: Region]
+    function reads(value: Option[Decimal], want: Span[Nat8, S]): Bool is
+        case value of
+            when Some(value as found: Decimal) do
+                let text: String := decimalToString(found);
+                let same: Bool := constantTimeEqual(asSpan(&text), want);
+                destroyString(text);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function isNone(value: Option[Decimal]): Bool is
+        case value of
+            when Some(value as found: Decimal) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    generic [R: Region]
+    function refused(text: Span[Nat8, R]): Bool is
+        return isNone(parseDecimal(text));
+    end;
+
+    ---
+    --- The tests
+    ---
+
+    -- The test the order names: 0.1 plus 0.2 is 0.3, as a number and as
+    -- text.
+    function testPointOnePlusPointTwo(): Unit is
+        let sum: Option[Decimal] := addDecimal(number("0.1"), number("0.2"));
+        assertTrue(reads(sum, "0.3"), "0.1 + 0.2 is written 0.3");
+        case sum of
+            when Some(value as three: Decimal) do
+                assertTrue(equalDecimal(three, number("0.3")), "0.1 + 0.2 = 0.3");
+                assertTrue(equalDecimal(three, number("0.30")), "and 0.30");
+                assertTrue(not equalDecimal(three, number("0.31")), "and not 0.31");
+            when None do
+                assertTrue(false, "the sum fits");
+        end case;
+        return nil;
+    end;
+
+    function testParseAndWrite(): Unit is
+        assertTrue(reads(parseDecimal("12.34"), "12.34"), "12.34");
+        assertTrue(reads(parseDecimal("-0.5"), "-0.5"), "-0.5");
+        assertTrue(reads(parseDecimal("0.30"), "0.30"), "the scale is kept");
+        assertTrue(reads(parseDecimal("-0"), "0"), "no minus zero");
+        assertTrue(reads(parseDecimal("-0.00"), "0.00"), "no minus zero with a scale");
+        assertTrue(reads(parseDecimal("007"), "7"), "leading zeros");
+        assertTrue(reads(parseDecimal("0.000000000000000001"), "0.000000000000000001"), "eighteen digits after the point");
+        assertTrue(reads(parseDecimal("999999999999999999"), "999999999999999999"), "eighteen nines");
+        assertTrue(decimalScale(number("1.250")) = 3, "the scale");
+        assertTrue(decimalUnits(number("-1.250")) = -1250, "the units");
+        assertTrue(mostScale = 18, "the most digits after the point");
+        return nil;
+    end;
+
+    function testRefusedTexts(): Unit is
+        assertTrue(refused(""), "an empty text");
+        assertTrue(refused("-"), "a minus alone");
+        assertTrue(refused(".5"), "a point first");
+        assertTrue(refused("1."), "a point last");
+        assertTrue(refused("1e3"), "an exponent");
+        assertTrue(refused("+1"), "a plus");
+        assertTrue(refused("1,5"), "a comma");
+        assertTrue(refused("1.2.3"), "two points");
+        assertTrue(refused(" 1"), "a space");
+        assertTrue(refused("0.0000000000000000001"), "nineteen digits after the point");
+        assertTrue(refused("1000000000000000000"), "nineteen digits");
+        return nil;
+    end;
+
+    -- Half away from zero, on both sides of zero.
+    function testRounding(): Unit is
+        assertTrue(reads(roundDecimal(number("2.345"), 2), "2.35"), "2.345 is 2.35");
+        assertTrue(reads(roundDecimal(number("-2.345"), 2), "-2.35"), "-2.345 is -2.35");
+        assertTrue(reads(roundDecimal(number("2.344"), 2), "2.34"), "2.344 is 2.34");
+        assertTrue(reads(roundDecimal(number("2.5"), 0), "3"), "2.5 is 3");
+        assertTrue(reads(roundDecimal(number("-2.5"), 0), "-3"), "-2.5 is -3");
+        assertTrue(reads(roundDecimal(number("0.005"), 2), "0.01"), "0.005 is 0.01");
+        assertTrue(reads(roundDecimal(number("-0.004"), 2), "0.00"), "-0.004 is 0.00, not minus zero");
+        assertTrue(reads(roundDecimal(number("1.5"), 3), "1.500"), "a larger scale is exact");
+        assertTrue(isNone(roundDecimal(number("999999999999999999"), 1)), "a larger scale that does not fit");
+        assertTrue(isNone(roundDecimal(number("1"), 19)), "a scale above the most");
+        return nil;
+    end;
+
+    function testArithmetic(): Unit is
+        assertTrue(reads(subtractDecimal(number("0.3"), number("0.1")), "0.2"), "0.3 - 0.1");
+        assertTrue(reads(subtractDecimal(number("0.1"), number("0.3")), "-0.2"), "0.1 - 0.3");
+        assertTrue(reads(addDecimal(number("1.5"), number("-2.25")), "-0.75"), "a sum below zero");
+        assertTrue(reads(addDecimal(number("-1"), number("1")), "0"), "a sum of zero without a minus");
+        assertTrue(isNone(addDecimal(number("999999999999999999"), number("1"))), "a sum that does not fit");
+        assertTrue(reads(multiplyDecimal(number("19.99"), number("1.19")), "23.7881"), "a price with tax, exact");
+        case multiplyDecimal(number("19.99"), number("1.19")) of
+            when Some(value as gross: Decimal) do
+                assertTrue(reads(roundDecimal(gross, 2), "23.79"), "and rounded");
+            when None do
+                assertTrue(false, "the product fits");
+        end case;
+        assertTrue(reads(multiplyDecimal(number("-2"), number("0.5")), "-1.0"), "a product below zero");
+        assertTrue(isNone(multiplyDecimal(number("0.0000000001"), number("0.000000001"))), "a product with too many digits after the point");
+        assertTrue(isNone(multiplyDecimal(number("1000000000"), number("1000000000"))), "a product that does not fit");
+        return nil;
+    end;
+
+    function testDivision(): Unit is
+        assertTrue(reads(divideDecimal(number("10"), number("3"), 2), "3.33"), "10 / 3");
+        assertTrue(reads(divideDecimal(number("2"), number("3"), 2), "0.67"), "2 / 3 rounds up");
+        assertTrue(reads(divideDecimal(number("-2"), number("3"), 2), "-0.67"), "-2 / 3 rounds away from zero");
+        assertTrue(reads(divideDecimal(number("1.00"), number("0.25"), 0), "4"), "scales on both sides");
+        assertTrue(reads(divideDecimal(number("999999999999999999"), number("999999999999999999"), 2), "1.00"), "a quotient whose way needs more than a Nat64");
+        assertTrue(reads(divideDecimal(number("0.000000000000000001"), number("999999999999999999"), 2), "0.00"), "a quotient far below the last digit");
+        assertTrue(isNone(divideDecimal(number("1"), number("0"), 2)), "by zero");
+        assertTrue(isNone(divideDecimal(number("999999999999999999"), number("0.1"), 0)), "a quotient that does not fit");
+        return nil;
+    end;
+
+    function testComparing(): Unit is
+        assertTrue(lessDecimal(number("-1"), number("0.5")), "-1 < 0.5");
+        assertTrue(lessDecimal(number("0.29"), number("0.3")), "0.29 < 0.3");
+        assertTrue(lessDecimal(number("-0.3"), number("-0.29")), "-0.3 < -0.29");
+        assertTrue(not lessDecimal(number("0.3"), number("0.30")), "0.3 is not less than 0.30");
+        assertTrue(not lessDecimal(number("1"), number("0.999999999999999999")), "1 is not less than eighteen nines after the point");
+        assertTrue(lessDecimal(number("0.999999999999999999"), number("1")), "the other way it is");
+        assertTrue(lessDecimal(number("0.1"), number("100000000000000000")), "a small number and one that cannot take eighteen digits after the point");
+        assertTrue(equalDecimal(number("0"), number("-0.000")), "zeros are equal");
+        assertTrue(isNone(makeDecimal(-9223372036854775808, 0)), "the smallest Int64 has too many digits");
+        assertTrue(reads(makeDecimal(-1250, 3), "-1.250"), "units and a scale");
+        assertTrue(isNone(makeDecimal(1, 19)), "a scale above the most");
+        return nil;
+    end;
+
+    ---
+    --- The limit: eighteen digits, a scale of at most eighteen
+    ---
+
+    -- The functions of the module that make a number check the limit themselves and answer None past it.  These
+    -- are the cases at the edge, each one digit or one place past it and at it.
+    function testBoundaries(): Unit is
+        assertTrue(not isNone(makeDecimal(999999999999999999, 0)), "makeDecimal: eighteen nines");
+        assertTrue(isNone(makeDecimal(1000000000000000000, 0)), "makeDecimal: nineteen digits");
+        assertTrue(not isNone(makeDecimal(-999999999999999999, 18)), "makeDecimal: minus eighteen nines at scale 18");
+        assertTrue(isNone(makeDecimal(-1000000000000000000, 18)), "makeDecimal: minus nineteen digits");
+        assertTrue(isNone(makeDecimal(9223372036854775807, 0)), "makeDecimal: the greatest Int64");
+        assertTrue(not isNone(makeDecimal(1, 18)), "makeDecimal: scale 18");
+        assertTrue(isNone(makeDecimal(1, 19)), "makeDecimal: scale 19");
+        assertTrue(isNone(makeDecimal(1, 255)), "makeDecimal: scale 255");
+        assertTrue(not isNone(parseDecimal("999999999999999999")), "parseDecimal: eighteen nines");
+        assertTrue(refused("1000000000000000000"), "parseDecimal: nineteen digits");
+        assertTrue(not isNone(parseDecimal("0.000000000000000001")), "parseDecimal: eighteen places");
+        assertTrue(refused("0.0000000000000000001"), "parseDecimal: nineteen places");
+        assertTrue(refused("-1000000000000000000"), "parseDecimal: minus nineteen digits");
+        assertTrue(not isNone(addDecimal(number("999999999999999998"), number("1"))), "addDecimal: up to the limit");
+        assertTrue(isNone(addDecimal(number("999999999999999999"), number("1"))), "addDecimal: past the limit");
+        assertTrue(isNone(addDecimal(number("-999999999999999999"), number("-1"))), "addDecimal: past the limit below zero");
+        assertTrue(not isNone(subtractDecimal(number("-999999999999999998"), number("1"))), "subtractDecimal: down to the limit");
+        assertTrue(isNone(subtractDecimal(number("-999999999999999999"), number("1"))), "subtractDecimal: past the limit");
+        assertTrue(isNone(subtractDecimal(number("999999999999999999"), number("-1"))), "subtractDecimal: past the limit above zero");
+        assertTrue(not isNone(multiplyDecimal(number("999999999"), number("1000000001"))), "multiplyDecimal: eighteen nines");
+        assertTrue(isNone(multiplyDecimal(number("1000000000"), number("1000000000"))), "multiplyDecimal: 10 to the 18th");
+        assertTrue(not isNone(multiplyDecimal(number("0.000000001"), number("0.000000001"))), "multiplyDecimal: scale 18");
+        assertTrue(isNone(multiplyDecimal(number("0.0000000001"), number("0.00000000001"))), "multiplyDecimal: scale 21");
+        assertTrue(not isNone(divideDecimal(number("999999999999999999"), number("1"), 0)), "divideDecimal: eighteen nines");
+        assertTrue(isNone(divideDecimal(number("999999999999999999"), number("1"), 1)), "divideDecimal: nineteen digits");
+        assertTrue(reads(divideDecimal(number("1"), number("3"), 18), "0.333333333333333333"), "divideDecimal: scale 18");
+        assertTrue(isNone(divideDecimal(number("1"), number("3"), 19)), "divideDecimal: scale 19");
+        assertTrue(not isNone(roundDecimal(number("99999999999999999.9"), 0)), "roundDecimal: down to fewer places");
+        assertTrue(isNone(roundDecimal(number("999999999999999999"), 1)), "roundDecimal: one place more, nineteen digits");
+        assertTrue(not isNone(roundDecimal(number("9999999999999999.99"), 1)), "roundDecimal: rounding up to 10 to the 17th");
+        assertTrue(not isNone(roundDecimal(number("0.5"), 18)), "roundDecimal: scale 18");
+        assertTrue(isNone(roundDecimal(number("1"), 18)), "roundDecimal: 10 to the 18th at scale 18");
+        assertTrue(isNone(roundDecimal(number("1"), 19)), "roundDecimal: scale 19");
+        return nil;
+    end;
+
+    -- Whether an answer keeps the limit: None, or a number of at most eighteen digits and a scale of at most 18.
+    function keeps(value: Option[Decimal]): Bool is
+        case value of
+            when Some(value as found: Decimal) do
+                let units: Int64 := decimalUnits(found);
+                return ((units <= 999999999999999999) and (units >= -999999999999999999)) and (decimalScale(found) <= mostScale);
+            when None do
+                return true;
+        end case;
+    end;
+
+    function breaks(value: Option[Decimal]): Index is
+        if keeps(value) then
+            return 0;
+        end if;
+        return 1;
+    end;
+
+    function refusals(value: Option[Decimal]): Index is
+        if isNone(value) then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region]
+    function pushUnits(grid: &![Buffer[Int64], R], value: Int64): Unit is
+        insertBack(grid, value);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushScale(grid: &![Buffer[Nat8], R], value: Nat8): Unit is
+        insertBack(grid, value);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function keep(into: &![Buffer[Decimal], R], value: Option[Decimal]): Unit is
+        case value of
+            when Some(value as found: Decimal) do
+                insertBack(&~into, found);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Every function that makes a number, called on a grid of units and scales around the limit, on every pair of
+    -- the numbers the grid made, with the scales around 18: no answer passes 18 digits or a scale of 18.  The
+    -- test counts the refusals as well, so that it is seen to have reached the limit from both sides.
+    function testBoundsHold(): Unit is
+        var grid: Buffer[Int64] := allocateEmpty();
+        pushUnits(&!grid, 0);
+        pushUnits(&!grid, 1);
+        pushUnits(&!grid, -1);
+        pushUnits(&!grid, 9);
+        pushUnits(&!grid, 10);
+        pushUnits(&!grid, 99999);
+        pushUnits(&!grid, 100000);
+        pushUnits(&!grid, 999999999);
+        pushUnits(&!grid, 1000000000);
+        pushUnits(&!grid, 999999999999999998);
+        pushUnits(&!grid, 999999999999999999);
+        pushUnits(&!grid, -999999999999999999);
+        pushUnits(&!grid, 1000000000000000000);
+        pushUnits(&!grid, -1000000000000000000);
+        pushUnits(&!grid, 9223372036854775807);
+        pushUnits(&!grid, -9223372036854775807);
+        var scales: Buffer[Nat8] := allocateEmpty();
+        pushScale(&!scales, 0);
+        pushScale(&!scales, 1);
+        pushScale(&!scales, 9);
+        pushScale(&!scales, 17);
+        pushScale(&!scales, 18);
+        pushScale(&!scales, 19);
+        pushScale(&!scales, 255);
+        var made: Buffer[Decimal] := allocateEmpty();
+        var broken: Index := 0;
+        var nones: Index := 0;
+        var calls: Index := 0;
+        var i: Index := 0;
+        while i < length(&grid) do
+            var j: Index := 0;
+            while j < length(&scales) do
+                let result: Option[Decimal] := makeDecimal(nth(&grid, i), nth(&scales, j));
+                broken := broken + breaks(result);
+                nones := nones + refusals(result);
+                calls := calls + 1;
+                keep(&!made, result);
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        let made_count: Index := length(&made);
+        var a: Index := 0;
+        while a < made_count do
+            var j: Index := 0;
+            while j < length(&scales) do
+                let rounded: Option[Decimal] := roundDecimal(nth(&made, a), nth(&scales, j));
+                broken := broken + breaks(rounded);
+                nones := nones + refusals(rounded);
+                calls := calls + 1;
+                j := j + 1;
+            end while;
+            var b: Index := 0;
+            while b < made_count do
+                let sum: Option[Decimal] := addDecimal(nth(&made, a), nth(&made, b));
+                let difference: Option[Decimal] := subtractDecimal(nth(&made, a), nth(&made, b));
+                let product: Option[Decimal] := multiplyDecimal(nth(&made, a), nth(&made, b));
+                broken := ((broken + breaks(sum)) + breaks(difference)) + breaks(product);
+                nones := ((nones + refusals(sum)) + refusals(difference)) + refusals(product);
+                calls := calls + 3;
+                var k: Index := 0;
+                while k < length(&scales) do
+                    let quotient: Option[Decimal] := divideDecimal(nth(&made, a), nth(&made, b), nth(&scales, k));
+                    broken := broken + breaks(quotient);
+                    nones := nones + refusals(quotient);
+                    calls := calls + 1;
+                    k := k + 1;
+                end while;
+                b := b + 1;
+            end while;
+            a := a + 1;
+        end while;
+        print("bounds: calls ");
+        print(calls);
+        print(", refused ");
+        print(nones);
+        print(", numbers made ");
+        printLn(made_count);
+        assertTrue(broken = 0, "no answer passes eighteen digits or a scale of 18");
+        assertTrue(calls > 10000, "the grid made many calls");
+        assertTrue(nones > 1000, "and reached the refusals");
+        assertTrue(nones < (calls - 1000), "and the answers as well");
+        destroyFree(made);
+        destroyFree(scales);
+        destroyFree(grid);
+        return nil;
+    end;
+end module body.

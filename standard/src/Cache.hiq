@@ -1,0 +1,375 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree
+);
+import Standard.HashMap (
+    HashMap,
+    makeHashMap,
+    destroyEmpty as destroyEmptyMap,
+    size,
+    remove as mapRemove,
+    put as mapPut,
+    valueAt,
+    removeAt
+);
+import Standard.Tuples (
+    Pair
+);
+import Standard.Order (
+    TotalOrder
+);
+import Standard.Hash (
+    Hashable
+);
+import Standard.Time (
+    monotonicNanos
+);
+
+module body Standard.Cache is
+    -- An entry: the value, its weight in the unit of the size limit, the
+    -- time it expires, and the use counter at its last use.
+    record Entry[V: Type]: Type is
+        value: V;
+        weight: Nat64;
+        expiry: Nat64;
+        used: Nat64;
+    end;
+
+    record Cache[K: Type, V: Type]: Linear is
+        entries: HashMap[K, Entry[V]];
+        limit: Index;
+        sizeLimit: Nat64;
+        lifetime: Nat64;
+        total: Nat64;
+        tick: Nat64;
+        serial: Nat64;
+        invariant size(&entries) <= limit;
+        invariant total <= sizeLimit;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type]
+    function makeCache(limit: Index, sizeLimit: Nat64, lifetime: Nat64): Cache[K, V] is
+        let zero: Nat64 := 0;
+        let entries: HashMap[K, Entry[V]] := makeHashMap();
+        return Cache(entries => entries, limit => limit, sizeLimit => sizeLimit, lifetime => lifetime,
+            total => zero, tick => zero, serial => zero);
+    end;
+
+    -- The key and the value of an entry taken out of the map.
+    generic [K: Type, V: Type]
+    function unwrap(pair: Pair[K, Entry[V]]): Pair[K, V] is
+        let { first: K, second: Entry[V] } := pair;
+        let { value: V, weight: Nat64, expiry: Nat64, used: Nat64 } := second;
+        return Pair(first => first, second => value);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function weightOf(pair: &[Pair[K, Entry[V]], R]): Nat64 is
+        return pair->second.weight;
+    end;
+
+    generic [K: Type, V: Type]
+    function drainCache(cache: Cache[K, V]): Buffer[Pair[K, V]] is
+        let { entries: HashMap[K, Entry[V]], limit: Index, sizeLimit: Nat64, lifetime: Nat64, total: Nat64, tick: Nat64, serial: Nat64 } := cache;
+        var map: HashMap[K, Entry[V]] := entries;
+        var out: Buffer[Pair[K, V]] := allocateEmpty();
+        let first: Index := 0;
+        while size(&map) > 0 do
+            case removeAt(&!map, first) of
+                when Some(value as pair: Pair[K, Entry[V]]) do
+                    insertBack(&!out, unwrap(pair));
+                when None do
+                    skip;
+            end case;
+        end while;
+        destroyEmptyMap(map);
+        return out;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function count(cache: &[Cache[K, V], R]): Index is
+        return size(&(cache->entries));
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function totalSize(cache: &[Cache[K, V], R]): Nat64 is
+        return cache->total;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function limitOf(cache: &[Cache[K, V], R]): Index is
+        return cache->limit;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function sizeLimitOf(cache: &[Cache[K, V], R]): Nat64 is
+        return cache->sizeLimit;
+    end;
+
+    function nowNanos(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as nanos: Nat64) do
+                return nanos;
+            when None do
+                abort("Standard.Cache: no monotonic clock");
+        end case;
+    end;
+
+    -- When an entry stored now expires: never for a lifetime of 0, and
+    -- never when the sum would pass the largest Nat64.
+    function expiryFor(lifetime: Nat64, now: Nat64): Nat64 is
+        let zero: Nat64 := 0;
+        if lifetime = zero then
+            return maximum_nat64;
+        end if;
+        if now > (maximum_nat64 - lifetime) then
+            return maximum_nat64;
+        end if;
+        return now + lifetime;
+    end;
+
+    -- Each use of the map takes the reference to the cache whole, so each
+    -- is a function of its own that the callers hand a fresh reborrow.
+    generic [K: Type, V: Type, R: Region]
+    function entryCount(cache: &![Cache[K, V], R]): Index is
+        return size(&(cache->entries));
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region, S: Region]
+    function removeKey(cache: &![Cache[K, V], R], key: &[K, S]): Option[Pair[K, Entry[V]]] is
+        return mapRemove(&!(cache->entries), key);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function removePosition(cache: &![Cache[K, V], R], position: Index): Option[Pair[K, Entry[V]]] is
+        return removeAt(&!(cache->entries), position);
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function insertEntry(cache: &![Cache[K, V], R], key: K, entry: Entry[V]): Option[Pair[K, Entry[V]]] is
+        return mapPut(&!(cache->entries), key, entry);
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function usedAt(cache: &![Cache[K, V], R], position: Index): Nat64 is
+        case valueAt(&(cache->entries), position) of
+            when Some(value as entry: &[Entry[V], R]) do
+                return entry->used;
+            when None do
+                return maximum_nat64;
+        end case;
+    end;
+
+    -- Take the entry at position out and give it back, its weight off the
+    -- total.
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region, B: Region]
+    function takeAt(cache: &![Cache[K, V], R], position: Index, out: &![Buffer[Pair[K, V]], B]): Unit is
+        case removePosition(&~cache, position) of
+            when Some(value as pair: Pair[K, Entry[V]]) do
+                cache->total := cache->total - weightOf(&pair);
+                insertBack(&~out, unwrap(pair));
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Every entry expired by now, out of the map and into out.
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region, B: Region]
+    function expireInto(cache: &![Cache[K, V], R], now: Nat64, out: &![Buffer[Pair[K, V]], B]): Unit is
+        var position: Index := 0;
+        while position < entryCount(&~cache) do
+            if expiredAt(&~cache, position, now) then
+                takeAt(&~cache, position, &~out);
+            else
+                position := position + 1;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function expiredAt(cache: &![Cache[K, V], R], position: Index, now: Nat64): Bool is
+        case valueAt(&(cache->entries), position) of
+            when Some(value as entry: &[Entry[V], R]) do
+                return now >= entry->expiry;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The position of the entry used longest ago: the smallest use
+    -- counter, the first of equal ones.  The map must not be empty.
+    -- A count of uses, not the clock, decides, so the choice is the same on
+    -- every run; finding it walks all entries.
+    generic [K: Type, V: Type, R: Region]
+    function oldest(cache: &![Cache[K, V], R]): Index is
+        var best: Index := 0;
+        var bestUse: Nat64 := maximum_nat64;
+        var position: Index := 0;
+        while position < entryCount(&~cache) do
+            let used: Nat64 := usedAt(&~cache, position);
+            if used < bestUse then
+                bestUse := used;
+                best := position;
+            end if;
+            position := position + 1;
+        end while;
+        return best;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function put(cache: &![Cache[K, V], R], key: K, value: V, weight: Nat64, now: Nat64): Buffer[Pair[K, V]] is
+        var out: Buffer[Pair[K, V]] := allocateEmpty();
+        if weight > cache->sizeLimit then
+            insertBack(&!out, Pair(first => key, second => value));
+            return out;
+        else
+            case removeKey(&~cache, &key) of
+                when Some(value as old: Pair[K, Entry[V]]) do
+                    cache->total := cache->total - weightOf(&old);
+                    insertBack(&!out, unwrap(old));
+                when None do
+                    skip;
+            end case;
+            expireInto(&~cache, now, &!out);
+            var room: Bool := false;
+            while not room do
+                let entries: Index := entryCount(&~cache);
+                if (entries < cache->limit) and ((cache->total + weight) <= cache->sizeLimit) then
+                    room := true;
+                else
+                    let victim: Index := oldest(&~cache);
+                    takeAt(&~cache, victim, &!out);
+                end if;
+            end while;
+            cache->tick := cache->tick + 1;
+            let entry: Entry[V] := Entry(value => value, weight => weight, expiry => expiryFor(cache->lifetime, now), used => cache->tick);
+            case insertEntry(&~cache, key, entry) of
+                when Some(value as replaced: Pair[K, Entry[V]]) do
+                    insertBack(&!out, unwrap(replaced));
+                when None do
+                    skip;
+            end case;
+            cache->total := cache->total + weight;
+            return out;
+        end if;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Free, R: Region, S: Region]
+    function get(cache: &![Cache[K, V], R], key: &[K, S], now: Nat64): Option[V] is
+        case removeKey(&~cache, key) of
+            when None do
+                return None();
+            when Some(value as pair: Pair[K, Entry[V]]) do
+                let { first: K, second: Entry[V] } := pair;
+                let { value: V, weight: Nat64, expiry: Nat64, used: Nat64 } := second;
+                var stamp: Nat64 := used;
+                let live: Bool := now < expiry;
+                if live then
+                    cache->tick := cache->tick + 1;
+                    stamp := cache->tick;
+                end if;
+                let back: Option[Pair[K, Entry[V]]] := insertEntry(&~cache, first, Entry(value => value, weight => weight, expiry => expiry, used => stamp));
+                if live then
+                    return Some(value => value);
+                end if;
+                return None();
+        end case;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Free, R: Region]
+    function getWith(cache: &![Cache[K, V], R], key: K, now: Nat64, fill: Fn[K, Option[Filled[V]]]): Option[V] is
+        case get(&~cache, &key, now) of
+            when Some(value as found: V) do
+                return Some(value => found);
+            when None do
+                let ticket: Ticket := Ticket(serial => cache->serial);
+                let made: Option[Filled[V]] := fill(key);
+                case made of
+                    when None do
+                        return None();
+                    when Some(value as filled: Filled[V]) do
+                        case finishFill(&~cache, ticket, key, filled.value, filled.size, now) of
+                            when Left(left as given: Pair[K, V]) do
+                                return Some(value => filled.value);
+                            when Right(right as pushed: Buffer[Pair[K, V]]) do
+                                destroyFree(pushed);
+                                return Some(value => filled.value);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function startFill(cache: &[Cache[K, V], R]): Ticket is
+        return Ticket(serial => cache->serial);
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region]
+    function finishFill(cache: &![Cache[K, V], R], ticket: Ticket, key: K, value: V, weight: Nat64, now: Nat64): Either[Pair[K, V], Buffer[Pair[K, V]]] is
+        if ticket.serial /= cache->serial then
+            return Left(left => Pair(first => key, second => value));
+        else
+            return Right(right => put(&~cache, key, value, weight, now));
+        end if;
+    end;
+
+    generic [K: Free(TotalOrder, Hashable), V: Type, R: Region, S: Region]
+    function clear(cache: &![Cache[K, V], R], key: &[K, S]): Option[Pair[K, V]] is
+        cache->serial := cache->serial + 1;
+        case removeKey(&~cache, key) of
+            when Some(value as pair: Pair[K, Entry[V]]) do
+                cache->total := cache->total - weightOf(&pair);
+                return Some(value => unwrap(pair));
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function flush(cache: &![Cache[K, V], R]): Buffer[Pair[K, V]] is
+        cache->serial := cache->serial + 1;
+        var out: Buffer[Pair[K, V]] := allocateEmpty();
+        let first: Index := 0;
+        while entryCount(&~cache) > 0 do
+            case removePosition(&~cache, first) of
+                when Some(value as pair: Pair[K, Entry[V]]) do
+                    cache->total := cache->total - weightOf(&pair);
+                    insertBack(&!out, unwrap(pair));
+                when None do
+                    skip;
+            end case;
+        end while;
+        return out;
+    end;
+
+    generic [K: Type, V: Type, R: Region]
+    function expire(cache: &![Cache[K, V], R], now: Nat64): Buffer[Pair[K, V]] is
+        var out: Buffer[Pair[K, V]] := allocateEmpty();
+        var position: Index := 0;
+        while position < entryCount(&~cache) do
+            if expiredAt(&~cache, position, now) then
+                case removePosition(&~cache, position) of
+                    when Some(value as pair: Pair[K, Entry[V]]) do
+                        cache->total := cache->total - weightOf(&pair);
+                        insertBack(&!out, unwrap(pair));
+                    when None do
+                        skip;
+                end case;
+            else
+                position := position + 1;
+            end if;
+        end while;
+        return out;
+    end;
+end module body.

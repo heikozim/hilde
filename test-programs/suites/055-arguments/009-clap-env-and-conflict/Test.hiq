@@ -1,0 +1,192 @@
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.Arguments (
+    Command,
+    FlagKey,
+    TextKey,
+    WholeKey,
+    ChoiceKey,
+    PathKey,
+    ArgumentError,
+    Outcome,
+    Run,
+    Help,
+    Version,
+    Matches,
+    makeCommand,
+    destroyCommand,
+    option,
+    repeatable,
+    fromEnvironment,
+    addFlag,
+    addText,
+    addWhole,
+    addChoice,
+    addPath,
+    addPositionalPath,
+    anyFlag,
+    anyPath,
+    anyChoice,
+    addConflict,
+    addDependency,
+    destroyArguments,
+    parse,
+    destroyMatches,
+    describeError,
+    destroyError,
+    flagCount,
+    textCount,
+    textAt,
+    wholeOf,
+    choiceOf,
+    pathOf,
+    addVerbose
+);
+
+module body Test is
+    record Keys: Free is
+        format: ChoiceKey;
+        jobs: WholeKey;
+        quiet: FlagKey;
+        verbose: FlagKey;
+        output: PathKey;
+        exclude: TextKey;
+        input: PathKey;
+    end;
+
+    -- What the programme does with the matches.
+    generic [R: Region]
+    function convert(m: &[Matches, R], keys: Keys): Unit is
+        case pathOf(m, keys.input) of
+            when Some(value as file: &[String, R]) do
+                print("input: ");
+                printLn(asSpan(file));
+            when None do
+                printLn("input: none");
+        end case;
+        case choiceOf(m, keys.format) of
+            when Some(value as which: Index) do
+                if which = 0 then
+                    printLn("format: json");
+                else
+                    printLn("format: text");
+                end if;
+            when None do
+                printLn("format: none");
+        end case;
+        case wholeOf(m, keys.jobs) of
+            when Some(value as jobs: Int64) do
+                print("jobs: ");
+                printLn(jobs);
+            when None do
+                printLn("jobs: none");
+        end case;
+        case pathOf(m, keys.output) of
+            when Some(value as file: &[String, R]) do
+                print("output: ");
+                printLn(asSpan(file));
+            when None do
+                printLn("output: none");
+        end case;
+        let skipped: Index := textCount(m, keys.exclude);
+        print("exclude: ");
+        printLn(skipped);
+        var i: Index := 0;
+        while i < skipped do
+            case textAt(m, keys.exclude, i) of
+                when Some(value as name: &[String, R]) do
+                    print("  skip: ");
+                    printLn(asSpan(name));
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        print("quiet: ");
+        print(flagCount(m, keys.quiet));
+        print(", verbose: ");
+        printLn(flagCount(m, keys.verbose));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function run(c: &[Command, R], keys: Keys, words: Buffer[String]): Unit is
+        case parse(c, &words) of
+            when Right(right as outcome: Outcome) do
+                case outcome of
+                    when Run(matches as m: Matches) do
+                        convert(&m, keys);
+                        destroyMatches(m);
+                    when Help(text as t: String) do
+                        print(asSpan(&t));
+                        destroyString(t);
+                    when Version(text as t: String) do
+                        print(asSpan(&t));
+                        destroyString(t);
+                end case;
+            when Left(left as e: ArgumentError) do
+                let message: String := describeError(c, &e);
+                print(asSpan(&message));
+                destroyString(message);
+                destroyError(e);
+        end case;
+        destroyArguments(words);
+        return nil;
+    end;
+
+    -- A command line is a buffer of words, built a word at a time.
+    function noWords(): Buffer[String] is
+        return allocateEmpty();
+    end;
+
+    function plus(line: Buffer[String], word: Span[Nat8, Static]): Buffer[String] is
+        var out: Buffer[String] := line;
+        insertBack(&!out, fromLiteral(word));
+        return out;
+    end;
+
+    function main(): ExitCode is
+        var c: Command := makeCommand("convert", "Converts a file.");
+        -- Arg::new("format").value_parser(["json", "text"]).env("CONVERT_FORMAT")
+        let format: ChoiceKey := addChoice(&!c, fromEnvironment(option("format", 'f', "Output format"), "CONVERT_FORMAT"), "json|text", "");
+        -- Arg::new("jobs").value_parser(value_parser!(i64).range(1..=64)).env("CONVERT_JOBS").default_value("1")
+        let jobs: WholeKey := addWhole(&!c, fromEnvironment(option("jobs", 'j', "Parallel jobs"), "CONVERT_JOBS"), 1, 64, "1");
+        let quiet: FlagKey := addFlag(&!c, option("quiet", 'q', "Print nothing"));
+        let verbose: FlagKey := addVerbose(&!c, "Print more");
+        -- Arg::new("output").value_parser(value_parser!(PathBuf)).requires("format")
+        let output: PathKey := addPath(&!c, option("output", 'o', "Where to write"));
+        -- Arg::new("exclude").action(ArgAction::Append)
+        let exclude: TextKey := addText(&!c, repeatable(option("exclude", 'x', "Skip a name")), "");
+        -- Arg::new("input").required(true), a positional argument that is a path
+        let input: PathKey := addPositionalPath(&!c, "input", "The file to convert", true, false);
+        -- Arg::new("quiet").conflicts_with("verbose")
+        addConflict(&!c, anyFlag(quiet), anyFlag(verbose));
+        addDependency(&!c, anyPath(output), anyChoice(format));
+        let keys: Keys := Keys(format => format, jobs => jobs, quiet => quiet, verbose => verbose, output => output, exclude => exclude, input => input);
+        printLn("the file alone, the jobs from the environment:");
+        run(&c, keys, plus(noWords(), "in.txt"));
+        printLn("everything on the line, which wins over the environment:");
+        run(&c, keys, plus(plus(plus(plus(plus(plus(plus(plus(plus(noWords(), "-f"), "json"), "-j8"), "-o"), "out.json"), "-x"), "a.tmp"), "--exclude=b.tmp"), "in.txt"));
+        printLn("an output without a format:");
+        run(&c, keys, plus(plus(plus(noWords(), "-o"), "out.json"), "in.txt"));
+        printLn("two flags that exclude each other:");
+        run(&c, keys, plus(plus(plus(noWords(), "-q"), "-v"), "in.txt"));
+        printLn("jobs out of the range:");
+        run(&c, keys, plus(plus(plus(noWords(), "-j"), "99"), "in.txt"));
+        printLn("a format that is not one:");
+        run(&c, keys, plus(plus(plus(noWords(), "-f"), "xml"), "in.txt"));
+        printLn("no input:");
+        run(&c, keys, plus(noWords(), "-v"));
+        destroyCommand(c);
+        return ExitSuccess();
+    end;
+end module body.

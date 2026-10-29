@@ -1,0 +1,323 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    nth,
+    nthRef,
+    insertBack
+);
+import Standard.String (
+    String,
+    fromSpan,
+    destroyString,
+    length as textLength,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    readExactly,
+    writeAll
+);
+import Standard.Raft (
+    Entry,
+    Message,
+    isWellFormed,
+    destroyMessage
+);
+
+module body Standard.RaftTcp is
+    constant byteMask: Nat64 := 255;
+    constant byteBase: Nat64 := 256;
+    constant top32: Nat64 := 16777216;
+    constant top64: Nat64 := 72057594037927936;
+    -- The fewest bytes an entry and a member take on the wire.
+    constant entryBytes: Nat64 := 13;
+    constant memberBytes: Nat64 := 8;
+
+    function frameLimit(): Index is
+        return 16777216;
+    end;
+
+    function wide(value: Index): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                abort("Standard.RaftTcp: an Index did not fit a Nat64");
+        end case;
+    end;
+
+    function narrow(value: Nat64): Index is
+        case toIndex(value) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("Standard.RaftTcp: a length did not fit an Index");
+        end case;
+    end;
+
+    function lowByte(value: Nat64): Nat8 is
+        case toNat8(bitwiseAnd(value, byteMask)) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                abort("Standard.RaftTcp: a byte did not fit a Nat8");
+        end case;
+    end;
+
+    function byteValue(byte: Nat8): Nat64 is
+        case toNat64(byte) of
+            when Some(value as widened: Nat64) do
+                return widened;
+            when None do
+                abort("Standard.RaftTcp: a byte did not fit a Nat64");
+        end case;
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    -- value in width bytes from top down, most significant first.
+    generic [R: Region]
+    function putNumber(out: &![StringBuilder, R], value: Nat64, top: Nat64): Unit is
+        var shift: Nat64 := top;
+        while shift > 0 do
+            writeByte(&~out, lowByte(value / shift));
+            shift := shift / byteBase;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function putBytes(out: &![StringBuilder, R], data: Span[Nat8, S]): Unit is
+        putNumber(&~out, wide(spanLength(data)), top32);
+        writeString(&~out, data);
+        return nil;
+    end;
+
+    function flag(value: Bool): Nat8 is
+        if value then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region]
+    function encodeMessage(message: &[Message, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, (message->kind));
+        putNumber(&!out, (message->sender), top64);
+        putNumber(&!out, (message->receiver), top64);
+        putNumber(&!out, (message->term), top64);
+        putNumber(&!out, (message->index), top64);
+        putNumber(&!out, (message->logTerm), top64);
+        putNumber(&!out, (message->commit), top64);
+        writeByte(&!out, flag((message->success)));
+        putNumber(&!out, (message->hint), top64);
+        let entries: &[Buffer[Entry], R] := &(message->entries);
+        putNumber(&!out, wide(length(entries)), top32);
+        var i: Index := 0;
+        while i < length(entries) do
+            let entry: &[Entry, R] := nthRef(entries, i);
+            putNumber(&!out, (entry->term), top64);
+            writeByte(&!out, (entry->kind));
+            putBytes(&!out, asSpan(&(entry->data)));
+            i := i + 1;
+        end while;
+        putBytes(&!out, asSpan(&(message->snapshot)));
+        let members: &[Buffer[Nat64], R] := &(message->members);
+        putNumber(&!out, wide(length(members)), top32);
+        var k: Index := 0;
+        while k < length(members) do
+            putNumber(&!out, nth(members, k), top64);
+            k := k + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    -- Where the reader stands in the bytes, and whether every read so far
+    -- found its bytes.  A read that does not gives 0 and clears good.
+    record Cursor: Free is
+        at: Index;
+        good: Bool;
+    end;
+
+    generic [R: Region, C: Region]
+    function remaining(bytes: Span[Nat8, R], cursor: &[Cursor, C]): Nat64 is
+        return wide(spanLength(bytes) - (cursor->at));
+    end;
+
+    generic [R: Region, C: Region]
+    function takeNumber(bytes: Span[Nat8, R], cursor: &![Cursor, C], width: Index): Nat64 is
+        if (not (cursor->good)) or ((spanLength(bytes) - (cursor->at)) < width) then
+            cursor->good := false;
+            return 0;
+        end if;
+        var value: Nat64 := 0;
+        var i: Index := 0;
+        while i < width do
+            value := modularAdd(modularMultiply(value, byteBase), byteValue(bytes[(cursor->at) + i]));
+            i := i + 1;
+        end while;
+        cursor->at := (cursor->at) + width;
+        return value;
+    end;
+
+    generic [R: Region, C: Region]
+    function takeByte(bytes: Span[Nat8, R], cursor: &![Cursor, C]): Nat8 is
+        return lowByte(takeNumber(bytes, &~cursor, 1));
+    end;
+
+    -- A length of four bytes and as many bytes after it.
+    generic [R: Region, C: Region]
+    function takeBytes(bytes: Span[Nat8, R], cursor: &![Cursor, C]): String is
+        let size: Nat64 := takeNumber(bytes, &~cursor, 4);
+        if (not (cursor->good)) or (size > remaining(bytes, &cursor)) then
+            cursor->good := false;
+            return fromSpan("");
+        end if;
+        let count: Index := narrow(size);
+        let text: String := fromSpan(spanPart(bytes, (cursor->at), count));
+        cursor->at := (cursor->at) + count;
+        return text;
+    end;
+
+    function noEntries(): Buffer[Entry] is
+        return allocateEmpty();
+    end;
+
+    function noIds(): Buffer[Nat64] is
+        return allocateEmpty();
+    end;
+
+    generic [R: Region]
+    function decodeMessage(bytes: Span[Nat8, R]): Option[Message] is
+        var cursor: Cursor := Cursor(at => 0, good => true);
+        let kind: Nat8 := takeByte(bytes, &!cursor);
+        let sender: Nat64 := takeNumber(bytes, &!cursor, 8);
+        let receiver: Nat64 := takeNumber(bytes, &!cursor, 8);
+        let term: Nat64 := takeNumber(bytes, &!cursor, 8);
+        let index: Nat64 := takeNumber(bytes, &!cursor, 8);
+        let logTerm: Nat64 := takeNumber(bytes, &!cursor, 8);
+        let commit: Nat64 := takeNumber(bytes, &!cursor, 8);
+        let success: Nat8 := takeByte(bytes, &!cursor);
+        let hint: Nat64 := takeNumber(bytes, &!cursor, 8);
+        var entries: Buffer[Entry] := noEntries();
+        let entryCount: Nat64 := takeNumber(bytes, &!cursor, 4);
+        -- A count the remaining bytes cannot hold is refused before any
+        -- entry is made.
+        if (entryCount * entryBytes) > remaining(bytes, &cursor) then
+            cursor.good := false;
+        end if;
+        var e: Nat64 := 0;
+        while cursor.good and (e < entryCount) do
+            let entryTerm: Nat64 := takeNumber(bytes, &!cursor, 8);
+            let entryKind: Nat8 := takeByte(bytes, &!cursor);
+            let data: String := takeBytes(bytes, &!cursor);
+            insertBack(&!entries, Entry(term => entryTerm, kind => entryKind, data => data));
+            e := e + 1;
+        end while;
+        let snapshot: String := takeBytes(bytes, &!cursor);
+        var members: Buffer[Nat64] := noIds();
+        let memberCount: Nat64 := takeNumber(bytes, &!cursor, 4);
+        if (memberCount * memberBytes) > remaining(bytes, &cursor) then
+            cursor.good := false;
+        end if;
+        var m: Nat64 := 0;
+        while cursor.good and (m < memberCount) do
+            insertBack(&!members, takeNumber(bytes, &!cursor, 8));
+            m := m + 1;
+        end while;
+        let complete: Bool := (cursor.good and (cursor.at = spanLength(bytes))) and (success <= 1);
+        let message: Message := Message(
+            kind => kind,
+            sender => sender,
+            receiver => receiver,
+            term => term,
+            index => index,
+            logTerm => logTerm,
+            commit => commit,
+            success => success = 1,
+            hint => hint,
+            entries => entries,
+            snapshot => snapshot,
+            members => members
+        );
+        let taken: Bool := complete and isWellFormed(&message);
+        if taken then
+            let some: Option[Message] := Some(value => message);
+            return some;
+        else
+            destroyMessage(message);
+            let none: Option[Message] := None();
+            return none;
+        end if;
+    end;
+
+    ---
+    --- The socket
+    ---
+
+    generic [S: Region, R: Region]
+    function sendMessage(socket: &![FileDescriptor, S], message: &[Message, R]): Bool is
+        let payload: String := encodeMessage(message);
+        var written: Bool := false;
+        if textLength(&payload) <= frameLimit() then
+            var head: StringBuilder := makeStringBuilder();
+            putNumber(&!head, wide(textLength(&payload)), top32);
+            let prefix: String := finalize(head);
+            let wroteHead: Bool := writeAll(&~socket, asSpan(&prefix));
+            destroyString(prefix);
+            if wroteHead then
+                written := writeAll(&~socket, asSpan(&payload));
+            end if;
+        end if;
+        destroyString(payload);
+        return written;
+    end;
+
+    generic [S: Region]
+    function receiveMessage(socket: &![FileDescriptor, S]): Option[Message] is
+        case readExactly(&~socket, 4) of
+            when Some(value as head: String) do
+                var cursor: Cursor := Cursor(at => 0, good => true);
+                let size: Nat64 := takeNumber(asSpan(&head), &!cursor, 4);
+                destroyString(head);
+                if size > wide(frameLimit()) then
+                    let none: Option[Message] := None();
+                    return none;
+                end if;
+                case readExactly(&~socket, narrow(size)) of
+                    when Some(value as payload: String) do
+                        let message: Option[Message] := decodeMessage(asSpan(&payload));
+                        destroyString(payload);
+                        return message;
+                    when None do
+                        let none: Option[Message] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[Message] := None();
+                return none;
+        end case;
+    end;
+end module body.

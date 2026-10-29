@@ -1,0 +1,221 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The FastCGI record protocol, from the responding side: records read from bytes and built into bytes.
+
+- This module is the format and nothing else: no socket and no loop.
+- The code that owns the descriptor hands bytes to it and takes bytes from it.
+- Every length that arrives on the wire is checked against the bytes that are really there.
+- A record that does not fit in what is left is refused with None, never read past its buffer.
+- A record written holds less than 65536 bytes of content; splitting a longer one is the caller's.
+
+    case readHeader(bytes, 0) of
+        when Some(value as header: RecordHeader) do
+            let content: Option[String] := readContent(bytes, 0, header);
+            let next: Index := recordLength(header);
+        when None do
+            skip;
+    end case;
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.String (
+    String
+);
+
+module Standard.Fcgi is
+    ---
+    --- The numbers of the protocol
+    ---
+
+    constant typeBeginRequest: Nat8;
+    constant typeAbortRequest: Nat8;
+    constant typeEndRequest: Nat8;
+    constant typeParams: Nat8;
+    constant typeStdin: Nat8;
+    constant typeStdout: Nat8;
+    constant typeStderr: Nat8;
+    constant typeData: Nat8;
+    constant typeGetValues: Nat8;
+    constant typeGetValuesResult: Nat8;
+    constant typeUnknown: Nat8;
+
+    constant roleResponder: Nat64;
+    constant roleAuthorizer: Nat64;
+    constant roleFilter: Nat64;
+
+    constant statusRequestComplete: Nat8;
+    constant statusCantMultiplex: Nat8;
+    constant statusOverloaded: Nat8;
+    constant statusUnknownRole: Nat8;
+
+    """
+    The eight-byte header that starts every record.  Free, so it copies.
+    """
+    type RecordHeader: Free;
+
+    ---
+    --- Reading
+    ---
+
+    """
+    The header of the record that starts at at.
+
+    None when there are fewer than eight bytes left, when the version is
+    not 1, or when the whole record -- header, content and padding -- does
+    not fit in what is left.  That last test is the one that matters: the
+    content length comes from the other end.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function readHeader(bytes: Span[Nat8, R], at: Index): Option[RecordHeader];
+
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function headerVersion(header: RecordHeader): Nat8;
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function headerKind(header: RecordHeader): Nat8;
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function headerRequestId(header: RecordHeader): Nat64;
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function headerContentLength(header: RecordHeader): Index;
+    """
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function headerPaddingLength(header: RecordHeader): Index;
+
+    """
+    The whole length of the record: eight, plus the content, plus the
+    padding.  Where the next record starts.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    function recordLength(header: RecordHeader): Index;
+
+    """
+    How many bytes follow the eight-byte header at the start of bytes --
+    content and padding -- read from the header alone.  For a reader on a
+    socket, which has to know how much to read before it has the record:
+    read eight bytes, ask this, read that many more, and hand the whole
+    record to readHeader.  None when there are fewer than eight bytes or
+    the version is not 1.  At most 65535 + 255.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function bytesAfterHeader(bytes: Span[Nat8, R]): Option[Index];
+
+    """
+    A fresh string holding the content of the record that starts at at,
+    whose header is header.  None when bytes does not hold that
+    content: when the header was read from other bytes, or at is past
+    their end.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function readContent(bytes: Span[Nat8, R], at: Index,
+        header: RecordHeader): Option[String];
+
+    """
+    The role out of the body of a FCGI_BEGIN_REQUEST record: 1 responder,
+    2 authorizer, 3 filter.  None when the body is not eight bytes.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function beginRequestRole(bodyBytes: Span[Nat8, R]): Option[Nat64];
+
+    """
+    Whether the server asked for the connection to be kept open after the
+    request -- the low bit of the flags byte.  None when the body is not
+    eight bytes.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function beginRequestKeepConnection(bodyBytes: Span[Nat8, R]): Option[Bool];
+
+    ---
+    --- Name-value pairs, which is what FCGI_PARAMS carries
+    ---
+
+    """
+    How many complete name-value pairs the block holds.
+
+    A pair whose declared lengths run past the end of the block is not
+    counted, and stops the walk: a truncated block is not half a block of
+    good pairs and a bad one, it is a block that ended early.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function pairCount(block: Span[Nat8, R]): Index;
+
+    """
+    The name of pair n, counting from 0.  None when there is no such
+    pair.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function nthPairName(block: Span[Nat8, R], n: Index): Option[String];
+
+    """
+    The value of pair n.  None under the same condition.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function nthPairValue(block: Span[Nat8, R], n: Index): Option[String];
+
+    ---
+    --- Writing
+    ---
+
+    """
+    A complete record: the header, the content, and padding to the next
+    multiple of eight.
+
+    The content must be shorter than 65536 bytes, which is what the
+    two-byte length field holds; a longer one is None, because splitting
+    it across records is the caller's decision -- only the caller knows
+    whether the parts have to stay together.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function makeRecord(kind: Nat8, requestId: Nat64,
+        content: Span[Nat8, R]): Option[String];
+
+    """
+    A complete FCGI_END_REQUEST record, which is how a responder says it
+    is finished.
+    No contract: a text whose length follows its input.
+    """
+    function makeEndRequest(requestId: Nat64, appStatus: Nat64,
+        protocolStatus: Nat8): String;
+
+    """
+    One name-value pair in the wire encoding, for a FCGI_GET_VALUES_RESULT
+    body.  Lengths below 128 take one byte and the rest take four, which is
+    what the protocol says.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function makePair(name: Span[Nat8, R], content: Span[Nat8, S]): Option[String];
+    """
+    An HTTP header name to its CGI variable name: Content-Type becomes
+    HTTP_CONTENT_TYPE.  The name ends at the first colon.
+
+    None when there is no colon, or when the name holds a byte that is
+    neither a letter, a digit nor a hyphen -- a CGI variable name that came
+    from an unchecked header is a way to reach past the variable the server
+    meant to set.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function headerToVariable(string: Span[Nat8, R]): Option[String];
+end module.

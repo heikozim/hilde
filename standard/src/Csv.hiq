@@ -1,0 +1,464 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: it reads bytes through spans, keeps the fields in
+-- buffers of strings and writes through a StringBuilder; it binds no C.
+import Standard.String (
+    String,
+    makeEmpty,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString as appendText,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyEmpty,
+    length as bufferLength,
+    nthRef,
+    insertBack,
+    removeLast
+);
+import Standard.Utf8 (
+    Decoded,
+    decodeAt,
+    decodedWidth,
+    isValid
+);
+
+module body Standard.Csv is
+    record CsvTable: Linear is
+        rows: Buffer[Buffer[String]];
+    end;
+
+    -- One field as it was read: its value, the place after it, and how
+    -- many line feeds its quotes held.
+    record Field: Linear is
+        value: String;
+        next: Index;
+        lines: Index;
+    end;
+
+    ---
+    --- Small pieces
+    ---
+
+    function isBadSeparator(separator: Nat8): Bool is
+        return (separator = '"') or ((separator = '\r') or (separator = '\n'));
+    end;
+
+    -- Whether a line ends at at: a line feed, or a carriage return with a
+    -- line feed after it.  A carriage return alone is a byte of its field.
+    generic [R: Region]
+    function isLineEnd(text: Span[Nat8, R], at: Index): Bool is
+        let byte: Nat8 := text[at];
+        if byte = '\n' then
+            return true;
+        end if;
+        return (byte = '\r') and (((at + 1) < spanLength(text)) and (text[at + 1] = '\n'));
+    end;
+
+    -- The place after the line end at at.
+    generic [R: Region]
+    function afterLineEnd(text: Span[Nat8, R], at: Index): Index is
+        if text[at] = '\r' then
+            return at + 2;
+        end if;
+        return at + 1;
+    end;
+
+    generic [R: Region]
+    function endsField(text: Span[Nat8, R], at: Index, separator: Nat8): Bool is
+        return (text[at] = separator) or isLineEnd(text, at);
+    end;
+
+    -- Three bytes of a byte order mark at the start are skipped.
+    generic [R: Region]
+    function bomLength(text: Span[Nat8, R]): Index is
+        if spanLength(text) < 3 then
+            return 0;
+        end if;
+        if ((text[0] = #xEF) and (text[1] = #xBB)) and (text[2] = #xBF) then
+            return 3;
+        end if;
+        return 0;
+    end;
+
+    -- The first byte that does not begin a well-formed UTF-8 sequence, or
+    -- None when the whole text is well-formed.
+    generic [R: Region]
+    function firstBadByte(text: Span[Nat8, R]): Option[Index] is
+        let size: Index := spanLength(text);
+        var i: Index := 0;
+        while i < size do
+            if text[i] < 128 then
+                i := i + 1;
+            else
+                case decodeAt(text, i) of
+                    when Some(value as decoded: Decoded) do
+                        i := i + decodedWidth(decoded);
+                    when None do
+                        return Some(value => i);
+                end case;
+            end if;
+        end while;
+        return None();
+    end;
+
+    -- The line of the byte at at, counting from 1.
+    generic [R: Region]
+    function lineOf(text: Span[Nat8, R], at: Index): Index is
+        var line: Index := 1;
+        var i: Index := 0;
+        while i < at do
+            if text[i] = '\n' then
+                line := line + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return line;
+    end;
+
+    function refused(fault: CsvFault, line: Index, at: Index): CsvError is
+        return CsvError(fault => fault, line => line, offset => at);
+    end;
+
+    function destroyRow(row: Buffer[String]): Unit is
+        var rest: Buffer[String] := row;
+        while bufferLength(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyRows(rows: Buffer[Buffer[String]]): Unit is
+        var rest: Buffer[Buffer[String]] := rows;
+        while bufferLength(&rest) > 0 do
+            destroyRow(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    -- The field that starts at at, on line line.
+    generic [R: Region]
+    function scanField(text: Span[Nat8, R], at: Index, separator: Nat8, line: Index): Either[CsvError, Field] is
+        let size: Index := spanLength(text);
+        var builder: StringBuilder := makeStringBuilder();
+        var failure: Option[CsvError] := None();
+        var i: Index := at;
+        var lines: Index := 0;
+        if text[at] = '"' then
+            i := at + 1;
+            var closed: Bool := false;
+            var going: Bool := true;
+            while going do
+                if i >= size then
+                    going := false;
+                else if text[i] = '"' then
+                    if ((i + 1) < size) and (text[i + 1] = '"') then
+                        writeByte(&!builder, '"');
+                        i := i + 2;
+                    else
+                        closed := true;
+                        i := i + 1;
+                        going := false;
+                    end if;
+                else
+                    if text[i] = '\n' then
+                        lines := lines + 1;
+                    end if;
+                    writeByte(&!builder, text[i]);
+                    i := i + 1;
+                end if;
+            end while;
+            if not closed then
+                failure := Some(value => refused(UnclosedQuote(), line, at));
+            else if (i < size) and (not endsField(text, i, separator)) then
+                failure := Some(value => refused(TextAfterQuote(), line + lines, i));
+            end if;
+        else
+            var going: Bool := true;
+            while going do
+                if i >= size then
+                    going := false;
+                else if endsField(text, i, separator) then
+                    going := false;
+                else if text[i] = '"' then
+                    failure := Some(value => refused(QuoteInPlainField(), line, i));
+                    going := false;
+                else
+                    writeByte(&!builder, text[i]);
+                    i := i + 1;
+                end if;
+            end while;
+        end if;
+        let value: String := finalize(builder);
+        case failure of
+            when Some(value as error: CsvError) do
+                destroyString(value);
+                return Left(left => error);
+            when None do
+                return Right(right => Field(value => value, next => i, lines => lines));
+        end case;
+    end;
+
+    generic [R: Region]
+    function readCsv(text: Span[Nat8, R]): Either[CsvError, CsvTable] is
+        return readCsvWith(text, ',');
+    end;
+
+    generic [R: Region]
+    function readCsvWith(text: Span[Nat8, R], separator: Nat8): Either[CsvError, CsvTable] is
+        if isBadSeparator(separator) then
+            return Left(left => refused(BadSeparator(), 1, 0));
+        end if;
+        case firstBadByte(text) of
+            when Some(value as bad: Index) do
+                return Left(left => refused(NotUtf8(), lineOf(text, bad), bad));
+            when None do
+                skip;
+        end case;
+        let size: Index := spanLength(text);
+        var rows: Buffer[Buffer[String]] := allocateEmpty();
+        var row: Buffer[String] := allocateEmpty();
+        var found: Option[CsvError] := None();
+        var at: Index := bomLength(text);
+        var line: Index := 1;
+        var rowLine: Index := 1;
+        var rowStart: Index := at;
+        var width: Index := 0;
+        var going: Bool := true;
+        while going do
+            var rowEnded: Bool := false;
+            if at >= size then
+                going := false;
+            else if (bufferLength(&row) = 0) and isLineEnd(text, at) then
+                at := afterLineEnd(text, at);
+                line := line + 1;
+            else
+                if bufferLength(&row) = 0 then
+                    rowLine := line;
+                    rowStart := at;
+                end if;
+                case scanField(text, at, separator, line) of
+                    when Left(left as error: CsvError) do
+                        found := Some(value => error);
+                        going := false;
+                    when Right(right as field: Field) do
+                        let { value: String, next: Index, lines: Index } := field;
+                        insertBack(&!row, value);
+                        at := next;
+                        line := line + lines;
+                        if at >= size then
+                            rowEnded := true;
+                        else if text[at] = separator then
+                            at := at + 1;
+                            if at >= size then
+                                insertBack(&!row, makeEmpty());
+                                rowEnded := true;
+                            end if;
+                        else
+                            at := afterLineEnd(text, at);
+                            line := line + 1;
+                            rowEnded := true;
+                        end if;
+                end case;
+            end if;
+            if rowEnded then
+                let count: Index := bufferLength(&row);
+                if (width /= 0) and (count /= width) then
+                    found := Some(value => refused(RaggedRow(), rowLine, rowStart));
+                    going := false;
+                else
+                    width := count;
+                    let full: Buffer[String] := row;
+                    insertBack(&!rows, full);
+                    let fresh: Buffer[String] := allocateEmpty();
+                    row := fresh;
+                end if;
+            end if;
+        end while;
+        destroyRow(row);
+        case found of
+            when Some(value as error: CsvError) do
+                destroyRows(rows);
+                return Left(left => error);
+            when None do
+                return Right(right => CsvTable(rows => rows));
+        end case;
+    end;
+
+    function destroyCsv(table: CsvTable): Unit is
+        let { rows: Buffer[Buffer[String]] } := table;
+        destroyRows(rows);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function rowCount(table: &[CsvTable, R]): Index is
+        return bufferLength(&(table->rows));
+    end;
+
+    generic [R: Region]
+    function columnCount(table: &[CsvTable, R]): Index is
+        let rows: &[Buffer[Buffer[String]], R] := &(table->rows);
+        if bufferLength(rows) = 0 then
+            return 0;
+        end if;
+        return bufferLength(nthRef(rows, 0));
+    end;
+
+    generic [R: Region]
+    function fieldAt(table: &[CsvTable, R], row: Index, column: Index): Option[Span[Nat8, R]] is
+        let rows: &[Buffer[Buffer[String]], R] := &(table->rows);
+        if row >= bufferLength(rows) then
+            return None();
+        end if;
+        let fields: &[Buffer[String], R] := nthRef(rows, row);
+        if column >= bufferLength(fields) then
+            return None();
+        end if;
+        return Some(value => asSpan(nthRef(fields, column)));
+    end;
+
+    ---
+    --- Writing
+    ---
+
+    record CsvWriter: Linear is
+        out: StringBuilder;
+        separator: Nat8;
+        inRow: Index;
+        width: Index;
+        firstEmpty: Bool;
+        spoiled: Bool;
+    end;
+
+    function makeCsvWriter(): CsvWriter is
+        return makeCsvWriterWith(',');
+    end;
+
+    function makeCsvWriterWith(separator: Nat8): CsvWriter is
+        return CsvWriter(out => makeStringBuilder(), separator => separator, inRow => 0, width => 0, firstEmpty => false, spoiled => isBadSeparator(separator));
+    end;
+
+    generic [R: Region]
+    function emitByte(writer: &![CsvWriter, R], byte: Nat8): Unit is
+        writeByte(&!(writer->out), byte);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function emitText(writer: &![CsvWriter, R], text: Span[Nat8, S]): Unit is
+        appendText(&!(writer->out), text);
+        return nil;
+    end;
+
+    -- Whether a field has to be quoted: it holds the separator, a double
+    -- quote, a carriage return or a line feed.
+    generic [S: Region]
+    function needsQuotes(field: Span[Nat8, S], separator: Nat8): Bool is
+        let size: Index := spanLength(field);
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := field[i];
+            if ((byte = separator) or (byte = '"')) or ((byte = '\r') or (byte = '\n')) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region, S: Region]
+    function emitQuoted(writer: &![CsvWriter, R], field: Span[Nat8, S]): Unit is
+        emitByte(&~writer, '"');
+        let size: Index := spanLength(field);
+        var i: Index := 0;
+        while i < size do
+            if field[i] = '"' then
+                emitByte(&~writer, '"');
+            end if;
+            emitByte(&~writer, field[i]);
+            i := i + 1;
+        end while;
+        emitByte(&~writer, '"');
+        return nil;
+    end;
+
+    -- The separator goes in front of every field but the first of a row.
+    -- An empty first field writes nothing; if the row ends with it alone,
+    -- endRow writes two quotes for it, since a line with nothing on it is
+    -- read as no row at all.
+    generic [R: Region, S: Region]
+    function writeField(writer: &![CsvWriter, R], field: Span[Nat8, S]): Unit is
+        if writer->spoiled then
+            return nil;
+        end if;
+        if not isValid(field) then
+            writer->spoiled := true;
+            return nil;
+        end if;
+        let separator: Nat8 := writer->separator;
+        if writer->inRow > 0 then
+            emitByte(&~writer, separator);
+        else
+            writer->firstEmpty := spanLength(field) = 0;
+        end if;
+        if needsQuotes(field, separator) then
+            emitQuoted(&~writer, field);
+        else
+            emitText(&~writer, field);
+        end if;
+        writer->inRow := writer->inRow + 1;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function endRow(writer: &![CsvWriter, R]): Unit is
+        if writer->spoiled then
+            return nil;
+        end if;
+        let count: Index := writer->inRow;
+        if (count = 0) or ((writer->width /= 0) and (count /= writer->width)) then
+            writer->spoiled := true;
+            return nil;
+        end if;
+        if (count = 1) and writer->firstEmpty then
+            emitText(&~writer, "\"\"");
+        end if;
+        emitText(&~writer, "\r\n");
+        let none: Index := 0;
+        writer->width := count;
+        writer->inRow := none;
+        return nil;
+    end;
+
+    function finishCsv(writer: CsvWriter): Option[String] is
+        let { out: StringBuilder, separator: Nat8, inRow: Index, width: Index, firstEmpty: Bool, spoiled: Bool } := writer;
+        let text: String := finalize(out);
+        if spoiled or (inRow /= 0) then
+            destroyString(text);
+            return None();
+        else
+            return Some(value => text);
+        end if;
+    end;
+end module body.
