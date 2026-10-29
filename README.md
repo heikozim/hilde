@@ -36,6 +36,9 @@ every other request to the socket. `docs/hiawatha.md` explains what
 Hiawatha is and lists the settings a Hilde service needs, with the
 reason for each.
 
+[github.com/heikozim/hilde-wolly](https://github.com/heikozim/hilde-wolly) builds on Hilde.
+A web framework in Hilde: Web-ready, OpenBSD-first, Linear, Lean, Yours.
+
 ## Where Hilde is developed
 
 Hilde is developed in a repository of its own.  This repository is its public
