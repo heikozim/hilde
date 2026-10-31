@@ -8441,11 +8441,13 @@ hilde_unit_t hilde_task_scope_wait_below(void* raw, size_t count) {
    task, down to the guard pages of the task's stack; on a stack the
    runtime did not map, the programme's own, SIZE_MAX, since the system
    grows that one itself.  A function with a large frame asks this first,
-   so that it does not step over the guard pages. */
+   so that it does not step over the guard pages.  The place is the
+   address of this function's frame, not of a local: AddressSanitizer may
+   move locals to a stack of its own to find a use after return, and the
+   address of such a local says nothing about the task's stack. */
 size_t hilde_task_stack_left(void) {
   hilde_task_worker_t* worker = hilde_task_worker_of_thread;
   hilde_task_fiber_t* fiber;
-  unsigned char here;
   uintptr_t low;
   uintptr_t at;
 
@@ -8454,7 +8456,7 @@ size_t hilde_task_stack_left(void) {
   }
   fiber = worker->current;
   low = (uintptr_t) fiber->mapping + (uintptr_t) HILDE_TASK_GUARD_PAGES * (uintptr_t) hilde_arena_page_size();
-  at = (uintptr_t) &here;
+  at = (uintptr_t) __builtin_frame_address(0);
   return (at > low) ? (size_t) (at - low) : 0;
 }
 

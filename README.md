@@ -91,7 +91,7 @@ release, with `hilde-X.Y.Z.tar.gz.sig`, its signature made by signify(1)
 with the key `hilde-1.0.pub` in the root of the repository:
 
 ```
-signify -V -p hilde-1.0.pub -m hilde-1.0.0.tar.gz
+signify -V -p hilde-1.0.pub -m hilde-1.x.y.tar.gz
 ```
 
 ## Building

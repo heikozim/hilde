@@ -12,7 +12,7 @@
 
 type version = int * int * int
 
-let version: version = (1, 0, 0)
+let version: version = (1, 0, 1)
 
 let version_string: string =
   let (mj, mi, p) = version

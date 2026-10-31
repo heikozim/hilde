@@ -1,0 +1,127 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Standard.MlDsa inside a task, where every call first asks how much of
+-- the task's stack is left.  A task with a large stack signs at every
+-- level; a task with the 64 KiB of a plain scope is refused, and does not
+-- run over its guard pages.  The answer must hold also when the compiler
+-- moves the locals of a function to a stack of its own, as
+-- AddressSanitizer does to find a use of a frame after its return.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.MlDsa (
+    ParameterSet,
+    Level44,
+    Level65,
+    Level87,
+    MlDsaKey,
+    generateKeyPair,
+    publicKeyOf,
+    sign,
+    verify,
+    destroyMlDsaKey
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    openScopeWithStack,
+    closeScope,
+    spawn,
+    join
+);
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+
+module body Standard.MlDsaTasks.Test is
+    -- The stack of the tasks that sign: more than the 576 KiB that
+    -- signing at level 87 asks for.
+    constant largeStack: Index := 1048576;
+
+    -- Makes a key of the set, signs with it and verifies the signature.
+    -- True when all of it worked.  The task asserts nothing itself, the
+    -- test does that with the answer.
+    function signsInTask(set: ParameterSet): Bool is
+        case generateKeyPair(set) of
+            when Some(value as key: MlDsaKey) do
+                let public: String := publicKeyOf(&key);
+                var holds: Bool := false;
+                case sign(&key, "the message", "ctx") of
+                    when Some(value as signature: String) do
+                        holds := verify(set, asSpan(&public), "the message", "ctx", asSpan(&signature));
+                        destroyString(signature);
+                    when None do
+                        holds := false;
+                end case;
+                destroyString(public);
+                destroyMlDsaKey(key);
+                return holds;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- True when no key is made: on a stack too small for it the call
+    -- must give None instead of running over the guard pages.
+    function refusedInTask(set: ParameterSet): Bool is
+        case generateKeyPair(set) of
+            when Some(value as key: MlDsaKey) do
+                destroyMlDsaKey(key);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- Runs work over the set in one task of the scope and gives its answer.
+    function inTask(scope: Scope, work: Fn[ParameterSet, Bool], set: ParameterSet): Bool is
+        var open: Scope := scope;
+        var answer: Bool := false;
+        case spawn(&!open, work, set) of
+            when Right(right as task: Task[Bool]) do
+                answer := join(task);
+            when Left(left as unused: ParameterSet) do
+                assertFailure("a task could be started");
+        end case;
+        closeScope(open);
+        return answer;
+    end;
+
+    function signsWithLargeStack(set: ParameterSet): Bool is
+        case openScopeWithStack(largeStack) of
+            when Some(value as scope: Scope) do
+                let work: Fn[ParameterSet, Bool] := signsInTask;
+                return inTask(scope, work, set);
+            when None do
+                assertFailure("a scope with a large stack could be opened");
+                return false;
+        end case;
+    end;
+
+    function testSignsInATask(): Unit is
+        assertTrue(signsWithLargeStack(Level44()), "a task signs at level 44");
+        assertTrue(signsWithLargeStack(Level65()), "a task signs at level 65");
+        assertTrue(signsWithLargeStack(Level87()), "a task signs at level 87");
+        return nil;
+    end;
+
+    function testRefusedOnASmallStack(): Unit is
+        case openScope() of
+            when Some(value as scope: Scope) do
+                let work: Fn[ParameterSet, Bool] := refusedInTask;
+                assertTrue(inTask(scope, work, Level65()), "a task of 64 KiB makes no key");
+            when None do
+                assertFailure("a scope could be opened");
+        end case;
+        return nil;
+    end;
+end module body.

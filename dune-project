@@ -3,7 +3,7 @@
 (using menhir 2.0)
 
 (name hilde)
-(version 1.0.0)
+(version 1.0.1)
 (maintainers "Heiko Zimmermann <code@heiko-zimmermann.com>")
 (bug_reports "code@heiko-zimmermann.com")
 
