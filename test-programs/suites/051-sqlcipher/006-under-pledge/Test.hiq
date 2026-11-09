@@ -1,0 +1,179 @@
+-- Standard.SqlCipher under pledge: the round trip of 001, after the
+-- programme has pledged stdio rpath wpath cpath flock, the promises a
+-- database in a file needs, and unveiled the working directory with rwc,
+-- where the database and its journal are made.  A policy that is not
+-- applied on OpenBSD is printed and fails the test.  On OpenBSD the library must not call mlock,
+-- which no promise allows: the kernel would stop the programme with the
+-- abort signal.  The policy is applied on OpenBSD only: elsewhere the same
+-- policy means capability mode, Landlock or Seatbelt, under which the file
+-- of the database is not reachable.  The output is that of 001.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readExactly,
+    closeFile
+);
+import Standard.Platform (
+    systemName
+);
+import Standard.Text (
+    equal
+);
+import Standard.Sandbox (
+    Report,
+    makePolicy,
+    allowPromises,
+    allowPath,
+    applyPolicy,
+    reportApplied
+);
+import Standard.SqlCipher (
+    Connection,
+    Writing,
+    Reading,
+    SqlError,
+    Key,
+    makeKey,
+    describe,
+    openWriter,
+    openReader,
+    closeDatabase,
+    migrate
+);
+
+module body Test is
+    record Secret[R: Region]: Free is
+        name: Span[Nat8, R];
+        note: Span[Nat8, R];
+    end;
+
+    function failed(what: Span[Nat8, Static], error: SqlError): Unit is
+        print(what);
+        print(": failed, code ");
+        print(error.code);
+        print(", ");
+        printLn(describe(error));
+        return nil;
+    end;
+
+    function report(what: Span[Nat8, Static], result: Either[SqlError, Nat64]): Unit is
+        print(what);
+        case result of
+            when Left(left as error: SqlError) do
+                print(": failed, code ");
+                print(error.code);
+                print(", ");
+                printLn(describe(error));
+            when Right(right as changed: Nat64) do
+                print(": ");
+                print(changed);
+                printLn(" row(s)");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function write(db: &![Connection[Writing], R]): Unit is
+        case migrate(&~db, @migrations) of
+            when Left(left as error: SqlError) do
+                failed("migrate", error);
+            when Right(right as applied: Index) do
+                print("migrations applied: ");
+                printLn(applied);
+        end case;
+        report("insert one",
+            @execute(&~db, "INSERT INTO secrets (name, note) VALUES (?, ?)", "one", "the first secret"));
+        report("insert two",
+            @execute(&~db, "INSERT INTO secrets (name, note) VALUES (?, ?)", "two", "the second secret"));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function read(db: &![Connection[Reading], R]): Unit is
+        @query(&~db, "SELECT name, note FROM secrets ORDER BY name")
+            for secret: Secret[Q] do
+            print(secret.name);
+            print(": ");
+            printLn(secret.note);
+        else error do
+            failed("select", error);
+        end for;
+        return nil;
+    end;
+
+    -- True when the file starts with SQLite's own 15 bytes.
+    function plainHeader(): Bool is
+        let path: String := fromLiteral("secret.db");
+        var plain: Bool := false;
+        case openRead(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                case readExactly(&!file, 15) of
+                    when Some(value as head: String) do
+                        let magic: String := fromLiteral("SQLite format 3");
+                        plain := true;
+                        var i: Index := 0;
+                        while i < 15 do
+                            if nthByte(&head, i) /= nthByte(&magic, i) then
+                                plain := false;
+                            end if;
+                            i := i + 1;
+                        end while;
+                        destroyString(magic);
+                        destroyString(head);
+                    when None do
+                        printLn("the file is shorter than 15 bytes");
+                end case;
+                let closed: Bool := closeFile(file);
+            when None do
+                printLn("the file cannot be opened");
+        end case;
+        destroyString(path);
+        return plain;
+    end;
+
+    function main(): ExitCode is
+        if equal(systemName(), "openbsd") then
+            let promises: String := fromLiteral("stdio rpath wpath cpath flock");
+            let here: String := fromLiteral(".");
+            let permissions: String := fromLiteral("rwc");
+            let applied: Report := applyPolicy(allowPath(allowPromises(makePolicy(), asSpan(&promises)), asSpan(&here), asSpan(&permissions)));
+            destroyString(promises);
+            destroyString(here);
+            destroyString(permissions);
+            if not reportApplied(applied) then
+                printLn("the policy was not applied");
+                return ExitFailure();
+            end if;
+        end if;
+        case openWriter("secret.db", makeKey("correct horse battery staple")) of
+            when Left(left as error: SqlError) do
+                failed("open writer", error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                write(&!db);
+                closeDatabase(db);
+        end case;
+        case openReader("secret.db", makeKey("correct horse battery staple")) of
+            when Left(left as error: SqlError) do
+                failed("open reader", error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Reading]) do
+                var db: Connection[Reading] := opened;
+                read(&!db);
+                closeDatabase(db);
+        end case;
+        print("the file starts with SQLite's plain header: ");
+        printLn(plainHeader());
+        return ExitSuccess();
+    end;
+end module body.

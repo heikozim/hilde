@@ -1,0 +1,414 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    destroyString,
+    makeString,
+    length as stringLength,
+    nthByte,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    destroyFree,
+    length,
+    nth
+);
+import Standard.Ip (
+    IpAddress,
+    parseIp,
+    sameIp,
+    ipToBytes,
+    ipToString
+);
+import Standard.Resolve (
+    Family,
+    AnyFamily,
+    OnlyIpv4,
+    OnlyIpv6,
+    ResolveFailure,
+    NotAHostName,
+    UnknownName,
+    ResolverUnavailable,
+    NoAddressOfFamily,
+    ResolveFailed,
+    validHostname,
+    resolveHost,
+    recordLength,
+    addressesOfRecords
+);
+
+module body Standard.Resolve.Test is
+    ---
+    --- Helpers
+    ---
+
+    -- piece written times times, then tail.
+    function repeated(piece: Span[Nat8, Static], times: Index, tail: Span[Nat8, Static]): String is
+        var builder: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < times do
+            var j: Index := 0;
+            while j < spanLength(piece) do
+                writeByte(&!builder, piece[j]);
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        var k: Index := 0;
+        while k < spanLength(tail) do
+            writeByte(&!builder, tail[k]);
+            k := k + 1;
+        end while;
+        return finalize(builder);
+    end;
+
+    -- One record as the binding writes it: the length byte size, then the
+    -- bytes of the address text, padded with zeros to 16.  An address text
+    -- that does not parse writes the length byte and zeros only.
+    generic [R: Region]
+    function writeRecord(builder: &![StringBuilder, R], size: Nat8, text: Span[Nat8, Static]): Unit is
+        writeByte(&~builder, size);
+        var written: Index := 0;
+        case parseIp(text) of
+            when Some(value as address: IpAddress) do
+                let bytes: String := ipToBytes(address);
+                while written < stringLength(&bytes) do
+                    writeByte(&~builder, nthByte(&bytes, written));
+                    written := written + 1;
+                end while;
+                destroyString(bytes);
+            when None do
+                skip;
+        end case;
+        let zero_byte: Nat8 := 0;
+        while written < 16 do
+            writeByte(&~builder, zero_byte);
+            written := written + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The addresses of records, as text joined by blanks, or the code of
+    -- the failure after a hash sign.
+    function decoded(records: String, family: Family): String is
+        var out: StringBuilder := makeStringBuilder();
+        case addressesOfRecords(asSpan(&records), family) of
+            when Right(right as found: Buffer[IpAddress]) do
+                var i: Index := 0;
+                while i < length(&found) do
+                    if i > 0 then
+                        writeByte(&!out, ' ');
+                    end if;
+                    let text: String := ipToString(nth(&found, i));
+                    var k: Index := 0;
+                    while k < stringLength(&text) do
+                        writeByte(&!out, nthByte(&text, k));
+                        k := k + 1;
+                    end while;
+                    destroyString(text);
+                    i := i + 1;
+                end while;
+                destroyFree(found);
+            when Left(left as failure: ResolveFailure) do
+                writeByte(&!out, '#');
+                writeByte(&!out, failureDigit(failure));
+        end case;
+        destroyString(records);
+        return finalize(out);
+    end;
+
+    -- The code of failureCode as a digit.
+    function failureDigit(failure: ResolveFailure): Nat8 is
+        case failure of
+            when NotAHostName do
+                return '1';
+            when UnknownName do
+                return '2';
+            when ResolverUnavailable do
+                return '3';
+            when NoAddressOfFamily do
+                return '4';
+            when ResolveFailed do
+                return '5';
+        end case;
+    end;
+
+    -- decoded gives expected.
+    function decodesTo(records: String, family: Family, expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        let got: String := decoded(records, family);
+        assertTrue(equal(asSpan(&got), expected), message);
+        destroyString(got);
+        return nil;
+    end;
+
+    function validAsString(name: String): Bool is
+        let valid: Bool := validHostname(asSpan(&name));
+        destroyString(name);
+        return valid;
+    end;
+
+    function failureCode(failure: ResolveFailure): Int32 is
+        case failure of
+            when NotAHostName do
+                return 1;
+            when UnknownName do
+                return 2;
+            when ResolverUnavailable do
+                return 3;
+            when NoAddressOfFamily do
+                return 4;
+            when ResolveFailed do
+                return 5;
+        end case;
+    end;
+
+    -- The answer for name holds exactly one address, expected.
+    function onlyAddress(name: Span[Nat8, Static], family: Family, expected: Span[Nat8, Static], message: Span[Nat8, Static]): Unit is
+        case resolveHost(name, family) of
+            when Right(right as found: Buffer[IpAddress]) do
+                let one: Index := 1;
+                var same: Bool := false;
+                if length(&found) = one then
+                    case parseIp(expected) of
+                        when Some(value as want: IpAddress) do
+                            same := sameIp(nth(&found, 0), want);
+                        when None do
+                            skip;
+                    end case;
+                end if;
+                assertTrue(same, message);
+                destroyFree(found);
+            when Left(left as failure: ResolveFailure) do
+                assertTrue(false, message);
+        end case;
+        return nil;
+    end;
+
+    -- Resolving name fails with the failure of the given code.
+    function failsWith(name: Span[Nat8, Static], family: Family, code: Int32, message: Span[Nat8, Static]): Unit is
+        case resolveHost(name, family) of
+            when Right(right as found: Buffer[IpAddress]) do
+                destroyFree(found);
+                assertTrue(false, message);
+            when Left(left as failure: ResolveFailure) do
+                assertTrue(failureCode(failure) = code, message);
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Host names
+    ---
+
+    function testValidHostnames(): Unit is
+        assertTrue(validHostname("example.com"), "example.com");
+        assertTrue(validHostname("www.ssllabs.com"), "www.ssllabs.com");
+        assertTrue(validHostname("a.b.c.d.example.org"), "five labels");
+        assertTrue(validHostname("xn--bcher-kva.example"), "a name in its xn-- form");
+        assertTrue(validHostname("host-with-hyphen.example.com"), "hyphens inside a label");
+        assertTrue(validHostname("1.2.3.4"), "digits only");
+        assertTrue(validHostname("localhost"), "one label");
+        assertTrue(validHostname("EXAMPLE.COM"), "capitals");
+        assertTrue(validAsString(repeated("a", 63, ".com")), "a label of 63");
+        return nil;
+    end;
+
+    function testInvalidHostnames(): Unit is
+        assertFalse(validHostname(""), "empty");
+        assertFalse(validHostname("example..com"), "an empty label");
+        assertFalse(validHostname(".example.com"), "a leading dot");
+        assertFalse(validHostname("example.com."), "a trailing dot");
+        assertFalse(validHostname("-example.com"), "a label beginning with a hyphen");
+        assertFalse(validHostname("example-.com"), "a label ending with a hyphen");
+        assertFalse(validHostname("exa mple.com"), "a space");
+        assertFalse(validHostname("exam_ple.com"), "an underscore");
+        assertFalse(validHostname("http://example.com"), "a scheme");
+        assertFalse(validHostname("example.com/path"), "a path");
+        assertFalse(validHostname("host:443"), "a port");
+        var unicode: StringBuilder := makeStringBuilder();
+        writeByte(&!unicode, 'e');
+        writeByte(&!unicode, 'x');
+        writeByte(&!unicode, 195);
+        writeByte(&!unicode, 164);
+        writeByte(&!unicode, 'm');
+        assertFalse(validAsString(finalize(unicode)), "a name in Unicode");
+        assertFalse(validAsString(repeated("a", 64, ".com")), "a label of 64");
+        assertFalse(validAsString(repeated("a.", 127, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")), "294 bytes");
+        return nil;
+    end;
+
+    -- The two sides of the length limit: 253 bytes
+    -- pass, 254 do not.
+    function testLengthBoundaries(): Unit is
+        let long: String := repeated("ab.", 83, "ab.xy");
+        assertTrue(stringLength(&long) = 254, "the long name is 254 bytes");
+        assertFalse(validHostname(asSpan(&long)), "254 bytes");
+        destroyString(long);
+        let limit: String := repeated("ab.", 83, "ab.x");
+        assertTrue(stringLength(&limit) = 253, "the limit is 253 bytes");
+        assertTrue(validHostname(asSpan(&limit)), "253 bytes");
+        destroyString(limit);
+        return nil;
+    end;
+
+    ---
+    --- Literals, which never reach the resolver
+    ---
+
+    function testLiterals(): Unit is
+        onlyAddress("1.2.3.4", AnyFamily(), "1.2.3.4", "an IPv4 literal");
+        onlyAddress("2001:db8::24", AnyFamily(), "2001:db8::24", "an IPv6 literal");
+        onlyAddress("::ffff:1.2.3.4", OnlyIpv4(), "1.2.3.4", "a mapped IPv4 address is IPv4");
+        onlyAddress("::FFFF:1.2.3.4", AnyFamily(), "1.2.3.4", "the mapped prefix in capitals");
+        onlyAddress("::ffff:7f00:1", OnlyIpv4(), "127.0.0.1", "a mapped IPv4 address in groups is IPv4");
+        onlyAddress("::ffff:0102:0304", AnyFamily(), "1.2.3.4", "a mapped IPv4 address in groups, leading zeros");
+        onlyAddress("1.2.3.4", OnlyIpv4(), "1.2.3.4", "IPv4 kept by OnlyIpv4");
+        onlyAddress("2001:db8::24", OnlyIpv6(), "2001:db8::24", "IPv6 kept by OnlyIpv6");
+        return nil;
+    end;
+
+    function testFamilies(): Unit is
+        failsWith("1.2.3.4", OnlyIpv6(), 4, "IPv4 dropped by OnlyIpv6");
+        failsWith("2001:db8::24", OnlyIpv4(), 4, "IPv6 dropped by OnlyIpv4");
+        failsWith("::ffff:1.2.3.4", OnlyIpv6(), 4, "a mapped address is not IPv6");
+        return nil;
+    end;
+
+    function testNotAHostName(): Unit is
+        failsWith("", AnyFamily(), 1, "the empty name");
+        failsWith("example..com", AnyFamily(), 1, "an empty label");
+        failsWith("host:443", AnyFamily(), 1, "a port");
+        failsWith("::ffff:1.2.3", AnyFamily(), 1, "a mapped prefix before three groups");
+        return nil;
+    end;
+
+    ---
+    --- The records of the binding
+    ---
+
+    function testRecordLength(): Unit is
+        let seventeen: Index := 17;
+        assertTrue(recordLength() = seventeen, "a record is 17 bytes");
+        return nil;
+    end;
+
+    -- A mapped address is folded, a length byte that is neither 4 nor 16
+    -- is skipped, an address given twice comes once, and the bytes after
+    -- the last whole record are not read.
+    function testRecordsDecoded(): Unit is
+        var b: StringBuilder := makeStringBuilder();
+        writeRecord(&!b, 16, "::ffff:7f00:1");
+        writeRecord(&!b, 4, "192.0.2.1");
+        writeRecord(&!b, 16, "2001:db8::1");
+        writeRecord(&!b, 4, "192.0.2.1");
+        writeRecord(&!b, 7, "192.0.2.2");
+        writeRecord(&!b, 0, "192.0.2.3");
+        writeByte(&!b, 4);
+        writeByte(&!b, 10);
+        writeByte(&!b, 0);
+        decodesTo(finalize(b), AnyFamily(), "127.0.0.1 192.0.2.1 2001:db8::1", "the records of every family");
+        return nil;
+    end;
+
+    function testRecordsOfAFamily(): Unit is
+        var four: StringBuilder := makeStringBuilder();
+        writeRecord(&!four, 16, "::ffff:7f00:1");
+        writeRecord(&!four, 16, "2001:db8::1");
+        decodesTo(finalize(four), OnlyIpv4(), "127.0.0.1", "a mapped address is IPv4");
+        var six: StringBuilder := makeStringBuilder();
+        writeRecord(&!six, 16, "::ffff:7f00:1");
+        writeRecord(&!six, 16, "2001:db8::1");
+        decodesTo(finalize(six), OnlyIpv6(), "2001:db8::1", "a mapped address is not IPv6");
+        var mapped: StringBuilder := makeStringBuilder();
+        writeRecord(&!mapped, 16, "::ffff:7f00:1");
+        decodesTo(finalize(mapped), OnlyIpv6(), "#4", "only a mapped address and IPv6 asked for");
+        return nil;
+    end;
+
+    function testRecordsEmptyOrBroken(): Unit is
+        let zero_byte: Nat8 := 0;
+        let nothing: String := makeString(0, zero_byte);
+        decodesTo(nothing, AnyFamily(), "", "no record, no address and no failure");
+        var short: StringBuilder := makeStringBuilder();
+        writeByte(&!short, 4);
+        writeByte(&!short, 127);
+        decodesTo(finalize(short), AnyFamily(), "", "a part of a record is not read");
+        var broken: StringBuilder := makeStringBuilder();
+        writeRecord(&!broken, 255, "192.0.2.1");
+        decodesTo(finalize(broken), AnyFamily(), "#4", "a record of no known length gives no address");
+        return nil;
+    end;
+
+    ---
+    --- The resolver
+    ---
+
+    -- The hosts file of the gate's image and of the OpenBSD guest both give
+    -- localhost as 127.0.0.1 and ::1 (measured).
+    function testLocalhost(): Unit is
+        onlyAddress("localhost", OnlyIpv4(), "127.0.0.1", "localhost as IPv4");
+        return nil;
+    end;
+
+    -- A test of its own, so that it runs whatever the one above found: a
+    -- test ends at its first assertion that does not hold.
+    function testEveryAddressOnce(): Unit is
+        case resolveHost("localhost", AnyFamily()) of
+            when Right(right as found: Buffer[IpAddress]) do
+                let count: Index := length(&found);
+                assertTrue(count >= 1, "localhost has an address");
+                var twice: Bool := false;
+                var i: Index := 0;
+                while i < count do
+                    var j: Index := i + 1;
+                    while j < count do
+                        if sameIp(nth(&found, i), nth(&found, j)) then
+                            twice := true;
+                        end if;
+                        j := j + 1;
+                    end while;
+                    i := i + 1;
+                end while;
+                assertFalse(twice, "every address once");
+                destroyFree(found);
+            when Left(left as failure: ResolveFailure) do
+                assertTrue(false, "localhost resolves");
+        end case;
+        return nil;
+    end;
+
+    -- The .invalid domain never resolves (RFC 6761).  Where there is no
+    -- resolver to ask, as in the gate's container, the answer is
+    -- ResolverUnavailable instead of UnknownName; both are right, and a
+    -- name that is not refused as a host name is what this holds.
+    function testUnknownName(): Unit is
+        case resolveHost("this.host.does.not.exist.invalid", AnyFamily()) of
+            when Right(right as found: Buffer[IpAddress]) do
+                destroyFree(found);
+                assertTrue(false, "an .invalid name has no address");
+            when Left(left as failure: ResolveFailure) do
+                let code: Int32 := failureCode(failure);
+                assertTrue((code = 2) or (code = 3), "an .invalid name is unknown or the resolver unavailable");
+        end case;
+        return nil;
+    end;
+end module body.

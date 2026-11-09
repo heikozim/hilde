@@ -1,0 +1,1 @@
+Test that a scope opened with openScopeWithStack gives its tasks the stack it asked for: a task recurses 3000 calls deep, each call holding a String across the next, about 200 KiB of stack and more than the 64 KiB of a task of openScope, and finishes.  A task of a plain scope recurses 10 calls deep beside it.

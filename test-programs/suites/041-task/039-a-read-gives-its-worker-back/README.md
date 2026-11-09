@@ -1,0 +1,1 @@
+A read gives its worker back: on one worker a task reads the output of a child that writes a line after two seconds, and main, which let the task run first, must run again within one second.  With the read on the worker main waited for the line (measured 1024 ms with a child of one second), and on one worker a task that read from main itself would wait for ever.

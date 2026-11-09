@@ -1,0 +1,162 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The Rust crates of a package, built by cargo into one static library with every bridge module of the package.
+
+- One crate is generated per package below target/rust; it is a staticlib, so the standard library of Rust is linked once.
+- The crates and bridge modules of every package in vendor/ join that one staticlib, so that two of them never stand in one binary.
+- Its profiles keep panic = "unwind"; a build is refused when the environment or a cargo configuration asks for abort.
+- Every public function and every extern "C" function of a bridge starts with a call of hilde_bridge::guard.
+- cargo runs with --offline and --locked from rust/Cargo.lock and the sources in rust/vendor; only --vendor fetches.
+- The library is found by pkg-config through target/rust/pkgconfig, by the name libraryName gives; for a dependency, under the name of its own library, pointing at the one staticlib.
+
+    let got: Got := buildRust(".", "/opt/hilde", "", false);
+"""
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength
+);
+import Pkg.Manifest (
+    Manifest,
+    Crate,
+    isPrefix
+);
+import Pkg.Get (
+    Got
+);
+
+module Pkg.Rust is
+    """
+    One bridge module of the generated crate: the name of its module in
+    lib.rs and the file it comes in, from the root of the package.  A
+    bridge of a dependency is named with its package in small letters
+    before the name of the file, so that two packages never meet.
+    """
+    record Bridge: Linear is
+        name: String;
+        path: String;
+    end;
+
+    """
+    The name of the static library of the package of the prefix: hilde_rust_
+    and the prefix in small letters, a dot made an underscore.  It is the
+    name of the generated crate, of its library and of its pkg-config file.
+    """
+    generic [P: Region]
+    function libraryName(prefix: Span[Nat8, P]): String
+        requires isPrefix(prefix)
+        ensures length(&result) = (spanLength(prefix) + 11);
+
+    """
+    Whether the text is the name of a bridge module, the name of its file
+    in rust/bridge without .rs: one to 64 small letters, digits and
+    underscores, the first a small letter.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isBridgeName(text: Span[Nat8, R]): Bool;
+
+    """
+    Whether the text is a target of rustc such as aarch64-unknown-linux-gnu:
+    one to 64 small letters, digits, underscores, dots and hyphens.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function isTriple(text: Span[Nat8, R]): Bool;
+
+    """
+    The Cargo.toml of the generated crate: a staticlib of the library
+    name, the rust-version of the channel, every crate of the manifest and
+    of its dependencies at its exact version, the guard crate at helper,
+    and panic = "unwind" in the dev and release profiles.
+    """
+    generic [R: Region, K: Region, H: Region, C: Region]
+    function cargoManifest(manifest: &[Manifest, R], crates: &[Buffer[Crate], K], helper: Span[Nat8, H], channel: Span[Nat8, C]): String
+        requires (spanLength(helper) > 0) and (spanLength(channel) > 0)
+        ensures length(&result) > 0;
+
+    """
+    The lib.rs of the generated crate: one public module for each bridge
+    named, its file found from the crate through the path of the bridge.
+    """
+    generic [B: Region]
+    function librarySource(bridges: &[Buffer[Bridge], B]): String
+        ensures length(&result) > 0;
+
+    """
+    Frees a bridge.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyBridge(bridge: Bridge): Unit;
+
+    """
+    The pkg-config file of the library: Libs names the directory cargo
+    wrote it to, relative to the file itself, the library and the native
+    libraries rustc said it needs.
+    """
+    generic [N: Region, V: Region, D: Region, L: Region]
+    function pkgConfigText(name: Span[Nat8, N], version: Span[Nat8, V], directory: Span[Nat8, D], native: Span[Nat8, L]): String
+        requires (spanLength(name) > 0) and (spanLength(directory) > 0)
+        ensures length(&result) > 0;
+
+    """
+    Whether a text of cargo, a configuration file or the value of the rust
+    flags in the environment, sets panic to abort, written as panic =
+    "abort", -C panic=abort or split into two words.  A comment from # to
+    the end of a line is not read.
+    No contract: the answer is a Bool, nothing cheaper holds.
+    """
+    generic [R: Region]
+    function setsPanicAbort(text: Span[Nat8, R]): Bool;
+
+    """
+    The line, counted from 1, of the first function of a bridge whose body
+    does not start with a call of hilde_bridge::guard, guard_or or
+    guard_code; a function is a pub fn, a pub unsafe fn or an extern "C"
+    fn with a body.  None when every one does.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function firstUnguarded(text: Span[Nat8, R]): Option[Index];
+
+    """
+    The channel of a rust-toolchain.toml, the value of channel in its table
+    toolchain, when it is a version X.Y.Z or X.Y; None otherwise.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function channelOf(text: Span[Nat8, R]): Option[String];
+
+    """
+    The native libraries rustc printed for a staticlib, the words after
+    native-static-libs: in the output of cargo; None when there is no such
+    line or it holds a byte a pkg-config file cannot take.
+    No contract: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region]
+    function nativeLibraries(output: Span[Nat8, R]): Option[String];
+
+    """
+    Builds the Rust crates of the package at root, when hilde.toml names
+    one or there is a directory rust/bridge: the crate below
+    target/rust written from hilde.toml, rust/bridge and the toolchain and
+    guard crate of the Hilde tree at hilde, then cargo, then the
+    pkg-config file.  triple is the rustc target, empty for the host.
+    vendor runs cargo vendor into rust/vendor and copies the lock file
+    back to rust/Cargo.lock instead, the one step that fetches.  The count
+    is the number of bridge modules; a problem is H1535 to H1541, H1519 or
+    one of the manifest.
+    No contract: the answer is the work of cargo and the file system.
+    """
+    generic [R: Region, H: Region, T: Region]
+    function buildRust(root: Span[Nat8, R], hilde: Span[Nat8, H], triple: Span[Nat8, T], vendor: Bool): Got;
+end module.

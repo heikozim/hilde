@@ -1,0 +1,531 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Standard.ArrayWire: the vectors of docs/array-vectors.txt, decoded and
+-- encoded again, and the refusals that a cut or a changed value must get.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length as stringLength,
+    nthByte,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length,
+    nth
+);
+import Standard.Text (
+    equal,
+    startsWith
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readAll,
+    closeFile
+);
+import Standard.Array (
+    Array,
+    View,
+    Shape,
+    nat8Type,
+    int32Type,
+    int64Type,
+    float32Type,
+    float64Type,
+    boolType,
+    shape1,
+    shape2,
+    shape3,
+    shape4,
+    sameShape,
+    zeros,
+    destroy,
+    elementType,
+    shape,
+    byteCount,
+    setFloat64,
+    setInt32,
+    setBool,
+    view,
+    getFloat64,
+    getInt32,
+    getBool
+);
+import Standard.ArrayWire (
+    DecodeError,
+    TooShort,
+    BadMagic,
+    BadVersion,
+    BadFlags,
+    BadElementType,
+    BadRank,
+    BadExtent,
+    TooLarge,
+    BadLength,
+    BadBool,
+    wireVersion,
+    headerSize,
+    encodedSize,
+    encode,
+    decode,
+    describe
+);
+
+module body Standard.ArrayWire.Test is
+    function hexDigit(byte: Nat8): Nat8 is
+        if (byte >= 48) and (byte <= 57) then
+            return byte - 48;
+        end if;
+        return (byte - 97) + 10;
+    end;
+
+    -- The bytes a line of the vector file spells after "hex: ": pairs of
+    -- digits behind blanks.
+    generic [R: Region]
+    function decodeHex(text: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            if text[i] = 32 then
+                i := i + 1;
+            else
+                writeByte(&!out, (hexDigit(text[i]) * 16) + hexDigit(text[i + 1]));
+                i := i + 2;
+            end if;
+        end while;
+        return finalize(out);
+    end;
+
+    function readVectors(): String is
+        case openRead("docs/array-vectors.txt") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                var text: String := fromLiteral("");
+                case readAll(&!file) of
+                    when Some(value as read: String) do
+                        destroyString(text);
+                        text := read;
+                    when None do
+                        skip;
+                end case;
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return fromLiteral("");
+        end case;
+    end;
+
+    function digitValue(byte: Nat8): Index is
+        case toIndex(byte - 48) of
+            when Some(value as at: Index) do
+                return at;
+            when None do
+                abort("a digit did not fit an Index");
+        end case;
+    end;
+
+    -- The element type named in the file.
+    generic [R: Region]
+    function typeCode(name: Span[Nat8, R]): Nat8 is
+        if equal(name, "nat8") then
+            return nat8Type();
+        end if;
+        if equal(name, "int32") then
+            return int32Type();
+        end if;
+        if equal(name, "int64") then
+            return int64Type();
+        end if;
+        if equal(name, "float32") then
+            return float32Type();
+        end if;
+        if equal(name, "float64") then
+            return float64Type();
+        end if;
+        if equal(name, "bool") then
+            return boolType();
+        end if;
+        abort("a vector names an unknown type");
+    end;
+
+    -- The shape that a line of blank separated extents spells.
+    generic [R: Region]
+    function shapeOf(line: Span[Nat8, R]): Shape is
+        var i: Index := 0;
+        var e0: Index := 1;
+        var e1: Index := 1;
+        var e2: Index := 1;
+        var e3: Index := 1;
+        var axes: Index := 0;
+        var current: Index := 0;
+        while i <= spanLength(line) do
+            if (i = spanLength(line)) or (line[i] = 32) then
+                if axes = 0 then
+                    e0 := current;
+                else if axes = 1 then
+                    e1 := current;
+                else if axes = 2 then
+                    e2 := current;
+                else
+                    e3 := current;
+                end if;
+                axes := axes + 1;
+                current := 0;
+            else
+                current := (current * 10) + digitValue(line[i]);
+            end if;
+            i := i + 1;
+        end while;
+        if axes = 1 then
+            return shape1(e0);
+        end if;
+        if axes = 2 then
+            return shape2(e0, e1);
+        end if;
+        if axes = 3 then
+            return shape3(e0, e1, e2);
+        end if;
+        return shape4(e0, e1, e2, e3);
+    end;
+
+    generic [V: Region]
+    function reasonIs(error: DecodeError, expect: Span[Nat8, V]): Bool is
+        case error of
+            when TooShort do
+                return equal(expect, "reject-too-short");
+            when BadMagic do
+                return equal(expect, "reject-magic");
+            when BadVersion do
+                return equal(expect, "reject-version");
+            when BadFlags do
+                return equal(expect, "reject-flags");
+            when BadElementType do
+                return equal(expect, "reject-element-type");
+            when BadRank do
+                return equal(expect, "reject-rank");
+            when BadExtent do
+                return equal(expect, "reject-extent");
+            when TooLarge do
+                return equal(expect, "reject-too-large");
+            when BadLength do
+                return equal(expect, "reject-length");
+            when BadBool do
+                return equal(expect, "reject-bool");
+        end case;
+    end;
+
+    -- Whether the buffer holds the same bytes as the string.
+    generic [R: Region, Q: Region]
+    function sameBytes(out: &[Buffer[Nat8], R], bytes: &[String, Q]): Bool is
+        if length(out) /= stringLength(bytes) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(out) do
+            if nth(out, i) /= nthByte(bytes, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- A decoded array is written again, and the bytes must be those it came from.
+    generic [R: Region, Q: Region]
+    function checkRoundtrip(a: &[Array, R], bytes: &[String, Q]): Unit is
+        var out: Buffer[Nat8] := allocateEmpty();
+        let written: Index := encode(a, &!out);
+        assertTrue(written = stringLength(bytes), "encode writes as many bytes as the vector has");
+        assertTrue(written = encodedSize(a), "encode writes encodedSize bytes");
+        assertTrue(sameBytes(&out, bytes), "the array is encoded to the bytes it was decoded from");
+        destroyFree(out);
+        return nil;
+    end;
+
+    generic [R: Region, E: Region, T: Region, S: Region]
+    function checkVector(bytes: &[String, R], expect: Span[Nat8, E], kind: Span[Nat8, T], form: Span[Nat8, S]): Unit is
+        case decode(asSpan(bytes)) of
+            when Right(right as a: Array) do
+                assertTrue(equal(expect, "ok"), "a vector that the file calls refused was taken");
+                assertTrue(elementType(&a) = typeCode(kind), "the element type is the one of the file");
+                assertTrue(sameShape(shape(&a), shapeOf(form)), "the shape is the one of the file");
+                checkRoundtrip(&a, bytes);
+                destroy(a);
+            when Left(left as error: DecodeError) do
+                assertFalse(equal(expect, "ok"), "a vector that the file calls good was refused");
+                assertTrue(reasonIs(error, expect), "the reason is the one of the file");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function lineHas(text: &[String, R], start: Index, final: Index, prefix: Span[Nat8, Static]): Bool is
+        return startsWith(getSpan(text, start, final), prefix);
+    end;
+
+    function testVectorFile(): Unit is
+        let text: String := readVectors();
+        assertTrue(stringLength(&text) > 0, "the vector file was read");
+        var name: Index := 0;
+        var verdict: Index := 0;
+        var verdict_end: Index := 0;
+        var kind: Index := 0;
+        var kind_end: Index := 0;
+        var form: Index := 0;
+        var form_end: Index := 0;
+        var accepted: Index := 0;
+        var refused: Index := 0;
+        var line_start: Index := 0;
+        while line_start < stringLength(&text) do
+            var line_end: Index := line_start;
+            while (line_end < stringLength(&text)) and (nthByte(&text, line_end) /= 10) do
+                line_end := line_end + 1;
+            end while;
+            if line_end > line_start then
+                if lineHas(&text, line_start, line_end - 1, "expect: ") then
+                    verdict := line_start + 8;
+                    verdict_end := line_end - 1;
+                end if;
+                if lineHas(&text, line_start, line_end - 1, "type: ") then
+                    kind := line_start + 6;
+                    kind_end := line_end - 1;
+                end if;
+                if lineHas(&text, line_start, line_end - 1, "shape: ") then
+                    form := line_start + 7;
+                    form_end := line_end - 1;
+                end if;
+                if lineHas(&text, line_start, line_end - 1, "hex:") then
+                    var bytes: String := fromLiteral("");
+                    if (line_end - line_start) > 5 then
+                        destroyString(bytes);
+                        bytes := decodeHex(getSpan(&text, line_start + 5, line_end - 1));
+                    end if;
+                    if equal(getSpan(&text, verdict, verdict_end), "ok") then
+                        checkVector(&bytes, getSpan(&text, verdict, verdict_end), getSpan(&text, kind, kind_end), getSpan(&text, form, form_end));
+                        accepted := accepted + 1;
+                    else
+                        checkVector(&bytes, getSpan(&text, verdict, verdict_end), "nat8", "1");
+                        refused := refused + 1;
+                    end if;
+                    destroyString(bytes);
+                end if;
+            end if;
+            line_start := line_end + 1;
+        end while;
+        assertTrue(accepted = 11, "eleven vectors are valid");
+        assertTrue(refused = 26, "twenty six vectors are refused");
+        destroyString(text);
+        return nil;
+    end;
+
+    ---
+    --- Arrays built here
+    ---
+
+    function testConstants(): Unit is
+        assertTrue(wireVersion() = 1, "the version is 1");
+        assertTrue(headerSize(1) = 16, "a vector has a head of 16 bytes");
+        assertTrue(headerSize(4) = 40, "a rank 4 array has a head of 40 bytes");
+        assertFalse(equal(describe(TooShort()), describe(BadMagic())), "reasons have different words");
+        assertTrue(equal(describe(BadBool()), "a Bool element is not 0 or 1"), "a reason has its words");
+        return nil;
+    end;
+
+    -- The bytes of an encoded array as a string.
+    generic [R: Region]
+    function encoded(a: &[Array, R]): String is
+        var out: Buffer[Nat8] := allocateEmpty();
+        let written: Index := encode(a, &!out);
+        var text: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < length(&out) do
+            writeByte(&!text, nth(&out, i));
+            i := i + 1;
+        end while;
+        assertTrue(written = length(&out), "encode returns the bytes it added");
+        destroyFree(out);
+        return finalize(text);
+    end;
+
+    -- A string with the byte at position changed to value.
+    generic [R: Region]
+    function withByte(text: &[String, R], position: Index, value: Nat8): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < stringLength(text) do
+            if i = position then
+                writeByte(&!out, value);
+            else
+                writeByte(&!out, nthByte(text, i));
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function refusedAs(bytes: Span[Nat8, R], expect: Span[Nat8, Static]): Bool is
+        case decode(bytes) of
+            when Right(right as a: Array) do
+                destroy(a);
+                return false;
+            when Left(left as error: DecodeError) do
+                return reasonIs(error, expect);
+        end case;
+    end;
+
+    generic [R: Region]
+    function checkFloat64Matrix(a: &[Array, R]): Unit is
+        let v: View[R] := view(a);
+        assertTrue(getFloat64(v, 0) = 1.5, "the first element");
+        assertTrue(getFloat64(v, 5) = -6.25, "the last element");
+        assertTrue(getFloat64(v, 3) = 0.0, "an element left at zero");
+        return nil;
+    end;
+
+    function testRoundtrip(): Unit is
+        var a: Array := zeros(float64Type(), shape2(2, 3));
+        setFloat64(&!a, 0, 1.5);
+        setFloat64(&!a, 5, -6.25);
+        let text: String := encoded(&a);
+        assertTrue(stringLength(&text) = (headerSize(2) + 48), "a head of 24 bytes and 48 of data");
+        assertTrue(nthByte(&text, 0) = 72, "H");
+        assertTrue(nthByte(&text, 1) = 76, "L");
+        assertTrue(nthByte(&text, 2) = 68, "D");
+        assertTrue(nthByte(&text, 3) = 65, "A");
+        assertTrue(nthByte(&text, 4) = 1, "version 1");
+        assertTrue(nthByte(&text, 5) = 6, "Float64");
+        assertTrue(nthByte(&text, 6) = 2, "rank 2");
+        assertTrue(nthByte(&text, 8) = 2, "the first extent, little endian");
+        assertTrue(nthByte(&text, 16) = 3, "the second extent");
+        assertTrue(nthByte(&text, 15) = 0, "the high byte of the first extent");
+        assertTrue(nthByte(&text, 24) = 0, "the low byte of 1.5 is 0");
+        assertTrue(nthByte(&text, 30) = 248, "the next to last byte of 1.5 is 0xf8");
+        assertTrue(nthByte(&text, 31) = 63, "the last byte of 1.5 is 0x3f");
+        case decode(asSpan(&text)) of
+            when Right(right as b: Array) do
+                assertTrue(sameShape(shape(&b), shape2(2, 3)), "the shape comes back");
+                assertTrue(byteCount(&b) = 48, "the bytes come back");
+                checkFloat64Matrix(&b);
+                destroy(b);
+            when Left(left as error: DecodeError) do
+                assertTrue(false, "an encoded array is decoded");
+        end case;
+        destroyString(text);
+        destroy(a);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function checkBools(a: &[Array, R]): Unit is
+        let v: View[R] := view(a);
+        assertTrue(getBool(v, 0) and (not getBool(v, 1)) and getBool(v, 2), "the Bools come back");
+        return nil;
+    end;
+
+    function testBoolRoundtrip(): Unit is
+        var a: Array := zeros(boolType(), shape3(1, 1, 3));
+        setBool(&!a, 0, true);
+        setBool(&!a, 2, true);
+        let text: String := encoded(&a);
+        case decode(asSpan(&text)) of
+            when Right(right as b: Array) do
+                checkBools(&b);
+                destroy(b);
+            when Left(left as error: DecodeError) do
+                assertTrue(false, "an encoded Bool array is decoded");
+        end case;
+        destroyString(text);
+        destroy(a);
+        return nil;
+    end;
+
+    -- Every prefix of a valid value is refused, whatever its length.
+    function testEveryPrefixIsRefused(): Unit is
+        var a: Array := zeros(int32Type(), shape2(2, 2));
+        setInt32(&!a, 3, 7);
+        let text: String := encoded(&a);
+        var n: Index := 0;
+        var refused: Index := 0;
+        while n < stringLength(&text) do
+            if n = 0 then
+                if refusedAs("", "reject-too-short") then
+                    refused := refused + 1;
+                end if;
+            else
+                if refusedAs(getSpan(&text, 0, n - 1), "reject-too-short") or refusedAs(getSpan(&text, 0, n - 1), "reject-length") then
+                    refused := refused + 1;
+                end if;
+            end if;
+            n := n + 1;
+        end while;
+        assertTrue(refused = stringLength(&text), "all prefixes were refused for a cut");
+        assertTrue(stringLength(&text) = 40, "the value has 40 bytes: a head of 24 and 16 of data");
+        destroyString(text);
+        destroy(a);
+        return nil;
+    end;
+
+    -- One byte of the head changed, one field at a time.
+    function testChangedHead(): Unit is
+        var a: Array := zeros(int32Type(), shape1(2));
+        let text: String := encoded(&a);
+        let bad_magic: String := withByte(&text, 0, 0);
+        assertTrue(refusedAs(asSpan(&bad_magic), "reject-magic"), "a changed magic");
+        let bad_version: String := withByte(&text, 4, 0);
+        assertTrue(refusedAs(asSpan(&bad_version), "reject-version"), "version 0");
+        let bad_flags: String := withByte(&text, 7, 1);
+        assertTrue(refusedAs(asSpan(&bad_flags), "reject-flags"), "a flag set");
+        let bad_type: String := withByte(&text, 5, 9);
+        assertTrue(refusedAs(asSpan(&bad_type), "reject-element-type"), "an unknown type");
+        let other_type: String := withByte(&text, 5, 6);
+        assertTrue(refusedAs(asSpan(&other_type), "reject-length"), "a type that makes the data too short");
+        let no_rank: String := withByte(&text, 6, 0);
+        assertTrue(refusedAs(asSpan(&no_rank), "reject-rank"), "rank 0");
+        let big_rank: String := withByte(&text, 6, 5);
+        assertTrue(refusedAs(asSpan(&big_rank), "reject-rank"), "rank 5");
+        let higher_rank: String := withByte(&text, 6, 2);
+        assertTrue(refusedAs(asSpan(&higher_rank), "reject-extent"), "rank 2 reads the first data word as an extent");
+        let no_extent: String := withByte(&text, 8, 0);
+        assertTrue(refusedAs(asSpan(&no_extent), "reject-extent"), "extent 0");
+        let wide_extent: String := withByte(&text, 15, 255);
+        assertTrue(refusedAs(asSpan(&wide_extent), "reject-extent"), "an extent in the top byte");
+        let longer_extent: String := withByte(&text, 8, 3);
+        assertTrue(refusedAs(asSpan(&longer_extent), "reject-length"), "an extent that asks for more data");
+        destroyString(longer_extent);
+        destroyString(wide_extent);
+        destroyString(no_extent);
+        destroyString(higher_rank);
+        destroyString(big_rank);
+        destroyString(no_rank);
+        destroyString(other_type);
+        destroyString(bad_type);
+        destroyString(bad_flags);
+        destroyString(bad_version);
+        destroyString(bad_magic);
+        destroyString(text);
+        destroy(a);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,543 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module.  Bindings.Postgres does the work with addresses and C;
+-- its handles are wrapped here, one record each, and the mode of a
+-- connection, Writing or Reading, is checked by the types of this module.
+import Standard.String (
+    String
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Bindings.Postgres (
+    libraryVersion as bindLibraryVersion,
+    Connection as Handle,
+    Transaction as BindTransaction,
+    Values as BindValues,
+    Cursor as BindCursor,
+    PgError as BindError,
+    connection_failed as bind_connection_failed,
+    newer_database as bind_newer_database,
+    too_large as bind_too_large,
+    connection_lost as bind_connection_lost,
+    already_in_transaction as bind_already_in_transaction,
+    stateNumber,
+    connect,
+    closeDatabase as bindCloseDatabase,
+    lastMessage as bindLastMessage,
+    usesTls as bindUsesTls,
+    migrate as bindMigrate,
+    begin as bindBegin,
+    commit as bindCommit,
+    rollback as bindRollback,
+    copyText as bindCopyText,
+    noValues as bindNoValues,
+    withInt64 as bindWithInt64,
+    withFloat64 as bindWithFloat64,
+    withBool as bindWithBool,
+    withTimestamp as bindWithTimestamp,
+    withText as bindWithText,
+    withBytes as bindWithBytes,
+    withNull as bindWithNull,
+    dropValues as bindDropValues,
+    valueCount as bindValueCount,
+    start as bindStart,
+    execute as bindExecute,
+    advance as bindAdvance,
+    columnCount as bindColumnCount,
+    isNullColumn as bindIsNullColumn,
+    columnInt64 as bindColumnInt64,
+    columnFloat64 as bindColumnFloat64,
+    columnBool as bindColumnBool,
+    columnTimestamp as bindColumnTimestamp,
+    columnText as bindColumnText,
+    columnBytes as bindColumnBytes,
+    finish as bindFinish
+);
+
+module body Standard.Postgres is
+    record Connection[M: Free]: Linear is
+        handle: Handle;
+        mode: M;
+    end;
+
+    record Transaction: Linear is
+        inner: BindTransaction;
+    end;
+
+    record Values: Linear is
+        inner: BindValues;
+    end;
+
+    record Cursor: Linear is
+        inner: BindCursor;
+    end;
+
+    constant connection_failed: Int32 := bind_connection_failed;
+    constant newer_database: Int32 := bind_newer_database;
+    constant too_large: Int32 := bind_too_large;
+    constant connection_lost: Int32 := bind_connection_lost;
+    constant already_in_transaction: Int32 := bind_already_in_transaction;
+
+    -- The SQLSTATEs this module names, as numbers in base 36.
+    constant unique_violation: Int32 := 3505685;
+    constant foreign_key_violation: Int32 := 3505683;
+    constant not_null_violation: Int32 := 3505682;
+    constant check_violation: Int32 := 3505720;
+    constant invalid_password: Int32 := 3764881;
+    constant serialization_failure: Int32 := 6718465;
+    constant deadlock_detected: Int32 := 6750865;
+    constant lock_not_available: Int32 := 8663763;
+    constant read_only_transaction: Int32 := 3592518;
+    constant failed_transaction: Int32 := 3624914;
+    constant syntax_error: Int32 := 6819553;
+    constant undefined_table: Int32 := 6844177;
+
+    -- 36 to the power of 3: what lies below the first two characters.
+    constant class_divisor: Int32 := 46656;
+    -- The class 23, integrity constraint violation.
+    constant integrity_class: Int32 := 75;
+
+    function errorOf(error: BindError): PgError is
+        return PgError(code => error.code);
+    end;
+
+    generic [R: Region]
+    function stateCode(text: Span[Nat8, R]): Int32 is
+        return stateNumber(text);
+    end;
+
+    function stateClass(error: PgError): Int32 is
+        if error.code < 0 then
+            return -1;
+        end if;
+        return error.code / class_divisor;
+    end;
+
+    function isUniqueViolation(error: PgError): Bool is
+        return error.code = unique_violation;
+    end;
+
+    function isConstraintViolation(error: PgError): Bool is
+        return stateClass(error) = integrity_class;
+    end;
+
+    function isBusy(error: PgError): Bool is
+        let retry: Bool := (error.code = serialization_failure) or (error.code = deadlock_detected);
+        return retry or (error.code = lock_not_available);
+    end;
+
+    function describe(error: PgError): Span[Nat8, Static] is
+        let code: Int32 := error.code;
+        if code = connection_failed then
+            return "the connection to the server could not be made";
+        else if code = newer_database then
+            return "the database has more migrations than this programme knows";
+        else if code = too_large then
+            return "a value of 2 GiB or more";
+        else if code = connection_lost then
+            return "the server gave no answer";
+        else if code = already_in_transaction then
+            return "a transaction is open on this connection already";
+        else if code = unique_violation then
+            return "a unique constraint was violated";
+        else if code = foreign_key_violation then
+            return "a foreign key constraint was violated";
+        else if code = not_null_violation then
+            return "a not null constraint was violated";
+        else if code = check_violation then
+            return "a check constraint was violated";
+        else if code = invalid_password then
+            return "the password was wrong";
+        else if code = serialization_failure then
+            return "the transaction could not be serialized";
+        else if code = deadlock_detected then
+            return "a deadlock was detected";
+        else if code = lock_not_available then
+            return "a lock was not available";
+        else if code = read_only_transaction then
+            return "a write in a read only transaction";
+        else if code = failed_transaction then
+            return "a statement of the transaction had failed";
+        else if code = syntax_error then
+            return "the statement is not valid SQL";
+        else if code = undefined_table then
+            return "the table does not exist";
+        end if;
+        return "the server refused the statement";
+    end;
+
+    ---
+    --- Opening and closing
+    ---
+
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openWriter(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], ca_file: Span[Nat8, F]): Either[PgError, Connection[Writing]] is
+        case connect(host, port, database, user, password, ca_file, false) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as handle: Handle) do
+                return Right(right => Connection(handle => handle, mode => Writing()));
+        end case;
+    end;
+
+    generic [H: Region, D: Region, U: Region, P: Region, F: Region]
+    function openReader(host: Span[Nat8, H], port: Nat16, database: Span[Nat8, D], user: Span[Nat8, U], password: Span[Nat8, P], ca_file: Span[Nat8, F]): Either[PgError, Connection[Reading]] is
+        case connect(host, port, database, user, password, ca_file, true) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as handle: Handle) do
+                return Right(right => Connection(handle => handle, mode => Reading()));
+        end case;
+    end;
+
+    generic [M: Free]
+    function closeDatabase(db: Connection[M]): Unit is
+        let { handle: Handle, mode: M } := db;
+        bindCloseDatabase(handle);
+        return nil;
+    end;
+
+    generic [M: Free, R: Region]
+    function lastMessage(db: &[Connection[M], R]): String is
+        return bindLastMessage(&(db->handle));
+    end;
+
+    generic [M: Free, R: Region]
+    function usesTls(db: &[Connection[M], R]): Bool is
+        return bindUsesTls(&(db->handle));
+    end;
+
+    generic [R: Region]
+    function migrate(db: &![Connection[Writing], R], migrations: Span[Nat8, Static]): Either[PgError, Index] is
+        case bindMigrate(&!(db->handle), migrations) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as count: Index) do
+                return Right(right => count);
+        end case;
+    end;
+
+    ---
+    --- Transactions
+    ---
+
+    generic [M: Free, R: Region]
+    function begin(db: &![Connection[M], R]): Either[PgError, Transaction] is
+        case bindBegin(&!(db->handle)) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as inner: BindTransaction) do
+                return Right(right => Transaction(inner => inner));
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function commit(db: &![Connection[M], R], transaction: Transaction): Either[PgError, Unit] is
+        let { inner: BindTransaction } := transaction;
+        case bindCommit(&!(db->handle), inner) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as done: Unit) do
+                return Right(right => nil);
+        end case;
+    end;
+
+    generic [M: Free, R: Region]
+    function rollback(db: &![Connection[M], R], transaction: Transaction): Unit is
+        let { inner: BindTransaction } := transaction;
+        bindRollback(&!(db->handle), inner);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): String is
+        return bindCopyText(text);
+    end;
+
+    ---
+    --- Values
+    ---
+
+    function noValues(): Values is
+        return Values(inner => bindNoValues());
+    end;
+
+    function withInt64(values: Values, value: Int64): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithInt64(inner, value));
+    end;
+
+    function withFloat64(values: Values, value: Float64): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithFloat64(inner, value));
+    end;
+
+    function withBool(values: Values, value: Bool): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithBool(inner, value));
+    end;
+
+    function withTimestamp(values: Values, value: Int64): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithTimestamp(inner, value));
+    end;
+
+    generic [R: Region]
+    function withText(values: Values, value: Span[Nat8, R]): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithText(inner, value));
+    end;
+
+    generic [R: Region]
+    function withBytes(values: Values, value: Span[Nat8, R]): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithBytes(inner, value));
+    end;
+
+    function withNull(values: Values): Values is
+        let { inner: BindValues } := values;
+        return Values(inner => bindWithNull(inner));
+    end;
+
+    function dropValues(values: Values): Unit is
+        let { inner: BindValues } := values;
+        bindDropValues(inner);
+        return nil;
+    end;
+
+    function withInt64OrNull(values: Values, value: Option[Int64]): Values is
+        case value of
+            when Some(value as v: Int64) do
+                return withInt64(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    function withFloat64OrNull(values: Values, value: Option[Float64]): Values is
+        case value of
+            when Some(value as v: Float64) do
+                return withFloat64(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    function withBoolOrNull(values: Values, value: Option[Bool]): Values is
+        case value of
+            when Some(value as v: Bool) do
+                return withBool(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    function withTimestampOrNull(values: Values, value: Option[Int64]): Values is
+        case value of
+            when Some(value as v: Int64) do
+                return withTimestamp(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    generic [R: Region]
+    function withTextOrNull(values: Values, value: Option[Span[Nat8, R]]): Values is
+        case value of
+            when Some(value as v: Span[Nat8, R]) do
+                return withText(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    generic [R: Region]
+    function withBytesOrNull(values: Values, value: Option[Span[Nat8, R]]): Values is
+        case value of
+            when Some(value as v: Span[Nat8, R]) do
+                return withBytes(values, v);
+            when None do
+                return withNull(values);
+        end case;
+    end;
+
+    generic [R: Region]
+    function valueCount(values: &[Values, R]): Index is
+        return bindValueCount(&(values->inner));
+    end;
+
+    ---
+    --- Statements
+    ---
+
+    generic [M: Free, R: Region, S: Region]
+    function start(db: &![Connection[M], R], sql: Span[Nat8, S], values: Values): Cursor is
+        let { inner: BindValues } := values;
+        return Cursor(inner => bindStart(&!(db->handle), sql, inner));
+    end;
+
+    generic [R: Region, S: Region]
+    function startWrite(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Cursor is
+        let { inner: BindValues } := values;
+        return Cursor(inner => bindStart(&!(db->handle), sql, inner));
+    end;
+
+    generic [R: Region, S: Region]
+    function execute(db: &![Connection[Writing], R], sql: Span[Nat8, S], values: Values): Either[PgError, Nat64] is
+        let { inner: BindValues } := values;
+        case bindExecute(&!(db->handle), sql, inner) of
+            when Left(left as error: BindError) do
+                return Left(left => errorOf(error));
+            when Right(right as count: Nat64) do
+                return Right(right => count);
+        end case;
+    end;
+
+    generic [R: Region]
+    function advance(cursor: &![Cursor, R]): Bool is
+        return bindAdvance(&!(cursor->inner));
+    end;
+
+    generic [R: Region]
+    function columnCount(cursor: &[Cursor, R]): Int32 is
+        return bindColumnCount(&(cursor->inner));
+    end;
+
+    generic [R: Region]
+    function columnInt64(cursor: &[Cursor, R], index: Int32): Int64 is
+        return bindColumnInt64(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnFloat64(cursor: &[Cursor, R], index: Int32): Float64 is
+        return bindColumnFloat64(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnBool(cursor: &[Cursor, R], index: Int32): Bool is
+        return bindColumnBool(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnTimestamp(cursor: &[Cursor, R], index: Int32): Int64 is
+        return bindColumnTimestamp(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnText(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        return bindColumnText(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnBytes(cursor: &[Cursor, R], index: Int32): Span[Nat8, R] is
+        return bindColumnBytes(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function isNullColumn(cursor: &[Cursor, R], index: Int32): Bool is
+        return bindIsNullColumn(&(cursor->inner), index);
+    end;
+
+    generic [R: Region]
+    function columnInt64OrNone(cursor: &[Cursor, R], index: Int32): Option[Int64] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnInt64(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnFloat64OrNone(cursor: &[Cursor, R], index: Int32): Option[Float64] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnFloat64(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnBoolOrNone(cursor: &[Cursor, R], index: Int32): Option[Bool] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnBool(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnTimestampOrNone(cursor: &[Cursor, R], index: Int32): Option[Int64] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnTimestamp(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnTextOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnText(cursor, index));
+    end;
+
+    generic [R: Region]
+    function columnBytesOrNone(cursor: &[Cursor, R], index: Int32): Option[Span[Nat8, R]] is
+        if isNullColumn(cursor, index) then
+            return None();
+        end if;
+        return Some(value => columnBytes(cursor, index));
+    end;
+
+    generic [M: Free, R: Region]
+    function finish(db: &![Connection[M], R], cursor: Cursor): Option[PgError] is
+        let { inner: BindCursor } := cursor;
+        case bindFinish(&!(db->handle), inner) of
+            when Some(value as error: BindError) do
+                return Some(value => errorOf(error));
+            when None do
+                return None();
+        end case;
+    end;
+
+    function libraryVersion(): String is
+        let number: Int32 := bindLibraryVersion();
+        let major: Int32 := number / 10000;
+        let minor: Int32 := number - (major * 10000);
+        var out: StringBuilder := makeStringBuilder();
+        writeDigits(&!out, major);
+        writeByte(&!out, '.');
+        writeDigits(&!out, minor);
+        return finalize(out);
+    end;
+
+    -- The decimal digits of value, 0 for one below 1.  Written here, not
+    -- with Standard.Text, which a programme over Postgres need not carry.
+    generic [R: Region]
+    function writeDigits(out: &![StringBuilder, R], value: Int32): Unit is
+        if value < 1 then
+            writeByte(&~out, '0');
+            return nil;
+        end if;
+        let ten: Int32 := 10;
+        if value >= ten then
+            writeDigits(&~out, value / ten);
+        end if;
+        let digit: Int32 := value - ((value / ten) * ten);
+        let zero: Nat8 := '0';
+        case toNat8(digit) of
+            when Some(value as d: Nat8) do
+                writeByte(&~out, zero + d);
+            when None do
+                writeByte(&~out, zero);
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,1 @@
+A task that is spawned before a child is forked and starts after it: its first frame lies in a page the fork shared, so the first write to it is a fault, and OpenBSD checks the stack pointer at a fault. The frame stands below the top of the stack so that the pointer is inside the mapping. On one worker main leaves for the first time after the fork as well.

@@ -1,0 +1,1 @@
+The four functions of Standard.IO.Terminal that read the standard input -- readLine, inputIsTerminal, readHiddenLine, drainInput -- compiled beside the binding of libcrypto, whose header openssl/evp.h brings stdio.h; on OpenBSD stdin is a macro there.  The calls are compiled and never taken.

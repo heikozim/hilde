@@ -1,0 +1,1 @@
+A module that does not parse, named on the command line after a module that imports it: the compiler reports its parse error (H0008, a reserved word as a name), not that the module before it imports an unknown module (H2017), which is what an unreadable head would give if it left the order as given.

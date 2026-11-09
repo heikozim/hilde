@@ -1,0 +1,1 @@
+Every pattern of 001, 002 and a list of edges, among them every property name, and whether Standard.Regex compile takes it or with which message; test/RegexCheckTest.ml holds the compiler check against this output.

@@ -1,0 +1,163 @@
+-- Standard.Htmx with Standard.Template: one handler answers a plain
+-- request with the whole page, page.jinja, and a request of htmx, one
+-- with HX-Request: true, with the fragment the page includes, items.jinja,
+-- rendered by itself.  Both answers carry Vary: HX-Request.  A request
+-- whose HX-Request is not exactly true gets the page.  The carriage
+-- returns of the answers are printed as nothing.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    removeLast,
+    destroyEmpty,
+    length as count
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Template (
+    Render
+);
+import Standard.Text (
+    replace
+);
+import Standard.Fcgi (
+    makePair
+);
+import Standard.FcgiServer (
+    Request,
+    makeRequest,
+    requestParam,
+    destroyRequest
+);
+import Standard.Htmx (
+    requestVariable,
+    isHtmxRequest,
+    htmlResponse
+);
+
+module body Test is
+    record Item: Linear is
+        name: String;
+    end;
+
+    record Page: Linear is
+        title: String;
+        items: Buffer[Item];
+    end;
+
+    generic [R: Region]
+    function renderPage(page: &[Page, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function renderItems(page: &[Page, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("items.jinja", page, out);
+        return finalize(out);
+    end;
+
+    -- The page for a plain request, the list alone for htmx.
+    generic [R: Region]
+    function handle(request: Request, page: &[Page, R]): String is
+        var htmx: Bool := false;
+        case requestParam(&request, requestVariable()) of
+            when Some(value as header: String) do
+                htmx := isHtmxRequest(asSpan(&header));
+                destroyString(header);
+            when None do
+                skip;
+        end case;
+        destroyRequest(request);
+        if htmx then
+            let fragment: String := renderItems(page);
+            let answer: String := htmlResponse(200, "", asSpan(&fragment));
+            destroyString(fragment);
+            return answer;
+        end if;
+        let whole: String := renderPage(page);
+        let answer: String := htmlResponse(200, "", asSpan(&whole));
+        destroyString(whole);
+        return answer;
+    end;
+
+    -- A request with REQUEST_METHOD GET and, when hx is not empty, the
+    -- header HX-Request with the value hx.
+    function probeRequest(hx: Span[Nat8, Static]): Request is
+        var params: StringBuilder := makeStringBuilder();
+        case makePair("REQUEST_METHOD", "GET") of
+            when Some(value as pair: String) do
+                writeString(&!params, asSpan(&pair));
+                destroyString(pair);
+            when None do
+                skip;
+        end case;
+        if spanLength(hx) > 0 then
+            case makePair(requestVariable(), hx) of
+                when Some(value as pair: String) do
+                    writeString(&!params, asSpan(&pair));
+                    destroyString(pair);
+                when None do
+                    skip;
+            end case;
+        end if;
+        return makeRequest(finalize(params), fromLiteral(""));
+    end;
+
+    generic [R: Region]
+    function show(label: Span[Nat8, Static], answer: &[String, R]): Unit is
+        printLn(label);
+        let plain: String := replace(asSpan(answer), "\r", "");
+        if length(&plain) > 0 then
+            print(getSpan(&plain, 0, length(&plain) - 1));
+        end if;
+        destroyString(plain);
+        printLn("-- end");
+        return nil;
+    end;
+
+    function destroyPage(page: Page): Unit is
+        let { title: String, items: Buffer[Item] } := page;
+        destroyString(title);
+        var rest: Buffer[Item] := items;
+        while count(&rest) > 0 do
+            let item: Item := removeLast(&!rest);
+            let { name: String } := item;
+            destroyString(name);
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        var items: Buffer[Item] := allocateEmpty();
+        insertBack(&!items, Item(name => fromLiteral("tea")));
+        insertBack(&!items, Item(name => fromLiteral("<b>cake</b>")));
+        let page: Page := Page(title => fromLiteral("Orders"), items => items);
+        let whole: String := handle(probeRequest(""), &page);
+        show("== a plain request", &whole);
+        destroyString(whole);
+        let fragment: String := handle(probeRequest("true"), &page);
+        show("== HX-Request: true", &fragment);
+        destroyString(fragment);
+        let other: String := handle(probeRequest("True"), &page);
+        show("== HX-Request: True", &other);
+        destroyString(other);
+        destroyPage(page);
+        return ExitSuccess();
+    end;
+end module body.

@@ -1,0 +1,1 @@
+A child process with three pipes: input in, output and errors out, the exit code back; arguments arrive unsplit; a missing programme and a spoiled argument are refused before anything runs; SIGTERM ends a child and is recognised; and a descriptor without close-on-exec does not reach the child.

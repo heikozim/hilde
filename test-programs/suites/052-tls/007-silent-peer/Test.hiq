@@ -1,0 +1,226 @@
+-- Standard.Tls.connect to a peer that takes the TCP connection and then
+-- stays silent: the handshake gets no byte, and connect must end in a Left
+-- within its time limit and give its worker back.  The limit is 10 s, so
+-- the test holds that the call ended within 12 s and that main ran while
+-- the task connected.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.Text (
+    formatNat,
+    parseNat
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Running,
+    Process,
+    ProcessStatus,
+    Command,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitedNormally,
+    exitCode,
+    readExactly,
+    readAll,
+    closeFile
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    closeScope,
+    spawn,
+    join,
+    yieldNow
+);
+import Standard.Tls (
+    Client,
+    connect,
+    closeClient
+);
+
+module body Test is
+    -- A file of the tree, from HILDE_TREE.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        let tail: String := fromLiteral(rest);
+        writeString(&!out, asSpan(&tail));
+        destroyString(tail);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    -- The TLS server of the tree, told to say nothing.
+    function serverCommand(): Command is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/tls/server.py");
+        let silent: String := fromLiteral("--silent");
+        let command: Command := addArgument(addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script)), asSpan(&silent));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        destroyString(silent);
+        return command;
+    end;
+
+    function now(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function widen(value: Nat16): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- Connects over TLS to the silent peer at port and prints how long it
+    -- took and what came back.
+    function connector(port: Nat16): Unit is
+        let service: String := formatNat(widen(port));
+        let started: Nat64 := now();
+        case connect("localhost", asSpan(&service), "server-cert.pem") of
+            when Right(right as client: Client) do
+                printLn("the task connected, which a silent peer cannot allow");
+                closeClient(client);
+            when Left(left as message: String) do
+                let ended: Nat64 := now();
+                let limit: Nat64 := 12000000000;
+                if (ended - started) < limit then
+                    printLn("the connect ended in a Left within the time limit");
+                else
+                    printLn("the connect ended, but too late");
+                end if;
+                print("detail: ");
+                printText(&message);
+                printLn("");
+                destroyString(message);
+        end case;
+        destroyString(service);
+        return nil;
+    end;
+
+    -- main must run again while the task is still in its handshake.
+    function run(port: Nat16): Unit is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                let work: Fn[Nat16, Unit] := connector;
+                case spawn(&!scope, work, port) of
+                    when Right(right as task: Task[Unit]) do
+                        let before: Nat64 := now();
+                        yieldNow();
+                        let after: Nat64 := now();
+                        let second: Nat64 := 1000000000;
+                        if (after - before) < second then
+                            printLn("main ran while the task connected");
+                        else
+                            printLn("main waited for the connect");
+                        end if;
+                        join(task);
+                    when Left(left as back: Nat16) do
+                        printLn("the task did not start");
+                end case;
+                closeScope(scope);
+            when None do
+                printLn("no scope");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case spawnProcess(serverCommand()) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                var out: FileDescriptor := output;
+                var err: FileDescriptor := errors;
+                case readExactly(&!out, 6) of
+                    when Some(value as printed: String) do
+                        case parseNat(getSpan(&printed, 0, 4)) of
+                            when Some(value as number: Nat64) do
+                                case toNat16(number) of
+                                    when Some(value as port: Nat16) do
+                                        run(port);
+                                    when None do
+                                        printLn("the port does not fit");
+                                end case;
+                            when None do
+                                printLn("the server printed no port");
+                        end case;
+                        destroyString(printed);
+                    when None do
+                        printLn("the server printed no port");
+                end case;
+                let closed_input: Bool := closeFile(input);
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        printText(&text);
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's output failed)");
+                end case;
+                case readAll(&!err) of
+                    when Some(value as text: String) do
+                        if length(&text) > 0 then
+                            printLn("-- the server's error stream:");
+                            printText(&text);
+                        end if;
+                        destroyString(text);
+                    when None do
+                        printLn("(reading the server's errors failed)");
+                end case;
+                let closed_out: Bool := closeFile(out);
+                let closed_err: Bool := closeFile(err);
+                let status: ProcessStatus := waitProcess(process);
+                print("server exited normally: ");
+                print(exitedNormally(status));
+                print(", code ");
+                printLn(exitCode(status));
+            when None do
+                printLn("the server could not be started");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

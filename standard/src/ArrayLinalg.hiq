@@ -1,0 +1,488 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Array (
+    Array,
+    View,
+    destroy,
+    float64Type,
+    getFloat64,
+    sameShape,
+    setFloat64,
+    shape,
+    shape1,
+    shape2,
+    size,
+    view,
+    viewElementType,
+    viewExtent,
+    viewRank,
+    zeros
+);
+import Standard.Buffer (
+    Buffer,
+    destroyFree,
+    getSpanMut,
+    initialize,
+    nth,
+    storeNth
+);
+import Bindings.Lapack (
+    gelsd,
+    geqrf,
+    gesdd,
+    orgqr
+);
+
+module body Standard.ArrayLinalg is
+    function largestDimension(): Index is
+        return 2147483647;
+    end;
+
+    -- The answer of svd.  The invariants hold the sizes of the three
+    -- matrices to the two sizes the call read off its input: u is of the
+    -- rows by the columns, the values carry one place per column, and vt
+    -- is square of the columns.
+    record Svd: Linear is
+        u: Array;
+        s: Array;
+        vt: Array;
+        rows: Index;
+        columns: Index;
+        invariant sameShape(shape(&u), shape2(rows, columns));
+        invariant sameShape(shape(&s), shape1(columns));
+        invariant sameShape(shape(&vt), shape2(columns, columns));
+    end;
+
+    -- The answer of qr.  The invariants hold the sizes of the two
+    -- matrices to the two sizes the call read off its input: q is of the
+    -- rows by the columns and r is square of the columns.
+    record Qr: Linear is
+        q: Array;
+        r: Array;
+        rows: Index;
+        columns: Index;
+        invariant sameShape(shape(&q), shape2(rows, columns));
+        invariant sameShape(shape(&r), shape2(columns, columns));
+    end;
+
+    -- The answer of lstsq.  The invariants hold the size of the answer
+    -- to the column count the call read off its input, and the rank at
+    -- most the column count.
+    record Lstsq: Linear is
+        x: Array;
+        columns: Index;
+        rank: Index;
+        invariant sameShape(shape(&x), shape1(columns));
+        invariant rank <= columns;
+    end;
+
+    -- The dimension as the 32-bit whole number the routines take.  The
+    -- contracts of the module hold every dimension at or below
+    -- largestDimension, so the conversion never fails; a failure would be
+    -- a broken contract, and the programme stops.
+    function dimension(width: Index): Int32 is
+        case toInt32(width) of
+            when Some(value as small: Int32) do
+                return small;
+            when None do
+                abort("a dimension of a matrix did not fit the 32 bits of the routines");
+        end case;
+    end;
+
+    -- The length of the work the query of the routine answered, as an
+    -- Index.  The routine names a length of places; a length the Index
+    -- of a buffer cannot carry stops the programme.
+    function workSize(asked: Float64): Index is
+        case toInt32(asked) of
+            when Some(value as small: Int32) do
+                case toIndex(small) of
+                    when Some(value as wide: Index) do
+                        return wide;
+                    when None do
+                        abort("the work the routine asked for did not fit the length of a buffer");
+                end case;
+            when None do
+                abort("the work the routine asked for was not a whole number of places");
+        end case;
+    end;
+
+    -- The rank the routine answered, as an Index.  The rank of a matrix
+    -- is never below 0 when the routine answered without a failure; a
+    -- rank the Index cannot carry stops the programme.
+    function rankIndex(ranked: Int32): Index is
+        case toIndex(ranked) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                abort("the rank the routine answered did not fit the length of an index");
+        end case;
+    end;
+
+    -- The elements of the matrix view a, with rows and columns, in the
+    -- column-major order the routine reads: the element of row i and
+    -- column j goes to the place j times rows plus i.
+    generic [A: Region, B: Region]
+    function columnMajor(a: View[A], rows: Index, columns: Index, into: &![Buffer[Float64], B]): Unit is
+        var i: Index := 0;
+        while i < rows do
+            var j: Index := 0;
+            while j < columns do
+                storeNth(&~into, (j * rows) + i, getFloat64(a, (i * columns) + j));
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The matrix the buffer holds in column-major order, with rows and
+    -- columns, as a new owning array in row-major order.
+    generic [B: Region]
+    function matrixRowMajor(source: &[Buffer[Float64], B], rows: Index, columns: Index): Array is
+        var out: Array := zeros(float64Type(), shape2(rows, columns));
+        var i: Index := 0;
+        while i < rows do
+            var j: Index := 0;
+            while j < columns do
+                setFloat64(&!out, (i * columns) + j, nth(source, (j * rows) + i));
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The upper triangle of the factors the buffer holds in column-major
+    -- order, with rows and columns, as a new owning array in row-major
+    -- order: the elements below the diagonal are zero in the answer.
+    generic [B: Region]
+    function triangleRowMajor(source: &[Buffer[Float64], B], rows: Index, columns: Index): Array is
+        var out: Array := zeros(float64Type(), shape2(columns, columns));
+        var i: Index := 0;
+        while i < columns do
+            var j: Index := i;
+            while j < columns do
+                setFloat64(&!out, (i * columns) + j, nth(source, (j * rows) + i));
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The first count elements of the buffer of Float64 as a new vector.
+    generic [B: Region]
+    function floatVectorFrom(source: &[Buffer[Float64], B], count: Index): Array is
+        var out: Array := zeros(float64Type(), shape1(count));
+        var k: Index := 0;
+        while k < count do
+            setFloat64(&!out, k, nth(source, k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    ---
+    --- The answer of svd
+    ---
+
+    function destroySvd(given: Svd): Unit is
+        let { u: Array, s: Array, vt: Array, rows: Index, columns: Index } := given;
+        destroy(u);
+        destroy(s);
+        destroy(vt);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function svdRows(made: &[Svd, R]): Index is
+        return made->rows;
+    end;
+
+    generic [R: Region]
+    function svdColumns(made: &[Svd, R]): Index is
+        return made->columns;
+    end;
+
+    generic [R: Region]
+    function uOf(made: &[Svd, R]): Array is
+        let rows: Index := made->rows;
+        let columns: Index := made->columns;
+        var out: Array := zeros(float64Type(), shape2(rows, columns));
+        var k: Index := 0;
+        while k < (rows * columns) do
+            setFloat64(&!out, k, getFloat64(view(&(made->u)), k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region]
+    function singularValuesOf(made: &[Svd, R]): Array is
+        let count: Index := size(&(made->s));
+        var out: Array := zeros(float64Type(), shape1(count));
+        var k: Index := 0;
+        while k < count do
+            setFloat64(&!out, k, getFloat64(view(&(made->s)), k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region]
+    function vtOf(made: &[Svd, R]): Array is
+        let width: Index := made->columns;
+        var out: Array := zeros(float64Type(), shape2(width, width));
+        var k: Index := 0;
+        while k < (width * width) do
+            setFloat64(&!out, k, getFloat64(view(&(made->vt)), k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    ---
+    --- The answer of qr
+    ---
+
+    function destroyQr(given: Qr): Unit is
+        let { q: Array, r: Array, rows: Index, columns: Index } := given;
+        destroy(q);
+        destroy(r);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function qrRows(made: &[Qr, R]): Index is
+        return made->rows;
+    end;
+
+    generic [R: Region]
+    function qrColumns(made: &[Qr, R]): Index is
+        return made->columns;
+    end;
+
+    generic [R: Region]
+    function qOf(made: &[Qr, R]): Array is
+        let rows: Index := made->rows;
+        let columns: Index := made->columns;
+        var out: Array := zeros(float64Type(), shape2(rows, columns));
+        var k: Index := 0;
+        while k < (rows * columns) do
+            setFloat64(&!out, k, getFloat64(view(&(made->q)), k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region]
+    function rOf(made: &[Qr, R]): Array is
+        let columns: Index := made->columns;
+        var out: Array := zeros(float64Type(), shape2(columns, columns));
+        var k: Index := 0;
+        while k < (columns * columns) do
+            setFloat64(&!out, k, getFloat64(view(&(made->r)), k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    ---
+    --- The answer of lstsq
+    ---
+
+    function destroyLstsq(given: Lstsq): Unit is
+        let { x: Array, columns: Index, rank: Index } := given;
+        destroy(x);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function lstsqColumns(made: &[Lstsq, R]): Index is
+        return made->columns;
+    end;
+
+    generic [R: Region]
+    function lstsqRank(made: &[Lstsq, R]): Index is
+        return made->rank;
+    end;
+
+    generic [R: Region]
+    function xOf(made: &[Lstsq, R]): Array is
+        let columns: Index := made->columns;
+        var out: Array := zeros(float64Type(), shape1(columns));
+        var k: Index := 0;
+        while k < columns do
+            setFloat64(&!out, k, getFloat64(view(&(made->x)), k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    ---
+    --- The decomposition
+    ---
+
+    generic [A: Region]
+    function svd(a: View[A]): Either[Int32, Svd] is
+        let rows: Index := viewExtent(a, 0);
+        let columns: Index := viewExtent(a, 1);
+        var a_cells: Buffer[Float64] := initialize(rows * columns, 0.0);
+        var s_cells: Buffer[Float64] := initialize(columns, 0.0);
+        var u_cells: Buffer[Float64] := initialize(rows * columns, 0.0);
+        var vt_cells: Buffer[Float64] := initialize(columns * columns, 0.0);
+        -- The routine takes the work array with its length, and the
+        -- integer work with eight times the smaller dimension.  For the
+        -- thin form and at least as many rows as columns every path of
+        -- the routine needs at most four times the square of the columns
+        -- plus seven times the columns, so one buffer of that size is
+        -- enough and no query of the best size is needed.
+        var work: Buffer[Float64] := initialize((4 * (columns * columns)) + (7 * columns), 0.0);
+        var i_work: Buffer[Int32] := initialize(8 * columns, 0);
+        var info: Buffer[Int32] := initialize(1, 0);
+        columnMajor(a, rows, columns, &!a_cells);
+        let code: Int32 := gesdd(dimension(rows), dimension(columns), getSpanMut(&!a_cells, 0, (rows * columns) - 1), getSpanMut(&!s_cells, 0, columns - 1), getSpanMut(&!u_cells, 0, (rows * columns) - 1), getSpanMut(&!vt_cells, 0, (columns * columns) - 1), getSpanMut(&!work, 0, ((4 * (columns * columns)) + (7 * columns)) - 1), getSpanMut(&!i_work, 0, (8 * columns) - 1), getSpanMut(&!info, 0, 0));
+        if code /= 0 then
+            destroyFree(info);
+            destroyFree(i_work);
+            destroyFree(work);
+            destroyFree(vt_cells);
+            destroyFree(u_cells);
+            destroyFree(s_cells);
+            destroyFree(a_cells);
+            let refused: Either[Int32, Svd] := Left(left => code);
+            return refused;
+        end if;
+        let u: Array := matrixRowMajor(&u_cells, rows, columns);
+        let s: Array := floatVectorFrom(&s_cells, columns);
+        let vt: Array := matrixRowMajor(&vt_cells, columns, columns);
+        destroyFree(info);
+        destroyFree(i_work);
+        destroyFree(work);
+        destroyFree(vt_cells);
+        destroyFree(u_cells);
+        destroyFree(s_cells);
+        destroyFree(a_cells);
+        let made: Svd := Svd(u => u, s => s, vt => vt, rows => rows, columns => columns);
+        let answered: Either[Int32, Svd] := Right(right => made);
+        return answered;
+    end;
+
+    generic [A: Region]
+    function qr(a: View[A]): Either[Int32, Qr] is
+        let rows: Index := viewExtent(a, 0);
+        let columns: Index := viewExtent(a, 1);
+        -- Both routines of the factorization take the block size from
+        -- the table of the library, which holds 32 for the factorization
+        -- and for the building of q; one buffer of 32 times the columns
+        -- is enough for both calls, so no query of the best size is
+        -- made.
+        var a_cells: Buffer[Float64] := initialize(rows * columns, 0.0);
+        var tau_cells: Buffer[Float64] := initialize(columns, 0.0);
+        var work: Buffer[Float64] := initialize(32 * columns, 0.0);
+        var info: Buffer[Int32] := initialize(1, 0);
+        let span: Int32 := dimension(32 * columns);
+        columnMajor(a, rows, columns, &!a_cells);
+        let first: Int32 := geqrf(dimension(rows), dimension(columns), getSpanMut(&!a_cells, 0, (rows * columns) - 1), getSpanMut(&!tau_cells, 0, columns - 1), getSpanMut(&!work, 0, (32 * columns) - 1), span, getSpanMut(&!info, 0, 0));
+        if first /= 0 then
+            destroyFree(info);
+            destroyFree(work);
+            destroyFree(tau_cells);
+            destroyFree(a_cells);
+            let refused: Either[Int32, Qr] := Left(left => first);
+            return refused;
+        end if;
+        -- r stands in the upper triangle of the factors before the
+        -- reflections are unfolded to q; below the diagonal the factors
+        -- hold the vectors of the reflections, which the answer does not
+        -- carry.
+        let r: Array := triangleRowMajor(&a_cells, rows, columns);
+        let second: Int32 := orgqr(dimension(rows), dimension(columns), dimension(columns), getSpanMut(&!a_cells, 0, (rows * columns) - 1), getSpanMut(&!tau_cells, 0, columns - 1), getSpanMut(&!work, 0, (32 * columns) - 1), span, getSpanMut(&!info, 0, 0));
+        if second /= 0 then
+            destroy(r);
+            destroyFree(info);
+            destroyFree(work);
+            destroyFree(tau_cells);
+            destroyFree(a_cells);
+            let refused: Either[Int32, Qr] := Left(left => second);
+            return refused;
+        end if;
+        let q: Array := matrixRowMajor(&a_cells, rows, columns);
+        destroyFree(info);
+        destroyFree(work);
+        destroyFree(tau_cells);
+        destroyFree(a_cells);
+        let made: Qr := Qr(q => q, r => r, rows => rows, columns => columns);
+        let answered: Either[Int32, Qr] := Right(right => made);
+        return answered;
+    end;
+
+    generic [A: Region, B: Region]
+    function lstsq(a: View[A], b: View[B]): Either[Int32, Lstsq] is
+        let rows: Index := viewExtent(a, 0);
+        let columns: Index := viewExtent(a, 1);
+        var a_cells: Buffer[Float64] := initialize(rows * columns, 0.0);
+        -- The routine takes the right-hand side with as many rows as the
+        -- larger of the two dimensions of a, and overwrites the first
+        -- columns of it with the answer; with at least as many rows as
+        -- columns that is the length of b.
+        var b_cells: Buffer[Float64] := initialize(rows, 0.0);
+        var s_cells: Buffer[Float64] := initialize(columns, 0.0);
+        -- The integer work of the routine is at most 203 times the
+        -- smaller dimension, the bound the binding holds.
+        var i_work: Buffer[Int32] := initialize(203 * columns, 0);
+        var info: Buffer[Int32] := initialize(2, 0);
+        columnMajor(a, rows, columns, &!a_cells);
+        var k: Index := 0;
+        while k < rows do
+            storeNth(&!b_cells, k, getFloat64(b, k));
+            k := k + 1;
+        end while;
+        -- The size of the work depends on the path the routine takes, so
+        -- the query of the routine answers it: a work of one place is
+        -- the question, and the answer stands in that one place.
+        var ask: Buffer[Float64] := initialize(1, 0.0);
+        let asked: Int32 := gelsd(dimension(rows), dimension(columns), getSpanMut(&!a_cells, 0, (rows * columns) - 1), getSpanMut(&!b_cells, 0, rows - 1), getSpanMut(&!s_cells, 0, columns - 1), getSpanMut(&!ask, 0, 0), getSpanMut(&!i_work, 0, (203 * columns) - 1), getSpanMut(&!info, 0, 1));
+        if asked /= 0 then
+            destroyFree(info);
+            destroyFree(i_work);
+            destroyFree(ask);
+            destroyFree(s_cells);
+            destroyFree(b_cells);
+            destroyFree(a_cells);
+            let refused: Either[Int32, Lstsq] := Left(left => asked);
+            return refused;
+        end if;
+        let wanted: Index := workSize(nth(&ask, 0));
+        var work: Buffer[Float64] := initialize(wanted, 0.0);
+        let code: Int32 := gelsd(dimension(rows), dimension(columns), getSpanMut(&!a_cells, 0, (rows * columns) - 1), getSpanMut(&!b_cells, 0, rows - 1), getSpanMut(&!s_cells, 0, columns - 1), getSpanMut(&!work, 0, wanted - 1), getSpanMut(&!i_work, 0, (203 * columns) - 1), getSpanMut(&!info, 0, 1));
+        if code /= 0 then
+            destroyFree(info);
+            destroyFree(i_work);
+            destroyFree(work);
+            destroyFree(ask);
+            destroyFree(s_cells);
+            destroyFree(b_cells);
+            destroyFree(a_cells);
+            let refused: Either[Int32, Lstsq] := Left(left => code);
+            return refused;
+        end if;
+        let x: Array := floatVectorFrom(&b_cells, columns);
+        let rank: Index := rankIndex(nth(&info, 1));
+        destroyFree(info);
+        destroyFree(i_work);
+        destroyFree(work);
+        destroyFree(ask);
+        destroyFree(s_cells);
+        destroyFree(b_cells);
+        destroyFree(a_cells);
+        let made: Lstsq := Lstsq(x => x, columns => columns, rank => rank);
+        let answered: Either[Int32, Lstsq] := Right(right => made);
+        return answered;
+    end;
+end module body.

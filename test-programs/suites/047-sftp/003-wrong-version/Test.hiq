@@ -1,0 +1,152 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    Command,
+    ProcessStatus,
+    FileDescriptor,
+    makeCommand,
+    addArgument,
+    exitCode,
+    openRead,
+    readAll,
+    closeFile
+);
+import Standard.Sftp (
+    Session,
+    SftpError,
+    describe,
+    startSession,
+    endSession,
+    writeFile,
+    sizeOf
+);
+
+module body Test is
+    -- A file of the tree: the tree's path from HILDE_TREE, which
+    -- test-programs/runner.py sets, and rest after it.  With
+    -- the variable unset -- a run by hand -- the path is rest alone,
+    -- which names nothing, and the test fails where it opens it.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        let tail: String := fromLiteral(rest);
+        writeString(&!out, asSpan(&tail));
+        destroyString(tail);
+        return finalize(out);
+    end;
+
+    -- "no session" is also what a server that never started gives, so the
+    -- replayer runs under /bin/sh, which writes its exit status into
+    -- server-exit.txt in this programme's working directory once it has
+    -- ended -- endSession closes the pipes and waits, it sends no signal.
+    -- The test prints that status: 0 only if the replayer ran and used the
+    -- whole exchange.
+    function serverCommand(): Command is
+        let sh: String := fromLiteral("/bin/sh");
+        let option: String := fromLiteral("-c");
+        let line: String := fromLiteral("python3 \"$1\" \"$2\"; echo $? > server-exit.txt");
+        let name: String := fromLiteral("sh");
+        let script: String := inTree("/scripts/sftp/replay.py");
+        let exchange: String := inTree("/test-programs/suites/047-sftp/003-wrong-version/exchange.txt");
+        let command: Command :=
+            addArgument(addArgument(addArgument(addArgument(addArgument(
+            makeCommand(asSpan(&sh)), asSpan(&option)), asSpan(&line)), asSpan(&name)), asSpan(&script)), asSpan(&exchange));
+        destroyString(sh);
+        destroyString(option);
+        destroyString(line);
+        destroyString(name);
+        destroyString(script);
+        destroyString(exchange);
+        return command;
+    end;
+
+    function reportServerExit(): Unit is
+        print("server exit: ");
+        let path: String := fromLiteral("server-exit.txt");
+        case openRead(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                case readAll(&!file) of
+                    when Some(value as got: String) do
+                        if length(&got) > 0 then
+                            print(getSpan(&got, 0, length(&got) - 1));
+                        else
+                            printLn("an empty file");
+                        end if;
+                        destroyString(got);
+                    when None do
+                        printLn("the file could not be read");
+                end case;
+                closeFile(file);
+            when None do
+                printLn("no file -- the server never ended under /bin/sh");
+        end case;
+        destroyString(path);
+        return nil;
+    end;
+
+    function report(what: Span[Nat8, Static], result: Either[SftpError, Unit]): Unit is
+        print(what);
+        case result of
+            when Left(left as error: SftpError) do
+                print(": failed, code ");
+                print(error.code);
+                print(", ");
+                printLn(describe(error));
+            when Right(right as done: Unit) do
+                printLn(": done");
+        end case;
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case startSession(serverCommand(), 20000) of
+            when None do
+                printLn("no session");
+                reportServerExit();
+                return ExitSuccess();
+            when Some(value as opened: Session) do
+                var session: Session := opened;
+                let hello: String := fromLiteral("hello.txt");
+                let greeting: String := fromLiteral("hello, sftp\n");
+                report("write hello.txt", writeFile(&!session, asSpan(&hello), asSpan(&greeting)));
+                case sizeOf(&!session, asSpan(&hello)) of
+                    when Left(left as error: SftpError) do
+                        print("size of hello.txt: failed, code ");
+                        print(error.code);
+                        print(", ");
+                        printLn(describe(error));
+                    when Right(right as size: Nat64) do
+                        print("size of hello.txt: ");
+                        printLn(size);
+                end case;
+                destroyString(hello);
+                destroyString(greeting);
+                let status: ProcessStatus := endSession(session);
+                print("server exit: ");
+                printLn(exitCode(status));
+                return ExitSuccess();
+        end case;
+    end;
+end module body.

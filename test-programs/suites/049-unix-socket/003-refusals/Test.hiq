@@ -1,0 +1,290 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    makeEmpty,
+    destroyString,
+    length,
+    getSpan,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    Listener,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    socketPathLimit,
+    listenUnix,
+    acceptWithin,
+    connectUnix,
+    closeListener,
+    openWrite,
+    openRead,
+    readAll,
+    writeAll,
+    closeFile,
+    removeFile,
+    kindOf,
+    describeKind,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode
+);
+
+module body Test is
+    -- A file of the tree: the tree's path from HILDE_TREE, which
+    -- test-programs/runner.py sets, and rest after it.  With
+    -- the variable unset -- a run by hand -- the path is rest alone,
+    -- which names nothing, and the test fails where it opens it.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        let tail: String := fromLiteral(rest);
+        writeString(&!out, asSpan(&tail));
+        destroyString(tail);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function printKind(what: Span[Nat8, Static], path: &[String, R]): Unit is
+        print(what);
+        print(": ");
+        let described: String := describeKind(kindOf(asSpan(path)));
+        printText(&described);
+        printLn("");
+        destroyString(described);
+        return nil;
+    end;
+
+    -- Listen, say whether it worked, and close again if it did.
+    generic [R: Region]
+    function tryListen(what: Span[Nat8, Static], path: &[String, R], mode: Nat32): Unit is
+        print(what);
+        case listenUnix(asSpan(path), mode) of
+            when Some(value as listener: Listener) do
+                print(": listening, closed ");
+                printLn(closeListener(listener));
+            when None do
+                printLn(": refused");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function tryConnect(what: Span[Nat8, Static], path: &[String, R]): Unit is
+        print(what);
+        case connectUnix(asSpan(path)) of
+            when Some(value as connected: FileDescriptor) do
+                printLn(": connected");
+                closeFile(connected);
+            when None do
+                printLn(": refused");
+        end case;
+        return nil;
+    end;
+
+    -- scripts/socket/fixture.py <action> <path>, and what it printed.
+    generic [R: Region]
+    function fixture(action: Span[Nat8, Static], path: &[String, R]): Unit is
+        let env: String := fromLiteral("/usr/bin/env");
+        let python: String := fromLiteral("python3");
+        let script: String := inTree("/scripts/socket/fixture.py");
+        let what: String := fromLiteral(action);
+        let command: Command :=
+            addArgument(addArgument(addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script)), asSpan(&what)), asSpan(path));
+        destroyString(env);
+        destroyString(python);
+        destroyString(script);
+        destroyString(what);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor,
+                    errors: FileDescriptor } := running;
+                closeFile(input);
+                var out: FileDescriptor := output;
+                case readAll(&!out) of
+                    when Some(value as text: String) do
+                        printText(&text);
+                        destroyString(text);
+                    when None do
+                        printLn("fixture: its output could not be read");
+                end case;
+                closeFile(out);
+                closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                if exitCode(status) /= 0 then
+                    print("fixture: exit code ");
+                    printLn(exitCode(status));
+                end if;
+            when None do
+                printLn("fixture: could not be started");
+        end case;
+        return nil;
+    end;
+
+    -- A name of exactly size bytes, all of them a.
+    function nameOf(size: Index): String is
+        return makeString(size, 'a');
+    end;
+
+    function main(): ExitCode is
+        let path: String := fromLiteral("hilde-049-003.sock");
+        removeFile(asSpan(&path));
+
+        -- 1. No path at all.
+        let empty: String := makeEmpty();
+        tryListen("an empty path", &empty, #o600);
+        tryConnect("connect to an empty path", &empty);
+        destroyString(empty);
+
+        -- 2. The length, at the limit and one byte past it.  The limit is
+        --    the platform's; the name at it is a file in the working
+        --    directory, and it is closed and gone at once.
+        let fits: String := nameOf(socketPathLimit());
+        tryListen("a path of exactly the limit", &fits, #o600);
+        printKind("  and after closing", &fits);
+        let over: String := nameOf(socketPathLimit() + 1);
+        tryListen("a path one byte over the limit", &over, #o600);
+        tryConnect("connect to a path one byte over", &over);
+        printKind("  the name over the limit", &over);
+        destroyString(fits);
+        destroyString(over);
+
+        -- 3. A mode with more than permission bits.
+        tryListen("mode #o1000", &path, #o1000);
+        printKind("  the path after it", &path);
+
+        -- 4. A regular file is not taken over, and not changed.
+        let kept: String := fromLiteral("keep me");
+        case openWrite(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                writeAll(&!file, asSpan(&kept));
+                closeFile(file);
+            when None do
+                printLn("the regular file could not be made");
+        end case;
+        tryListen("a regular file at the path", &path, #o600);
+        case openRead(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                case readAll(&!file) of
+                    when Some(value as got: String) do
+                        print("  the file still holds: ");
+                        printText(&got);
+                        printLn("");
+                        destroyString(got);
+                    when None do
+                        printLn("  the file could not be read");
+                end case;
+                closeFile(file);
+            when None do
+                printLn("  the file is gone");
+        end case;
+        print("  removed: ");
+        printLn(removeFile(asSpan(&path)));
+        destroyString(kept);
+
+        -- 5. A directory.
+        let directory: String := inTree("/test-programs");
+        tryListen("a directory at the path", &directory, #o600);
+        destroyString(directory);
+
+        -- 6. A stale socket, which a server that died leaves: replaced.
+        fixture("stale", &path);
+        printKind("  the path", &path);
+        tryListen("a stale socket at the path", &path, #o600);
+        printKind("  the path after closing", &path);
+
+        -- 7. A named pipe: connect(2) refuses it exactly as it refuses a
+        --    stale socket, and it is still not taken.
+        fixture("fifo", &path);
+        tryListen("a fifo at the path", &path, #o600);
+        printKind("  the path", &path);
+        print("  removed: ");
+        printLn(removeFile(asSpan(&path)));
+
+        -- 8. Nothing there.
+        tryConnect("connect to a path with nothing", &path);
+
+        -- 9. Waiting for a client that does not come.
+        case listenUnix(asSpan(&path), #o600) of
+            when Some(value as opened: Listener) do
+                let listener: Listener := opened;
+                case acceptWithin(&listener, 100) of
+                    when Some(value as connection: FileDescriptor) do
+                        printLn("accept within 100 ms: WRONGLY got a connection");
+                        closeFile(connection);
+                    when None do
+                        printLn("accept within 100 ms, nobody connecting: none");
+                end case;
+                -- Connected first, then accepted without waiting.
+                case connectUnix(asSpan(&path)) of
+                    when Some(value as client: FileDescriptor) do
+                        case acceptWithin(&listener, 0) of
+                            when Some(value as connection: FileDescriptor) do
+                                printLn("accept within 0 ms, a client waiting: a connection");
+                                closeFile(connection);
+                            when None do
+                                printLn("accept within 0 ms, a client waiting: WRONGLY none");
+                        end case;
+                        closeFile(client);
+                    when None do
+                        printLn("connect: failed");
+                end case;
+                print("listener closed: ");
+                printLn(closeListener(listener));
+            when None do
+                printLn("listen: failed");
+        end case;
+
+        -- 10. The mode, as the kernel has it: two different ones, so that
+        --     the answer is the argument's and not the umask's.
+        case listenUnix(asSpan(&path), #o600) of
+            when Some(value as opened: Listener) do
+                print("listening with #o600: ");
+                fixture("mode", &path);
+                closeListener(opened);
+            when None do
+                printLn("listen: failed");
+        end case;
+        case listenUnix(asSpan(&path), #o660) of
+            when Some(value as opened: Listener) do
+                print("listening with #o660: ");
+                fixture("mode", &path);
+                closeListener(opened);
+            when None do
+                printLn("listen: failed");
+        end case;
+        printKind("the path at the end", &path);
+        destroyString(path);
+        return ExitSuccess();
+    end;
+end module body.

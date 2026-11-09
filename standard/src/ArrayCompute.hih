@@ -1,0 +1,311 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Arithmetic over arrays: elementwise operations with broadcasting, reductions over the whole array and along one axis, and the joining of partial results.
+
+- Elementwise operations join two views under the rules of NumPy and give a new owning array of the stretched shape.
+- The four number types Int32, Int64, Float32 and Float64 are worked on; Nat8 and Bool are refused by a requires.
+- An integer overflow and a division by zero, on floats as well, stop the programme, as the operators of the language do.
+- Reductions visit the elements in the row-major order of the view and give a new array: one element over the whole array, or one position for each place along the other axes.
+- minimum and maximum replace an element only when the next one compares smaller or larger, the rule of the Sperli protocol, so that a local and a distributed reduction agree.
+- combine joins two arrays of partial results element by element and wraps whole numbers at their width, so that no call stops the programme.
+- Every operation takes time linear in the elements, and nothing is written into the arguments.
+
+    var a: Array := zeros(float64Type(), shape2(2, 3));
+    setFloat64(&!a, 0, 1.5);
+    let doubled: Array := add(view(&a), view(&a));
+    destroy(doubled);
+    destroy(a);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.Array (
+    Array,
+    View,
+    broadcastCount,
+    elementType,
+    rank,
+    sameShape,
+    shape,
+    shape1,
+    size,
+    viewElementType,
+    viewExtent,
+    viewRank,
+    viewShape,
+    viewSize
+);
+
+module Standard.ArrayCompute is
+    """
+    Whether code names one of the four number types an operation of this
+    module works on: Int32, Int64, Float32 or Float64.
+    No contract: a Bool answer to a question about the argument alone.
+    """
+    function isNumberType(code: Nat8): Bool;
+
+    """
+    The code of the reduction sum, 1, as the collective header of the
+    Sperli protocol numbers it.
+    """
+    function sumReduction(): Nat8
+        ensures result = 1;
+
+    """
+    The code of the reduction minimum, 2, as the collective header of the
+    Sperli protocol numbers it.
+    """
+    function minReduction(): Nat8
+        ensures result = 2;
+
+    """
+    The code of the reduction maximum, 3, as the collective header of the
+    Sperli protocol numbers it.
+    """
+    function maxReduction(): Nat8
+        ensures result = 3;
+
+    """
+    The code of the reduction product, 4, as the collective header of the
+    Sperli protocol numbers it.
+    """
+    function productReduction(): Nat8
+        ensures result = 4;
+
+    ---
+    --- Elementwise operations
+    ---
+
+    """
+    The elementwise sum of a and b, both stretched to the shape they
+    broadcast to.  The result is a new array of that shape and of the
+    element type of the operands.  An integer overflow stops the
+    programme, as the operator does.
+    """
+    generic [A: Region, B: Region]
+    function add(a: View[A], b: View[B]): Array
+        requires isNumberType(viewElementType(a))
+        requires viewElementType(a) = viewElementType(b)
+        requires broadcastCount(viewShape(a), viewShape(b)) > 0
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = broadcastCount(viewShape(a), viewShape(b));
+
+    """
+    The elementwise difference of a and b, both stretched to the shape
+    they broadcast to.  The result is a new array of that shape and of
+    the element type of the operands.  An integer overflow stops the
+    programme, as the operator does.
+    """
+    generic [A: Region, B: Region]
+    function subtract(a: View[A], b: View[B]): Array
+        requires isNumberType(viewElementType(a))
+        requires viewElementType(a) = viewElementType(b)
+        requires broadcastCount(viewShape(a), viewShape(b)) > 0
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = broadcastCount(viewShape(a), viewShape(b));
+
+    """
+    The elementwise product of a and b, both stretched to the shape they
+    broadcast to.  The result is a new array of that shape and of the
+    element type of the operands.  An integer overflow stops the
+    programme, as the operator does.
+    """
+    generic [A: Region, B: Region]
+    function multiply(a: View[A], b: View[B]): Array
+        requires isNumberType(viewElementType(a))
+        requires viewElementType(a) = viewElementType(b)
+        requires broadcastCount(viewShape(a), viewShape(b)) > 0
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = broadcastCount(viewShape(a), viewShape(b));
+
+    """
+    The elementwise quotient of a and b, both stretched to the shape they
+    broadcast to.  The result is a new array of that shape and of the
+    element type of the operands.  A zero divisor stops the programme,
+    as the division operator does, and an integer division rounds towards
+    zero.
+    """
+    generic [A: Region, B: Region]
+    function divide(a: View[A], b: View[B]): Array
+        requires isNumberType(viewElementType(a))
+        requires viewElementType(a) = viewElementType(b)
+        requires broadcastCount(viewShape(a), viewShape(b)) > 0
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = broadcastCount(viewShape(a), viewShape(b));
+
+    """
+    The elementwise negation of a, a new array of the same shape and of
+    the element type of the view.  The negation of the smallest number of
+    an integer type stops the programme, as the operator does.
+    """
+    generic [A: Region]
+    function negate(a: View[A]): Array
+        requires isNumberType(viewElementType(a))
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = viewSize(a);
+
+    """
+    The elementwise absolute value of a, a new array of the same shape and
+    of the element type of the view.  The absolute value of the smallest
+    number of an integer type stops the programme, as its negation does.
+    """
+    generic [A: Region]
+    function absolute(a: View[A]): Array
+        requires isNumberType(viewElementType(a))
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = viewSize(a);
+
+    ---
+    --- Reductions over the whole array
+    ---
+
+    """
+    The sum of all elements, as a new array of one element, joined in the
+    row-major order of the view.  An integer overflow stops the
+    programme, as the operator does.
+    """
+    generic [A: Region]
+    function sum(a: View[A]): Array
+        requires isNumberType(viewElementType(a))
+        ensures elementType(&result) = viewElementType(a)
+        ensures sameShape(shape(&result), shape1(1));
+
+    """
+    The product of all elements, as a new array of one element, joined in
+    the row-major order of the view.  An integer overflow stops the
+    programme, as the operator does.
+    """
+    generic [A: Region]
+    function product(a: View[A]): Array
+        requires isNumberType(viewElementType(a))
+        ensures elementType(&result) = viewElementType(a)
+        ensures sameShape(shape(&result), shape1(1));
+
+    """
+    The smallest element, as a new array of one element, chosen in the
+    row-major order of the view: an element replaces the one before it
+    only when it compares smaller, so a NaN that comes first stays.
+    """
+    generic [A: Region]
+    function minimum(a: View[A]): Array
+        requires isNumberType(viewElementType(a))
+        ensures elementType(&result) = viewElementType(a)
+        ensures sameShape(shape(&result), shape1(1));
+
+    """
+    The largest element, as a new array of one element, chosen in the
+    row-major order of the view: an element replaces the one before it
+    only when it compares larger, so a NaN that comes first stays.
+    """
+    generic [A: Region]
+    function maximum(a: View[A]): Array
+        requires isNumberType(viewElementType(a))
+        ensures elementType(&result) = viewElementType(a)
+        ensures sameShape(shape(&result), shape1(1));
+
+    """
+    The mean of all elements: the sum divided by their number, as a new
+    array of one element.  An integer division rounds towards zero, and
+    a count that does not fit the element type stops the programme.
+    """
+    generic [A: Region]
+    function mean(a: View[A]): Array
+        requires isNumberType(viewElementType(a))
+        ensures elementType(&result) = viewElementType(a)
+        ensures sameShape(shape(&result), shape1(1));
+
+    ---
+    --- Reductions along one axis
+    ---
+
+    """
+    The sums along axis, as a new array with the axis taken out; an array
+    of rank 1 gives a vector of one element.  Each sum joins its elements
+    in the row-major order of the view, and an integer overflow stops the
+    programme.
+    """
+    generic [A: Region]
+    function sumAxis(a: View[A], axis: Index): Array
+        requires isNumberType(viewElementType(a))
+        requires axis < viewRank(a)
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = (viewSize(a) / viewExtent(a, axis))
+        ensures (rank(shape(&result)) = 1) or (rank(shape(&result)) = (viewRank(a) - 1));
+
+    """
+    The products along axis, as a new array with the axis taken out; an
+    array of rank 1 gives a vector of one element.  Each product joins
+    its elements in the row-major order of the view, and an integer
+    overflow stops the programme.
+    """
+    generic [A: Region]
+    function productAxis(a: View[A], axis: Index): Array
+        requires isNumberType(viewElementType(a))
+        requires axis < viewRank(a)
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = (viewSize(a) / viewExtent(a, axis))
+        ensures (rank(shape(&result)) = 1) or (rank(shape(&result)) = (viewRank(a) - 1));
+
+    """
+    The smallest elements along axis, as a new array with the axis taken
+    out; an array of rank 1 gives a vector of one element.  Each choice
+    follows the row-major order of the view: an element replaces the one
+    before it only when it compares smaller.
+    """
+    generic [A: Region]
+    function minimumAxis(a: View[A], axis: Index): Array
+        requires isNumberType(viewElementType(a))
+        requires axis < viewRank(a)
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = (viewSize(a) / viewExtent(a, axis))
+        ensures (rank(shape(&result)) = 1) or (rank(shape(&result)) = (viewRank(a) - 1));
+
+    """
+    The largest elements along axis, as a new array with the axis taken
+    out; an array of rank 1 gives a vector of one element.  Each choice
+    follows the row-major order of the view: an element replaces the one
+    before it only when it compares larger.
+    """
+    generic [A: Region]
+    function maximumAxis(a: View[A], axis: Index): Array
+        requires isNumberType(viewElementType(a))
+        requires axis < viewRank(a)
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = (viewSize(a) / viewExtent(a, axis))
+        ensures (rank(shape(&result)) = 1) or (rank(shape(&result)) = (viewRank(a) - 1));
+
+    """
+    The means along axis, as a new array with the axis taken out; an
+    array of rank 1 gives a vector of one element.  Each mean is the sum
+    along the axis divided by the length of the axis; an integer
+    division rounds towards zero, and a length that does not fit the
+    element type stops the programme.
+    """
+    generic [A: Region]
+    function meanAxis(a: View[A], axis: Index): Array
+        requires isNumberType(viewElementType(a))
+        requires axis < viewRank(a)
+        ensures elementType(&result) = viewElementType(a)
+        ensures size(&result) = (viewSize(a) / viewExtent(a, axis))
+        ensures (rank(shape(&result)) = 1) or (rank(shape(&result)) = (viewRank(a) - 1));
+
+    ---
+    --- The joining of partial results
+    ---
+
+    """
+    Two arrays of partial results of the reduction of code reduction
+    joined into one, first as the left operand, as a new array of their
+    shape.  Nothing is broadcast.  Whole numbers wrap at their width and
+    no call stops the programme; a float sum and product follow the
+    machine's arithmetic.  None when the element types differ, name no
+    number type, or the shapes differ.
+    """
+    generic [A: Region, B: Region]
+    function combine(first: View[A], second: View[B], reduction: Nat8): Option[Array]
+        requires (reduction >= 1) and (reduction <= 4);
+end module.

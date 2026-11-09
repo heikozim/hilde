@@ -1,0 +1,1 @@
+Test that a task has more than one guard page below its stack: a write into the fifteenth page above the lowest address of its mapping ends the programme, where with one guard page it would land in the stack and the programme would finish.

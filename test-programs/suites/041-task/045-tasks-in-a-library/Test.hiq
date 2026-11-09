@@ -1,0 +1,135 @@
+-- A library whose exported function uses tasks.  host.c calls it from
+-- several threads at once; each call opens a scope, fans a sum out to four
+-- tasks, and receives values from a fifth over a channel of capacity 0,
+-- so that the host's thread waits for tasks in join and in receive.
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join,
+    Sender,
+    Receiver,
+    Channel,
+    openChannel,
+    send,
+    receive,
+    closeSender,
+    closeReceiver
+);
+
+module body Test is
+    -- The sum of the squares of first to first + 999.
+    function squares(first: Int64): Int64 is
+        var sum: Int64 := 0;
+        var k: Int64 := first;
+        while k < (first + 1000) do
+            sum := sum + (k * k);
+            k := k + 1;
+        end while;
+        return sum;
+    end;
+
+    -- One task for each of chunks blocks of 1000 numbers from first, all
+    -- running at once; the sum of their sums, or -1 when a task could not
+    -- be started.
+    generic [R: Region]
+    function fanOut(scope: &![Scope, R], first: Int64, chunks: Int64): Int64 is
+        if chunks <= 0 then
+            return 0;
+        end if;
+        let work: Fn[Int64, Int64] := squares;
+        case spawn(&~scope, work, first) of
+            when Right(right as task: Task[Int64]) do
+                let rest: Int64 := fanOut(&~scope, first + 1000, chunks - 1);
+                let mine: Int64 := join(task);
+                if rest < 0 then
+                    return rest;
+                end if;
+                return mine + rest;
+            when Left(left as unused: Int64) do
+                return -1;
+        end case;
+    end;
+
+    -- Sends 0 to 99, then closes.
+    function produce(sender: Sender[Int64]): Unit is
+        var out: Sender[Int64] := sender;
+        var k: Int64 := 0;
+        while k < 100 do
+            case send(&!out, k) of
+                when Some(value as returned: Int64) do
+                    k := 100;
+                when None do
+                    k := k + 1;
+            end case;
+        end while;
+        closeSender(out);
+        return nil;
+    end;
+
+    -- Receives until the sender closes and gives back the sum.
+    function drain(receiver: Receiver[Int64]): Int64 is
+        var input: Receiver[Int64] := receiver;
+        var sum: Int64 := 0;
+        var more: Bool := true;
+        while more do
+            case receive(&!input) of
+                when Some(value as got: Int64) do
+                    sum := sum + got;
+                when None do
+                    more := false;
+            end case;
+        end while;
+        closeReceiver(input);
+        return sum;
+    end;
+
+    -- A producer task and the caller as the consumer over a channel of
+    -- capacity 0: 4950, or -1 when there is no channel or no task.
+    generic [R: Region]
+    function throughChannel(scope: &![Scope, R]): Int64 is
+        let made: Option[Channel[Int64]] := openChannel(0);
+        case made of
+            when Some(value as ends: Channel[Int64]) do
+                let { sender: Sender[Int64], receiver: Receiver[Int64] } := ends;
+                let work: Fn[Sender[Int64], Unit] := produce;
+                case spawn(&~scope, work, sender) of
+                    when Right(right as producer: Task[Unit]) do
+                        let sum: Int64 := drain(receiver);
+                        join(producer);
+                        return sum;
+                    when Left(left as unused: Sender[Int64]) do
+                        closeSender(unused);
+                        closeReceiver(receiver);
+                        return -1;
+                end case;
+            when None do
+                return -1;
+        end case;
+    end;
+
+    -- The squares of first to first + 3999, summed by four tasks, plus the
+    -- 4950 of the channel; -1 when a task or the channel could not be had,
+    -- -2 when there is no scope.  first is from 0 to 10000000, so that the
+    -- sum stays far below the largest Int64.
+    pragma Foreign_Export(External_Name => "sum_in_tasks");
+    function sumInTasks(first: Int64): Int64
+        requires (first >= 0) and (first <= 10000000)
+    is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                let fanned: Int64 := fanOut(&!scope, first, 4);
+                let passed: Int64 := throughChannel(&!scope);
+                closeScope(scope);
+                if (fanned < 0) or (passed < 0) then
+                    return -1;
+                end if;
+                return fanned + passed;
+            when None do
+                return -2;
+        end case;
+    end;
+end module body.

@@ -1,0 +1,149 @@
+-- Standard.SqlCipher: a database written with a key and
+-- read back with the same key, through @migrations, @execute and @query --
+-- the code the compiler generates calls Standard.SqlCipher because this
+-- module imports it.  Then the proof that the file on disk is encrypted: a
+-- plain SQLite file starts with the 15 bytes "SQLite format 3"; this one
+-- does not.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte,
+    asSpan
+);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    readExactly,
+    closeFile
+);
+import Standard.SqlCipher (
+    Connection,
+    Writing,
+    Reading,
+    SqlError,
+    Key,
+    makeKey,
+    describe,
+    openWriter,
+    openReader,
+    closeDatabase,
+    migrate
+);
+
+module body Test is
+    record Secret[R: Region]: Free is
+        name: Span[Nat8, R];
+        note: Span[Nat8, R];
+    end;
+
+    function failed(what: Span[Nat8, Static], error: SqlError): Unit is
+        print(what);
+        print(": failed, code ");
+        print(error.code);
+        print(", ");
+        printLn(describe(error));
+        return nil;
+    end;
+
+    function report(what: Span[Nat8, Static], result: Either[SqlError, Nat64]): Unit is
+        print(what);
+        case result of
+            when Left(left as error: SqlError) do
+                print(": failed, code ");
+                print(error.code);
+                print(", ");
+                printLn(describe(error));
+            when Right(right as changed: Nat64) do
+                print(": ");
+                print(changed);
+                printLn(" row(s)");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function write(db: &![Connection[Writing], R]): Unit is
+        case migrate(&~db, @migrations) of
+            when Left(left as error: SqlError) do
+                failed("migrate", error);
+            when Right(right as applied: Index) do
+                print("migrations applied: ");
+                printLn(applied);
+        end case;
+        report("insert one",
+            @execute(&~db, "INSERT INTO secrets (name, note) VALUES (?, ?)", "one", "the first secret"));
+        report("insert two",
+            @execute(&~db, "INSERT INTO secrets (name, note) VALUES (?, ?)", "two", "the second secret"));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function read(db: &![Connection[Reading], R]): Unit is
+        @query(&~db, "SELECT name, note FROM secrets ORDER BY name")
+            for secret: Secret[Q] do
+            print(secret.name);
+            print(": ");
+            printLn(secret.note);
+        else error do
+            failed("select", error);
+        end for;
+        return nil;
+    end;
+
+    -- True when the file starts with SQLite's own 15 bytes.
+    function plainHeader(): Bool is
+        let path: String := fromLiteral("secret.db");
+        var plain: Bool := false;
+        case openRead(asSpan(&path)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                case readExactly(&!file, 15) of
+                    when Some(value as head: String) do
+                        let magic: String := fromLiteral("SQLite format 3");
+                        plain := true;
+                        var i: Index := 0;
+                        while i < 15 do
+                            if nthByte(&head, i) /= nthByte(&magic, i) then
+                                plain := false;
+                            end if;
+                            i := i + 1;
+                        end while;
+                        destroyString(magic);
+                        destroyString(head);
+                    when None do
+                        printLn("the file is shorter than 15 bytes");
+                end case;
+                let closed: Bool := closeFile(file);
+            when None do
+                printLn("the file cannot be opened");
+        end case;
+        destroyString(path);
+        return plain;
+    end;
+
+    function main(): ExitCode is
+        case openWriter("secret.db", makeKey("correct horse battery staple")) of
+            when Left(left as error: SqlError) do
+                failed("open writer", error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                write(&!db);
+                closeDatabase(db);
+        end case;
+        case openReader("secret.db", makeKey("correct horse battery staple")) of
+            when Left(left as error: SqlError) do
+                failed("open reader", error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Reading]) do
+                var db: Connection[Reading] := opened;
+                read(&!db);
+                closeDatabase(db);
+        end case;
+        print("the file starts with SQLite's plain header: ");
+        printLn(plainHeader());
+        return ExitSuccess();
+    end;
+end module body.

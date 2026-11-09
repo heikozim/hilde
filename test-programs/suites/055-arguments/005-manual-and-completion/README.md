@@ -1,0 +1,1 @@
+The texts written from one command with two subcommands: its manual page in mdoc and the scripts that complete it in bash, zsh and fish.  Held word for word; that they work in mandoc and in the shells was measured by running them there.

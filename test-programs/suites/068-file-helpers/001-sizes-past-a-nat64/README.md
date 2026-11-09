@@ -1,0 +1,1 @@
+directorySize over sparse files whose sizes add up to more than a Nat64 holds answers a Left of kind Invalid instead of stopping.  The files live in /dev/shm, a tmpfs that holds files of 2^62 bytes; where no file system takes them the test is named in the list of tests not run, with the measurement.

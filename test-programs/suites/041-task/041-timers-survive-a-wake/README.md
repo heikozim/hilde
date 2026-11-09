@@ -1,0 +1,1 @@
+Test that deadlines still fire when a timed wait and the wake of its key fall together: three pairs of a sender, one value each millisecond, and a receiver waiting at most one millisecond each time, on four workers, beside a task that sleeps twenty times; every value arrives and every sleep ends.

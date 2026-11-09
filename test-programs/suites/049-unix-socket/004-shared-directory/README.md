@@ -1,0 +1,1 @@
+Test that a socket is made right in a directory everybody may write to, mode 1777 as /tmp: it listens with mode 0600, it leaves no directory of its own behind, and a file at the path is not replaced by the rename that brings the socket there.

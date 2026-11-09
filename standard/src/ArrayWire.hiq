@@ -1,0 +1,247 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    insertBack
+);
+import Standard.Text (
+    substring
+);
+import Standard.Array (
+    Array,
+    Shape,
+    shape,
+    shape1,
+    shape2,
+    shape3,
+    shape4,
+    rank,
+    extent,
+    elementType,
+    packedBytes,
+    byteCount,
+    fromPacked,
+    isElementType,
+    elementSize,
+    maxElements
+);
+
+module body Standard.ArrayWire is
+    function wireVersion(): Nat8 is
+        return 1;
+    end;
+
+    function headerSize(axes: Index): Index is
+        return 8 + (8 * axes);
+    end;
+
+    generic [R: Region]
+    function encodedSize(a: &[Array, R]): Index is
+        return headerSize(rank(shape(a))) + byteCount(a);
+    end;
+
+    -- The low byte of x.
+    function lowByte(x: Index): Nat8 is
+        case toNat8(rem(x, 256)) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                abort("a remainder below 256 did not fit a Nat8");
+        end case;
+    end;
+
+    generic [Q: Region]
+    function putByte(out: &![Buffer[Nat8], Q], byte: Nat8): Unit is
+        insertBack(out, byte);
+        return nil;
+    end;
+
+    -- x as eight little endian bytes.
+    generic [Q: Region]
+    function putExtent(out: &![Buffer[Nat8], Q], x: Index): Unit is
+        var rest: Index := x;
+        var i: Index := 0;
+        while i < 8 do
+            putByte(&~out, lowByte(rest));
+            rest := rest / 256;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, Q: Region]
+    function encode(a: &[Array, R], out: &![Buffer[Nat8], Q]): Index is
+        let form: Shape := shape(a);
+        putByte(&~out, 72);
+        putByte(&~out, 76);
+        putByte(&~out, 68);
+        putByte(&~out, 65);
+        putByte(&~out, wireVersion());
+        putByte(&~out, elementType(a));
+        putByte(&~out, lowByte(rank(form)));
+        putByte(&~out, 0);
+        var axis: Index := 0;
+        while axis < rank(form) do
+            putExtent(&~out, extent(form, axis));
+            axis := axis + 1;
+        end while;
+        let data: Span[Nat8, R] := packedBytes(a);
+        var i: Index := 0;
+        while i < spanLength(data) do
+            putByte(&~out, data[i]);
+            i := i + 1;
+        end while;
+        return encodedSize(a);
+    end;
+
+    -- The value of the eight little endian bytes at at, or None when it is
+    -- above maxElements.
+    generic [R: Region]
+    function readExtent(bytes: Span[Nat8, R], at: Index): Option[Index] is
+        var i: Index := 8;
+        var value: Index := 0;
+        while i > 0 do
+            i := i - 1;
+            case toIndex(bytes[at + i]) of
+                when Some(value as digit: Index) do
+                    if value > 8388608 then
+                        let none: Option[Index] := None();
+                        return none;
+                    end if;
+                    value := (value * 256) + digit;
+                when None do
+                    abort("a byte did not fit an Index");
+            end case;
+        end while;
+        let some: Option[Index] := Some(value => value);
+        return some;
+    end;
+
+    function failure(error: DecodeError): Either[DecodeError, Array] is
+        return Left(left => error);
+    end;
+
+    -- The shape of the extents e0 to e3 for the rank, with the product kept
+    -- below maxElements by the caller.
+    function shapeOf(axes: Index, e0: Index, e1: Index, e2: Index, e3: Index): Shape is
+        if axes = 1 then
+            return shape1(e0);
+        end if;
+        if axes = 2 then
+            return shape2(e0, e1);
+        end if;
+        if axes = 3 then
+            return shape3(e0, e1, e2);
+        end if;
+        return shape4(e0, e1, e2, e3);
+    end;
+
+    generic [R: Region]
+    function decode(bytes: Span[Nat8, R]): Either[DecodeError, Array] is
+        let n: Index := spanLength(bytes);
+        if n < 8 then
+            return failure(TooShort());
+        end if;
+        if (((bytes[0] /= 72) or (bytes[1] /= 76)) or (bytes[2] /= 68)) or (bytes[3] /= 65) then
+            return failure(BadMagic());
+        end if;
+        if bytes[4] /= wireVersion() then
+            return failure(BadVersion());
+        end if;
+        if bytes[7] /= 0 then
+            return failure(BadFlags());
+        end if;
+        let kind: Nat8 := bytes[5];
+        if not isElementType(kind) then
+            return failure(BadElementType());
+        end if;
+        if (bytes[6] < 1) or (bytes[6] > 4) then
+            return failure(BadRank());
+        end if;
+        var axes: Index := 0;
+        case toIndex(bytes[6]) of
+            when Some(value as r: Index) do
+                axes := r;
+            when None do
+                abort("a byte did not fit an Index");
+        end case;
+        if n < headerSize(axes) then
+            return failure(TooShort());
+        end if;
+        var e0: Index := 1;
+        var e1: Index := 1;
+        var e2: Index := 1;
+        var e3: Index := 1;
+        var total: Index := 1;
+        var axis: Index := 0;
+        while axis < axes do
+            case readExtent(bytes, 8 + (8 * axis)) of
+                when Some(value as width: Index) do
+                    if (width < 1) or (width > maxElements()) then
+                        return failure(BadExtent());
+                    end if;
+                    if width > (maxElements() / total) then
+                        return failure(TooLarge());
+                    end if;
+                    total := total * width;
+                    if axis = 0 then
+                        e0 := width;
+                    else if axis = 1 then
+                        e1 := width;
+                    else if axis = 2 then
+                        e2 := width;
+                    else
+                        e3 := width;
+                    end if;
+                when None do
+                    return failure(BadExtent());
+            end case;
+            axis := axis + 1;
+        end while;
+        -- The length is compared over the division: the product of the count
+        -- and the width of an element can be larger than an Index of a target
+        -- with a 32-bit Index holds, but the length of the value cannot.
+        let want: Index := n - headerSize(axes);
+        let width: Index := elementSize(kind);
+        if (rem(want, width) /= 0) or ((want / width) /= total) then
+            return failure(BadLength());
+        end if;
+        let data: Span[Nat8, R] := substring(bytes, headerSize(axes), n);
+        case fromPacked(kind, shapeOf(axes, e0, e1, e2, e3), data) of
+            when Some(value as a: Array) do
+                return Right(right => a);
+            when None do
+                return failure(BadBool());
+        end case;
+    end;
+
+    function describe(error: DecodeError): Span[Nat8, Static] is
+        case error of
+            when TooShort do
+                return "the value is shorter than its header";
+            when BadMagic do
+                return "the magic is wrong";
+            when BadVersion do
+                return "the version is not supported";
+            when BadFlags do
+                return "the reserved byte is not zero";
+            when BadElementType do
+                return "the element type is unknown";
+            when BadRank do
+                return "the rank is not 1 to 4";
+            when BadExtent do
+                return "an extent is zero or too large";
+            when TooLarge do
+                return "the shape holds too many elements";
+            when BadLength do
+                return "the length does not match the shape";
+            when BadBool do
+                return "a Bool element is not 0 or 1";
+        end case;
+    end;
+end module body.

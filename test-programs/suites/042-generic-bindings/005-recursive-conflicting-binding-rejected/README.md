@@ -1,0 +1,1 @@
+A recursive call binds T to itself through one argument and to Index through another. Upstream dropped the first binding and accepted the call, so a T was passed where an Index was expected; it is now a type error.
