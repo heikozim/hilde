@@ -1,0 +1,214 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromLiteral
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    length,
+    removeLast,
+    destroyEmpty
+);
+import Standard.Text (
+    equal,
+    contains,
+    countOf
+);
+import Pkg.Report (
+    Problem,
+    destroyProblem
+);
+import Pkg.Manifest (
+    Manifest,
+    readManifest,
+    destroyManifest
+);
+import Pkg.Rust (
+    libraryName,
+    isBridgeName,
+    isTriple,
+    cargoManifest,
+    librarySource,
+    destroyBridge,
+    Bridge,
+    pkgConfigText,
+    setsPanicAbort,
+    firstUnguarded,
+    channelOf,
+    nativeLibraries
+);
+
+module body Pkg.Rust.Test is
+    constant sheet: Span[Nat8, Static] := "[package]\nname = \"Acme.Sheet\"\nversion = \"v0.3.1\"\n\n[rust]\ncalamine = { version = \"0.26.1\", default-features = false, features = [\"dates\"] }\ndiplomat = { version = \"0.13.0\" }\n";
+
+    function testNames(): Unit is
+        let name: String := libraryName("Acme.Sheet");
+        assertTrue(equal(asSpan(&name), "hilde_rust_acme_sheet"), "the library name");
+        destroyString(name);
+        assertTrue(isBridgeName("sheet"), "a bridge");
+        assertTrue(isBridgeName("cell_values2"), "an underscore and a digit");
+        assertTrue(not isBridgeName("Sheet"), "a capital");
+        assertTrue(not isBridgeName("2sheet"), "a digit first");
+        assertTrue(not isBridgeName("sheet-x"), "a hyphen");
+        assertTrue(not isBridgeName(""), "empty");
+        assertTrue(isTriple("aarch64-unknown-linux-gnu"), "a triple");
+        assertTrue(isTriple("x86_64-unknown-openbsd"), "an underscore");
+        assertTrue(not isTriple("x86_64 unknown"), "a blank");
+        assertTrue(not isTriple("../x"), "a slash");
+        assertTrue(not isTriple(""), "empty");
+        return nil;
+    end;
+
+    function testCargoManifest(): Unit is
+        case readManifest(sheet) of
+            when Right(right as manifest: Manifest) do
+                borrow held: &[Manifest, Q] := &manifest do
+                    let text: String := cargoManifest(held, &(held->crates), "/opt/hilde/rust/hilde-bridge", "1.88.0");
+                    assertTrue(contains(asSpan(&text), "name = \"hilde_rust_acme_sheet\"\nversion = \"0.3.1\""), "the package");
+                    assertTrue(contains(asSpan(&text), "rust-version = \"1.88.0\""), "the rust-version of the channel");
+                    assertTrue(countOf(asSpan(&text), "crate-type = [\"staticlib\"]") = 1, "one staticlib");
+                    assertTrue(countOf(asSpan(&text), "[lib]") = 1, "one library");
+                    assertTrue(contains(asSpan(&text), "hilde-bridge = { path = \"/opt/hilde/rust/hilde-bridge\" }"), "the guard crate");
+                    assertTrue(contains(asSpan(&text), "calamine = { version = \"=0.26.1\", default-features = false, features = [\"dates\"] }"), "the crate pinned exactly");
+                    assertTrue(contains(asSpan(&text), "diplomat = { version = \"=0.13.0\" }"), "the second crate");
+                    assertTrue(contains(asSpan(&text), "[profile.release]\npanic = \"unwind\""), "release unwinds");
+                    assertTrue(contains(asSpan(&text), "[profile.dev]\npanic = \"unwind\""), "dev unwinds");
+                    assertTrue(not setsPanicAbort(asSpan(&text)), "the generated manifest does not abort");
+                    assertTrue(contains(asSpan(&text), "\n[workspace]\n"), "a workspace of its own");
+                    destroyString(text);
+                end borrow;
+                destroyManifest(manifest);
+            when Left(left as problem: Problem) do
+                assertFailure("the manifest was refused");
+                destroyProblem(problem);
+        end case;
+        return nil;
+    end;
+
+    function testLibrarySource(): Unit is
+        var bridges: Buffer[Bridge] := allocateEmpty();
+        insertBack(&!bridges, Bridge(name => fromLiteral("cells"), path => fromLiteral("rust/bridge/cells.rs")));
+        insertBack(&!bridges, Bridge(name => fromLiteral("acme_helper_one"), path => fromLiteral("vendor/Acme.Helper/rust/bridge/one.rs")));
+        let text: String := librarySource(&bridges);
+        assertTrue(countOf(asSpan(&text), "pub mod ") = 2, "two modules");
+        assertTrue(contains(asSpan(&text), "#[path = \"../../rust/bridge/cells.rs\"]\npub mod cells;"), "the first bridge");
+        assertTrue(contains(asSpan(&text), "#[path = \"../../vendor/Acme.Helper/rust/bridge/one.rs\"]\npub mod acme_helper_one;"), "the bridge of a dependency");
+        destroyString(text);
+        var rest: Buffer[Bridge] := bridges;
+        while length(&rest) > 0 do
+            destroyBridge(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function testPkgConfig(): Unit is
+        let text: String := pkgConfigText("hilde_rust_acme_sheet", "0.3.1", "../build/release", "-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc");
+        assertTrue(contains(asSpan(&text), "\nLibs: -L${pcfiledir}/../build/release -lhilde_rust_acme_sheet -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc\n"), "Libs");
+        assertTrue(contains(asSpan(&text), "Version: 0.3.1\n"), "Version");
+        destroyString(text);
+        return nil;
+    end;
+
+    function testPanicAbort(): Unit is
+        assertTrue(setsPanicAbort("[profile.release]\npanic = \"abort\"\n"), "a profile");
+        assertTrue(setsPanicAbort("[profile.release]\npanic='abort'\n"), "single quotes");
+        assertTrue(setsPanicAbort("-C panic=abort"), "rustflags");
+        assertTrue(setsPanicAbort("-Cpanic=abort"), "rustflags in one word");
+        assertTrue(setsPanicAbort("[build]\nrustflags = [\"-C\", \"panic=abort\"]\n"), "rustflags of a configuration");
+        assertTrue(setsPanicAbort("[profile.release]\npanic =\n  \"abort\"\n"), "split over two lines");
+        assertTrue(not setsPanicAbort("[profile.release]\npanic = \"unwind\"\n"), "unwind");
+        assertTrue(not setsPanicAbort("# panic = \"abort\" would catch nothing\n"), "a comment");
+        assertTrue(not setsPanicAbort(""), "empty");
+        return nil;
+    end;
+
+    function unguardedLine(text: Span[Nat8, Static]): Index is
+        case firstUnguarded(text) of
+            when Some(value as line: Index) do
+                return line;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function testGuarded(): Unit is
+        assertTrue(unguardedLine("impl Sheet {\n    pub fn open(b: &[u8]) -> Result<Box<Sheet>, Fault> {\n        hilde_bridge::guard(|| read(b))\n    }\n}\n") = 0, "a guarded method");
+        assertTrue(unguardedLine("pub fn count(&self) -> usize {\n    hilde_bridge::guard_or(0, || self.n)\n}\n") = 0, "guard_or");
+        assertTrue(unguardedLine("#[no_mangle]\npub extern \"C\" fn f() -> i32 {\n    hilde_bridge::guard_code(|| 0)\n}\n") = 0, "guard_code in an extern function");
+        assertTrue(unguardedLine("hilde_bridge::export! {\n    fn f(x: i32) -> i32 { x }\n}\n") = 0, "the export macro");
+        assertTrue(unguardedLine("fn helper() -> i32 {\n    1\n}\n") = 0, "a private helper");
+        assertTrue(unguardedLine("// pub fn x() { 1 }\n") = 0, "a comment");
+        assertTrue(unguardedLine("extern \"C\" {\n    fn c_side(x: i32) -> i32;\n}\n") = 0, "a declaration of C");
+        assertTrue(unguardedLine("\n\npub fn open(b: &[u8]) -> u8 {\n    b[0]\n}\n") = 3, "an unguarded method");
+        assertTrue(unguardedLine("#[no_mangle]\nextern \"C\" fn f() -> i32 {\n    0\n}\n") = 2, "an unguarded extern function");
+        assertTrue(unguardedLine("#[no_mangle]\npub unsafe extern \"C\" fn f() -> i32 {\n    0\n}\n") = 2, "an unguarded unsafe extern function");
+        assertTrue(unguardedLine("pub unsafe fn f() -> i32 {\n    0\n}\n") = 1, "an unguarded unsafe function");
+        assertTrue(unguardedLine("pub fn a() -> i32 {\n    hilde_bridge::guard_code(|| 0)\n}\npub fn b() -> i32 {\n    let x = 1;\n    hilde_bridge::guard_code(|| x)\n}\n") = 4, "the guard must come first");
+        return nil;
+    end;
+
+    function testChannel(): Unit is
+        case channelOf("[toolchain]\nchannel = \"1.88.0\"\nprofile = \"minimal\"\n") of
+            when Some(value as channel: String) do
+                assertTrue(equal(asSpan(&channel), "1.88.0"), "the channel");
+                destroyString(channel);
+            when None do
+                assertFailure("no channel read");
+        end case;
+        case channelOf("[toolchain]\nchannel = \"stable\"\n") of
+            when Some(value as channel: String) do
+                destroyString(channel);
+                assertFailure("stable is no pin");
+            when None do
+                skip;
+        end case;
+        case channelOf("[toolchain\n") of
+            when Some(value as channel: String) do
+                destroyString(channel);
+                assertFailure("no TOML");
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    function testNative(): Unit is
+        case nativeLibraries("   Compiling hilde_rust_a v0.1.0\nnote: Link against the following native artifacts when linking against this static library.\nnote: native-static-libs: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc\n    Finished\n") of
+            when Some(value as native: String) do
+                assertTrue(equal(asSpan(&native), "-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc"), "the native libraries");
+                destroyString(native);
+            when None do
+                assertFailure("no native libraries read");
+        end case;
+        case nativeLibraries("note: native-static-libs: -lc $(rm -rf x)\n") of
+            when Some(value as native: String) do
+                destroyString(native);
+                assertFailure("a dollar sign may not reach a pkg-config file");
+            when None do
+                skip;
+        end case;
+        case nativeLibraries("Finished\n") of
+            when Some(value as native: String) do
+                destroyString(native);
+                assertFailure("no line");
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+end module body.

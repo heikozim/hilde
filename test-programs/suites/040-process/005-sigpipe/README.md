@@ -1,0 +1,1 @@
+Test that a programme ignores SIGPIPE and its children do not: a write into a pipe whose reader is closed fails with EPIPE instead of ending the programme, and a shell started by it lists no trap, where an inherited ignore would show as one.

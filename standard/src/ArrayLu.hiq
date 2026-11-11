@@ -1,0 +1,259 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Array (
+    Array,
+    View,
+    destroy,
+    float64Type,
+    getFloat64,
+    getInt32,
+    int32Type,
+    sameShape,
+    setFloat64,
+    setInt32,
+    shape,
+    shape1,
+    shape2,
+    size,
+    view,
+    viewElementType,
+    viewExtent,
+    viewRank,
+    zeros
+);
+import Standard.Buffer (
+    Buffer,
+    destroyFree,
+    getSpanMut,
+    initialize,
+    nth,
+    storeNth
+);
+import Bindings.Lapack (
+    gesv,
+    getrf
+);
+
+module body Standard.ArrayLu is
+    function largestDimension(): Index is
+        return 2147483647;
+    end;
+
+    -- The factors of the answer of lu.  The invariants hold the sizes of
+    -- the two matrices to the order the call read off its input: the
+    -- factored matrix is square of the order, and the pivots carry one
+    -- row exchange per row.
+    record LuFactors: Linear is
+        factors: Array;
+        pivots: Array;
+        order: Index;
+        invariant sameShape(shape(&factors), shape2(order, order));
+        invariant sameShape(shape(&pivots), shape1(order));
+    end;
+
+    -- The answer of solve.  The invariant holds the shape of x to the
+    -- two sizes the call read off its inputs: rows of x is the order of
+    -- the matrix, columns of x is the columns of the right hand sides.
+    record Solution: Linear is
+        x: Array;
+        rows: Index;
+        columns: Index;
+        invariant sameShape(shape(&x), shape2(rows, columns));
+    end;
+
+    -- The dimension as the 32-bit whole number the routines take.  The
+    -- contracts of the module hold every dimension at or below
+    -- largestDimension, so the conversion never fails; a failure would be
+    -- a broken contract, and the programme stops.
+    function dimension(width: Index): Int32 is
+        case toInt32(width) of
+            when Some(value as small: Int32) do
+                return small;
+            when None do
+                abort("a dimension of a matrix did not fit the 32 bits of the routines");
+        end case;
+    end;
+
+    -- The elements of the matrix view a, with rows and columns, in the
+    -- column-major order the routines read: the element of row i and
+    -- column j goes to the place j times rows plus i.
+    generic [A: Region, B: Region]
+    function columnMajor(a: View[A], rows: Index, columns: Index, into: &![Buffer[Float64], B]): Unit is
+        var i: Index := 0;
+        while i < rows do
+            var j: Index := 0;
+            while j < columns do
+                storeNth(&~into, (j * rows) + i, getFloat64(a, (i * columns) + j));
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The matrix the buffer holds in column-major order, with rows and
+    -- columns, as a new owning array in row-major order.
+    generic [B: Region]
+    function matrixRowMajor(source: &[Buffer[Float64], B], rows: Index, columns: Index): Array is
+        var out: Array := zeros(float64Type(), shape2(rows, columns));
+        var i: Index := 0;
+        while i < rows do
+            var j: Index := 0;
+            while j < columns do
+                setFloat64(&!out, (i * columns) + j, nth(source, (j * rows) + i));
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The first count elements of the buffer of 32-bit whole numbers as a
+    -- new vector.
+    generic [B: Region]
+    function intVectorFrom(source: &[Buffer[Int32], B], count: Index): Array is
+        var out: Array := zeros(int32Type(), shape1(count));
+        var k: Index := 0;
+        while k < count do
+            setInt32(&!out, k, nth(source, k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    ---
+    --- Giving the records of the answers back
+    ---
+
+    function destroyLuFactors(given: LuFactors): Unit is
+        let { factors: Array, pivots: Array, order: Index } := given;
+        destroy(factors);
+        destroy(pivots);
+        return nil;
+    end;
+
+    function destroySolution(given: Solution): Unit is
+        let { x: Array, rows: Index, columns: Index } := given;
+        destroy(x);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function luOrder(made: &[LuFactors, R]): Index is
+        return made->order;
+    end;
+
+    generic [R: Region]
+    function luPivotCount(made: &[LuFactors, R]): Index is
+        return size(&(made->pivots));
+    end;
+
+    generic [R: Region]
+    function factorsOf(made: &[LuFactors, R]): Array is
+        let n: Index := made->order;
+        var out: Array := zeros(float64Type(), shape2(n, n));
+        var k: Index := 0;
+        while k < (n * n) do
+            setFloat64(&!out, k, getFloat64(view(&(made->factors)), k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region]
+    function pivotsOf(made: &[LuFactors, R]): Array is
+        let count: Index := size(&(made->pivots));
+        var out: Array := zeros(int32Type(), shape1(count));
+        var k: Index := 0;
+        while k < count do
+            setInt32(&!out, k, getInt32(view(&(made->pivots)), k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region]
+    function solveRows(made: &[Solution, R]): Index is
+        return made->rows;
+    end;
+
+    generic [R: Region]
+    function solveColumns(made: &[Solution, R]): Index is
+        return made->columns;
+    end;
+
+    generic [R: Region]
+    function xOf(made: &[Solution, R]): Array is
+        let count: Index := (made->rows) * (made->columns);
+        var out: Array := zeros(float64Type(), shape2(made->rows, made->columns));
+        var k: Index := 0;
+        while k < count do
+            setFloat64(&!out, k, getFloat64(view(&(made->x)), k));
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    ---
+    --- The factorization and the system
+    ---
+
+    generic [A: Region]
+    function lu(a: View[A]): Either[Int32, LuFactors] is
+        let n: Index := viewExtent(a, 0);
+        var cells: Buffer[Float64] := initialize(n * n, 0.0);
+        var pivots: Buffer[Int32] := initialize(n, 0);
+        var info: Buffer[Int32] := initialize(1, 0);
+        columnMajor(a, n, n, &!cells);
+        let code: Int32 := getrf(dimension(n), dimension(n), getSpanMut(&!cells, 0, (n * n) - 1), getSpanMut(&!pivots, 0, n - 1), getSpanMut(&!info, 0, 0));
+        if code /= 0 then
+            destroyFree(info);
+            destroyFree(pivots);
+            destroyFree(cells);
+            let refused: Either[Int32, LuFactors] := Left(left => code);
+            return refused;
+        end if;
+        let factors: Array := matrixRowMajor(&cells, n, n);
+        let swaps: Array := intVectorFrom(&pivots, n);
+        destroyFree(info);
+        destroyFree(pivots);
+        destroyFree(cells);
+        let made: LuFactors := LuFactors(factors => factors, pivots => swaps, order => n);
+        let answered: Either[Int32, LuFactors] := Right(right => made);
+        return answered;
+    end;
+
+    generic [A: Region, B: Region]
+    function solve(a: View[A], b: View[B]): Either[Int32, Solution] is
+        let n: Index := viewExtent(a, 0);
+        let sides: Index := viewExtent(b, 1);
+        var factors: Buffer[Float64] := initialize(n * n, 0.0);
+        var rhs: Buffer[Float64] := initialize(n * sides, 0.0);
+        var pivots: Buffer[Int32] := initialize(n, 0);
+        var info: Buffer[Int32] := initialize(1, 0);
+        columnMajor(a, n, n, &!factors);
+        columnMajor(b, n, sides, &!rhs);
+        let code: Int32 := gesv(dimension(n), dimension(sides), getSpanMut(&!factors, 0, (n * n) - 1), getSpanMut(&!pivots, 0, n - 1), getSpanMut(&!rhs, 0, (n * sides) - 1), getSpanMut(&!info, 0, 0));
+        if code /= 0 then
+            destroyFree(info);
+            destroyFree(pivots);
+            destroyFree(rhs);
+            destroyFree(factors);
+            let refused: Either[Int32, Solution] := Left(left => code);
+            return refused;
+        end if;
+        let x: Array := matrixRowMajor(&rhs, n, sides);
+        destroyFree(info);
+        destroyFree(pivots);
+        destroyFree(rhs);
+        destroyFree(factors);
+        let made: Solution := Solution(x => x, rows => n, columns => sides);
+        let answered: Either[Int32, Solution] := Right(right => made);
+        return answered;
+    end;
+end module body.

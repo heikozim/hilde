@@ -1,0 +1,1 @@
+Test two decisions of the runtime at their edges: a time limit of poll(2) above the largest int is held there instead of turning negative, which poll reads as no limit; and a seccomp filter installed for one thread counts as confining the process only when the process has that one thread, not with two and not when the count is unknown.

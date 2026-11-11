@@ -1,0 +1,1 @@
+Preemption: on one worker main asks a channel in a loop that never waits, and the task it started, which sends the value, must still run.  The loop gives up after five seconds and prints that the task never ran, so that a runtime without preemption fails instead of hanging.

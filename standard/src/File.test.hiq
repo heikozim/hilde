@@ -1,0 +1,383 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A write with a time limit to the pipe of a child process
+--: a pipe that nobody reads
+-- takes only what it holds, and the write then ends with WaitTimedOut after
+-- the time given; a pipe whose reader has gone is a failure and not the end
+-- of the programme; a pipe that is read takes a small write at once.  Under
+-- WASI, which starts no process, both hold the refusal of the spawn instead.
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Text (
+    equal
+);
+import Standard.Platform (
+    systemName
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    finalize
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.File (
+    Command,
+    Running,
+    Process,
+    FileDescriptor,
+    ProcessStatus,
+    WaitFailure,
+    WaitTimedOut,
+    WaitFailed,
+    makeCommand,
+    addArgument,
+    emptyEnvironment,
+    addEnvironment,
+    spawnProcess,
+    waitProcess,
+    waitProcessFor,
+    terminateProcess,
+    killProcess,
+    exitCode,
+    endedBySignal,
+    signalNumber,
+    closeFile,
+    makeNonblocking,
+    writeWithin,
+    openRead,
+    openWrite,
+    readAll,
+    writeAll,
+    removeFile
+);
+
+module body Standard.File.Test is
+    constant nanos_per_milli: Nat64 := 1000000;
+
+    -- Whether this programme runs as a module for WebAssembly.  WASI
+    -- starts no process: spawnProcess answers None for every command
+    -- there, and the tests then hold the refusal instead of a child.
+    function onWasi(): Bool is
+        return equal(systemName(), "wasi");
+    end;
+
+    function shell(script: Span[Nat8, Static]): Command is
+        let sh: String := fromLiteral("/bin/sh");
+        let flag: String := fromLiteral("-c");
+        let text: String := fromLiteral(script);
+        let command: Command := addArgument(addArgument(makeCommand(asSpan(&sh)), asSpan(&flag)), asSpan(&text));
+        destroyString(sh);
+        destroyString(flag);
+        destroyString(text);
+        return command;
+    end;
+
+    function nowNanos(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as now: Nat64) do
+                return now;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function millisSince(began: Nat64): Nat64 is
+        return (nowNanos() - began) / nanos_per_milli;
+    end;
+
+    -- 1 when the write ended with WaitTimedOut, 2 with WaitFailed, 0 when it
+    -- was done.
+    generic [R: Region, S: Region]
+    function writeCode(pipe: &![FileDescriptor, R], data: Span[Nat8, S], milliseconds: Nat32): Int32 is
+        case writeWithin(pipe, data, milliseconds) of
+            when Right(right as done: Unit) do
+                return 0;
+            when Left(left as why: WaitFailure) do
+                case why of
+                    when WaitTimedOut do
+                        return 1;
+                    when WaitFailed do
+                        return 2;
+                end case;
+        end case;
+    end;
+
+    -- A child that reads nothing takes what the pipe holds and no more: a
+    -- megabyte does not go in, and the write ends with WaitTimedOut after
+    -- the time given, not before and not long after.  The control: a few
+    -- bytes to the same pipe go in at once.
+    function testPipeNobodyReadsTimesOut(): Unit is
+        case spawnProcess(shell("exec sleep 30")) of
+            when None do
+                assertTrue(onWasi(), "the child did not start");
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                var pipe: FileDescriptor := input;
+                assertTrue(makeNonblocking(&!pipe), "the pipe could not be made non-blocking");
+                let small: String := fromLiteral("hello");
+                assertTrue(writeCode(&!pipe, asSpan(&small), 1000) = 0, "a few bytes did not go into a pipe");
+                destroyString(small);
+                var big: StringBuilder := makeStringBuilder();
+                for i from 0 to 1048575 do
+                    writeByte(&!big, 97);
+                end for;
+                let megabyte: String := finalize(big);
+                let began: Nat64 := nowNanos();
+                let code: Int32 := writeCode(&!pipe, asSpan(&megabyte), 600);
+                let took: Nat64 := millisSince(began);
+                destroyString(megabyte);
+                assertTrue(code = 1, "a megabyte into a pipe nobody reads did not end with WaitTimedOut");
+                assertTrue(took >= 550, "the write ended before the time given");
+                assertTrue(took < 5000, "the write waited far beyond the time given");
+                let told: Bool := terminateProcess(&process);
+                let a: Bool := closeFile(pipe);
+                let b: Bool := closeFile(output);
+                let c: Bool := closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+        end case;
+        return nil;
+    end;
+
+    -- A pipe whose reader has gone: the child has ended and been waited for,
+    -- so nobody holds the other end.  Writing to it is a failure the caller
+    -- is told of; without the look at the pipe, write(2) would raise SIGPIPE
+    -- and this test, with the programme, would end by the signal.
+    function testPipeReaderGoneFails(): Unit is
+        case spawnProcess(shell("exit 0")) of
+            when None do
+                assertTrue(onWasi(), "the child did not start");
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                var pipe: FileDescriptor := input;
+                assertTrue(makeNonblocking(&!pipe), "the pipe could not be made non-blocking");
+                let status: ProcessStatus := waitProcess(process);
+                let small: String := fromLiteral("hello");
+                assertTrue(writeCode(&!pipe, asSpan(&small), 1000) = 2, "a write to a pipe whose reader had gone did not fail");
+                destroyString(small);
+                let a: Bool := closeFile(pipe);
+                let b: Bool := closeFile(output);
+                let c: Bool := closeFile(errors);
+        end case;
+        return nil;
+    end;
+
+    -- The byte at position i of the file of testReadAllAcrossChunks: i
+    -- modulo 251, so that no two chunks of the reader hold the same bytes.
+    function patternAt(i: Index): Nat8 is
+        let rest: Index := i - ((i / 251) * 251);
+        case toNat8(rest) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- readAll gives back every byte of a file longer than one read, a zero
+    -- byte among them, in its place; and an empty file as an empty string.
+    function testReadAllAcrossChunks(): Unit is
+        let path: Span[Nat8, Static] := "file-test-read-all.bin";
+        let count: Index := 10007;
+        var data: String := makeString(count, 0);
+        var i: Index := 0;
+        while i < count do
+            storeNth(&!data, i, patternAt(i));
+            i := i + 1;
+        end while;
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                assertTrue(writeAll(&!file, asSpan(&data)), "the file was written");
+                assertTrue(closeFile(file), "the written file was closed");
+            when None do
+                assertTrue(false, "the file could be made");
+        end case;
+        destroyString(data);
+        assertTrue(readsBack(path, count), "every byte comes back in its place");
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                assertTrue(closeFile(opened), "the emptied file was closed");
+            when None do
+                assertTrue(false, "the file could be emptied");
+        end case;
+        assertTrue(readsBack(path, 0), "an empty file is an empty string");
+        assertTrue(removeFile(path), "the file was removed");
+        return nil;
+    end;
+
+    -- Whether readAll of path gives count bytes, each the one of patternAt.
+    function readsBack(path: Span[Nat8, Static], count: Index): Bool is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let content: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case content of
+                    when Some(value as text: String) do
+                        var same: Bool := closed and (length(&text) = count);
+                        var i: Index := 0;
+                        while same and (i < count) do
+                            if nthByte(&text, i) /= patternAt(i) then
+                                same := false;
+                            end if;
+                            i := i + 1;
+                        end while;
+                        destroyString(text);
+                        return same;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- A child that sleeps is still running after 100 ms: waitProcessFor
+    -- answers None after the time given and not long after.  killProcess
+    -- ends it with the kill signal, number 9; waitProcessFor then sees the end, and
+    -- waitProcess gives the same status again without waiting.  A child
+    -- seen to end is not signalled any more: its number may be another
+    -- process now.
+    function testWaitProcessForAndKill(): Unit is
+        case spawnProcess(shell("exec sleep 30")) of
+            when None do
+                assertTrue(onWasi(), "the child did not start");
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                var child: Process := process;
+                let began: Nat64 := nowNanos();
+                let early: Option[ProcessStatus] := waitProcessFor(&!child, 100);
+                let took: Nat64 := millisSince(began);
+                assertTrue(stillRunning(early), "a sleeping child was taken for ended after 100 ms");
+                assertTrue(took >= 90, "waitProcessFor ended before the time given");
+                assertTrue(took < 5000, "waitProcessFor waited far beyond the time given");
+                assertTrue(killProcess(&child), "SIGKILL was not delivered");
+                let late: Option[ProcessStatus] := waitProcessFor(&!child, 5000);
+                assertTrue(killedBy(late, 9), "the child did not end by SIGKILL within 5 s");
+                assertTrue(not killProcess(&child), "a child seen to end was signalled again");
+                assertTrue(not terminateProcess(&child), "a child seen to end was terminated again");
+                let status: ProcessStatus := waitProcess(child);
+                assertTrue(endedBySignal(status) and (signalNumber(status) = 9), "waitProcess did not give the status seen");
+                let a: Bool := closeFile(input);
+                let b: Bool := closeFile(output);
+                let c: Bool := closeFile(errors);
+        end case;
+        return nil;
+    end;
+
+    -- Whether the answer of waitProcessFor says the child still runs.
+    function stillRunning(answer: Option[ProcessStatus]): Bool is
+        case answer of
+            when Some(value as status: ProcessStatus) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- Whether the answer of waitProcessFor says the signal number ended the child.
+    function killedBy(answer: Option[ProcessStatus], number: Int32): Bool is
+        case answer of
+            when Some(value as status: ProcessStatus) do
+                return endedBySignal(status) and (signalNumber(status) = number);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The standard output of command when it exits with 0, else None.
+    function outputOf(command: Command): Option[String] is
+        case spawnProcess(command) of
+            when None do
+                let none: Option[String] := None();
+                return none;
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let a: Bool := closeFile(input);
+                var out: FileDescriptor := output;
+                let content: Option[String] := readAll(&!out);
+                let b: Bool := closeFile(out);
+                let c: Bool := closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                if exitCode(status) = 0 then
+                    return content;
+                end if;
+                case content of
+                    when Some(value as text: String) do
+                        destroyString(text);
+                    when None do
+                        let nothing: Bool := false;
+                end case;
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    -- Whether command prints exactly expected and exits with 0.
+    function printsExactly(command: Command, expected: Span[Nat8, Static]): Bool is
+        case outputOf(command) of
+            when Some(value as text: String) do
+                let same: Bool := equal(asSpan(&text), expected);
+                destroyString(text);
+                return same;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- env of a child with an environment of its own prints only what was
+    -- added: nothing after emptyEnvironment, A=1 after addEnvironment, while
+    -- the same command without either prints the variables of this
+    -- process.
+    function testEnvironmentOfItsOwn(): Unit is
+        if onWasi() then
+            return nil;
+        end if;
+        assertTrue(printsExactly(emptyEnvironment(makeCommand("/usr/bin/env")), ""), "a child after emptyEnvironment saw variables");
+        assertTrue(printsExactly(addEnvironment(makeCommand("/usr/bin/env"), "A", "1"), "A=1\n"), "a child after addEnvironment saw more than A=1");
+        assertTrue(printsExactly(addEnvironment(addEnvironment(makeCommand("/usr/bin/env"), "A", "1"), "B", ""), "A=1\nB=\n"), "two variables did not reach the child in order");
+        assertTrue(not printsExactly(makeCommand("/usr/bin/env"), ""), "a child without an environment of its own inherited nothing");
+        return nil;
+    end;
+
+    -- A name with = spoils the command: spawnProcess refuses it and starts
+    -- nothing.  The same command with a fitting name starts.
+    function testEnvironmentNameWithEqualsSpoils(): Unit is
+        if onWasi() then
+            return nil;
+        end if;
+        case spawnProcess(addEnvironment(makeCommand("/usr/bin/env"), "A=B", "1")) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let a: Bool := closeFile(input);
+                let b: Bool := closeFile(output);
+                let c: Bool := closeFile(errors);
+                let status: ProcessStatus := waitProcess(process);
+                assertTrue(false, "a name with = was given to the child");
+            when None do
+                assertTrue(true, "a name with = is refused");
+        end case;
+        assertTrue(printsExactly(addEnvironment(makeCommand("/usr/bin/env"), "AB", "1"), "AB=1\n"), "a fitting name did not start the child");
+        return nil;
+    end;
+end module body.

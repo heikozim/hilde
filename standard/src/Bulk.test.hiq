@@ -1,0 +1,156 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    initialize,
+    nth,
+    getSpanMut,
+    getSpan,
+    destroyFree
+);
+import Standard.Bulk (
+    fillBytes,
+    fillSpan,
+    copySpan,
+    copyRange
+);
+import Standard.Arena (
+    Arena,
+    createArena,
+    arenaSpan,
+    resetArena,
+    freeArena
+);
+import Standard.Testing (assertTrue);
+
+module body Standard.Bulk.Test is
+    -- Bytes 2 to 5 of ten set to 7, the others left at 0.
+    function testFillBytes(): Unit is
+        var buf: Buffer[Nat8] := initialize(10, 0);
+        borrow b: &![Buffer[Nat8], R] := &!buf do
+            let sp: Span![Nat8, R] := getSpanMut(b, 0, 9);
+            fillBytes(sp, 2, 4, 7);
+        end borrow;
+        assertTrue(nth(&buf, 1) = 0, "byte 1 before the range");
+        assertTrue(nth(&buf, 2) = 7, "byte 2 is the first of the range");
+        assertTrue(nth(&buf, 5) = 7, "byte 5 is the last of the range");
+        assertTrue(nth(&buf, 6) = 0, "byte 6 after the range");
+        destroyFree(buf);
+        return nil;
+    end;
+
+    -- A count of 0 at the very end writes nothing and is allowed.
+    function testFillNothingAtTheEnd(): Unit is
+        var buf: Buffer[Nat8] := initialize(4, 3);
+        borrow b: &![Buffer[Nat8], R] := &!buf do
+            let sp: Span![Nat8, R] := getSpanMut(b, 0, 3);
+            fillBytes(sp, 4, 0, 9);
+        end borrow;
+        assertTrue(nth(&buf, 3) = 3, "nothing written");
+        destroyFree(buf);
+        return nil;
+    end;
+
+    -- Elements of eight bytes, a value above 2 to the 32 so that every
+    -- byte counts.
+    function testFillSpanOfInt64(): Unit is
+        var buf: Buffer[Int64] := initialize(5, 0);
+        let big: Int64 := 81985529216486895;
+        borrow b: &![Buffer[Int64], R] := &!buf do
+            let sp: Span![Int64, R] := getSpanMut(b, 0, 4);
+            fillSpan(sp, 1, 3, big);
+        end borrow;
+        assertTrue(nth(&buf, 0) = 0, "element 0 left");
+        assertTrue(nth(&buf, 1) = big, "element 1 set");
+        assertTrue(nth(&buf, 3) = big, "element 3 set");
+        assertTrue(nth(&buf, 4) = 0, "element 4 left");
+        destroyFree(buf);
+        return nil;
+    end;
+
+    -- The bytes 1 2 3 4 of one buffer into another at 3.
+    function testCopySpan(): Unit is
+        var source: Buffer[Nat8] := initialize(4, 0);
+        borrow s: &![Buffer[Nat8], R] := &!source do
+            let ones: Span![Nat8, R] := getSpanMut(s, 0, 3);
+            fillBytes(ones, 0, 4, 1);
+        end borrow;
+        var target: Buffer[Nat8] := initialize(8, 0);
+        borrow r: &[Buffer[Nat8], S] := &source do
+            let from_source: Span[Nat8, S] := getSpan(r, 0, 3);
+            borrow t: &![Buffer[Nat8], Q] := &!target do
+                let sp: Span![Nat8, Q] := getSpanMut(t, 0, 7);
+                copySpan(from_source, sp, 3);
+            end borrow;
+        end borrow;
+        assertTrue(nth(&target, 2) = 0, "byte 2 before the copy");
+        assertTrue(nth(&target, 3) = 1, "byte 3 is the first copied");
+        assertTrue(nth(&target, 6) = 1, "byte 6 is the last copied");
+        assertTrue(nth(&target, 7) = 0, "byte 7 after the copy");
+        destroyFree(source);
+        destroyFree(target);
+        return nil;
+    end;
+
+    -- Scratch memory of one unit of work from an arena: a span of 4096
+    -- bytes filled at once, read back at both ends, the arena reset.  A
+    -- target without pages to map, wasm, has no arena, and the test has
+    -- nothing to fill there.
+    function testFillArenaSpan(): Unit is
+        case createArena(65536) of
+            when Some(value as made: Arena) do
+                var arena: Arena := made;
+                borrow r: &![Arena, R] := &!arena do
+                    let got: Option[Span![Nat8, R]] := arenaSpan(r, 4096);
+                    case got of
+                        when Some(value as scratch: Span![Nat8, R]) do
+                            var bytes: Span![Nat8, R] := scratch;
+                            let size: Index := spanWriteLength(&bytes);
+                            fillBytes(&~bytes, 0, size, 170);
+                            assertTrue(bytes[0] = 170, "the first byte filled");
+                            assertTrue(bytes[4095] = 170, "the last byte filled");
+                        when None do
+                            assertTrue(false, "the arena holds 4096 bytes");
+                    end case;
+                end borrow;
+                arena := resetArena(arena);
+                freeArena(arena);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- Elements 1 to 3 of 10 20 30 40 50 into 0 of a second buffer.
+    function testCopyRange(): Unit is
+        var source: Buffer[Int32] := initialize(5, 0);
+        borrow s: &![Buffer[Int32], R] := &!source do
+            var values: Span![Int32, R] := getSpanMut(s, 0, 4);
+            var k: Index := 0;
+            var v: Int32 := 10;
+            while k < spanWriteLength(&values) do
+                values[k] := v;
+                v := v + 10;
+                k := k + 1;
+            end while;
+        end borrow;
+        var target: Buffer[Int32] := initialize(3, 0);
+        borrow r: &[Buffer[Int32], S] := &source do
+            let from_source: Span[Int32, S] := getSpan(r, 0, 4);
+            borrow t: &![Buffer[Int32], Q] := &!target do
+                let sp: Span![Int32, Q] := getSpanMut(t, 0, 2);
+                copyRange(from_source, 1, sp, 0, 3);
+            end borrow;
+        end borrow;
+        assertTrue(nth(&target, 0) = 20, "element 0 is element 1 of the source");
+        assertTrue(nth(&target, 2) = 40, "element 2 is element 3 of the source");
+        destroyFree(source);
+        destroyFree(target);
+        return nil;
+    end;
+end module body.

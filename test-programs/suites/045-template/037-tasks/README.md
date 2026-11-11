@@ -1,0 +1,3 @@
+Pages rendered in several tasks at once: rendering from several tasks must work without a lock. Each task owns its page, renders it, yields, renders it again and hands both back; the two tasks take turns at every yield. Nothing in the generated code or in Standard.Template is shared or changed between renders, so there is no lock to take. What this does NOT show: two tasks rendering the SAME data, and renders on several OS threads; 050-lend-on-many-workers does both.
+
+The test asserts the order of ONE thread -- the two tasks take turns at every yield -- and names HILDE_TASK_THREADS=1 in its env.txt since tasks run on several threads.

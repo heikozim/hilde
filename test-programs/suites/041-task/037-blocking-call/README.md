@@ -1,0 +1,1 @@
+A blocking call gives its worker back: on one worker a task that waits a second for a child process lets another task sleep 200 ms and print first, in whichever order the worker starts the two. With the wait on the worker the timer cannot fire before the wait ends, and the order of the two lines turns round.

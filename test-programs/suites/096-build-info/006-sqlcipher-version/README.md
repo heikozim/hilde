@@ -1,0 +1,1 @@
+Test that Standard.SqlCipher tells the version of the SQLite in libsqlcipher at run time, 3.x, as Standard.Sqlite does for libsqlite3; a programme of its own, since the two libraries export the same names.

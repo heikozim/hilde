@@ -1,0 +1,1 @@
+Parameters, locals, a variable, the binding of a slot and the variable of a loop named like macros of the C library -- errno, stdin, stdout, stderr.  errno is a macro of errno.h, which every generated file includes, and stdin is one of stdio.h on OpenBSD.  The C gives every parameter and local a prefix of its own.

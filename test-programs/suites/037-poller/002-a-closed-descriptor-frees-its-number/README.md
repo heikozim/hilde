@@ -1,0 +1,1 @@
+A pipe's reading end is watched and the pipe is closed without unwatching it.  The next pipe gets the same number for its reading end, and that number can be watched again and reports the byte written into the new pipe, on epoll and on kqueue alike.  The count keeps the closed descriptor, on both backends.  Without a poller backend the first line is 0 and the test fails.

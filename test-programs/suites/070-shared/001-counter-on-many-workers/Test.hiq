@@ -1,0 +1,108 @@
+import Standard.Task (
+    Lending,
+    openLending,
+    closeLending,
+    Task,
+    spawnLending,
+    join
+);
+import Standard.Shared (
+    Mutex,
+    Key,
+    makeMutex,
+    acquire,
+    release,
+    mutexHeld,
+    destroyMutex,
+    Atomic,
+    makeAtomic,
+    atomicAdd,
+    destroyAtomic
+);
+
+module body Test is
+    -- What the tasks share: a count behind a mutex, and an atomic word.
+    record Counters: Linear is
+        guarded: Mutex[Int64];
+        word: Atomic;
+    end;
+
+    -- 5000 rounds, each adding one to the count under the mutex and one to
+    -- the atomic word.  Read, add and write back are three steps; without
+    -- the mutex two tasks would write back the same sum and lose one.
+    generic [R: Region]
+    function count(counters: &[Counters, R]): Int64 is
+        var round: Int32 := 0;
+        var last: Int64 := 0;
+        while round < 5000 do
+            let { value as seen: Int64, key: Key } := acquire(&(counters->guarded));
+            release(&(counters->guarded), seen + 1, key);
+            last := atomicAdd(&(counters->word), 1);
+            round := round + 1;
+        end while;
+        if last > 0 then
+            return 0;
+        else
+            return 1;
+        end if;
+    end;
+
+    -- left tasks, all started before any is joined; the sum of what they
+    -- return, 0 when every task saw its additions arrive.
+    generic [R: Region, S: Region]
+    function many(scope: &![Lending[R], S], c: &[Counters, R], left: Int32): Int64 is
+        if left = 0 then
+            return 0;
+        end if;
+        let work: Fn[&[Counters, R], Int64] := count;
+        case spawnLending(&~scope, work, c) of
+            when Right(right as task: Task[Int64]) do
+                let rest: Int64 := many(&~scope, c, left - 1);
+                return rest + join(task);
+            when Left(left as back: &[Counters, R]) do
+                return 100;
+        end case;
+    end;
+
+    -- Eight tasks on eight workers: 8 * 5000 = 40000 on both counts.
+    function main(): ExitCode is
+        let zero: Int64 := 0;
+        case makeMutex(zero) of
+            when Right(right as mutex: Mutex[Int64]) do
+                case makeAtomic(0) of
+                    when Some(value as word: Atomic) do
+                        let counters: Counters := Counters(guarded => mutex, word => word);
+                        let refused: Int64 := 200;
+                        var failed: Int64 := 0;
+                        borrow c: &[Counters, rho] := &counters do
+                            case openLending(c) of
+                                when Some(value as opened: Lending[rho]) do
+                                    var scope: Lending[rho] := opened;
+                                    failed := many(&!scope, c, 8);
+                                    closeLending(scope);
+                                when None do
+                                    failed := refused;
+                            end case;
+                        end borrow;
+                        let { guarded: Mutex[Int64], word as w: Atomic } := counters;
+                        var held: Bool := true;
+                        borrow g: &[Mutex[Int64], gamma] := &guarded do
+                            held := mutexHeld(g);
+                        end borrow;
+                        printLn(destroyMutex(guarded));
+                        printLn(destroyAtomic(w));
+                        print("held at the end: ");
+                        printLn(held);
+                        if failed /= 0 then
+                            printLn(failed);
+                        end if;
+                    when None do
+                        let back: Int64 := destroyMutex(mutex);
+                        printLn(back);
+                end case;
+            when Left(left as back: Int64) do
+                printLn(back);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.
