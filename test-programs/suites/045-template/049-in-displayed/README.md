@@ -1,0 +1,1 @@
+in over a buffer of numbers compares the displayed text: "3" in a buffer holding the number 3 is True here and False in Jinja2 3.1.6 (measured), where a string never equals a number. The expected output is this implementation's own.

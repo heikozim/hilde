@@ -1,0 +1,847 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    initialize,
+    destroyFree,
+    storeNth,
+    getSpan
+);
+import Standard.Array (
+    Array,
+    View,
+    nat8Type,
+    int32Type,
+    int64Type,
+    float32Type,
+    float64Type,
+    shape1,
+    shape2,
+    shape3,
+    rank,
+    sameShape,
+    zeros,
+    destroy,
+    elementType,
+    shape,
+    size,
+    setNat8,
+    setInt32,
+    setInt64,
+    setFloat32,
+    setFloat64,
+    view,
+    viewShape,
+    viewExtent,
+    viewSize,
+    sliceAxis,
+    broadcast,
+    getInt32,
+    getInt64,
+    getFloat32,
+    getFloat64,
+    fromPacked
+);
+import Standard.ArrayCompute (
+    isNumberType,
+    sumReduction,
+    minReduction,
+    maxReduction,
+    productReduction,
+    add,
+    subtract,
+    multiply,
+    divide,
+    negate,
+    absolute,
+    sum,
+    product,
+    minimum,
+    maximum,
+    mean,
+    sumAxis,
+    productAxis,
+    minimumAxis,
+    maximumAxis,
+    meanAxis,
+    combine
+);
+
+module body Standard.ArrayCompute.Test is
+    ---
+    --- Builders and comparison helpers
+    ---
+
+    -- The matrix [[1, 2, 3], [4, 5, 6]] of Int32.
+    function int32Matrix(): Array is
+        var a: Array := zeros(int32Type(), shape2(2, 3));
+        setInt32(&!a, 0, 1);
+        setInt32(&!a, 1, 2);
+        setInt32(&!a, 2, 3);
+        setInt32(&!a, 3, 4);
+        setInt32(&!a, 4, 5);
+        setInt32(&!a, 5, 6);
+        return a;
+    end;
+
+    -- The cube [[[1, 2], [3, 4]], [[5, 6], [7, 8]]] of Int32, the ordinal
+    -- of each element is its value less one.
+    function int32Cube(): Array is
+        var a: Array := zeros(int32Type(), shape3(2, 2, 2));
+        var k: Index := 0;
+        while k < 8 do
+            case toInt32(k + 1) of
+                when Some(value as at: Int32) do
+                    setInt32(&!a, k, at);
+                when None do
+                    skip;
+            end case;
+            k := k + 1;
+        end while;
+        return a;
+    end;
+
+    -- A vector of Float64 of the values given, for the exact tests.
+    function float64Pair(x: Float64, y: Float64): Array is
+        var a: Array := zeros(float64Type(), shape1(2));
+        setFloat64(&!a, 0, x);
+        setFloat64(&!a, 1, y);
+        return a;
+    end;
+
+    -- A vector of two Float64, a quiet NaN first or second, made from the
+    -- bit patterns of the bytes: a NaN is 7F F8 and zero bytes, a 1.5 is
+    -- 3F F8 and zero bytes, little endian.
+    function nanPair(nan_first: Bool): Array is
+        var buf: Buffer[Nat8] := initialize(16, 0);
+        var at: Index := 0;
+        var other: Index := 8;
+        if not nan_first then
+            at := 8;
+            other := 0;
+        end if;
+        storeNth(&!buf, at + 6, 248);
+        storeNth(&!buf, at + 7, 127);
+        storeNth(&!buf, other + 6, 248);
+        storeNth(&!buf, other + 7, 63);
+        let taken: Option[Array] := fromPacked(float64Type(), shape1(2), getSpan(&buf, 0, 15));
+        destroyFree(buf);
+        case taken of
+            when Some(value as a: Array) do
+                return a;
+            when None do
+                abort("the bytes of a NaN and a 1.5 were not taken");
+        end case;
+    end;
+
+    -- Whether an Option holds None; a Some is given back.
+    function isNone(value: Option[Array]): Bool is
+        case value of
+            when Some(value as a: Array) do
+                destroy(a);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- Whether two Float64 sit within 1e-12 of each other.  A Float64
+    -- holds about 15 decimal places, and a sum of rounded decimal
+    -- fractions misses its decimal value by a few units in the last
+    -- place, which stays far below 1e-12.
+    function near64(x: Float64, y: Float64): Bool is
+        let gap: Float64 := x - y;
+        if gap < 0.0 then
+            return (-gap) <= 0.000000000001;
+        end if;
+        return gap <= 0.000000000001;
+    end;
+
+    -- Whether two Float32 sit within 1e-5 of each other.  A Float32
+    -- holds about seven decimal places, and one rounding of a quotient
+    -- or of a literal moves a value near 1 by about 1e-7, which stays
+    -- far below 1e-5.
+    function near32(x: Float32, y: Float32): Bool is
+        let gap: Float32 := x - y;
+        if gap < 0.0 then
+            return (-gap) <= 0.00001;
+        end if;
+        return gap <= 0.00001;
+    end;
+
+    -- Two arrays join under the reduction; the joined Int32 must be the
+    -- four values expected.
+    generic [S: Region, T: Region]
+    function joinInt32(first: &[Array, S], second: &[Array, T], reduction: Nat8, e0: Int32, e1: Int32, e2: Int32, e3: Int32, what: Span[Nat8, Static]): Unit is
+        case combine(view(first), view(second), reduction) of
+            when Some(value as joined: Array) do
+                assertTrue(getInt32(view(&joined), 0) = e0, what);
+                assertTrue(getInt32(view(&joined), 1) = e1, what);
+                assertTrue(getInt32(view(&joined), 2) = e2, what);
+                assertTrue(getInt32(view(&joined), 3) = e3, what);
+                destroy(joined);
+            when None do
+                assertTrue(false, what);
+        end case;
+        return nil;
+    end;
+
+    -- Two arrays join under the reduction; the joined Int64 must be the
+    -- two values expected.
+    generic [S: Region, T: Region]
+    function joinInt64(first: &[Array, S], second: &[Array, T], reduction: Nat8, e0: Int64, e1: Int64, what: Span[Nat8, Static]): Unit is
+        case combine(view(first), view(second), reduction) of
+            when Some(value as joined: Array) do
+                assertTrue(getInt64(view(&joined), 0) = e0, what);
+                assertTrue(getInt64(view(&joined), 1) = e1, what);
+                destroy(joined);
+            when None do
+                assertTrue(false, what);
+        end case;
+        return nil;
+    end;
+
+    -- Two arrays join under the reduction; the joined Float64 must be
+    -- the two values expected.
+    generic [S: Region, T: Region]
+    function joinFloat64(first: &[Array, S], second: &[Array, T], reduction: Nat8, e0: Float64, e1: Float64, what: Span[Nat8, Static]): Unit is
+        case combine(view(first), view(second), reduction) of
+            when Some(value as joined: Array) do
+                assertTrue(getFloat64(view(&joined), 0) = e0, what);
+                assertTrue(getFloat64(view(&joined), 1) = e1, what);
+                destroy(joined);
+            when None do
+                assertTrue(false, what);
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- Element types and reduction codes
+    ---
+
+    function testNumberTypes(): Unit is
+        assertTrue(isNumberType(int32Type()), "Int32 is worked on");
+        assertTrue(isNumberType(int64Type()), "Int64 is worked on");
+        assertTrue(isNumberType(float32Type()), "Float32 is worked on");
+        assertTrue(isNumberType(float64Type()), "Float64 is worked on");
+        assertFalse(isNumberType(nat8Type()), "Nat8 is refused");
+        assertFalse(isNumberType(7), "Bool is refused");
+        assertFalse(isNumberType(3), "an unknown code is refused");
+        return nil;
+    end;
+
+    function testReductionCodes(): Unit is
+        assertTrue(sumReduction() = 1, "sum is code 1");
+        assertTrue(minReduction() = 2, "minimum is code 2");
+        assertTrue(maxReduction() = 3, "maximum is code 3");
+        assertTrue(productReduction() = 4, "product is code 4");
+        return nil;
+    end;
+
+    ---
+    --- Elementwise operations
+    ---
+
+    function testAddRow(): Unit is
+        var a: Array := int32Matrix();
+        var row: Array := zeros(int32Type(), shape1(3));
+        setInt32(&!row, 0, 10);
+        setInt32(&!row, 1, 20);
+        setInt32(&!row, 2, 30);
+        let wide: Array := add(view(&a), view(&row));
+        assertTrue(elementType(&wide) = int32Type(), "the element type is kept");
+        assertTrue(size(&wide) = 6, "the row stretches over both rows");
+        -- row 0: 1+10=11, 2+20=22, 3+30=33; row 1: 4+10=14, 5+20=25, 6+30=36
+        assertTrue(getInt32(view(&wide), 0) = 11, "1 + 10 = 11");
+        assertTrue(getInt32(view(&wide), 1) = 22, "2 + 20 = 22");
+        assertTrue(getInt32(view(&wide), 2) = 33, "3 + 30 = 33");
+        assertTrue(getInt32(view(&wide), 3) = 14, "4 + 10 = 14");
+        assertTrue(getInt32(view(&wide), 4) = 25, "5 + 20 = 25");
+        assertTrue(getInt32(view(&wide), 5) = 36, "6 + 30 = 36");
+        destroy(wide);
+        destroy(row);
+        destroy(a);
+        return nil;
+    end;
+
+    function testAddColumn(): Unit is
+        -- A column of 3 and a row of 3 stretch to a 3 by 3 matrix.
+        var col: Array := zeros(int32Type(), shape2(3, 1));
+        setInt32(&!col, 0, 1);
+        setInt32(&!col, 1, 2);
+        setInt32(&!col, 2, 3);
+        var row: Array := zeros(int32Type(), shape1(3));
+        setInt32(&!row, 0, 10);
+        setInt32(&!row, 1, 20);
+        setInt32(&!row, 2, 30);
+        let wide: Array := add(view(&col), view(&row));
+        assertTrue(sameShape(shape(&wide), shape2(3, 3)), "the rank of the column grows to 3 by 3");
+        -- row 0: 1+10=11, 1+20=21, 1+30=31; row 1: 2+10=12, 2+20=22, 2+30=32;
+        -- row 2: 3+10=13, 3+20=23, 3+30=33
+        assertTrue(getInt32(view(&wide), 0) = 11, "1 + 10 = 11");
+        assertTrue(getInt32(view(&wide), 2) = 31, "1 + 30 = 31");
+        assertTrue(getInt32(view(&wide), 3) = 12, "2 + 10 = 12");
+        assertTrue(getInt32(view(&wide), 5) = 32, "2 + 30 = 32");
+        assertTrue(getInt32(view(&wide), 6) = 13, "3 + 10 = 13");
+        assertTrue(getInt32(view(&wide), 8) = 33, "3 + 30 = 33");
+        destroy(wide);
+        destroy(row);
+        destroy(col);
+        return nil;
+    end;
+
+    function testSubtractMultiplyDivide(): Unit is
+        var a: Array := zeros(int64Type(), shape1(4));
+        setInt64(&!a, 0, 10);
+        setInt64(&!a, 1, 24);
+        setInt64(&!a, 2, 7);
+        setInt64(&!a, 3, 9);
+        var b: Array := zeros(int64Type(), shape1(4));
+        setInt64(&!b, 0, 2);
+        setInt64(&!b, 1, 4);
+        setInt64(&!b, 2, -2);
+        setInt64(&!b, 3, 3);
+        let difference: Array := subtract(view(&a), view(&b));
+        -- 10-2=8, 24-4=20, 7-(-2)=9, 9-3=6
+        assertTrue(getInt64(view(&difference), 0) = 8, "10 - 2 = 8");
+        assertTrue(getInt64(view(&difference), 1) = 20, "24 - 4 = 20");
+        assertTrue(getInt64(view(&difference), 2) = 9, "7 - (-2) = 9");
+        assertTrue(getInt64(view(&difference), 3) = 6, "9 - 3 = 6");
+        destroy(difference);
+        let scaled: Array := multiply(view(&a), view(&b));
+        -- 10*2=20, 24*4=96, 7*(-2)=-14, 9*3=27
+        assertTrue(getInt64(view(&scaled), 0) = 20, "10 * 2 = 20");
+        assertTrue(getInt64(view(&scaled), 1) = 96, "24 * 4 = 96");
+        assertTrue(getInt64(view(&scaled), 2) = -14, "7 * (-2) = -14");
+        assertTrue(getInt64(view(&scaled), 3) = 27, "9 * 3 = 27");
+        destroy(scaled);
+        let quotient: Array := divide(view(&a), view(&b));
+        -- 10/2=5, 24/4=6, 7/(-2) rounds towards zero to -3, 9/3=3
+        assertTrue(getInt64(view(&quotient), 0) = 5, "10 / 2 = 5");
+        assertTrue(getInt64(view(&quotient), 1) = 6, "24 / 4 = 6");
+        assertTrue(getInt64(view(&quotient), 2) = -3, "7 / (-2) = -3, towards zero");
+        assertTrue(getInt64(view(&quotient), 3) = 3, "9 / 3 = 3");
+        destroy(quotient);
+        destroy(b);
+        destroy(a);
+        return nil;
+    end;
+
+    function testNegateAbsolute(): Unit is
+        var a: Array := zeros(int32Type(), shape1(3));
+        setInt32(&!a, 0, 5);
+        setInt32(&!a, 1, -7);
+        setInt32(&!a, 2, 0);
+        let negated: Array := negate(view(&a));
+        assertTrue(size(&negated) = 3, "the shape is kept");
+        -- -5, -(-7)=7, -0=0
+        assertTrue(getInt32(view(&negated), 0) = -5, "-5");
+        assertTrue(getInt32(view(&negated), 1) = 7, "-(-7) = 7");
+        assertTrue(getInt32(view(&negated), 2) = 0, "-0 = 0");
+        destroy(negated);
+        let magnitudes: Array := absolute(view(&a));
+        -- |5|=5, |-7|=7, |0|=0
+        assertTrue(getInt32(view(&magnitudes), 0) = 5, "|5| = 5");
+        assertTrue(getInt32(view(&magnitudes), 1) = 7, "|-7| = 7");
+        assertTrue(getInt32(view(&magnitudes), 2) = 0, "|0| = 0");
+        destroy(magnitudes);
+        destroy(a);
+        return nil;
+    end;
+
+    function testFloatOps(): Unit is
+        -- 0.5, 1.25, 0.25 and every result below are exact in binary.
+        var a: Array := float64Pair(0.5, 1.25);
+        var b: Array := float64Pair(0.25, 0.25);
+        let total: Array := add(view(&a), view(&b));
+        -- 0.5+0.25=0.75, 1.25+0.25=1.5
+        assertTrue(getFloat64(view(&total), 0) = 0.75, "0.5 + 0.25 = 0.75");
+        assertTrue(getFloat64(view(&total), 1) = 1.5, "1.25 + 0.25 = 1.5");
+        destroy(total);
+        let difference: Array := subtract(view(&a), view(&b));
+        -- 0.5-0.25=0.25, 1.25-0.25=1
+        assertTrue(getFloat64(view(&difference), 0) = 0.25, "0.5 - 0.25 = 0.25");
+        assertTrue(getFloat64(view(&difference), 1) = 1.0, "1.25 - 0.25 = 1");
+        destroy(difference);
+        let scaled: Array := multiply(view(&a), view(&b));
+        -- 0.5*0.25=0.125, 1.25*0.25=0.3125
+        assertTrue(getFloat64(view(&scaled), 0) = 0.125, "0.5 * 0.25 = 0.125");
+        assertTrue(getFloat64(view(&scaled), 1) = 0.3125, "1.25 * 0.25 = 0.3125");
+        destroy(scaled);
+        let quotient: Array := divide(view(&a), view(&b));
+        -- 0.5/0.25=2, 1.25/0.25=5
+        assertTrue(getFloat64(view(&quotient), 0) = 2.0, "0.5 / 0.25 = 2");
+        assertTrue(getFloat64(view(&quotient), 1) = 5.0, "1.25 / 0.25 = 5");
+        destroy(quotient);
+        let negated: Array := negate(view(&a));
+        assertTrue(getFloat64(view(&negated), 0) = -0.5, "-0.5");
+        assertTrue(getFloat64(view(&negated), 1) = -1.25, "-1.25");
+        destroy(negated);
+        let magnitudes: Array := absolute(view(&a));
+        assertTrue(getFloat64(view(&magnitudes), 0) = 0.5, "|0.5| = 0.5");
+        assertTrue(getFloat64(view(&magnitudes), 1) = 1.25, "|1.25| = 1.25");
+        destroy(magnitudes);
+        destroy(b);
+        destroy(a);
+        return nil;
+    end;
+
+    function testFloatTolerance(): Unit is
+        -- 0.1, 0.2 and 0.3 are not exact in binary; their sum misses the
+        -- decimal 0.6 by a few units in the last place, about 1e-16, so
+        -- the comparison allows 1e-12 (see near64).
+        var a: Array := zeros(float64Type(), shape1(3));
+        setFloat64(&!a, 0, 0.1);
+        setFloat64(&!a, 1, 0.2);
+        setFloat64(&!a, 2, 0.3);
+        let total: Array := sum(view(&a));
+        assertTrue(near64(getFloat64(view(&total), 0), 0.6), "0.1 + 0.2 + 0.3 is 0.6 within 1e-12");
+        destroy(total);
+        let average: Array := mean(view(&a));
+        assertTrue(near64(getFloat64(view(&average), 0), 0.2), "the mean of 0.1, 0.2 and 0.3 is 0.2 within 1e-12");
+        destroy(average);
+        destroy(a);
+        -- The quotient 5/3 rounds to 1.66666663 as a Float32 and the
+        -- literal 1.6666667 to 1.66666675; the gap is 1.2e-7, so the
+        -- comparison allows 1e-5 (see near32).
+        var three: Array := zeros(float32Type(), shape1(3));
+        setFloat32(&!three, 0, 1.0);
+        setFloat32(&!three, 1, 2.0);
+        setFloat32(&!three, 2, 2.0);
+        let mean32: Array := mean(view(&three));
+        assertTrue(near32(getFloat32(view(&mean32), 0), 1.6666667), "the mean of 1, 2 and 2 is 5/3 within 1e-5");
+        destroy(mean32);
+        destroy(three);
+        return nil;
+    end;
+
+    ---
+    --- Reductions
+    ---
+
+    function testWholeReductions(): Unit is
+        var a: Array := int32Matrix();
+        let total: Array := sum(view(&a));
+        assertTrue(sameShape(shape(&total), shape1(1)), "the sum is one element");
+        assertTrue(elementType(&total) = int32Type(), "the element type is kept");
+        -- 1+2+3+4+5+6 = 21
+        assertTrue(getInt32(view(&total), 0) = 21, "1 + 2 + 3 + 4 + 5 + 6 = 21");
+        destroy(total);
+        let all_product: Array := product(view(&a));
+        -- 1*2=2, *3=6, *4=24, *5=120, *6=720
+        assertTrue(getInt32(view(&all_product), 0) = 720, "1 * 2 * 3 * 4 * 5 * 6 = 720");
+        destroy(all_product);
+        let least: Array := minimum(view(&a));
+        assertTrue(getInt32(view(&least), 0) = 1, "the smallest of 1 to 6 is 1");
+        destroy(least);
+        let most: Array := maximum(view(&a));
+        assertTrue(getInt32(view(&most), 0) = 6, "the largest of 1 to 6 is 6");
+        destroy(most);
+        let average: Array := mean(view(&a));
+        -- 21/6 = 3.5, rounded towards zero to 3
+        assertTrue(getInt32(view(&average), 0) = 3, "21 / 6 = 3, towards zero");
+        destroy(average);
+        destroy(a);
+        return nil;
+    end;
+
+    function testWholeFloatReductions(): Unit is
+        var a: Array := zeros(float64Type(), shape1(3));
+        setFloat64(&!a, 0, 0.5);
+        setFloat64(&!a, 1, 1.5);
+        setFloat64(&!a, 2, 2.5);
+        -- 0.5, 1.5 and 2.5 are exact, and so are the results
+        let total: Array := sum(view(&a));
+        -- 0.5+1.5=2, 2+2.5=4.5
+        assertTrue(getFloat64(view(&total), 0) = 4.5, "0.5 + 1.5 + 2.5 = 4.5");
+        destroy(total);
+        let all_product: Array := product(view(&a));
+        -- 0.5*1.5=0.75, 0.75*2.5=1.875
+        assertTrue(getFloat64(view(&all_product), 0) = 1.875, "0.5 * 1.5 * 2.5 = 1.875");
+        destroy(all_product);
+        let least: Array := minimum(view(&a));
+        assertTrue(getFloat64(view(&least), 0) = 0.5, "the smallest is 0.5");
+        destroy(least);
+        let most: Array := maximum(view(&a));
+        assertTrue(getFloat64(view(&most), 0) = 2.5, "the largest is 2.5");
+        destroy(most);
+        let average: Array := mean(view(&a));
+        -- 4.5/3 = 1.5
+        assertTrue(getFloat64(view(&average), 0) = 1.5, "4.5 / 3 = 1.5");
+        destroy(average);
+        destroy(a);
+        return nil;
+    end;
+
+    function testAxisReductions(): Unit is
+        var a: Array := int32Matrix();
+        let by_rows: Array := sumAxis(view(&a), 0);
+        assertTrue(sameShape(shape(&by_rows), shape1(3)), "a 2 by 3 matrix along axis 0 gives 3 sums");
+        -- 1+4=5, 2+5=7, 3+6=9
+        assertTrue(getInt32(view(&by_rows), 0) = 5, "1 + 4 = 5");
+        assertTrue(getInt32(view(&by_rows), 1) = 7, "2 + 5 = 7");
+        assertTrue(getInt32(view(&by_rows), 2) = 9, "3 + 6 = 9");
+        destroy(by_rows);
+        let by_columns: Array := sumAxis(view(&a), 1);
+        assertTrue(sameShape(shape(&by_columns), shape1(2)), "a 2 by 3 matrix along axis 1 gives 2 sums");
+        -- 1+2+3=6, 4+5+6=15
+        assertTrue(getInt32(view(&by_columns), 0) = 6, "1 + 2 + 3 = 6");
+        assertTrue(getInt32(view(&by_columns), 1) = 15, "4 + 5 + 6 = 15");
+        destroy(by_columns);
+        let products: Array := productAxis(view(&a), 1);
+        -- 1*2*3=6, 4*5*6=120
+        assertTrue(getInt32(view(&products), 0) = 6, "1 * 2 * 3 = 6");
+        assertTrue(getInt32(view(&products), 1) = 120, "4 * 5 * 6 = 120");
+        destroy(products);
+        let least: Array := minimumAxis(view(&a), 0);
+        -- min(1,4)=1, min(2,5)=2, min(3,6)=3
+        assertTrue(getInt32(view(&least), 0) = 1, "min(1, 4) = 1");
+        assertTrue(getInt32(view(&least), 1) = 2, "min(2, 5) = 2");
+        assertTrue(getInt32(view(&least), 2) = 3, "min(3, 6) = 3");
+        destroy(least);
+        let most: Array := maximumAxis(view(&a), 0);
+        -- max(1,4)=4, max(2,5)=5, max(3,6)=6
+        assertTrue(getInt32(view(&most), 0) = 4, "max(1, 4) = 4");
+        assertTrue(getInt32(view(&most), 1) = 5, "max(2, 5) = 5");
+        assertTrue(getInt32(view(&most), 2) = 6, "max(3, 6) = 6");
+        destroy(most);
+        let row_means: Array := meanAxis(view(&a), 0);
+        -- 5/2=2.5 towards 2, 7/2=3.5 towards 3, 9/2=4.5 towards 4
+        assertTrue(getInt32(view(&row_means), 0) = 2, "5 / 2 = 2, towards zero");
+        assertTrue(getInt32(view(&row_means), 1) = 3, "7 / 2 = 3, towards zero");
+        assertTrue(getInt32(view(&row_means), 2) = 4, "9 / 2 = 4, towards zero");
+        destroy(row_means);
+        let column_means: Array := meanAxis(view(&a), 1);
+        -- 6/3=2, 15/3=5
+        assertTrue(getInt32(view(&column_means), 0) = 2, "6 / 3 = 2");
+        assertTrue(getInt32(view(&column_means), 1) = 5, "15 / 3 = 5");
+        destroy(column_means);
+        destroy(a);
+        return nil;
+    end;
+
+    function testAxisRank3(): Unit is
+        var a: Array := int32Cube();
+        -- The middle and the last axis move the results of the other
+        -- axes, so all three sums are checked against the hand sums.
+        let by_height: Array := sumAxis(view(&a), 0);
+        assertTrue(sameShape(shape(&by_height), shape2(2, 2)), "a 2 by 2 by 2 cube along axis 0 gives a 2 by 2 matrix");
+        -- 1+5=6, 2+6=8, 3+7=10, 4+8=12
+        assertTrue(getInt32(view(&by_height), 0) = 6, "1 + 5 = 6");
+        assertTrue(getInt32(view(&by_height), 1) = 8, "2 + 6 = 8");
+        assertTrue(getInt32(view(&by_height), 2) = 10, "3 + 7 = 10");
+        assertTrue(getInt32(view(&by_height), 3) = 12, "4 + 8 = 12");
+        destroy(by_height);
+        let by_rows: Array := sumAxis(view(&a), 1);
+        -- 1+3=4, 2+4=6, 5+7=12, 6+8=14
+        assertTrue(getInt32(view(&by_rows), 0) = 4, "1 + 3 = 4");
+        assertTrue(getInt32(view(&by_rows), 1) = 6, "2 + 4 = 6");
+        assertTrue(getInt32(view(&by_rows), 2) = 12, "5 + 7 = 12");
+        assertTrue(getInt32(view(&by_rows), 3) = 14, "6 + 8 = 14");
+        destroy(by_rows);
+        let by_columns: Array := sumAxis(view(&a), 2);
+        -- 1+2=3, 3+4=7, 5+6=11, 7+8=15
+        assertTrue(getInt32(view(&by_columns), 0) = 3, "1 + 2 = 3");
+        assertTrue(getInt32(view(&by_columns), 1) = 7, "3 + 4 = 7");
+        assertTrue(getInt32(view(&by_columns), 2) = 11, "5 + 6 = 11");
+        assertTrue(getInt32(view(&by_columns), 3) = 15, "7 + 8 = 15");
+        destroy(by_columns);
+        let row_maxima: Array := maximumAxis(view(&a), 1);
+        -- max(1,3)=3, max(2,4)=4, max(5,7)=7, max(6,8)=8
+        assertTrue(getInt32(view(&row_maxima), 0) = 3, "max(1, 3) = 3");
+        assertTrue(getInt32(view(&row_maxima), 1) = 4, "max(2, 4) = 4");
+        assertTrue(getInt32(view(&row_maxima), 2) = 7, "max(5, 7) = 7");
+        assertTrue(getInt32(view(&row_maxima), 3) = 8, "max(6, 8) = 8");
+        destroy(row_maxima);
+        let row_means: Array := meanAxis(view(&a), 1);
+        -- 4/2=2, 6/2=3, 12/2=6, 14/2=7
+        assertTrue(getInt32(view(&row_means), 0) = 2, "4 / 2 = 2");
+        assertTrue(getInt32(view(&row_means), 1) = 3, "6 / 2 = 3");
+        assertTrue(getInt32(view(&row_means), 2) = 6, "12 / 2 = 6");
+        assertTrue(getInt32(view(&row_means), 3) = 7, "14 / 2 = 7");
+        destroy(row_means);
+        destroy(a);
+        return nil;
+    end;
+
+    function testAxisLengthOne(): Unit is
+        -- An extent is at least 1, so no axis is empty; the narrowest is
+        -- an axis of length 1, whose sums are the single elements.
+        var col: Array := zeros(int32Type(), shape2(3, 1));
+        setInt32(&!col, 0, 7);
+        setInt32(&!col, 1, 8);
+        setInt32(&!col, 2, 9);
+        let narrow: Array := sumAxis(view(&col), 1);
+        assertTrue(sameShape(shape(&narrow), shape1(3)), "a 3 by 1 matrix along axis 1 gives 3 sums");
+        -- 7, 8, 9, each the single element of its row
+        assertTrue(getInt32(view(&narrow), 0) = 7, "7");
+        assertTrue(getInt32(view(&narrow), 1) = 8, "8");
+        assertTrue(getInt32(view(&narrow), 2) = 9, "9");
+        destroy(narrow);
+        let average: Array := meanAxis(view(&col), 1);
+        -- 7/1=7, 8/1=8, 9/1=9
+        assertTrue(getInt32(view(&average), 0) = 7, "7 / 1 = 7");
+        assertTrue(getInt32(view(&average), 1) = 8, "8 / 1 = 8");
+        assertTrue(getInt32(view(&average), 2) = 9, "9 / 1 = 9");
+        destroy(average);
+        let total: Array := sumAxis(view(&col), 0);
+        assertTrue(sameShape(shape(&total), shape1(1)), "a 3 by 1 matrix along axis 0 gives one sum");
+        -- 7+8+9 = 24
+        assertTrue(getInt32(view(&total), 0) = 24, "7 + 8 + 9 = 24");
+        destroy(total);
+        destroy(col);
+        -- A vector along its only axis gives one element.
+        var v: Array := zeros(int32Type(), shape1(4));
+        setInt32(&!v, 0, 1);
+        setInt32(&!v, 1, 2);
+        setInt32(&!v, 2, 3);
+        setInt32(&!v, 3, 4);
+        let whole: Array := sumAxis(view(&v), 0);
+        assertTrue(sameShape(shape(&whole), shape1(1)), "a vector along axis 0 gives one sum");
+        -- 1+2+3+4 = 10
+        assertTrue(getInt32(view(&whole), 0) = 10, "1 + 2 + 3 + 4 = 10");
+        destroy(whole);
+        var single: Array := zeros(int32Type(), shape1(1));
+        setInt32(&!single, 0, 42);
+        let one: Array := sum(view(&single));
+        -- the only element is the sum of itself
+        assertTrue(getInt32(view(&one), 0) = 42, "the sum of one element is the element");
+        destroy(one);
+        destroy(single);
+        destroy(v);
+        return nil;
+    end;
+
+    -- A row of 3 stretched over 2 rows: each column holds its value
+    -- twice, each row is [1, 2, 3].
+    generic [R: Region]
+    function checkBroadcastReduce(a: &[Array, R]): Unit is
+        let wide: View[R] := broadcast(view(a), shape2(2, 3));
+        let by_rows: Array := sumAxis(wide, 0);
+        -- 1+1=2, 2+2=4, 3+3=6
+        assertTrue(getFloat64(view(&by_rows), 0) = 2.0, "1 + 1 = 2");
+        assertTrue(getFloat64(view(&by_rows), 1) = 4.0, "2 + 2 = 4");
+        assertTrue(getFloat64(view(&by_rows), 2) = 6.0, "3 + 3 = 6");
+        destroy(by_rows);
+        let row_means: Array := meanAxis(wide, 1);
+        -- (1+2+3)/3 = 2, for both rows
+        assertTrue(getFloat64(view(&row_means), 0) = 2.0, "(1 + 2 + 3) / 3 = 2");
+        assertTrue(getFloat64(view(&row_means), 1) = 2.0, "the second row gives the same mean");
+        destroy(row_means);
+        let total: Array := mean(wide);
+        -- (1+2+3+1+2+3)/6 = 2
+        assertTrue(getFloat64(view(&total), 0) = 2.0, "the mean of both rows is 2");
+        destroy(total);
+        return nil;
+    end;
+
+    function testReduceBroadcastView(): Unit is
+        var a: Array := zeros(float64Type(), shape2(1, 3));
+        setFloat64(&!a, 0, 1.0);
+        setFloat64(&!a, 1, 2.0);
+        setFloat64(&!a, 2, 3.0);
+        checkBroadcastReduce(&a);
+        destroy(a);
+        return nil;
+    end;
+
+    -- The first two columns of [[1, 2, 3], [4, 5, 6]] are
+    -- [[1, 2], [4, 5]], a view with a gap.
+    generic [R: Region]
+    function checkNonContiguous(a: &[Array, R]): Unit is
+        let part: View[R] := sliceAxis(view(a), 1, 0, 2, 1);
+        let doubled: Array := add(part, part);
+        assertTrue(size(&doubled) = 4, "the view holds 4 elements");
+        -- 1+1=2, 2+2=4, 4+4=8, 5+5=10
+        assertTrue(getInt32(view(&doubled), 0) = 2, "1 + 1 = 2");
+        assertTrue(getInt32(view(&doubled), 1) = 4, "2 + 2 = 4");
+        assertTrue(getInt32(view(&doubled), 2) = 8, "4 + 4 = 8");
+        assertTrue(getInt32(view(&doubled), 3) = 10, "5 + 5 = 10");
+        destroy(doubled);
+        let total: Array := sum(part);
+        -- 1+2+4+5 = 12
+        assertTrue(getInt32(view(&total), 0) = 12, "1 + 2 + 4 + 5 = 12");
+        destroy(total);
+        let by_rows: Array := sumAxis(part, 0);
+        -- 1+4=5, 2+5=7
+        assertTrue(getInt32(view(&by_rows), 0) = 5, "1 + 4 = 5");
+        assertTrue(getInt32(view(&by_rows), 1) = 7, "2 + 5 = 7");
+        destroy(by_rows);
+        return nil;
+    end;
+
+    function testNonContiguous(): Unit is
+        var a: Array := int32Matrix();
+        checkNonContiguous(&a);
+        destroy(a);
+        return nil;
+    end;
+
+    ---
+    --- The joining of partial results
+    ---
+
+    function testCombineInt32(): Unit is
+        var first: Array := zeros(int32Type(), shape1(4));
+        setInt32(&!first, 0, 2147483647);
+        setInt32(&!first, 1, -2147483648);
+        setInt32(&!first, 2, 100);
+        setInt32(&!first, 3, 7);
+        var second: Array := zeros(int32Type(), shape1(4));
+        setInt32(&!second, 0, 1);
+        setInt32(&!second, 1, -1);
+        setInt32(&!second, 2, -200);
+        setInt32(&!second, 3, 7);
+        -- 2147483647+1 wraps to -2147483648; -2147483648-1 wraps to
+        -- 2147483647; 100-200 = -100; 7+7 = 14
+        joinInt32(&first, &second, sumReduction(), -2147483648, 2147483647, -100, 14, "the sums wrap at 32 bits");
+        -- 2147483647*1 stays; -2147483648*(-1) = 2^31 wraps to -2147483648;
+        -- 100*(-200) = -20000; 7*7 = 49
+        joinInt32(&first, &second, productReduction(), 2147483647, -2147483648, -20000, 49, "the products wrap at 32 bits");
+        -- min(2147483647,1)=1; min(-2147483648,-1)=-2147483648;
+        -- min(100,-200)=-200; min(7,7)=7, the second is not smaller
+        joinInt32(&first, &second, minReduction(), 1, -2147483648, -200, 7, "the minima");
+        -- max(2147483647,1)=2147483647; max(-2147483648,-1)=-1;
+        -- max(100,-200)=100; max(7,7)=7, the second is not larger
+        joinInt32(&first, &second, maxReduction(), 2147483647, -1, 100, 7, "the maxima");
+        destroy(second);
+        destroy(first);
+        return nil;
+    end;
+
+    function testCombineInt64(): Unit is
+        var first: Array := zeros(int64Type(), shape1(2));
+        setInt64(&!first, 0, 9223372036854775807);
+        setInt64(&!first, 1, -9223372036854775808);
+        var second: Array := zeros(int64Type(), shape1(2));
+        setInt64(&!second, 0, 4);
+        setInt64(&!second, 1, -4);
+        -- 2^63-1 + 4 = 2^63+3 wraps to -(2^63-3) = -9223372036854775805;
+        -- -2^63 + (-4) wraps to 2^63-4 = 9223372036854775804
+        joinInt64(&first, &second, sumReduction(), -9223372036854775805, 9223372036854775804, "the sums wrap at 64 bits");
+        -- (2^63-1)*4 = 2^65-4 wraps to -4; (-2^63)*(-4) = 2^65 wraps to 0
+        joinInt64(&first, &second, productReduction(), -4, 0, "the products wrap at 64 bits");
+        -- min(2^63-1, 4) = 4; min(-2^63, -4) = -2^63
+        joinInt64(&first, &second, minReduction(), 4, -9223372036854775808, "the minima");
+        -- max(2^63-1, 4) = 2^63-1; max(-2^63, -4) = -4
+        joinInt64(&first, &second, maxReduction(), 9223372036854775807, -4, "the maxima");
+        destroy(second);
+        destroy(first);
+        return nil;
+    end;
+
+    function testCombineFloat64(): Unit is
+        var first: Array := float64Pair(1.5, 2.5);
+        var second: Array := float64Pair(2.25, 0.5);
+        -- 1.5+2.25=3.75, 2.5+0.5=3
+        joinFloat64(&first, &second, sumReduction(), 3.75, 3.0, "the sums");
+        -- 1.5*2.25=3.375, 2.5*0.5=1.25
+        joinFloat64(&first, &second, productReduction(), 3.375, 1.25, "the products");
+        -- min(1.5,2.25)=1.5, min(2.5,0.5)=0.5
+        joinFloat64(&first, &second, minReduction(), 1.5, 0.5, "the minima");
+        -- max(1.5,2.25)=2.25, max(2.5,0.5)=2.5
+        joinFloat64(&first, &second, maxReduction(), 2.25, 2.5, "the maxima");
+        destroy(second);
+        destroy(first);
+        return nil;
+    end;
+
+    function testCombineNaN(): Unit is
+        var leading: Array := nanPair(true);
+        var trailing: Array := nanPair(false);
+        var plain: Array := float64Pair(2.5, 0.5);
+        -- A NaN first: the sum follows the machine's arithmetic, and the
+        -- NaN stays the smallest and the largest, for no second element
+        -- compares with it.
+        let total: Array := sum(view(&leading));
+        let leading_sum: Float64 := getFloat64(view(&total), 0);
+        assertTrue(leading_sum /= leading_sum, "NaN + 1.5 is a NaN");
+        destroy(total);
+        let least: Array := minimum(view(&leading));
+        let leading_least: Float64 := getFloat64(view(&least), 0);
+        assertTrue(leading_least /= leading_least, "a NaN that comes first stays the smallest");
+        destroy(least);
+        let most: Array := maximum(view(&leading));
+        let leading_most: Float64 := getFloat64(view(&most), 0);
+        assertTrue(leading_most /= leading_most, "a NaN that comes first stays the largest");
+        destroy(most);
+        -- A NaN second: it compares with nothing, so the 1.5 before it
+        -- stays.
+        let kept: Array := minimum(view(&trailing));
+        assertTrue(getFloat64(view(&kept), 0) = 1.5, "a NaN that comes second is passed over");
+        destroy(kept);
+        let kept_most: Array := maximum(view(&trailing));
+        assertTrue(getFloat64(view(&kept_most), 0) = 1.5, "a NaN that comes second is passed over");
+        destroy(kept_most);
+        -- The same rule joins two arrays of partial results.
+        case combine(view(&leading), view(&plain), minReduction()) of
+            when Some(value as joined: Array) do
+                let joined_least: Float64 := getFloat64(view(&joined), 0);
+                let joined_last: Float64 := getFloat64(view(&joined), 1);
+                assertTrue(joined_least /= joined_least, "the NaN stays the smaller");
+                assertTrue(joined_last = 0.5, "min(1.5, 0.5) = 0.5");
+                destroy(joined);
+            when None do
+                assertTrue(false, "two Float64 arrays of one shape join under minimum");
+        end case;
+        case combine(view(&trailing), view(&plain), maxReduction()) of
+            when Some(value as joined: Array) do
+                let joined_max: Float64 := getFloat64(view(&joined), 1);
+                assertTrue(getFloat64(view(&joined), 0) = 2.5, "max(1.5, 2.5) = 2.5");
+                assertTrue(joined_max /= joined_max, "the NaN stays the larger");
+                destroy(joined);
+            when None do
+                assertTrue(false, "two Float64 arrays of one shape join under maximum");
+        end case;
+        destroy(plain);
+        destroy(trailing);
+        destroy(leading);
+        return nil;
+    end;
+
+    function testCombineRefusals(): Unit is
+        var a: Array := zeros(int32Type(), shape1(2));
+        setInt32(&!a, 0, 1);
+        setInt32(&!a, 1, 2);
+        var wide: Array := zeros(int32Type(), shape1(3));
+        setInt32(&!wide, 0, 1);
+        setInt32(&!wide, 1, 2);
+        setInt32(&!wide, 2, 3);
+        var b: Array := zeros(int64Type(), shape1(2));
+        setInt64(&!b, 0, 1);
+        setInt64(&!b, 1, 2);
+        var bytes1: Array := zeros(nat8Type(), shape1(2));
+        setNat8(&!bytes1, 0, 1);
+        setNat8(&!bytes1, 1, 2);
+        var bytes2: Array := zeros(nat8Type(), shape1(2));
+        setNat8(&!bytes2, 0, 1);
+        setNat8(&!bytes2, 1, 2);
+        var turned: Array := zeros(int32Type(), shape2(3, 2));
+        -- Int32 and Int64 do not join.
+        assertTrue(isNone(combine(view(&a), view(&b), sumReduction())), "Int32 and Int64 do not join");
+        -- Nat8 names no number type.
+        assertTrue(isNone(combine(view(&bytes1), view(&bytes2), sumReduction())), "Nat8 is refused");
+        -- A vector of 2 and one of 3 do not join.
+        assertTrue(isNone(combine(view(&a), view(&wide), sumReduction())), "shapes of a different length do not join");
+        -- Nothing is broadcast, not even two shapes that hold as many
+        -- elements in another order.
+        assertTrue(isNone(combine(view(&wide), view(&turned), sumReduction())), "3 by 2 and a vector of 3 do not join");
+        destroy(turned);
+        destroy(bytes2);
+        destroy(bytes1);
+        destroy(b);
+        destroy(wide);
+        destroy(a);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,1 @@
+A pipe is registered with the poller, is not ready, becomes ready when a byte is written into the other end, and is reported as exactly one readable event.  Without a poller backend the first line is 0 and the test fails.

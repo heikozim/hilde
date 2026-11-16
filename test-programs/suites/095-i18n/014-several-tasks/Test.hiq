@@ -1,0 +1,175 @@
+-- One catalog, three tasks on four workers, each rendering its own page in
+-- its own language 200 times.  Each task counts the renders equal to its
+-- first; nothing is shared but the catalog, which is constant, so every
+-- render of a task is the same text.
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan,
+    length,
+    nthByte
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    spawn,
+    join
+);
+import Standard.Template (
+    Render
+);
+import Standard.I18n (
+    Message,
+    Text,
+    Language,
+    Catalog,
+    englishPlural,
+    germanPlural
+);
+
+module body Test is
+    union Key: Free is
+        case Greeting;
+    end;
+
+    function english(key: Key): Message is
+        case key of
+            when Greeting do
+                return Text(text => "Hello, {name}!");
+        end case;
+    end;
+
+    function german(key: Key): Message is
+        case key of
+            when Greeting do
+                return Text(text => "Hallo, {name}!");
+        end case;
+    end;
+
+    function others(i: Index): Option[Language[Key]] is
+        if i = 0 then
+            return Some(value => Language(code => "de", texts => german, plural => germanPlural));
+        end if;
+        return None();
+    end;
+
+    function messages(): Catalog[Key] is
+        return Catalog(default => Language(code => "en", texts => english, plural => englishPlural), others => others);
+    end;
+
+    record Page: Linear is
+        lang: String;
+        user: String;
+    end;
+
+    generic [R: Region]
+    function render(page: &[Page, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        @template("page.jinja", page, out);
+        return finalize(out);
+    end;
+
+    generic [R: Region, S: Region]
+    function same(a: &[String, R], b: &[String, S]): Bool is
+        if length(a) /= length(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(a) do
+            if nthByte(a, i) /= nthByte(b, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The first render, and after it how many of the next 199 were equal.
+    function work(page: Page): String is
+        let first: String := render(&page);
+        var equal: Int32 := 0;
+        var round: Int32 := 1;
+        while round < 200 do
+            let again: String := render(&page);
+            if same(&first, &again) then
+                equal := equal + 1;
+            end if;
+            destroyString(again);
+            round := round + 1;
+        end while;
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, asSpan(&first));
+        if equal = 199 then
+            writeString(&!out, " same 199");
+        else
+            writeString(&!out, " DIFFERED");
+        end if;
+        destroyString(first);
+        let { lang: String, user: String } := page;
+        destroyString(lang);
+        destroyString(user);
+        return finalize(out);
+    end;
+
+    function makePage(lang: Span[Nat8, Static], user: Span[Nat8, Static]): Page is
+        return Page(lang => fromLiteral(lang), user => fromLiteral(user));
+    end;
+
+    function show(text: String): Unit is
+        printLn(asSpan(&text));
+        destroyString(text);
+        return nil;
+    end;
+
+    function drop(page: Page): Unit is
+        let { lang: String, user: String } := page;
+        destroyString(lang);
+        destroyString(user);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                let renderer: Fn[Page, String] := work;
+                case spawn(&!scope, renderer, makePage("en", "Ada")) of
+                    when Right(right as first: Task[String]) do
+                        case spawn(&!scope, renderer, makePage("de", "Bea")) of
+                            when Right(right as second: Task[String]) do
+                                case spawn(&!scope, renderer, makePage("fr", "Cy")) of
+                                    when Right(right as third: Task[String]) do
+                                        show(join(first));
+                                        show(join(second));
+                                        show(join(third));
+                                    when Left(left as unused: Page) do
+                                        drop(unused);
+                                        show(join(first));
+                                        show(join(second));
+                                        printLn("third task not started");
+                                end case;
+                            when Left(left as unused: Page) do
+                                drop(unused);
+                                show(join(first));
+                                printLn("second task not started");
+                        end case;
+                    when Left(left as unused: Page) do
+                        drop(unused);
+                        printLn("first task not started");
+                end case;
+                closeScope(scope);
+            when None do
+                printLn("no scope");
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

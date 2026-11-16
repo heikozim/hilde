@@ -1,0 +1,1078 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The builder holds the open element names in one pool of bytes, with the
+-- start of each name beside it, so a name is copied once and a document
+-- of many elements is three values and not one string per element.  The
+-- start tag of the innermost element is left open until the first thing
+-- that cannot be an attribute is written, so attributes need no look-ahead.
+-- A path into a linear value uses it up, so every step of the work stands
+-- in a small function of its own that takes the whole value and touches
+-- one part of it, and the callers hand the value on with a reborrow.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan,
+    fromSpan,
+    length as stringLength
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length,
+    nth,
+    getSpan,
+    insertBack,
+    removeLast,
+    wholeSpan
+);
+import Standard.Text (
+    formatInt,
+    substring
+);
+import Standard.Html (
+    escapeHtml
+);
+
+module body Standard.Svg is
+    constant zero_i: Int64 := 0;
+    constant one_i: Int64 := 1;
+    constant two_i: Int64 := 2;
+    constant five_i: Int64 := 5;
+    constant ten_i: Int64 := 10;
+    constant max_i: Int64 := 9223372036854775807;
+    constant min_i: Int64 := -9223372036854775808;
+    -- The highest bit of a positive Int64, where the bit walk of
+    -- mulDivFloor starts.
+    constant high_bit_i: Int64 := 4611686018427387904;
+    constant points_most: Index := 1000;
+    constant series_most: Index := 1000;
+    -- The plot area of the chart inside its size.
+    constant chart_left: Int64 := 60;
+    constant chart_top: Int64 := 30;
+    constant chart_right: Int64 := 20;
+    constant chart_bottom: Int64 := 40;
+    constant title_y: Int64 := 20;
+
+    record Builder: Linear is
+        out: StringBuilder;
+        names: Buffer[Nat8];
+        starts: Buffer[Index];
+        tagOpen: Bool;
+    end;
+
+    record LineChart: Linear is
+        width: Int64;
+        height: Int64;
+        title: String;
+        xLabel: String;
+        yLabel: String;
+        xs: Buffer[Int64];
+        ys: Buffer[Int64];
+        starts: Buffer[Index];
+        counts: Buffer[Index];
+        classPool: Buffer[Nat8];
+        classStarts: Buffer[Index];
+    end;
+
+    function makeBuilder(): Builder is
+        let made: Builder := Builder(out => makeStringBuilder(), names => allocateEmpty(), starts => allocateEmpty(),
+            tagOpen => false);
+        return made;
+    end;
+
+    -- The two buffers of open names go with the text: nothing in them is
+    -- needed once the text stands or is given back.
+    function destroyBuilder(builder: Builder): Unit is
+        let { out: StringBuilder, names: Buffer[Nat8], starts: Buffer[Index], tagOpen as tag_open: Bool } := builder;
+        let rest: String := finalize(out);
+        destroyString(rest);
+        destroyFree(names);
+        destroyFree(starts);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function elementDepth(builder: &[Builder, R]): Index is
+        return length(&(builder->starts));
+    end;
+
+    function render(builder: Builder): String is
+        let { out: StringBuilder, names: Buffer[Nat8], starts: Buffer[Index], tagOpen as tag_open: Bool } := builder;
+        let made: String := finalize(out);
+        destroyFree(names);
+        destroyFree(starts);
+        return made;
+    end;
+
+    generic [R: Region]
+    function escapeText(content: Span[Nat8, R]): String is
+        return escapeHtml(content);
+    end;
+
+    generic [R: Region]
+    function escapeAttribute(value: Span[Nat8, R]): String is
+        return escapeHtml(value);
+    end;
+
+    -- A name is held to letters, digits and the signs of a name of a tag:
+    -- a letter, an underscore or a colon first, and never a sign that
+    -- could close the tag or add an attribute.
+    generic [N: Region]
+    function validName(name: Span[Nat8, N]): Bool is
+        let size: Index := spanLength(name);
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := name[i];
+            let head: Bool := ((byte >= 'a') and (byte <= 'z')) or ((byte >= 'A') and (byte <= 'Z'))
+                or (byte = '_') or (byte = ':');
+            let rest: Bool := head or ((byte >= '0') and (byte <= '9')) or (byte = '.') or (byte = '-');
+            if i = 0 then
+                if not head then
+                    return false;
+                end if;
+            else
+                if not rest then
+                    return false;
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    ---
+    --- Steps of the work over the builder, one path into it each
+    ---
+
+    -- How many elements are open, read through a write reference.
+    generic [R: Region]
+    function depthOf(builder: &![Builder, R]): Index is
+        return length(&(builder->starts));
+    end;
+
+    generic [R: Region]
+    function tagIsOpen(builder: &![Builder, R]): Bool is
+        return builder->tagOpen;
+    end;
+
+    generic [R: Region]
+    function markTag(builder: &![Builder, R], open: Bool): Unit is
+        builder->tagOpen := open;
+        return nil;
+    end;
+
+    -- One byte into the document.
+    generic [R: Region]
+    function putByte(builder: &![Builder, R], byte: Nat8): Unit is
+        writeByte(&!(builder->out), byte);
+        return nil;
+    end;
+
+    -- Bytes into the document.
+    generic [R: Region, S: Region]
+    function putText(builder: &![Builder, R], span: Span[Nat8, S]): Unit is
+        writeString(&!(builder->out), span);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushStart(builder: &![Builder, R], at: Index): Unit is
+        insertBack(&!(builder->starts), at);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushNameByte(builder: &![Builder, R], byte: Nat8): Unit is
+        insertBack(&!(builder->names), byte);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function namePoolSize(builder: &![Builder, R]): Index is
+        return length(&(builder->names));
+    end;
+
+    generic [R: Region]
+    function popStart(builder: &![Builder, R]): Index is
+        return removeLast(&!(builder->starts));
+    end;
+
+    generic [R: Region]
+    function popNameByte(builder: &![Builder, R]): Nat8 is
+        return removeLast(&!(builder->names));
+    end;
+
+    generic [R: Region]
+    function startAt(builder: &![Builder, R], n: Index): Index is
+        return nth(&(builder->starts), n);
+    end;
+
+    -- The name of the innermost element, copied out of the pool, so the
+    -- pool can be cut while the end tag is written.
+    generic [R: Region]
+    function innerName(builder: &![Builder, R]): String is
+        let count: Index := depthOf(&~builder);
+        let start: Index := startAt(&~builder, count - 1);
+        let pool: Span[Nat8, R] := wholeSpan(&(builder->names));
+        return fromSpan(substring(pool, start, spanLength(pool)));
+    end;
+
+    -- The tag of the innermost element is closed before anything that is
+    -- not an attribute is written.
+    generic [R: Region]
+    function closeTag(builder: &![Builder, R]): Unit is
+        if tagIsOpen(&~builder) then
+            putByte(&~builder, '>');
+            markTag(&~builder, false);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region, N: Region]
+    function beginElement(builder: &![Builder, R], name: Span[Nat8, N]): Unit is
+        if not validName(name) then
+            abort("Standard.Svg.beginElement: the name is not a name of a tag");
+        end if;
+        closeTag(&~builder);
+        let at: Index := namePoolSize(&~builder);
+        pushStart(&~builder, at);
+        var i: Index := 0;
+        while i < spanLength(name) do
+            pushNameByte(&~builder, name[i]);
+            i := i + 1;
+        end while;
+        putByte(&~builder, '<');
+        putText(&~builder, name);
+        markTag(&~builder, true);
+        return nil;
+    end;
+
+    -- A name outside the signs of a tag stops the programme: the names of
+    -- attributes come from the programme and not from the data, and a
+    -- wrong one is a fault of the caller, as a wrong index is.
+    generic [R: Region, N: Region]
+    function writeCheckedName(builder: &![Builder, R], name: Span[Nat8, N]): Unit is
+        if not validName(name) then
+            abort("Standard.Svg: the name of an attribute is not a name");
+        end if;
+        putByte(&~builder, ' ');
+        putText(&~builder, name);
+        putByte(&~builder, '=');
+        putByte(&~builder, '"');
+        return nil;
+    end;
+
+    -- An attribute belongs to an open start tag; both wrong calls stop the
+    -- programme, as a wrong index does.
+    generic [R: Region]
+    function wantAttribute(builder: &![Builder, R]): Unit is
+        if depthOf(&~builder) = 0 then
+            abort("Standard.Svg: no element is open");
+        end if;
+        if not tagIsOpen(&~builder) then
+            abort("Standard.Svg: the start tag is closed");
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region, N: Region, V: Region]
+    function attribute(builder: &![Builder, R], name: Span[Nat8, N], value: Span[Nat8, V]): Unit is
+        wantAttribute(&~builder);
+        writeCheckedName(&~builder, name);
+        let escaped: String := escapeAttribute(value);
+        putText(&~builder, asSpan(&escaped));
+        destroyString(escaped);
+        putByte(&~builder, '"');
+        return nil;
+    end;
+
+    generic [R: Region, N: Region]
+    function attributeInt(builder: &![Builder, R], name: Span[Nat8, N], value: Int64): Unit is
+        wantAttribute(&~builder);
+        writeCheckedName(&~builder, name);
+        let digits: String := formatInt(value);
+        putText(&~builder, asSpan(&digits));
+        destroyString(digits);
+        putByte(&~builder, '"');
+        return nil;
+    end;
+
+    generic [R: Region, T: Region]
+    function text(builder: &![Builder, R], content: Span[Nat8, T]): Unit is
+        if depthOf(&~builder) = 0 then
+            abort("Standard.Svg.text: no element is open");
+        end if;
+        closeTag(&~builder);
+        let escaped: String := escapeText(content);
+        putText(&~builder, asSpan(&escaped));
+        destroyString(escaped);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function endElement(builder: &![Builder, R]): Unit is
+        if depthOf(&~builder) = 0 then
+            abort("Standard.Svg.endElement: no element is open");
+        end if;
+        if tagIsOpen(&~builder) then
+            putByte(&~builder, ' ');
+            putByte(&~builder, '/');
+            putByte(&~builder, '>');
+            markTag(&~builder, false);
+        else
+            putByte(&~builder, '<');
+            putByte(&~builder, '/');
+            let name: String := innerName(&~builder);
+            putText(&~builder, asSpan(&name));
+            destroyString(name);
+            putByte(&~builder, '>');
+        end if;
+        let gone_start: Index := popStart(&~builder);
+        var size: Index := namePoolSize(&~builder);
+        while size > gone_start do
+            let gone_byte: Nat8 := popNameByte(&~builder);
+            size := size - 1;
+        end while;
+        return nil;
+    end;
+
+    -- The box of a document of a given size: 0 0 width height.
+    function boxOf(width: Int64, height: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeByte(&!out, '0');
+        writeByte(&!out, ' ');
+        writeByte(&!out, '0');
+        writeByte(&!out, ' ');
+        let w: String := formatInt(width);
+        writeString(&!out, asSpan(&w));
+        destroyString(w);
+        writeByte(&!out, ' ');
+        let h: String := formatInt(height);
+        writeString(&!out, asSpan(&h));
+        destroyString(h);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function beginSvg(builder: &![Builder, R], width: Int64, height: Int64): Unit is
+        beginElement(&~builder, "svg");
+        attribute(&~builder, "xmlns", "http://www.w3.org/2000/svg");
+        attributeInt(&~builder, "width", width);
+        attributeInt(&~builder, "height", height);
+        let box: String := boxOf(width, height);
+        attribute(&~builder, "viewBox", asSpan(&box));
+        destroyString(box);
+        return nil;
+    end;
+
+    generic [R: Region, V: Region]
+    function beginSvgViewBox(builder: &![Builder, R], view_box: Span[Nat8, V]): Unit is
+        beginElement(&~builder, "svg");
+        attribute(&~builder, "xmlns", "http://www.w3.org/2000/svg");
+        attribute(&~builder, "viewBox", view_box);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function endSvg(builder: &![Builder, R]): Unit is
+        endElement(&~builder);
+        return nil;
+    end;
+
+    generic [R: Region, D: Region]
+    function path(builder: &![Builder, R], d: Span[Nat8, D]): Unit is
+        beginElement(&~builder, "path");
+        attribute(&~builder, "d", d);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    -- The points as x,y x,y ..., the value of the attribute points.
+    generic [R: Region, S: Region, T: Region]
+    function writePoints(builder: &![Builder, R], xs: Span[Int64, S], ys: Span[Int64, T]): Unit is
+        let n: Index := spanLength(xs);
+        var i: Index := 0;
+        while i < n do
+            if i > 0 then
+                putByte(&~builder, ' ');
+            end if;
+            let x: String := formatInt(xs[i]);
+            putText(&~builder, asSpan(&x));
+            destroyString(x);
+            putByte(&~builder, ',');
+            let y: String := formatInt(ys[i]);
+            putText(&~builder, asSpan(&y));
+            destroyString(y);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function polyline(builder: &![Builder, R], xs: Span[Int64, S], ys: Span[Int64, T]): Unit is
+        beginElement(&~builder, "polyline");
+        attribute(&~builder, "fill", "none");
+        writeCheckedName(&~builder, "points");
+        writePoints(&~builder, xs, ys);
+        putByte(&~builder, '"');
+        endElement(&~builder);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, T: Region]
+    function pointsAttribute(builder: &![Builder, R], xs: Span[Int64, S], ys: Span[Int64, T]): Unit is
+        wantAttribute(&~builder);
+        writeCheckedName(&~builder, "points");
+        writePoints(&~builder, xs, ys);
+        putByte(&~builder, '"');
+        return nil;
+    end;
+
+    generic [R: Region]
+    function rect(builder: &![Builder, R], x: Int64, y: Int64, width: Int64, height: Int64): Unit is
+        beginElement(&~builder, "rect");
+        attributeInt(&~builder, "x", x);
+        attributeInt(&~builder, "y", y);
+        attributeInt(&~builder, "width", width);
+        attributeInt(&~builder, "height", height);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    generic [R: Region, F: Region]
+    function rectFilled(builder: &![Builder, R], x: Int64, y: Int64, width: Int64, height: Int64, fill: Span[Nat8, F]): Unit is
+        beginElement(&~builder, "rect");
+        attributeInt(&~builder, "x", x);
+        attributeInt(&~builder, "y", y);
+        attributeInt(&~builder, "width", width);
+        attributeInt(&~builder, "height", height);
+        attribute(&~builder, "fill", fill);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    generic [R: Region, T: Region]
+    function textAt(builder: &![Builder, R], x: Int64, y: Int64, content: Span[Nat8, T]): Unit is
+        beginElement(&~builder, "text");
+        attributeInt(&~builder, "x", x);
+        attributeInt(&~builder, "y", y);
+        text(&~builder, content);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    generic [R: Region, F: Region]
+    function circleFilled(builder: &![Builder, R], cx: Int64, cy: Int64, r: Int64, fill: Span[Nat8, F]): Unit is
+        beginElement(&~builder, "circle");
+        attributeInt(&~builder, "cx", cx);
+        attributeInt(&~builder, "cy", cy);
+        attributeInt(&~builder, "r", r);
+        attribute(&~builder, "fill", fill);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    ---
+    --- Scale and ticks
+    ---
+
+    -- The arithmetic of the scales holds every answer inside Int64: a
+    -- difference, a sum or a product that would go past an end of the
+    -- type stops at that end, and a quotient that would overflow takes
+    -- its bits one at a time.  A drawing of numbers a caller did not
+    -- check is then drawn to its ends instead of stopping the programme.
+
+    -- a - b, held at the end of Int64 that the answer goes past.
+    function satSub(a: Int64, b: Int64): Int64 is
+        if (b > zero_i) and (a < (min_i + b)) then
+            return min_i;
+        end if;
+        if (b < zero_i) and (a > (max_i + b)) then
+            return max_i;
+        end if;
+        return a - b;
+    end;
+
+    -- a + b, held at the end of Int64 that the answer goes past.
+    function satAdd(a: Int64, b: Int64): Int64 is
+        if (b > zero_i) and (a > (max_i - b)) then
+            return max_i;
+        end if;
+        if (b < zero_i) and (a < (min_i - b)) then
+            return min_i;
+        end if;
+        return a + b;
+    end;
+
+    -- x times s for an s above nought, held at the end of Int64 that the
+    -- answer goes past.
+    function mulByPositive(x: Int64, s: Int64): Int64 is
+        if x > (max_i / s) then
+            return max_i;
+        end if;
+        if x < (min_i / s) then
+            return min_i;
+        end if;
+        return x * s;
+    end;
+
+    -- How far a data range has to be brought down to fit into Int64:
+    -- nought when high - low fits, one when it does not.  A range from
+    -- below nought up to nought itself is wider than the type as well,
+    -- since its low end may be the bottom of Int64.
+    function rangeShift(low: Int64, high: Int64): Int64 is
+        if low >= zero_i then
+            return zero_i;
+        end if;
+        if high > (max_i + low) then
+            return one_i;
+        end if;
+        return zero_i;
+    end;
+
+    -- floor(a * b / c) for nought at most a at most c and c above nought,
+    -- with no product that may not fit: the bits of b are taken one at a
+    -- time and the remainder stays below c.
+    function mulDivFloor(a: Int64, b: Int64, c: Int64): Int64 is
+        if (a = zero_i) or (b = zero_i) then
+            return zero_i;
+        end if;
+        if a <= (max_i / b) then
+            return (a * b) / c;
+        end if;
+        var quotient: Int64 := zero_i;
+        var remainder: Int64 := zero_i;
+        var rest: Int64 := b;
+        var bit: Int64 := high_bit_i;
+        while bit > zero_i do
+            quotient := quotient + quotient;
+            if remainder >= (c - remainder) then
+                remainder := remainder - (c - remainder);
+                quotient := quotient + one_i;
+            else
+                remainder := remainder + remainder;
+            end if;
+            if rest >= bit then
+                rest := rest - bit;
+                if remainder >= (c - a) then
+                    remainder := remainder - (c - a);
+                    quotient := quotient + one_i;
+                else
+                    remainder := remainder + a;
+                end if;
+            end if;
+            bit := bit / two_i;
+        end while;
+        return quotient;
+    end;
+
+    function tickStep(low: Int64, high: Int64): Step is
+        var target: Int64 := satSub(high, low) / five_i;
+        if target < one_i then
+            target := one_i;
+        end if;
+        -- The largest power of ten that does not go past the target.
+        var p: Int64 := one_i;
+        var exponent: Int64 := 0;
+        while p <= (target / 10) do
+            p := p * 10;
+            exponent := exponent + 1;
+        end while;
+        let mantissa: Int64 := target / p;
+        var multiple: Int64 := five_i;
+        if mantissa < 2 then
+            multiple := one_i;
+        else if mantissa < 5 then
+            multiple := two_i;
+        end if;
+        return Step(multiple => multiple, exponent => exponent);
+    end;
+
+    function stepValue(step: Step): Int64 is
+        var p: Int64 := one_i;
+        var e: Int64 := step.exponent;
+        while e > zero_i do
+            p := mulByPositive(ten_i, p);
+            e := e - one_i;
+        end while;
+        return mulByPositive(step.multiple, p);
+    end;
+
+    function firstTick(low: Int64, step: Step): Int64 is
+        let s: Int64 := stepValue(step);
+        if s <= zero_i then
+            return low;
+        end if;
+        let q: Int64 := low / s;
+        let r: Int64 := rem(low, s);
+        if r = zero_i then
+            return low;
+        end if;
+        if low > zero_i then
+            return mulByPositive(q + one_i, s);
+        end if;
+        return mulByPositive(q, s);
+    end;
+
+    function lastTick(high: Int64, step: Step): Int64 is
+        let s: Int64 := stepValue(step);
+        if s <= zero_i then
+            return high;
+        end if;
+        let q: Int64 := high / s;
+        let r: Int64 := rem(high, s);
+        if r = zero_i then
+            return high;
+        end if;
+        if high > zero_i then
+            return mulByPositive(q, s);
+        end if;
+        return mulByPositive(q - one_i, s);
+    end;
+
+    function formatTick(value: Int64): String is
+        return formatInt(value);
+    end;
+
+    function mapX(value: Int64, data_low: Int64, data_high: Int64, pixel_low: Int64, pixel_high: Int64): Int64 is
+        let shift: Int64 := rangeShift(data_low, data_high);
+        var lo: Int64 := data_low;
+        var hi: Int64 := data_high;
+        var v: Int64 := value;
+        if shift > zero_i then
+            lo := lo / two_i;
+            hi := hi / two_i;
+            v := v / two_i;
+        end if;
+        let span: Int64 := hi - lo;
+        let width: Int64 := satSub(pixel_high, pixel_low);
+        let scaled: Int64 := mulDivFloor(v - lo, width, span);
+        return satAdd(pixel_low, scaled);
+    end;
+
+    function mapY(value: Int64, data_low: Int64, data_high: Int64, pixel_low: Int64, pixel_high: Int64): Int64 is
+        let shift: Int64 := rangeShift(data_low, data_high);
+        var lo: Int64 := data_low;
+        var hi: Int64 := data_high;
+        var v: Int64 := value;
+        if shift > zero_i then
+            lo := lo / two_i;
+            hi := hi / two_i;
+            v := v / two_i;
+        end if;
+        let span: Int64 := hi - lo;
+        let width: Int64 := satSub(pixel_high, pixel_low);
+        let scaled: Int64 := mulDivFloor(v - lo, width, span);
+        return satSub(pixel_high, scaled);
+    end;
+
+    function pixelX(frame: Frame, value: Int64): Int64 is
+        return mapX(value, frame.xLow, frame.xHigh, frame.left, satAdd(frame.left, frame.width));
+    end;
+
+    function pixelY(frame: Frame, value: Int64): Int64 is
+        return mapY(value, frame.yLow, frame.yHigh, frame.top, satAdd(frame.top, frame.height));
+    end;
+
+    -- One line of the axes, of the class svg-axis.
+    generic [R: Region]
+    function axisLine(builder: &![Builder, R], x1: Int64, y1: Int64, x2: Int64, y2: Int64): Unit is
+        beginElement(&~builder, "line");
+        attribute(&~builder, "class", "svg-axis");
+        attribute(&~builder, "stroke", "currentColor");
+        attributeInt(&~builder, "x1", x1);
+        attributeInt(&~builder, "y1", y1);
+        attributeInt(&~builder, "x2", x2);
+        attributeInt(&~builder, "y2", y2);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    -- One tick of an axis: a short line and its number beside it.
+    generic [R: Region]
+    function tickMark(builder: &![Builder, R], x: Int64, y: Int64, label_x: Int64, label_y: Int64, anchor: Span[Nat8, Static], value: Int64): Unit is
+        axisLine(&~builder, x, y, x, satAdd(y, five_i));
+        beginElement(&~builder, "text");
+        attribute(&~builder, "class", "svg-tick");
+        attribute(&~builder, "text-anchor", anchor);
+        attributeInt(&~builder, "x", label_x);
+        attributeInt(&~builder, "y", label_y);
+        let label: String := formatTick(value);
+        text(&~builder, asSpan(&label));
+        destroyString(label);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function drawXAxis(builder: &![Builder, R], frame: Frame): Unit is
+        let step: Step := tickStep(frame.xLow, frame.xHigh);
+        let s: Int64 := stepValue(step);
+        let bottom: Int64 := satAdd(frame.top, frame.height);
+        axisLine(&~builder, frame.left, bottom, satAdd(frame.left, frame.width), bottom);
+        let first_k: Int64 := firstTick(frame.xLow, step) / s;
+        let last_k: Int64 := lastTick(frame.xHigh, step) / s;
+        var k: Int64 := first_k;
+        var done: Bool := false;
+        while (not done) and (k <= last_k) do
+            let v: Int64 := k * s;
+            let x: Int64 := pixelX(frame, v);
+            tickMark(&~builder, x, bottom, x, satAdd(bottom, 18), "middle", v);
+            if k >= last_k then
+                done := true;
+            else
+                k := k + one_i;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function drawYAxis(builder: &![Builder, R], frame: Frame): Unit is
+        let step: Step := tickStep(frame.yLow, frame.yHigh);
+        let s: Int64 := stepValue(step);
+        axisLine(&~builder, frame.left, frame.top, frame.left, satAdd(frame.top, frame.height));
+        let first_k: Int64 := firstTick(frame.yLow, step) / s;
+        let last_k: Int64 := lastTick(frame.yHigh, step) / s;
+        var k: Int64 := first_k;
+        var done: Bool := false;
+        while (not done) and (k <= last_k) do
+            let v: Int64 := k * s;
+            let y: Int64 := pixelY(frame, v);
+            tickMark(&~builder, satSub(frame.left, five_i), y, satSub(frame.left, 8), satAdd(y, 4), "end", v);
+            if k >= last_k then
+                done := true;
+            else
+                k := k + one_i;
+            end if;
+        end while;
+        return nil;
+    end;
+
+    ---
+    --- Line chart
+    ---
+
+    function mostPoints(): Index is
+        return points_most;
+    end;
+
+    function mostSeries(): Index is
+        return series_most;
+    end;
+
+    generic [T: Region, X: Region, Y: Region]
+    function makeLineChart(width: Int64, height: Int64, title: Span[Nat8, T], x_label: Span[Nat8, X], y_label: Span[Nat8, Y]): LineChart is
+        let made: LineChart := LineChart(width => width, height => height, title => fromSpan(title),
+            xLabel => fromSpan(x_label), yLabel => fromSpan(y_label), xs => allocateEmpty(), ys => allocateEmpty(),
+            starts => allocateEmpty(), counts => allocateEmpty(), classPool => allocateEmpty(), classStarts => allocateEmpty());
+        return made;
+    end;
+
+    function destroyLineChart(chart: LineChart): Unit is
+        let { width: Int64, height: Int64, title: String, xLabel as x_label: String, yLabel as y_label: String, xs: Buffer[Int64],
+            ys: Buffer[Int64], starts: Buffer[Index], counts: Buffer[Index], classPool as class_pool: Buffer[Nat8],
+            classStarts as class_starts: Buffer[Index] } := chart;
+        destroyString(title);
+        destroyString(x_label);
+        destroyString(y_label);
+        destroyFree(xs);
+        destroyFree(ys);
+        destroyFree(starts);
+        destroyFree(counts);
+        destroyFree(class_pool);
+        destroyFree(class_starts);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function seriesCount(chart: &[LineChart, R]): Index is
+        return length(&(chart->starts));
+    end;
+
+    ---
+    --- Steps of the work over the chart, one path into it each
+    ---
+
+    generic [R: Region]
+    function seriesTotal(chart: &![LineChart, R]): Index is
+        return length(&(chart->starts));
+    end;
+
+    generic [R: Region]
+    function pointsTotal(chart: &![LineChart, R]): Index is
+        return length(&(chart->xs));
+    end;
+
+    generic [R: Region]
+    function pushStartOf(chart: &![LineChart, R], at: Index): Unit is
+        insertBack(&!(chart->starts), at);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushX(chart: &![LineChart, R], v: Int64): Unit is
+        insertBack(&!(chart->xs), v);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushY(chart: &![LineChart, R], v: Int64): Unit is
+        insertBack(&!(chart->ys), v);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushCount(chart: &![LineChart, R], n: Index): Unit is
+        insertBack(&!(chart->counts), n);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushClassStart(chart: &![LineChart, R], at: Index): Unit is
+        insertBack(&!(chart->classStarts), at);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushClassByte(chart: &![LineChart, R], byte: Nat8): Unit is
+        insertBack(&!(chart->classPool), byte);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function classPoolSize(chart: &![LineChart, R]): Index is
+        return length(&(chart->classPool));
+    end;
+
+    generic [R: Region, S: Region, T: Region, C: Region]
+    function addSeries(chart: &![LineChart, R], xs: &[Buffer[Int64], S], ys: &[Buffer[Int64], T], class_name: Span[Nat8, C]): Unit is
+        if seriesTotal(&~chart) >= series_most then
+            abort("Standard.Svg.addSeries: the chart holds the most series it can");
+        end if;
+        let at: Index := pointsTotal(&~chart);
+        pushStartOf(&~chart, at);
+        let n: Index := length(xs);
+        var take: Index := n;
+        if take > points_most then
+            take := points_most;
+        end if;
+        var i: Index := 0;
+        while i < take do
+            pushX(&~chart, nth(xs, i));
+            pushY(&~chart, nth(ys, i));
+            i := i + 1;
+        end while;
+        pushCount(&~chart, take);
+        let pool_at: Index := classPoolSize(&~chart);
+        pushClassStart(&~chart, pool_at);
+        var c: Index := 0;
+        while c < spanLength(class_name) do
+            pushClassByte(&~chart, class_name[c]);
+            c := c + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The class of series n, as a span of the pool.
+    generic [R: Region]
+    function classOf(chart: &[LineChart, R], n: Index): Span[Nat8, R] is
+        let start: Index := nth(&(chart->classStarts), n);
+        let pool: Span[Nat8, R] := wholeSpan(&(chart->classPool));
+        var stop: Index := spanLength(pool);
+        if (n + 1) < length(&(chart->classStarts)) then
+            stop := nth(&(chart->classStarts), n + 1);
+        end if;
+        return substring(pool, start, stop);
+    end;
+
+    -- The title of the chart above the plot, when there is one.
+    generic [B: Region, T: Region]
+    function writeTitle(builder: &![Builder, B], title: Span[Nat8, T], width: Int64): Unit is
+        if spanLength(title) = 0 then
+            return nil;
+        end if;
+        beginElement(&~builder, "text");
+        attribute(&~builder, "class", "svg-title");
+        attributeInt(&~builder, "x", width / 2);
+        attributeInt(&~builder, "y", title_y);
+        attribute(&~builder, "text-anchor", "middle");
+        text(&~builder, title);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    -- The transform that puts a turned label at x, y.
+    function turned(x: Int64, y: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "translate(");
+        let px: String := formatInt(x);
+        writeString(&!out, asSpan(&px));
+        destroyString(px);
+        writeByte(&!out, ' ');
+        let py: String := formatInt(y);
+        writeString(&!out, asSpan(&py));
+        destroyString(py);
+        writeString(&!out, ") rotate(-90)");
+        return finalize(out);
+    end;
+
+    -- The label below the axis of x or beside the axis of y, when there is
+    -- one.  The label of y stands on its side, turned a quarter way back.
+    generic [B: Region, T: Region]
+    function writeLabel(builder: &![Builder, B], label: Span[Nat8, T], x: Int64, y: Int64, on_side: Bool): Unit is
+        if spanLength(label) = 0 then
+            return nil;
+        end if;
+        beginElement(&~builder, "text");
+        attribute(&~builder, "class", "svg-label");
+        attribute(&~builder, "text-anchor", "middle");
+        if on_side then
+            let place: String := turned(x, y);
+            attribute(&~builder, "transform", asSpan(&place));
+            destroyString(place);
+        else
+            attributeInt(&~builder, "x", x);
+            attributeInt(&~builder, "y", y);
+        end if;
+        text(&~builder, label);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    -- The smallest and the largest of the data of the whole chart, for
+    -- both axes; a chart without points is drawn over 0 to 1.
+    generic [R: Region]
+    function dataRange(chart: &[LineChart, R]): Frame is
+        var x_low: Int64 := 0;
+        var x_high: Int64 := 1;
+        var y_low: Int64 := 0;
+        var y_high: Int64 := 1;
+        let n: Index := length(&(chart->xs));
+        if n > 0 then
+            x_low := nth(&(chart->xs), 0);
+            x_high := x_low;
+            y_low := nth(&(chart->ys), 0);
+            y_high := y_low;
+            var i: Index := 1;
+            while i < n do
+                let x: Int64 := nth(&(chart->xs), i);
+                let y: Int64 := nth(&(chart->ys), i);
+                if x < x_low then
+                    x_low := x;
+                end if;
+                if x > x_high then
+                    x_high := x;
+                end if;
+                if y < y_low then
+                    y_low := y;
+                end if;
+                if y > y_high then
+                    y_high := y;
+                end if;
+                i := i + 1;
+            end while;
+            if x_low = x_high then
+                x_low := satSub(x_low, one_i);
+                x_high := satAdd(x_high, one_i);
+            end if;
+            if y_low = y_high then
+                y_low := satSub(y_low, one_i);
+                y_high := satAdd(y_high, one_i);
+            end if;
+        end if;
+        let plot_w: Int64 := (chart->width - chart_left) - chart_right;
+        let plot_h: Int64 := (chart->height - chart_top) - chart_bottom;
+        return Frame(left => chart_left, top => chart_top, width => plot_w, height => plot_h,
+            xLow => x_low, xHigh => x_high, yLow => y_low, yHigh => y_high);
+    end;
+
+    -- One series: a circle for a single point, a polyline for the rest.
+    generic [B: Region, C: Region]
+    function writeSeries(builder: &![Builder, B], chart: &[LineChart, C], frame: Frame, n: Index): Unit is
+        let start: Index := nth(&(chart->starts), n);
+        let count: Index := nth(&(chart->counts), n);
+        if count = 0 then
+            return nil;
+        end if;
+        let stop: Index := start + count;
+        let xs: Span[Int64, C] := getSpan(&(chart->xs), start, stop - 1);
+        let ys: Span[Int64, C] := getSpan(&(chart->ys), start, stop - 1);
+        let class_name: Span[Nat8, C] := classOf(chart, n);
+        if count = 1 then
+            let px: Int64 := pixelX(frame, xs[0]);
+            let py: Int64 := pixelY(frame, ys[0]);
+            beginElement(&~builder, "circle");
+            if spanLength(class_name) > 0 then
+                attribute(&~builder, "class", class_name);
+            end if;
+            attributeInt(&~builder, "cx", px);
+            attributeInt(&~builder, "cy", py);
+            attributeInt(&~builder, "r", 3);
+            attribute(&~builder, "fill", "currentColor");
+            endElement(&~builder);
+            return nil;
+        end if;
+        beginElement(&~builder, "polyline");
+        if spanLength(class_name) > 0 then
+            attribute(&~builder, "class", class_name);
+        end if;
+        attribute(&~builder, "fill", "none");
+        attribute(&~builder, "stroke", "currentColor");
+        attributeInt(&~builder, "stroke-width", 2);
+        -- The points go out as pixels: each value of the data mapped first.
+        var pxs: Buffer[Int64] := allocateEmpty();
+        var pys: Buffer[Int64] := allocateEmpty();
+        var i: Index := 0;
+        while i < count do
+            insertBack(&!pxs, pixelX(frame, xs[i]));
+            insertBack(&!pys, pixelY(frame, ys[i]));
+            i := i + 1;
+        end while;
+        pointsAttribute(&~builder, wholeSpan(&pxs), wholeSpan(&pys));
+        destroyFree(pxs);
+        destroyFree(pys);
+        endElement(&~builder);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function renderLineChart(chart: &[LineChart, R]): String is
+        let frame: Frame := dataRange(chart);
+        var out: Builder := makeBuilder();
+        beginSvg(&!out, chart->width, chart->height);
+        attribute(&!out, "class", "svg-chart");
+        if stringLength(&(chart->title)) > 0 then
+            beginElement(&!out, "title");
+            text(&!out, asSpan(&(chart->title)));
+            endElement(&!out);
+        end if;
+        drawXAxis(&!out, frame);
+        drawYAxis(&!out, frame);
+        let count: Index := seriesCount(chart);
+        var n: Index := 0;
+        while n < count do
+            writeSeries(&!out, chart, frame, n);
+            n := n + 1;
+        end while;
+        writeTitle(&!out, asSpan(&(chart->title)), chart->width);
+        writeLabel(&!out, asSpan(&(chart->xLabel)), frame.left + (frame.width / 2), chart->height - 8, false);
+        writeLabel(&!out, asSpan(&(chart->yLabel)), 14, frame.top + (frame.height / 2), true);
+        endSvg(&!out);
+        return render(out);
+    end;
+end module body.

@@ -1,0 +1,1 @@
+The migration check: page.gohtml is a page for Go's html/template, page.jinja its rewrite. The expected output is Go's (scripts/jinja/go-oracle.go, run on a host with Go) on data.json, and @template renders the same bytes -- text, quoted attributes, and URLs at their start (a javascript: URL filtered), in the path and in the query.

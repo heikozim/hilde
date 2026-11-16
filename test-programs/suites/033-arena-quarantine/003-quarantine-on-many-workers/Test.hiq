@@ -1,0 +1,92 @@
+import Standard.Arena (
+    Arena,
+    arenaSpan
+);
+import Standard.Task (
+    Scope,
+    openScope,
+    closeScope,
+    Task,
+    join
+);
+import Standard.TaskArena (
+    WithArena,
+    spawnWithArena
+);
+
+module body Test is
+    -- Sum 1..n after writing them into the span.
+    generic [R: Region]
+    function fill(span: Span![Int32, R], n: Index): Int32 is
+        var sp: Span![Int32, R] := span;
+        var k: Int32 := 1;
+        for i from 0 to n - 1 do
+            sp[i] := k;
+            k := k + 1;
+        end for;
+        var sum: Int32 := 0;
+        for i from 0 to n - 1 do
+            sum := sum + sp[i];
+        end for;
+        return sum;
+    end;
+
+    -- Ten times: ask the arena for 10 Int32, fill, sum.  Each round asks
+    -- anew, so the arena hands out 400 bytes in all; 10 * 55 = 550.
+    function work(input: WithArena[Int32]): WithArena[Int32] is
+        let { value as rounds: Int32, arena: Arena } := input;
+        var a: Arena := arena;
+        var total: Int32 := 0;
+        var round: Int32 := 0;
+        while round < rounds do
+            borrow r: &![Arena, R] := &!a do
+                let got: Option[Span![Int32, R]] := arenaSpan(r, 10);
+                case got of
+                    when Some(value as sp: Span![Int32, R]) do
+                        total := total + fill(sp, 10);
+                    when None do
+                        total := total - 100000;
+                end case;
+            end borrow;
+            round := round + 1;
+        end while;
+        return WithArena(value => total, arena => a);
+    end;
+
+    -- left tasks with an arena each, all started before any is joined.
+    generic [R: Region]
+    function many(scope: &![Scope, R], left: Int32): Int32 is
+        if left = 0 then
+            return 0;
+        end if;
+        let page: ByteSize := 4096;
+        let run: Fn[WithArena[Int32], WithArena[Int32]] := work;
+        case spawnWithArena(&~scope, run, 10, page) of
+            when Right(right as task: Task[Int32]) do
+                let rest: Int32 := many(&~scope, left - 1);
+                return rest + join(task);
+            when Left(left as back: Int32) do
+                return -1;
+        end case;
+    end;
+
+    -- The quarantine is one per thread, without a
+    -- lock.  Forty tasks on four workers (env.txt) each end by freeing
+    -- their arena, into the quarantine of whichever worker ran them, while
+    -- main makes new arenas on its own; the quarantines fill and cycle.
+    -- Built with the quarantine on (cflags.txt); the gate runs it under
+    -- ThreadSanitizer as well.  40 * 550 = 22000, twice over: 44000.
+    function main(): ExitCode is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                let first: Int32 := many(&!scope, 40);
+                let second: Int32 := many(&!scope, 40);
+                printLn(first + second);
+                closeScope(scope);
+            when None do
+                printLn(-3);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

@@ -1,0 +1,248 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth,
+    getSpan,
+    asSpan
+);
+import Standard.Buffer (
+    Buffer,
+    removeFirst,
+    destroyEmpty,
+    length as bufferLength
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    Command,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    exitCode,
+    environmentValue
+);
+import Standard.Sftp (
+    Session,
+    SftpError,
+    describe,
+    startSession,
+    endSession,
+    readFile,
+    writeFile,
+    listDirectory,
+    sizeOf,
+    makeDirectory,
+    deleteFile,
+    deleteDirectory,
+    renamePath
+);
+
+module body Test is
+    -- A file of the tree: the tree's path from HILDE_TREE, which
+    -- test-programs/runner.py sets, and rest after it.  With
+    -- the variable unset -- a run by hand -- the path is rest alone,
+    -- which names nothing, and the test fails where it opens it.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        let tail: String := fromLiteral(rest);
+        writeString(&!out, asSpan(&tail));
+        destroyString(tail);
+        return finalize(out);
+    end;
+
+    -- The server: the recorded exchange, replayed by scripts/sftp/replay.py
+    -- -- or, when the programme is given one, the sftp-server named by its
+    -- first argument, which is how the exchange was checked against the
+    -- real one.
+    function serverCommand(): Command is
+        if argumentCount() > 1 then
+            let program: String := fromLiteral(nthArgument(1));
+            let command: Command := makeCommand(asSpan(&program));
+            destroyString(program);
+            return command;
+        else
+            let env: String := fromLiteral("/usr/bin/env");
+            let python: String := fromLiteral("python3");
+            let script: String := inTree("/scripts/sftp/replay.py");
+            let exchange: String := inTree("/test-programs/suites/047-sftp/001-against-openssh/exchange.txt");
+            let command: Command :=
+                addArgument(addArgument(addArgument(makeCommand(asSpan(&env)), asSpan(&python)), asSpan(&script)), asSpan(&exchange));
+            destroyString(env);
+            destroyString(python);
+            destroyString(script);
+            destroyString(exchange);
+            return command;
+        end if;
+    end;
+
+    function report(what: Span[Nat8, Static], result: Either[SftpError, Unit]): Unit is
+        print(what);
+        case result of
+            when Left(left as error: SftpError) do
+                print(": failed, code ");
+                print(error.code);
+                print(", ");
+                printLn(describe(error));
+            when Right(right as done: Unit) do
+                printLn(": done");
+        end case;
+        return nil;
+    end;
+
+    function failed(what: Span[Nat8, Static], error: SftpError): Unit is
+        let result: Either[SftpError, Unit] := Left(left => error);
+        report(what, result);
+        return nil;
+    end;
+
+    -- 32800 bytes: two WRITEs and two READs at 32768 at a time.
+    function longContent(): String is
+        let size: Index := 32800;
+        var text: String := makeString(size, 0);
+        var i: Index := 0;
+        while i < size do
+            let value: Index := ((i * 7) + 3) - (((((i * 7) + 3) / 251)) * 251);
+            case toNat8(value) of
+                when Some(value as b: Nat8) do
+                    storeNth(&!text, i, b);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return text;
+    end;
+
+    generic [R: Region]
+    function printText(text: &[String, R]): Unit is
+        if length(text) > 0 then
+            print(getSpan(text, 0, length(text) - 1));
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function same(a: &[String, R], b: &[String, S]): Bool is
+        if length(a) /= length(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < length(a) do
+            if nthByte(a, i) /= nthByte(b, i) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function run(session: &![Session, R]): Unit is
+        let hello: String := fromLiteral("hello.txt");
+        let greeting: String := fromLiteral("hello, sftp\n");
+        report("write hello.txt", writeFile(&~session, asSpan(&hello), asSpan(&greeting)));
+        case readFile(&~session, asSpan(&hello)) of
+            when Left(left as error: SftpError) do
+                failed("read hello.txt", error);
+            when Right(right as data: String) do
+                print("read hello.txt: ");
+                print(length(&data));
+                print(" bytes, the same: ");
+                printLn(same(&data, &greeting));
+                destroyString(data);
+        end case;
+        let long: String := fromLiteral("long.bin");
+        let content: String := longContent();
+        report("write long.bin", writeFile(&~session, asSpan(&long), asSpan(&content)));
+        case readFile(&~session, asSpan(&long)) of
+            when Left(left as error: SftpError) do
+                failed("read long.bin", error);
+            when Right(right as data: String) do
+                print("read long.bin: ");
+                print(length(&data));
+                print(" bytes, the same: ");
+                printLn(same(&data, &content));
+                destroyString(data);
+        end case;
+        case sizeOf(&~session, asSpan(&hello)) of
+            when Left(left as error: SftpError) do
+                failed("size of hello.txt", error);
+            when Right(right as size: Nat64) do
+                print("size of hello.txt: ");
+                printLn(size);
+        end case;
+        let missing: String := fromLiteral("missing.txt");
+        case sizeOf(&~session, asSpan(&missing)) of
+            when Left(left as error: SftpError) do
+                failed("size of missing.txt", error);
+            when Right(right as size: Nat64) do
+                print("size of missing.txt: ");
+                printLn(size);
+        end case;
+        let sub: String := fromLiteral("sub");
+        report("make sub", makeDirectory(&~session, asSpan(&sub)));
+        let here: String := fromLiteral(".");
+        case listDirectory(&~session, asSpan(&here)) of
+            when Left(left as error: SftpError) do
+                failed("list .", error);
+            when Right(right as names: Buffer[String]) do
+                print("list .:");
+                var list: Buffer[String] := names;
+                while bufferLength(&list) > 0 do
+                    let name: String := removeFirst(&!list);
+                    print(" ");
+                    printText(&name);
+                    destroyString(name);
+                end while;
+                destroyEmpty(list);
+                printLn("");
+        end case;
+        let moved: String := fromLiteral("moved.txt");
+        report("rename hello.txt to moved.txt", renamePath(&~session, asSpan(&hello), asSpan(&moved)));
+        report("delete moved.txt", deleteFile(&~session, asSpan(&moved)));
+        report("delete long.bin", deleteFile(&~session, asSpan(&long)));
+        report("delete sub", deleteDirectory(&~session, asSpan(&sub)));
+        report("delete moved.txt again", deleteFile(&~session, asSpan(&moved)));
+        destroyString(hello);
+        destroyString(greeting);
+        destroyString(long);
+        destroyString(content);
+        destroyString(missing);
+        destroyString(sub);
+        destroyString(here);
+        destroyString(moved);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case startSession(serverCommand(), 20000) of
+            when None do
+                printLn("no session");
+                return ExitFailure();
+            when Some(value as opened: Session) do
+                var session: Session := opened;
+                run(&!session);
+                let status: ProcessStatus := endSession(session);
+                print("server exit: ");
+                printLn(exitCode(status));
+                return ExitSuccess();
+        end case;
+    end;
+end module body.

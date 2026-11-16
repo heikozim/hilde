@@ -1,0 +1,1180 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The rules of Unicode's Standard Annex 29 for grapheme clusters, applied
+-- from left to right between each code point and the next.  Each code
+-- point has a class: its Grapheme_Cluster_Break in the low four bits, its
+-- Indic_Conjunct_Break in the next two and Extended_Pictographic as the
+-- bit of 64.  Three rules look further back than one code point, and a
+-- small state carries what they need: whether the run of regional
+-- indicators so far is odd, whether a pictograph with extenders and then a
+-- zero width joiner came last, and how far a conjunct has got.  The tables
+-- at the end hold records of fixed width in string literals, found by
+-- binary search; scripts/unicode/make-grapheme-tables.py writes the class
+-- table and says its format, scripts/unicode/make-width-tables.py the
+-- table of the width a terminal shows for a code point.
+import Standard.Utf8 (
+    Decoded,
+    decodedPoint,
+    decodedWidth,
+    decodeAt,
+    codePointValue
+);
+
+module body Standard.Grapheme is
+    constant record_width: Index := 14;
+    constant sixteen: Index := 16;
+
+    -- The values of Grapheme_Cluster_Break, as the generator numbers them.
+    constant gcb_cr: Index := 1;
+    constant gcb_lf: Index := 2;
+    constant gcb_control: Index := 3;
+    constant gcb_extend: Index := 4;
+    constant gcb_zwj: Index := 5;
+    constant gcb_regional: Index := 6;
+    constant gcb_prepend: Index := 7;
+    constant gcb_spacing_mark: Index := 8;
+    constant gcb_l: Index := 9;
+    constant gcb_v: Index := 10;
+    constant gcb_t: Index := 11;
+    constant gcb_lv: Index := 12;
+    constant gcb_lvt: Index := 13;
+
+    -- The values of Indic_Conjunct_Break.
+    constant incb_consonant: Index := 1;
+    constant incb_extend: Index := 2;
+    constant incb_linker: Index := 3;
+
+    -- How far a conjunct has got.
+    constant after_consonant: Index := 1;
+    constant after_linker: Index := 2;
+
+    -- What the rules that look back need.  conjunct is 0 outside a
+    -- conjunct, 1 after its consonant and 2 once a linker followed.
+    record State: Free is
+        regionalOdd: Bool;
+        pictograph: Bool;
+        pictographJoined: Bool;
+        conjunct: Index;
+    end;
+
+    -- The value of count hexadecimal digits of table from at.  The table
+    -- holds capital hexadecimal digits there; anything else is a fault of
+    -- the generator.
+    function hexAt(table: Span[Nat8, Static], at: Index, count: Index): Index is
+        var total: Index := 0;
+        var i: Index := 0;
+        while i < count do
+            let byte: Nat8 := table[at + i];
+            var digit: Index := 0;
+            if (byte >= '0') and (byte <= '9') then
+                digit := widen(byte - '0');
+            else if (byte >= 'A') and (byte <= 'F') then
+                digit := widen((byte - 'A') + 10);
+            else
+                abort("Standard.Grapheme: the table holds a byte that is not a hexadecimal digit");
+            end if;
+            total := (total * sixteen) + digit;
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    function widen(byte: Nat8): Index is
+        case toIndex(byte) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The class of a code point: the record whose run holds it, or 0.
+    function classOf(point: Index): Index is
+        let table: Span[Nat8, Static] := classTable();
+        let count: Index := spanLength(table) / record_width;
+        if (count = 0) or (hexAt(table, 0, 6) > point) then
+            return 0;
+        end if;
+        var low: Index := 0;
+        var high: Index := count - 1;
+        while low < high do
+            let middle: Index := ((low + high) + 1) / 2;
+            if hexAt(table, middle * record_width, 6) <= point then
+                low := middle;
+            else
+                high := middle - 1;
+            end if;
+        end while;
+        if point > hexAt(table, (low * record_width) + 6, 6) then
+            return 0;
+        end if;
+        return hexAt(table, (low * record_width) + 12, 2);
+    end;
+
+    function breakValue(kind: Index): Index is
+        return rem(kind, sixteen);
+    end;
+
+    function conjunctValue(kind: Index): Index is
+        let four: Index := 4;
+        return rem(kind / sixteen, four);
+    end;
+
+    function pictographic(kind: Index): Bool is
+        let sixty_four: Index := 64;
+        return (kind / sixty_four) = 1;
+    end;
+
+    -- The state before any code point.
+    function initial(): State is
+        return State(regionalOdd => false, pictograph => false, pictographJoined => false,
+            conjunct => 0);
+    end;
+
+    -- The state after a code point of the class.
+    function advance(state: State, kind: Index): State is
+        let value: Index := breakValue(kind);
+        let incb: Index := conjunctValue(kind);
+        var odd: Bool := false;
+        if value = gcb_regional then
+            odd := not state.regionalOdd;
+        end if;
+        var pictograph: Bool := false;
+        var joined: Bool := false;
+        if pictographic(kind) then
+            pictograph := true;
+        else
+            if (value = gcb_extend) and state.pictograph then
+                pictograph := true;
+            else
+                if (value = gcb_zwj) and state.pictograph then
+                    joined := true;
+                end if;
+            end if;
+        end if;
+        var conjunct: Index := 0;
+        if incb = incb_consonant then
+            conjunct := after_consonant;
+        else
+            if (incb = incb_linker) and (state.conjunct >= 1) then
+                conjunct := after_linker;
+            else
+                if (incb = incb_extend) and (state.conjunct >= 1) then
+                    conjunct := state.conjunct;
+                end if;
+            end if;
+        end if;
+        return State(regionalOdd => odd, pictograph => pictograph, pictographJoined => joined,
+            conjunct => conjunct);
+    end;
+
+    -- Whether the code point of class next stays in the cluster of the code
+    -- point of class previous, after which the state is state.  The rules
+    -- in the order of the annex, GB3 to GB13; everything else breaks.
+    function joins(previous: Index, next: Index, state: State): Bool is
+        let before: Index := breakValue(previous);
+        let after: Index := breakValue(next);
+        if (before = gcb_cr) and (after = gcb_lf) then
+            return true;
+        end if;
+        if ((before = gcb_control) or (before = gcb_cr)) or (before = gcb_lf) then
+            return false;
+        end if;
+        if ((after = gcb_control) or (after = gcb_cr)) or (after = gcb_lf) then
+            return false;
+        end if;
+        if before = gcb_l then
+            if ((after = gcb_l) or (after = gcb_v)) or ((after = gcb_lv) or (after = gcb_lvt)) then
+                return true;
+            end if;
+        end if;
+        if ((before = gcb_lv) or (before = gcb_v)) and ((after = gcb_v) or (after = gcb_t)) then
+            return true;
+        end if;
+        if ((before = gcb_lvt) or (before = gcb_t)) and (after = gcb_t) then
+            return true;
+        end if;
+        if ((after = gcb_extend) or (after = gcb_zwj)) or (after = gcb_spacing_mark) then
+            return true;
+        end if;
+        if before = gcb_prepend then
+            return true;
+        end if;
+        if (conjunctValue(next) = incb_consonant) and (state.conjunct = after_linker) then
+            return true;
+        end if;
+        if ((before = gcb_zwj) and pictographic(next)) and state.pictographJoined then
+            return true;
+        end if;
+        if ((before = gcb_regional) and (after = gcb_regional)) and state.regionalOdd then
+            return true;
+        end if;
+        return false;
+    end;
+
+    -- The code point at at, as an index, and its width in bytes; a width
+    -- of 0 when no well-formed UTF-8 begins there.
+    record Point: Free is
+        value: Index;
+        width: Index;
+    end;
+
+    generic [R: Region]
+    function pointAt(text: Span[Nat8, R], at: Index): Point is
+        case decodeAt(text, at) of
+            when Some(value as decoded: Decoded) do
+                case toIndex(codePointValue(decodedPoint(decoded))) of
+                    when Some(value as scalar: Index) do
+                        return Point(value => scalar, width => decodedWidth(decoded));
+                    when None do
+                        return Point(value => 0, width => 0);
+                end case;
+            when None do
+                return Point(value => 0, width => 0);
+        end case;
+    end;
+
+    generic [R: Region]
+    function clusterEnd(text: Span[Nat8, R], start: Index): Option[Index] is
+        let size: Index := spanLength(text);
+        if start >= size then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        let first: Point := pointAt(text, start);
+        if first.width = 0 then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        var previous: Index := classOf(first.value);
+        var state: State := advance(initial(), previous);
+        var at: Index := start + first.width;
+        var going: Bool := true;
+        while going and (at < size) do
+            let next: Point := pointAt(text, at);
+            if next.width = 0 then
+                going := false;
+            else
+                let kind: Index := classOf(next.value);
+                if joins(previous, kind, state) then
+                    state := advance(state, kind);
+                    previous := kind;
+                    at := at + next.width;
+                else
+                    going := false;
+                end if;
+            end if;
+        end while;
+        let some: Option[Index] := Some(value => at);
+        return some;
+    end;
+
+    generic [R: Region]
+    function countClusters(text: Span[Nat8, R]): Option[Index] is
+        let size: Index := spanLength(text);
+        var count: Index := 0;
+        var at: Index := 0;
+        var valid: Bool := true;
+        while valid and (at < size) do
+            case clusterEnd(text, at) of
+                when Some(value as stop: Index) do
+                    count := count + 1;
+                    at := stop;
+                when None do
+                    valid := false;
+            end case;
+        end while;
+        if valid then
+            let some: Option[Index] := Some(value => count);
+            return some;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    -- The code points of the variation selectors: 15 asks a terminal for
+    -- the text presentation of the cluster, 16 for the emoji presentation.
+    constant text_selector: Index := #xFE0E;
+    constant emoji_selector: Index := #xFE0F;
+    constant two: Index := 2;
+
+    -- The width a terminal shows for a code point: the record whose run
+    -- holds it.  The table covers every code point, so the narrow width
+    -- of 1 stands only where a fault of the generator would leave a gap.
+    function widthOf(point: Index): Index is
+        let table: Span[Nat8, Static] := widthTable();
+        let count: Index := spanLength(table) / record_width;
+        if (count = 0) or (hexAt(table, 0, 6) > point) then
+            return 1;
+        end if;
+        var low: Index := 0;
+        var high: Index := count - 1;
+        while low < high do
+            let middle: Index := ((low + high) + 1) / 2;
+            if hexAt(table, middle * record_width, 6) <= point then
+                low := middle;
+            else
+                high := middle - 1;
+            end if;
+        end while;
+        if point > hexAt(table, (low * record_width) + 6, 6) then
+            return 1;
+        end if;
+        return hexAt(table, (low * record_width) + 12, 2);
+    end;
+
+    function pointWidth(point: Index): Index is
+        return widthOf(point);
+    end;
+
+    -- Whether the cluster at at is a carriage return or a line feed,
+    -- which ends the line before it and is not part of it.
+    generic [R: Region]
+    function hardBreakAt(text: Span[Nat8, R], at: Index): Bool is
+        let p: Point := pointAt(text, at);
+        let value: Index := breakValue(classOf(p.value));
+        return (value = gcb_cr) or (value = gcb_lf);
+    end;
+
+    generic [R: Region]
+    function clusterWidth(text: Span[Nat8, R], start: Index): Option[Index] is
+        let size: Index := spanLength(text);
+        if start >= size then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        case clusterEnd(text, start) of
+            when Some(value as stop: Index) do
+                var at: Index := start;
+                var w: Index := 0;
+                var seen: Bool := false;
+                var first_kind: Index := 0;
+                var text_form: Bool := false;
+                var emoji_form: Bool := false;
+                var flags: Index := 0;
+                while at < stop do
+                    let p: Point := pointAt(text, at);
+                    let kind: Index := classOf(p.value);
+                    if not seen then
+                        seen := true;
+                        first_kind := kind;
+                        w := widthOf(p.value);
+                    end if;
+                    if p.value = text_selector then
+                        text_form := true;
+                    end if;
+                    if p.value = emoji_selector then
+                        emoji_form := true;
+                    end if;
+                    if breakValue(kind) = gcb_regional then
+                        flags := flags + 1;
+                    end if;
+                    at := at + p.width;
+                end while;
+                if w > 0 then
+                    if text_form then
+                        w := 1;
+                    else
+                        if emoji_form and pictographic(first_kind) then
+                            w := 2;
+                        else
+                            if flags = two then
+                                w := 2;
+                            end if;
+                        end if;
+                    end if;
+                end if;
+                let some: Option[Index] := Some(value => w);
+                return some;
+            when None do
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function countColumns(text: Span[Nat8, R]): Option[Index] is
+        let size: Index := spanLength(text);
+        var at: Index := 0;
+        var total: Index := 0;
+        var valid: Bool := true;
+        while valid and (at < size) do
+            case clusterEnd(text, at) of
+                when Some(value as next: Index) do
+                    case clusterWidth(text, at) of
+                        when Some(value as w: Index) do
+                            total := total + w;
+                            at := next;
+                        when None do
+                            valid := false;
+                    end case;
+                when None do
+                    valid := false;
+            end case;
+        end while;
+        if valid then
+            let some: Option[Index] := Some(value => total);
+            return some;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function fittingEnd(text: Span[Nat8, R], width: Index): Option[Index] is
+        let size: Index := spanLength(text);
+        var at: Index := 0;
+        var total: Index := 0;
+        var stop: Index := 0;
+        var going: Bool := true;
+        var valid: Bool := true;
+        while going and valid and (at < size) do
+            case clusterEnd(text, at) of
+                when Some(value as next: Index) do
+                    case clusterWidth(text, at) of
+                        when Some(value as w: Index) do
+                            if (total + w) > width then
+                                going := false;
+                            else
+                                total := total + w;
+                                stop := next;
+                                at := next;
+                            end if;
+                        when None do
+                            valid := false;
+                    end case;
+                when None do
+                    valid := false;
+            end case;
+        end while;
+        if valid then
+            let some: Option[Index] := Some(value => stop);
+            return some;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function lineEnd(text: Span[Nat8, R], width: Index, start: Index): Option[Index] is
+        let size: Index := spanLength(text);
+        if start >= size then
+            let none: Option[Index] := None();
+            return none;
+        end if;
+        var at: Index := start;
+        var total: Index := 0;
+        var taken: Index := 0;
+        var stop: Index := start;
+        var going: Bool := true;
+        var valid: Bool := true;
+        while going and valid and (at < size) do
+            if hardBreakAt(text, at) then
+                stop := at;
+                going := false;
+            else
+                case clusterEnd(text, at) of
+                    when Some(value as next: Index) do
+                        case clusterWidth(text, at) of
+                            when Some(value as w: Index) do
+                                if (taken > 0) and ((total + w) > width) then
+                                    stop := at;
+                                    going := false;
+                                else
+                                    total := total + w;
+                                    taken := taken + 1;
+                                    at := next;
+                                    stop := next;
+                                end if;
+                            when None do
+                                valid := false;
+                        end case;
+                    when None do
+                        valid := false;
+                end case;
+            end if;
+        end while;
+        if valid then
+            let some: Option[Index] := Some(value => stop);
+            return some;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    generic [R: Region]
+    function countLines(text: Span[Nat8, R], width: Index): Option[Index] is
+        let size: Index := spanLength(text);
+        var at: Index := 0;
+        var count: Index := 0;
+        var valid: Bool := true;
+        while valid and (at < size) do
+            case lineEnd(text, width, at) of
+                when Some(value as stop: Index) do
+                    count := count + 1;
+                    if stop >= size then
+                        at := size;
+                    else
+                        if hardBreakAt(text, stop) then
+                            case clusterEnd(text, stop) of
+                                when Some(value as next: Index) do
+                                    at := next;
+                                when None do
+                                    valid := false;
+                            end case;
+                        else
+                            at := stop;
+                        end if;
+                    end if;
+                when None do
+                    valid := false;
+            end case;
+        end while;
+        if valid then
+            let some: Option[Index] := Some(value => count);
+            return some;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    ---
+    --- The table, written by scripts/unicode/make-grapheme-tables.py
+    --- from the Unicode Character Database 17.0.0 and ICU.  Not edited by
+    --- hand.
+    ---
+
+    -- Runs of one class other than 0: first code point, last, class.
+    function classTable(): Span[Nat8, Static] is
+        return "0000000000090300000A00000A0200000B00000C0300000D00000D010000\
+            \0E00001F0300007F00009F030000A90000A9400000AD0000AD030000AE00\
+            \00AE4000030000036F24000483000489240005910005BD240005BF0005BF\
+            \240005C10005C2240005C40005C5240005C70005C7240006000006050700\
+            \061000061A2400061C00061C0300064B00065F24000670000670240006D6\
+            \0006DC240006DD0006DD070006DF0006E4240006E70006E8240006EA0006\
+            \ED2400070F00070F070007110007112400073000074A240007A60007B024\
+            \0007EB0007F3240007FD0007FD240008160008192400081B000823240008\
+            \250008272400082900082D2400085900085B240008900008910700089700\
+            \089F240008CA0008E1240008E20008E2070008E300090224000903000903\
+            \080009150009391000093A00093A2400093B00093B0800093C00093C2400\
+            \093E000940080009410009482400094900094C0800094D00094D3400094E\
+            \00094F080009510009572400095800095F10000962000963240009780009\
+            \7F1000098100098124000982000983080009950009A8100009AA0009B010\
+            \0009B20009B2100009B60009B9100009BC0009BC240009BE0009BE240009\
+            \BF0009C0080009C10009C4240009C70009C8080009CB0009CC080009CD00\
+            \09CD340009D70009D7240009DC0009DD100009DF0009DF100009E20009E3\
+            \240009F00009F1100009FE0009FE24000A01000A0224000A03000A030800\
+            \0A3C000A3C24000A3E000A4008000A41000A4224000A47000A4824000A4B\
+            \000A4D24000A51000A5124000A70000A7124000A75000A7524000A81000A\
+            \8224000A83000A8308000A95000AA810000AAA000AB010000AB2000AB310\
+            \000AB5000AB910000ABC000ABC24000ABE000AC008000AC1000AC524000A\
+            \C7000AC824000AC9000AC908000ACB000ACC08000ACD000ACD34000AE200\
+            \0AE324000AF9000AF910000AFA000AFF24000B01000B0124000B02000B03\
+            \08000B15000B2810000B2A000B3010000B32000B3310000B35000B391000\
+            \0B3C000B3C24000B3E000B3F24000B40000B4008000B41000B4424000B47\
+            \000B4808000B4B000B4C08000B4D000B4D34000B55000B5724000B5C000B\
+            \5D10000B5F000B5F10000B62000B6324000B71000B7110000B82000B8224\
+            \000BBE000BBE24000BBF000BBF08000BC0000BC024000BC1000BC208000B\
+            \C6000BC808000BCA000BCC08000BCD000BCD24000BD7000BD724000C0000\
+            \0C0024000C01000C0308000C04000C0424000C15000C2810000C2A000C39\
+            \10000C3C000C3C24000C3E000C4024000C41000C4408000C46000C482400\
+            \0C4A000C4C24000C4D000C4D34000C55000C5624000C58000C5A10000C62\
+            \000C6324000C81000C8124000C82000C8308000CBC000CBC24000CBE000C\
+            \BE08000CBF000CC024000CC1000CC108000CC2000CC224000CC3000CC408\
+            \000CC6000CC824000CCA000CCD24000CD5000CD624000CE2000CE324000C\
+            \F3000CF308000D00000D0124000D02000D0308000D15000D3A10000D3B00\
+            \0D3C24000D3E000D3E24000D3F000D4008000D41000D4424000D46000D48\
+            \08000D4A000D4C08000D4D000D4D34000D4E000D4E07000D57000D572400\
+            \0D62000D6324000D81000D8124000D82000D8308000DCA000DCA24000DCF\
+            \000DCF24000DD0000DD108000DD2000DD424000DD6000DD624000DD8000D\
+            \DE08000DDF000DDF24000DF2000DF308000E31000E3124000E33000E3308\
+            \000E34000E3A24000E47000E4E24000EB1000EB124000EB3000EB308000E\
+            \B4000EBC24000EC8000ECE24000F18000F1924000F35000F3524000F3700\
+            \0F3724000F39000F3924000F3E000F3F08000F71000F7E24000F7F000F7F\
+            \08000F80000F8424000F86000F8724000F8D000F9724000F99000FBC2400\
+            \0FC6000FC62400100000102A1000102D0010302400103100103108001032\
+            \001037240010390010393400103A00103A2400103B00103C0800103D0010\
+            \3E2400103F00103F10001050001055100010560010570800105800105924\
+            \00105A00105D1000105E0010602400106100106110001065001066100010\
+            \6E0010701000107100107424001075001081100010820010822400108400\
+            \1084080010850010862400108D00108D2400108E00108E1000109D00109D\
+            \2400110000115F090011600011A70A0011A80011FF0B00135D00135F2400\
+            \171200171524001732001734240017520017532400177200177324001780\
+            \0017B3100017B40017B5240017B60017B6080017B70017BD240017BE0017\
+            \C5080017C60017C6240017C70017C8080017C90017D1240017D20017D234\
+            \0017D30017D3240017DD0017DD2400180B00180D2400180E00180E030018\
+            \0F00180F24001885001886240018A90018A9240019200019222400192300\
+            \1926080019270019282400192900192B0800193000193108001932001932\
+            \240019330019380800193900193B24001A17001A1824001A19001A1A0800\
+            \1A1B001A1B24001A20001A5410001A55001A5508001A56001A5624001A57\
+            \001A5708001A58001A5E24001A60001A6034001A62001A6224001A65001A\
+            \6C24001A6D001A7208001A73001A7C24001A7F001A7F24001AB0001ADD24\
+            \001AE0001AEB24001B00001B0324001B04001B0408001B0B001B0C10001B\
+            \13001B3310001B34001B3D24001B3E001B4108001B42001B4324001B4400\
+            \1B4434001B45001B4C10001B6B001B7324001B80001B8124001B82001B82\
+            \08001B83001BA010001BA1001BA108001BA2001BA524001BA6001BA70800\
+            \1BA8001BAA24001BAB001BAB34001BAC001BAD24001BAE001BAF10001BBB\
+            \001BBD10001BE6001BE624001BE7001BE708001BE8001BE924001BEA001B\
+            \EC08001BED001BED24001BEE001BEE08001BEF001BF324001C24001C2B08\
+            \001C2C001C3324001C34001C3508001C36001C3724001CD0001CD224001C\
+            \D4001CE024001CE1001CE108001CE2001CE824001CED001CED24001CF400\
+            \1CF424001CF7001CF708001CF8001CF924001DC0001DFF2400200B00200B\
+            \0300200C00200C0400200D00200D2500200E00200F0300202800202E0300\
+            \203C00203C400020490020494000206000206F030020D00020F024002122\
+            \0021224000213900213940002194002199400021A90021AA4000231A0023\
+            \1B40002328002328400023CF0023CF400023E90023F3400023F80023FA40\
+            \0024C20024C2400025AA0025AB400025B60025B6400025C00025C0400025\
+            \FB0025FE400026000026044000260E00260E400026110026114000261400\
+            \2615400026180026184000261D00261D4000262000262040002622002623\
+            \400026260026264000262A00262A4000262E00262F4000263800263A4000\
+            \264000264040002642002642400026480026534000265F00266040002663\
+            \00266340002665002666400026680026684000267B00267B4000267E0026\
+            \7F40002692002697400026990026994000269B00269C400026A00026A140\
+            \0026A70026A7400026AA0026AB400026B00026B1400026BD0026BE400026\
+            \C40026C5400026C80026C8400026CE0026CF400026D10026D1400026D300\
+            \26D4400026E90026EA400026F00026F5400026F70026FA400026FD0026FD\
+            \40002702002702400027050027054000270800270D4000270F00270F4000\
+            \271200271240002714002714400027160027164000271D00271D40002721\
+            \002721400027280027284000273300273440002744002744400027470027\
+            \474000274C00274C4000274E00274E400027530027554000275700275740\
+            \00276300276440002795002797400027A10027A1400027B00027B0400027\
+            \BF0027BF4000293400293540002B05002B0740002B1B002B1C40002B5000\
+            \2B5040002B55002B5540002CEF002CF124002D7F002D7F24002DE0002DFF\
+            \2400302A00302F240030300030304000303D00303D4000309900309A2400\
+            \3297003297400032990032994000A66F00A6722400A67400A67D2400A69E\
+            \00A69F2400A6F000A6F12400A80200A8022400A80600A8062400A80B00A8\
+            \0B2400A82300A8240800A82500A8262400A82700A8270800A82C00A82C24\
+            \00A88000A8810800A8B400A8C30800A8C400A8C52400A8E000A8F12400A8\
+            \FF00A8FF2400A92600A92D2400A94700A9512400A95200A9520800A95300\
+            \A9532400A96000A97C0900A98000A9822400A98300A9830800A98900A98B\
+            \1000A98F00A9B21000A9B300A9B32400A9B400A9B50800A9B600A9B92400\
+            \A9BA00A9BB0800A9BC00A9BD2400A9BE00A9BF0800A9C000A9C03400A9E0\
+            \00A9E41000A9E500A9E52400A9E700A9EF1000A9FA00A9FE1000AA2900AA\
+            \2E2400AA2F00AA300800AA3100AA322400AA3300AA340800AA3500AA3624\
+            \00AA4300AA432400AA4C00AA4C2400AA4D00AA4D0800AA6000AA6F1000AA\
+            \7100AA731000AA7A00AA7A1000AA7C00AA7C2400AA7E00AA7F1000AAB000\
+            \AAB02400AAB200AAB42400AAB700AAB82400AABE00AABF2400AAC100AAC1\
+            \2400AAE000AAEA1000AAEB00AAEB0800AAEC00AAED2400AAEE00AAEF0800\
+            \AAF500AAF50800AAF600AAF63400ABC000ABDA1000ABE300ABE40800ABE5\
+            \00ABE52400ABE600ABE70800ABE800ABE82400ABE900ABEA0800ABEC00AB\
+            \EC0800ABED00ABED2400AC0000AC000C00AC0100AC1B0D00AC1C00AC1C0C\
+            \00AC1D00AC370D00AC3800AC380C00AC3900AC530D00AC5400AC540C00AC\
+            \5500AC6F0D00AC7000AC700C00AC7100AC8B0D00AC8C00AC8C0C00AC8D00\
+            \ACA70D00ACA800ACA80C00ACA900ACC30D00ACC400ACC40C00ACC500ACDF\
+            \0D00ACE000ACE00C00ACE100ACFB0D00ACFC00ACFC0C00ACFD00AD170D00\
+            \AD1800AD180C00AD1900AD330D00AD3400AD340C00AD3500AD4F0D00AD50\
+            \00AD500C00AD5100AD6B0D00AD6C00AD6C0C00AD6D00AD870D00AD8800AD\
+            \880C00AD8900ADA30D00ADA400ADA40C00ADA500ADBF0D00ADC000ADC00C\
+            \00ADC100ADDB0D00ADDC00ADDC0C00ADDD00ADF70D00ADF800ADF80C00AD\
+            \F900AE130D00AE1400AE140C00AE1500AE2F0D00AE3000AE300C00AE3100\
+            \AE4B0D00AE4C00AE4C0C00AE4D00AE670D00AE6800AE680C00AE6900AE83\
+            \0D00AE8400AE840C00AE8500AE9F0D00AEA000AEA00C00AEA100AEBB0D00\
+            \AEBC00AEBC0C00AEBD00AED70D00AED800AED80C00AED900AEF30D00AEF4\
+            \00AEF40C00AEF500AF0F0D00AF1000AF100C00AF1100AF2B0D00AF2C00AF\
+            \2C0C00AF2D00AF470D00AF4800AF480C00AF4900AF630D00AF6400AF640C\
+            \00AF6500AF7F0D00AF8000AF800C00AF8100AF9B0D00AF9C00AF9C0C00AF\
+            \9D00AFB70D00AFB800AFB80C00AFB900AFD30D00AFD400AFD40C00AFD500\
+            \AFEF0D00AFF000AFF00C00AFF100B00B0D00B00C00B00C0C00B00D00B027\
+            \0D00B02800B0280C00B02900B0430D00B04400B0440C00B04500B05F0D00\
+            \B06000B0600C00B06100B07B0D00B07C00B07C0C00B07D00B0970D00B098\
+            \00B0980C00B09900B0B30D00B0B400B0B40C00B0B500B0CF0D00B0D000B0\
+            \D00C00B0D100B0EB0D00B0EC00B0EC0C00B0ED00B1070D00B10800B1080C\
+            \00B10900B1230D00B12400B1240C00B12500B13F0D00B14000B1400C00B1\
+            \4100B15B0D00B15C00B15C0C00B15D00B1770D00B17800B1780C00B17900\
+            \B1930D00B19400B1940C00B19500B1AF0D00B1B000B1B00C00B1B100B1CB\
+            \0D00B1CC00B1CC0C00B1CD00B1E70D00B1E800B1E80C00B1E900B2030D00\
+            \B20400B2040C00B20500B21F0D00B22000B2200C00B22100B23B0D00B23C\
+            \00B23C0C00B23D00B2570D00B25800B2580C00B25900B2730D00B27400B2\
+            \740C00B27500B28F0D00B29000B2900C00B29100B2AB0D00B2AC00B2AC0C\
+            \00B2AD00B2C70D00B2C800B2C80C00B2C900B2E30D00B2E400B2E40C00B2\
+            \E500B2FF0D00B30000B3000C00B30100B31B0D00B31C00B31C0C00B31D00\
+            \B3370D00B33800B3380C00B33900B3530D00B35400B3540C00B35500B36F\
+            \0D00B37000B3700C00B37100B38B0D00B38C00B38C0C00B38D00B3A70D00\
+            \B3A800B3A80C00B3A900B3C30D00B3C400B3C40C00B3C500B3DF0D00B3E0\
+            \00B3E00C00B3E100B3FB0D00B3FC00B3FC0C00B3FD00B4170D00B41800B4\
+            \180C00B41900B4330D00B43400B4340C00B43500B44F0D00B45000B4500C\
+            \00B45100B46B0D00B46C00B46C0C00B46D00B4870D00B48800B4880C00B4\
+            \8900B4A30D00B4A400B4A40C00B4A500B4BF0D00B4C000B4C00C00B4C100\
+            \B4DB0D00B4DC00B4DC0C00B4DD00B4F70D00B4F800B4F80C00B4F900B513\
+            \0D00B51400B5140C00B51500B52F0D00B53000B5300C00B53100B54B0D00\
+            \B54C00B54C0C00B54D00B5670D00B56800B5680C00B56900B5830D00B584\
+            \00B5840C00B58500B59F0D00B5A000B5A00C00B5A100B5BB0D00B5BC00B5\
+            \BC0C00B5BD00B5D70D00B5D800B5D80C00B5D900B5F30D00B5F400B5F40C\
+            \00B5F500B60F0D00B61000B6100C00B61100B62B0D00B62C00B62C0C00B6\
+            \2D00B6470D00B64800B6480C00B64900B6630D00B66400B6640C00B66500\
+            \B67F0D00B68000B6800C00B68100B69B0D00B69C00B69C0C00B69D00B6B7\
+            \0D00B6B800B6B80C00B6B900B6D30D00B6D400B6D40C00B6D500B6EF0D00\
+            \B6F000B6F00C00B6F100B70B0D00B70C00B70C0C00B70D00B7270D00B728\
+            \00B7280C00B72900B7430D00B74400B7440C00B74500B75F0D00B76000B7\
+            \600C00B76100B77B0D00B77C00B77C0C00B77D00B7970D00B79800B7980C\
+            \00B79900B7B30D00B7B400B7B40C00B7B500B7CF0D00B7D000B7D00C00B7\
+            \D100B7EB0D00B7EC00B7EC0C00B7ED00B8070D00B80800B8080C00B80900\
+            \B8230D00B82400B8240C00B82500B83F0D00B84000B8400C00B84100B85B\
+            \0D00B85C00B85C0C00B85D00B8770D00B87800B8780C00B87900B8930D00\
+            \B89400B8940C00B89500B8AF0D00B8B000B8B00C00B8B100B8CB0D00B8CC\
+            \00B8CC0C00B8CD00B8E70D00B8E800B8E80C00B8E900B9030D00B90400B9\
+            \040C00B90500B91F0D00B92000B9200C00B92100B93B0D00B93C00B93C0C\
+            \00B93D00B9570D00B95800B9580C00B95900B9730D00B97400B9740C00B9\
+            \7500B98F0D00B99000B9900C00B99100B9AB0D00B9AC00B9AC0C00B9AD00\
+            \B9C70D00B9C800B9C80C00B9C900B9E30D00B9E400B9E40C00B9E500B9FF\
+            \0D00BA0000BA000C00BA0100BA1B0D00BA1C00BA1C0C00BA1D00BA370D00\
+            \BA3800BA380C00BA3900BA530D00BA5400BA540C00BA5500BA6F0D00BA70\
+            \00BA700C00BA7100BA8B0D00BA8C00BA8C0C00BA8D00BAA70D00BAA800BA\
+            \A80C00BAA900BAC30D00BAC400BAC40C00BAC500BADF0D00BAE000BAE00C\
+            \00BAE100BAFB0D00BAFC00BAFC0C00BAFD00BB170D00BB1800BB180C00BB\
+            \1900BB330D00BB3400BB340C00BB3500BB4F0D00BB5000BB500C00BB5100\
+            \BB6B0D00BB6C00BB6C0C00BB6D00BB870D00BB8800BB880C00BB8900BBA3\
+            \0D00BBA400BBA40C00BBA500BBBF0D00BBC000BBC00C00BBC100BBDB0D00\
+            \BBDC00BBDC0C00BBDD00BBF70D00BBF800BBF80C00BBF900BC130D00BC14\
+            \00BC140C00BC1500BC2F0D00BC3000BC300C00BC3100BC4B0D00BC4C00BC\
+            \4C0C00BC4D00BC670D00BC6800BC680C00BC6900BC830D00BC8400BC840C\
+            \00BC8500BC9F0D00BCA000BCA00C00BCA100BCBB0D00BCBC00BCBC0C00BC\
+            \BD00BCD70D00BCD800BCD80C00BCD900BCF30D00BCF400BCF40C00BCF500\
+            \BD0F0D00BD1000BD100C00BD1100BD2B0D00BD2C00BD2C0C00BD2D00BD47\
+            \0D00BD4800BD480C00BD4900BD630D00BD6400BD640C00BD6500BD7F0D00\
+            \BD8000BD800C00BD8100BD9B0D00BD9C00BD9C0C00BD9D00BDB70D00BDB8\
+            \00BDB80C00BDB900BDD30D00BDD400BDD40C00BDD500BDEF0D00BDF000BD\
+            \F00C00BDF100BE0B0D00BE0C00BE0C0C00BE0D00BE270D00BE2800BE280C\
+            \00BE2900BE430D00BE4400BE440C00BE4500BE5F0D00BE6000BE600C00BE\
+            \6100BE7B0D00BE7C00BE7C0C00BE7D00BE970D00BE9800BE980C00BE9900\
+            \BEB30D00BEB400BEB40C00BEB500BECF0D00BED000BED00C00BED100BEEB\
+            \0D00BEEC00BEEC0C00BEED00BF070D00BF0800BF080C00BF0900BF230D00\
+            \BF2400BF240C00BF2500BF3F0D00BF4000BF400C00BF4100BF5B0D00BF5C\
+            \00BF5C0C00BF5D00BF770D00BF7800BF780C00BF7900BF930D00BF9400BF\
+            \940C00BF9500BFAF0D00BFB000BFB00C00BFB100BFCB0D00BFCC00BFCC0C\
+            \00BFCD00BFE70D00BFE800BFE80C00BFE900C0030D00C00400C0040C00C0\
+            \0500C01F0D00C02000C0200C00C02100C03B0D00C03C00C03C0C00C03D00\
+            \C0570D00C05800C0580C00C05900C0730D00C07400C0740C00C07500C08F\
+            \0D00C09000C0900C00C09100C0AB0D00C0AC00C0AC0C00C0AD00C0C70D00\
+            \C0C800C0C80C00C0C900C0E30D00C0E400C0E40C00C0E500C0FF0D00C100\
+            \00C1000C00C10100C11B0D00C11C00C11C0C00C11D00C1370D00C13800C1\
+            \380C00C13900C1530D00C15400C1540C00C15500C16F0D00C17000C1700C\
+            \00C17100C18B0D00C18C00C18C0C00C18D00C1A70D00C1A800C1A80C00C1\
+            \A900C1C30D00C1C400C1C40C00C1C500C1DF0D00C1E000C1E00C00C1E100\
+            \C1FB0D00C1FC00C1FC0C00C1FD00C2170D00C21800C2180C00C21900C233\
+            \0D00C23400C2340C00C23500C24F0D00C25000C2500C00C25100C26B0D00\
+            \C26C00C26C0C00C26D00C2870D00C28800C2880C00C28900C2A30D00C2A4\
+            \00C2A40C00C2A500C2BF0D00C2C000C2C00C00C2C100C2DB0D00C2DC00C2\
+            \DC0C00C2DD00C2F70D00C2F800C2F80C00C2F900C3130D00C31400C3140C\
+            \00C31500C32F0D00C33000C3300C00C33100C34B0D00C34C00C34C0C00C3\
+            \4D00C3670D00C36800C3680C00C36900C3830D00C38400C3840C00C38500\
+            \C39F0D00C3A000C3A00C00C3A100C3BB0D00C3BC00C3BC0C00C3BD00C3D7\
+            \0D00C3D800C3D80C00C3D900C3F30D00C3F400C3F40C00C3F500C40F0D00\
+            \C41000C4100C00C41100C42B0D00C42C00C42C0C00C42D00C4470D00C448\
+            \00C4480C00C44900C4630D00C46400C4640C00C46500C47F0D00C48000C4\
+            \800C00C48100C49B0D00C49C00C49C0C00C49D00C4B70D00C4B800C4B80C\
+            \00C4B900C4D30D00C4D400C4D40C00C4D500C4EF0D00C4F000C4F00C00C4\
+            \F100C50B0D00C50C00C50C0C00C50D00C5270D00C52800C5280C00C52900\
+            \C5430D00C54400C5440C00C54500C55F0D00C56000C5600C00C56100C57B\
+            \0D00C57C00C57C0C00C57D00C5970D00C59800C5980C00C59900C5B30D00\
+            \C5B400C5B40C00C5B500C5CF0D00C5D000C5D00C00C5D100C5EB0D00C5EC\
+            \00C5EC0C00C5ED00C6070D00C60800C6080C00C60900C6230D00C62400C6\
+            \240C00C62500C63F0D00C64000C6400C00C64100C65B0D00C65C00C65C0C\
+            \00C65D00C6770D00C67800C6780C00C67900C6930D00C69400C6940C00C6\
+            \9500C6AF0D00C6B000C6B00C00C6B100C6CB0D00C6CC00C6CC0C00C6CD00\
+            \C6E70D00C6E800C6E80C00C6E900C7030D00C70400C7040C00C70500C71F\
+            \0D00C72000C7200C00C72100C73B0D00C73C00C73C0C00C73D00C7570D00\
+            \C75800C7580C00C75900C7730D00C77400C7740C00C77500C78F0D00C790\
+            \00C7900C00C79100C7AB0D00C7AC00C7AC0C00C7AD00C7C70D00C7C800C7\
+            \C80C00C7C900C7E30D00C7E400C7E40C00C7E500C7FF0D00C80000C8000C\
+            \00C80100C81B0D00C81C00C81C0C00C81D00C8370D00C83800C8380C00C8\
+            \3900C8530D00C85400C8540C00C85500C86F0D00C87000C8700C00C87100\
+            \C88B0D00C88C00C88C0C00C88D00C8A70D00C8A800C8A80C00C8A900C8C3\
+            \0D00C8C400C8C40C00C8C500C8DF0D00C8E000C8E00C00C8E100C8FB0D00\
+            \C8FC00C8FC0C00C8FD00C9170D00C91800C9180C00C91900C9330D00C934\
+            \00C9340C00C93500C94F0D00C95000C9500C00C95100C96B0D00C96C00C9\
+            \6C0C00C96D00C9870D00C98800C9880C00C98900C9A30D00C9A400C9A40C\
+            \00C9A500C9BF0D00C9C000C9C00C00C9C100C9DB0D00C9DC00C9DC0C00C9\
+            \DD00C9F70D00C9F800C9F80C00C9F900CA130D00CA1400CA140C00CA1500\
+            \CA2F0D00CA3000CA300C00CA3100CA4B0D00CA4C00CA4C0C00CA4D00CA67\
+            \0D00CA6800CA680C00CA6900CA830D00CA8400CA840C00CA8500CA9F0D00\
+            \CAA000CAA00C00CAA100CABB0D00CABC00CABC0C00CABD00CAD70D00CAD8\
+            \00CAD80C00CAD900CAF30D00CAF400CAF40C00CAF500CB0F0D00CB1000CB\
+            \100C00CB1100CB2B0D00CB2C00CB2C0C00CB2D00CB470D00CB4800CB480C\
+            \00CB4900CB630D00CB6400CB640C00CB6500CB7F0D00CB8000CB800C00CB\
+            \8100CB9B0D00CB9C00CB9C0C00CB9D00CBB70D00CBB800CBB80C00CBB900\
+            \CBD30D00CBD400CBD40C00CBD500CBEF0D00CBF000CBF00C00CBF100CC0B\
+            \0D00CC0C00CC0C0C00CC0D00CC270D00CC2800CC280C00CC2900CC430D00\
+            \CC4400CC440C00CC4500CC5F0D00CC6000CC600C00CC6100CC7B0D00CC7C\
+            \00CC7C0C00CC7D00CC970D00CC9800CC980C00CC9900CCB30D00CCB400CC\
+            \B40C00CCB500CCCF0D00CCD000CCD00C00CCD100CCEB0D00CCEC00CCEC0C\
+            \00CCED00CD070D00CD0800CD080C00CD0900CD230D00CD2400CD240C00CD\
+            \2500CD3F0D00CD4000CD400C00CD4100CD5B0D00CD5C00CD5C0C00CD5D00\
+            \CD770D00CD7800CD780C00CD7900CD930D00CD9400CD940C00CD9500CDAF\
+            \0D00CDB000CDB00C00CDB100CDCB0D00CDCC00CDCC0C00CDCD00CDE70D00\
+            \CDE800CDE80C00CDE900CE030D00CE0400CE040C00CE0500CE1F0D00CE20\
+            \00CE200C00CE2100CE3B0D00CE3C00CE3C0C00CE3D00CE570D00CE5800CE\
+            \580C00CE5900CE730D00CE7400CE740C00CE7500CE8F0D00CE9000CE900C\
+            \00CE9100CEAB0D00CEAC00CEAC0C00CEAD00CEC70D00CEC800CEC80C00CE\
+            \C900CEE30D00CEE400CEE40C00CEE500CEFF0D00CF0000CF000C00CF0100\
+            \CF1B0D00CF1C00CF1C0C00CF1D00CF370D00CF3800CF380C00CF3900CF53\
+            \0D00CF5400CF540C00CF5500CF6F0D00CF7000CF700C00CF7100CF8B0D00\
+            \CF8C00CF8C0C00CF8D00CFA70D00CFA800CFA80C00CFA900CFC30D00CFC4\
+            \00CFC40C00CFC500CFDF0D00CFE000CFE00C00CFE100CFFB0D00CFFC00CF\
+            \FC0C00CFFD00D0170D00D01800D0180C00D01900D0330D00D03400D0340C\
+            \00D03500D04F0D00D05000D0500C00D05100D06B0D00D06C00D06C0C00D0\
+            \6D00D0870D00D08800D0880C00D08900D0A30D00D0A400D0A40C00D0A500\
+            \D0BF0D00D0C000D0C00C00D0C100D0DB0D00D0DC00D0DC0C00D0DD00D0F7\
+            \0D00D0F800D0F80C00D0F900D1130D00D11400D1140C00D11500D12F0D00\
+            \D13000D1300C00D13100D14B0D00D14C00D14C0C00D14D00D1670D00D168\
+            \00D1680C00D16900D1830D00D18400D1840C00D18500D19F0D00D1A000D1\
+            \A00C00D1A100D1BB0D00D1BC00D1BC0C00D1BD00D1D70D00D1D800D1D80C\
+            \00D1D900D1F30D00D1F400D1F40C00D1F500D20F0D00D21000D2100C00D2\
+            \1100D22B0D00D22C00D22C0C00D22D00D2470D00D24800D2480C00D24900\
+            \D2630D00D26400D2640C00D26500D27F0D00D28000D2800C00D28100D29B\
+            \0D00D29C00D29C0C00D29D00D2B70D00D2B800D2B80C00D2B900D2D30D00\
+            \D2D400D2D40C00D2D500D2EF0D00D2F000D2F00C00D2F100D30B0D00D30C\
+            \00D30C0C00D30D00D3270D00D32800D3280C00D32900D3430D00D34400D3\
+            \440C00D34500D35F0D00D36000D3600C00D36100D37B0D00D37C00D37C0C\
+            \00D37D00D3970D00D39800D3980C00D39900D3B30D00D3B400D3B40C00D3\
+            \B500D3CF0D00D3D000D3D00C00D3D100D3EB0D00D3EC00D3EC0C00D3ED00\
+            \D4070D00D40800D4080C00D40900D4230D00D42400D4240C00D42500D43F\
+            \0D00D44000D4400C00D44100D45B0D00D45C00D45C0C00D45D00D4770D00\
+            \D47800D4780C00D47900D4930D00D49400D4940C00D49500D4AF0D00D4B0\
+            \00D4B00C00D4B100D4CB0D00D4CC00D4CC0C00D4CD00D4E70D00D4E800D4\
+            \E80C00D4E900D5030D00D50400D5040C00D50500D51F0D00D52000D5200C\
+            \00D52100D53B0D00D53C00D53C0C00D53D00D5570D00D55800D5580C00D5\
+            \5900D5730D00D57400D5740C00D57500D58F0D00D59000D5900C00D59100\
+            \D5AB0D00D5AC00D5AC0C00D5AD00D5C70D00D5C800D5C80C00D5C900D5E3\
+            \0D00D5E400D5E40C00D5E500D5FF0D00D60000D6000C00D60100D61B0D00\
+            \D61C00D61C0C00D61D00D6370D00D63800D6380C00D63900D6530D00D654\
+            \00D6540C00D65500D66F0D00D67000D6700C00D67100D68B0D00D68C00D6\
+            \8C0C00D68D00D6A70D00D6A800D6A80C00D6A900D6C30D00D6C400D6C40C\
+            \00D6C500D6DF0D00D6E000D6E00C00D6E100D6FB0D00D6FC00D6FC0C00D6\
+            \FD00D7170D00D71800D7180C00D71900D7330D00D73400D7340C00D73500\
+            \D74F0D00D75000D7500C00D75100D76B0D00D76C00D76C0C00D76D00D787\
+            \0D00D78800D7880C00D78900D7A30D00D7B000D7C60A00D7CB00D7FB0B00\
+            \FB1E00FB1E2400FE0000FE0F2400FE2000FE2F2400FEFF00FEFF0300FF9E\
+            \00FF9F2400FFF000FFFB030101FD0101FD240102E00102E0240103760103\
+            \7A24010A00010A0010010A01010A0324010A05010A0624010A0C010A0F24\
+            \010A10010A1310010A15010A1710010A19010A3510010A38010A3A24010A\
+            \3F010A3F34010AE5010AE624010D24010D2724010D69010D6D24010EAB01\
+            \0EAC24010EFA010EFF24010F46010F5024010F82010F8524011000011000\
+            \080110010110012401100201100208011038011046240110700110702401\
+            \10730110742401107F01108124011082011082080110B00110B2080110B3\
+            \0110B6240110B70110B8080110B90110BA240110BD0110BD070110C20110\
+            \C2240110CD0110CD07011100011102240111030111261001112701112B24\
+            \01112C01112C0801112D0111322401113301113334011134011134240111\
+            \440111441001114501114608011147011147100111730111732401118001\
+            \118124011182011182080111B30111B5080111B60111BE240111BF0111BF\
+            \080111C00111C0240111C20111C3070111C90111CC240111CE0111CE0801\
+            \11CF0111CF2401122C01122E0801122F0112312401123201123308011234\
+            \0112372401123E01123E24011241011241240112DF0112DF240112E00112\
+            \E2080112E30112EA24011300011301240113020113030801133B01133C24\
+            \01133E01133E2401133F01133F0801134001134024011341011344080113\
+            \470113480801134B01134C0801134D01134D240113570113572401136201\
+            \13630801136601136C24011370011374240113800113891001138B01138B\
+            \1001138E01138E100113900113B5100113B80113B8240113B90113BA0801\
+            \13BB0113C0240113C20113C2240113C50113C5240113C70113C9240113CA\
+            \0113CA080113CC0113CD080113CE0113CF240113D00113D0340113D10113\
+            \D1070113D20113D2240113E10113E2240114350114370801143801143F24\
+            \011440011441080114420114442401144501144508011446011446240114\
+            \5E01145E240114B00114B0240114B10114B2080114B30114B8240114B901\
+            \14B9080114BA0114BA240114BB0114BC080114BD0114BD240114BE0114BE\
+            \080114BF0114C0240114C10114C1080114C20114C3240115AF0115AF2401\
+            \15B00115B1080115B20115B5240115B80115BB080115BC0115BD240115BE\
+            \0115BE080115BF0115C0240115DC0115DD24011630011632080116330116\
+            \3A2401163B01163C0801163D01163D2401163E01163E0801163F01164024\
+            \0116AB0116AB240116AC0116AC080116AD0116AD240116AE0116AF080116\
+            \B00116B72401171D01171D2401171E01171E0801171F01171F2401172201\
+            \1725240117260117260801172701172B2401182C01182E0801182F011837\
+            \240118380118380801183901183A24011900011906100119090119091001\
+            \190C011913100119150119161001191801192F1001193001193024011931\
+            \011935080119370119380801193B01193D2401193E01193E3401193F0119\
+            \3F0701194001194008011941011941070119420119420801194301194324\
+            \0119D10119D3080119D40119D7240119DA0119DB240119DC0119DF080119\
+            \E00119E0240119E40119E408011A00011A0010011A01011A0A24011A0B01\
+            \1A3210011A33011A3824011A39011A3908011A3B011A3E24011A47011A47\
+            \34011A50011A5010011A51011A5624011A57011A5808011A59011A5B2401\
+            \1A5C011A8310011A84011A8907011A8A011A9624011A97011A9708011A98\
+            \011A9824011A99011A9934011B60011B6024011B61011B6108011B62011B\
+            \6424011B65011B6508011B66011B6624011B67011B6708011C2F011C2F08\
+            \011C30011C3624011C38011C3D24011C3E011C3E08011C3F011C3F24011C\
+            \92011CA724011CA9011CA908011CAA011CB024011CB1011CB108011CB201\
+            \1CB324011CB4011CB408011CB5011CB624011D31011D3624011D3A011D3A\
+            \24011D3C011D3D24011D3F011D4524011D46011D4607011D47011D472401\
+            \1D8A011D8E08011D90011D9124011D93011D9408011D95011D9524011D96\
+            \011D9608011D97011D9724011EF3011EF424011EF5011EF608011F00011F\
+            \0124011F02011F0207011F03011F0308011F04011F1010011F12011F3310\
+            \011F34011F3508011F36011F3A24011F3E011F3F08011F40011F4124011F\
+            \42011F4234011F5A011F5A2401343001343F030134400134402401344701\
+            \34552401611E0161292401612A01612C0801612D01612F24016AF0016AF4\
+            \24016B30016B3624016D63016D630A016D67016D6A0A016F4F016F4F2401\
+            \6F51016F8708016F8F016F9224016FE4016FE424016FF0016FF12401BC9D\
+            \01BC9E2401BCA001BCA30301CF0001CF2D2401CF3001CF462401D16501D1\
+            \692401D16D01D1722401D17301D17A0301D17B01D1822401D18501D18B24\
+            \01D1AA01D1AD2401D24201D2442401DA0001DA362401DA3B01DA6C2401DA\
+            \7501DA752401DA8401DA842401DA9B01DA9F2401DAA101DAAF2401E00001\
+            \E0062401E00801E0182401E01B01E0212401E02301E0242401E02601E02A\
+            \2401E08F01E08F2401E13001E1362401E2AE01E2AE2401E2EC01E2EF2401\
+            \E4EC01E4EF2401E5EE01E5EF2401E6E301E6E32401E6E601E6E62401E6EE\
+            \01E6EF2401E6F501E6F52401E8D001E8D62401E94401E94A2401F00401F0\
+            \044001F02C01F02F4001F09401F09F4001F0AF01F0B04001F0C001F0C040\
+            \01F0CF01F0D04001F0F601F0FF4001F17001F1714001F17E01F17F4001F1\
+            \8E01F18E4001F19101F19A4001F1AE01F1E54001F1E601F1FF0601F20101\
+            \F20F4001F21A01F21A4001F22F01F22F4001F23201F23A4001F23C01F23F\
+            \4001F24901F25F4001F26601F3214001F32401F3934001F39601F3974001\
+            \F39901F39B4001F39E01F3F04001F3F301F3F54001F3F701F3FA4001F3FB\
+            \01F3FF2401F40001F4FD4001F4FF01F53D4001F54901F54E4001F55001F5\
+            \674001F56F01F5704001F57301F57A4001F58701F5874001F58A01F58D40\
+            \01F59001F5904001F59501F5964001F5A401F5A54001F5A801F5A84001F5\
+            \B101F5B24001F5BC01F5BC4001F5C201F5C44001F5D101F5D34001F5DC01\
+            \F5DE4001F5E101F5E14001F5E301F5E34001F5E801F5E84001F5EF01F5EF\
+            \4001F5F301F5F34001F5FA01F64F4001F68001F6C54001F6CB01F6D24001\
+            \F6D501F6E54001F6E901F6E94001F6EB01F6F04001F6F301F6FF4001F7DA\
+            \01F7FF4001F80C01F80F4001F84801F84F4001F85A01F85F4001F88801F8\
+            \8F4001F8AE01F8AF4001F8BC01F8BF4001F8C201F8CF4001F8D901F8FF40\
+            \01F90C01F93A4001F93C01F9454001F94701F9FF4001FA5801FA5F4001FA\
+            \6E01FAFF4001FC0001FFFD400E00000E001F030E00200E007F240E00800E\
+            \00FF030E01000E01EF240E01F00E0FFF03";
+    end;
+
+    ---
+    --- The table, written by scripts/unicode/make-width-tables.py
+    --- from the Unicode Character Database 17.0.0.  Not edited by
+    --- hand.
+    ---
+
+    -- Runs of one width: first code point, last, the width.
+    function widthTable(): Span[Nat8, Static] is
+        return "00000000001F0000002000007E0100007F00009F000000A00000AC010000\
+            \AD0000AD000000AE0002FF0100030000036F000003700004820100048300\
+            \04890000048A000590010005910005BD000005BE0005BE010005BF0005BF\
+            \000005C00005C0010005C10005C2000005C30005C3010005C40005C50000\
+            \05C60005C6010005C70005C7000005C80005FF0100060000060500000606\
+            \00060F0100061000061A0000061B00061B0100061C00061C0000061D0006\
+            \4A0100064B00065F0000066000066F01000670000670000006710006D501\
+            \0006D60006DD000006DE0006DE010006DF0006E4000006E50006E6010006\
+            \E70006E8000006E90006E9010006EA0006ED000006EE00070E0100070F00\
+            \070F00000710000710010007110007110000071200072F0100073000074A\
+            \0000074B0007A5010007A60007B0000007B10007EA010007EB0007F30000\
+            \07F40007FC010007FD0007FD000007FE000815010008160008190000081A\
+            \00081A0100081B0008230000082400082401000825000827000008280008\
+            \280100082900082D0000082E0008580100085900085B0000085C00088F01\
+            \000890000891000008920008960100089700089F000008A00008C9010008\
+            \CA000902000009030009390100093A00093A0000093B00093B0100093C00\
+            \093C0000093D000940010009410009480000094900094C0100094D00094D\
+            \0000094E0009500100095100095700000958000961010009620009630000\
+            \096400098001000981000981000009820009BB010009BC0009BC000009BD\
+            \0009C0010009C10009C4000009C50009CC010009CD0009CD000009CE0009\
+            \E1010009E20009E3000009E40009FD010009FE0009FE000009FF000A0001\
+            \000A01000A0200000A03000A3B01000A3C000A3C00000A3D000A4001000A\
+            \41000A4200000A43000A4601000A47000A4800000A49000A4A01000A4B00\
+            \0A4D00000A4E000A5001000A51000A5100000A52000A6F01000A70000A71\
+            \00000A72000A7401000A75000A7500000A76000A8001000A81000A820000\
+            \0A83000ABB01000ABC000ABC00000ABD000AC001000AC1000AC500000AC6\
+            \000AC601000AC7000AC800000AC9000ACC01000ACD000ACD00000ACE000A\
+            \E101000AE2000AE300000AE4000AF901000AFA000AFF00000B00000B0001\
+            \000B01000B0100000B02000B3B01000B3C000B3C00000B3D000B3E01000B\
+            \3F000B3F00000B40000B4001000B41000B4400000B45000B4C01000B4D00\
+            \0B4D00000B4E000B5401000B55000B5600000B57000B6101000B62000B63\
+            \00000B64000B8101000B82000B8200000B83000BBF01000BC0000BC00000\
+            \0BC1000BCC01000BCD000BCD00000BCE000BFF01000C00000C0000000C01\
+            \000C0301000C04000C0400000C05000C3B01000C3C000C3C00000C3D000C\
+            \3D01000C3E000C4000000C41000C4501000C46000C4800000C49000C4901\
+            \000C4A000C4D00000C4E000C5401000C55000C5600000C57000C6101000C\
+            \62000C6300000C64000C8001000C81000C8100000C82000CBB01000CBC00\
+            \0CBC00000CBD000CBE01000CBF000CBF00000CC0000CC501000CC6000CC6\
+            \00000CC7000CCB01000CCC000CCD00000CCE000CE101000CE2000CE30000\
+            \0CE4000CFF01000D00000D0100000D02000D3A01000D3B000D3C00000D3D\
+            \000D4001000D41000D4400000D45000D4C01000D4D000D4D00000D4E000D\
+            \6101000D62000D6300000D64000D8001000D81000D8100000D82000DC901\
+            \000DCA000DCA00000DCB000DD101000DD2000DD400000DD5000DD501000D\
+            \D6000DD600000DD7000E3001000E31000E3100000E32000E3301000E3400\
+            \0E3A00000E3B000E4601000E47000E4E00000E4F000EB001000EB1000EB1\
+            \00000EB2000EB301000EB4000EBC00000EBD000EC701000EC8000ECE0000\
+            \0ECF000F1701000F18000F1900000F1A000F3401000F35000F3500000F36\
+            \000F3601000F37000F3700000F38000F3801000F39000F3900000F3A000F\
+            \7001000F71000F7E00000F7F000F7F01000F80000F8400000F85000F8501\
+            \000F86000F8700000F88000F8C01000F8D000F9700000F98000F9801000F\
+            \99000FBC00000FBD000FC501000FC6000FC600000FC700102C0100102D00\
+            \10300000103100103101001032001037000010380010380100103900103A\
+            \0000103B00103C0100103D00103E0000103F001057010010580010590000\
+            \105A00105D0100105E001060000010610010700100107100107400001075\
+            \001081010010820010820000108300108401001085001086000010870010\
+            \8C0100108D00108D0000108E00109C0100109D00109D0000109E0010FF01\
+            \00110000115F0200116000135C0100135D00135F00001360001711010017\
+            \120017140000171500173101001732001733000017340017510100175200\
+            \17530000175400177101001772001773000017740017B3010017B40017B5\
+            \000017B60017B6010017B70017BD000017BE0017C5010017C60017C60000\
+            \17C70017C8010017C90017D3000017D40017DC010017DD0017DD000017DE\
+            \00180A0100180B00180F0000181000188401001885001886000018870018\
+            \A8010018A90018A9000018AA00191F010019200019220000192300192601\
+            \001927001928000019290019310100193200193200001933001938010019\
+            \3900193B0000193C001A1601001A17001A1800001A19001A1A01001A1B00\
+            \1A1B00001A1C001A5501001A56001A5600001A57001A5701001A58001A5E\
+            \00001A5F001A5F01001A60001A6000001A61001A6101001A62001A620000\
+            \1A63001A6401001A65001A6C00001A6D001A7201001A73001A7C00001A7D\
+            \001A7E01001A7F001A7F00001A80001AAF01001AB0001ADD00001ADE001A\
+            \DF01001AE0001AEB00001AEC001AFF01001B00001B0300001B04001B3301\
+            \001B34001B3400001B35001B3501001B36001B3A00001B3B001B3B01001B\
+            \3C001B3C00001B3D001B4101001B42001B4200001B43001B6A01001B6B00\
+            \1B7300001B74001B7F01001B80001B8100001B82001BA101001BA2001BA5\
+            \00001BA6001BA701001BA8001BA900001BAA001BAA01001BAB001BAD0000\
+            \1BAE001BE501001BE6001BE600001BE7001BE701001BE8001BE900001BEA\
+            \001BEC01001BED001BED00001BEE001BEE01001BEF001BF100001BF2001C\
+            \2B01001C2C001C3300001C34001C3501001C36001C3700001C38001CCF01\
+            \001CD0001CD200001CD3001CD301001CD4001CE000001CE1001CE101001C\
+            \E2001CE800001CE9001CEC01001CED001CED00001CEE001CF301001CF400\
+            \1CF400001CF5001CF701001CF8001CF900001CFA001DBF01001DC0001DFF\
+            \00001E0000200A0100200B00200F000020100020270100202800202E0000\
+            \202F00205F01002060002064000020650020650100206600206F00002070\
+            \0020CF010020D00020F0000020F10023190100231A00231B0200231C0023\
+            \280100232900232A0200232B0023E8010023E90023EC020023ED0023EF01\
+            \0023F00023F0020023F10023F2010023F30023F3020023F40025FC010025\
+            \FD0025FE020025FF002613010026140026150200261600262F0100263000\
+            \263702002638002647010026480026530200265400267E0100267F00267F\
+            \020026800026890100268A00268F02002690002692010026930026930200\
+            \26940026A0010026A10026A1020026A20026A9010026AA0026AB020026AC\
+            \0026BC010026BD0026BE020026BF0026C3010026C40026C5020026C60026\
+            \CD010026CE0026CE020026CF0026D3010026D40026D4020026D50026E901\
+            \0026EA0026EA020026EB0026F1010026F20026F3020026F40026F4010026\
+            \F50026F5020026F60026F9010026FA0026FA020026FB0026FC010026FD00\
+            \26FD020026FE00270401002705002705020027060027090100270A00270B\
+            \0200270C002727010027280027280200272900274B0100274C00274C0200\
+            \274D00274D0100274E00274E0200274F0027520100275300275502002756\
+            \002756010027570027570200275800279401002795002797020027980027\
+            \AF010027B00027B0020027B10027BE010027BF0027BF020027C0002B1A01\
+            \002B1B002B1C02002B1D002B4F01002B50002B5002002B51002B5401002B\
+            \55002B5502002B56002CEE01002CEF002CF100002CF2002D7E01002D7F00\
+            \2D7F00002D80002DDF01002DE0002DFF00002E00002E7F01002E80002E99\
+            \02002E9A002E9A01002E9B002EF302002EF4002EFF01002F00002FD50200\
+            \2FD6002FEF01002FF00030290200302A00302D0000302E00303E0200303F\
+            \00304001003041003096020030970030980100309900309A0000309B0030\
+            \FF020031000031040100310500312F020031300031300100313100318E02\
+            \00318F00318F010031900031E5020031E60031EE010031EF00321E020032\
+            \1F00321F010032200032470200324800324F0100325000A48C0200A48D00\
+            \A48F0100A49000A4C60200A4C700A66E0100A66F00A6720000A67300A673\
+            \0100A67400A67D0000A67E00A69D0100A69E00A69F0000A6A000A6EF0100\
+            \A6F000A6F10000A6F200A8010100A80200A8020000A80300A8050100A806\
+            \00A8060000A80700A80A0100A80B00A80B0000A80C00A8240100A82500A8\
+            \260000A82700A82B0100A82C00A82C0000A82D00A8C30100A8C400A8C500\
+            \00A8C600A8DF0100A8E000A8F10000A8F200A8FE0100A8FF00A8FF0000A9\
+            \0000A9250100A92600A92D0000A92E00A9460100A94700A9510000A95200\
+            \A95F0100A96000A97C0200A97D00A97F0100A98000A9820000A98300A9B2\
+            \0100A9B300A9B30000A9B400A9B50100A9B600A9B90000A9BA00A9BB0100\
+            \A9BC00A9BD0000A9BE00A9E40100A9E500A9E50000A9E600AA280100AA29\
+            \00AA2E0000AA2F00AA300100AA3100AA320000AA3300AA340100AA3500AA\
+            \360000AA3700AA420100AA4300AA430000AA4400AA4B0100AA4C00AA4C00\
+            \00AA4D00AA7B0100AA7C00AA7C0000AA7D00AAAF0100AAB000AAB00000AA\
+            \B100AAB10100AAB200AAB40000AAB500AAB60100AAB700AAB80000AAB900\
+            \AABD0100AABE00AABF0000AAC000AAC00100AAC100AAC10000AAC200AAEB\
+            \0100AAEC00AAED0000AAEE00AAF50100AAF600AAF60000AAF700ABE40100\
+            \ABE500ABE50000ABE600ABE70100ABE800ABE80000ABE900ABEC0100ABED\
+            \00ABED0000ABEE00ABFF0100AC0000D7A30200D7A400F8FF0100F90000FA\
+            \FF0200FB0000FB1D0100FB1E00FB1E0000FB1F00FDFF0100FE0000FE0F00\
+            \00FE1000FE190200FE1A00FE1F0100FE2000FE2F0000FE3000FE520200FE\
+            \5300FE530100FE5400FE660200FE6700FE670100FE6800FE6B0200FE6C00\
+            \FEFE0100FEFF00FEFF0000FF0000FF000100FF0100FF600200FF6100FFDF\
+            \0100FFE000FFE60200FFE700FFF80100FFF900FFFB0000FFFC0101FC0101\
+            \01FD0101FD000101FE0102DF010102E00102E0000102E101037501010376\
+            \01037A0001037B010A0001010A01010A0300010A04010A0401010A05010A\
+            \0600010A07010A0B01010A0C010A0F00010A10010A3701010A38010A3A00\
+            \010A3B010A3E01010A3F010A3F00010A40010AE401010AE5010AE600010A\
+            \E7010D2301010D24010D2700010D28010D6801010D69010D6D00010D6E01\
+            \0EAA01010EAB010EAC00010EAD010EF901010EFA010EFF00010F00010F45\
+            \01010F46010F5000010F51010F8101010F82010F8500010F860110000101\
+            \100101100100011002011037010110380110460001104701106F01011070\
+            \01107000011071011072010110730110740001107501107E0101107F0110\
+            \81000110820110B2010110B30110B6000110B70110B8010110B90110BA00\
+            \0110BB0110BC010110BD0110BD000110BE0110C1010110C20110C2000110\
+            \C30110CC010110CD0110CD000110CE0110FF010111000111020001110301\
+            \11260101112701112B0001112C01112C0101112D01113400011135011172\
+            \010111730111730001117401117F01011180011181000111820111B50101\
+            \11B60111BE000111BF0111C8010111C90111CC000111CD0111CE010111CF\
+            \0111CF000111D001122E0101122F01123100011232011233010112340112\
+            \3400011235011235010112360112370001123801123D0101123E01123E00\
+            \01123F01124001011241011241000112420112DE010112DF0112DF000112\
+            \E00112E2010112E30112EA000112EB0112FF010113000113010001130201\
+            \133A0101133B01133C0001133D01133F0101134001134000011341011365\
+            \0101136601136C0001136D01136F01011370011374000113750113BA0101\
+            \13BB0113C0000113C10113CD010113CE0113CE000113CF0113CF010113D0\
+            \0113D0000113D10113D1010113D20113D2000113D30113E0010113E10113\
+            \E2000113E30114370101143801143F000114400114410101144201144400\
+            \011445011445010114460114460001144701145D0101145E01145E000114\
+            \5F0114B2010114B30114B8000114B90114B9010114BA0114BA000114BB01\
+            \14BE010114BF0114C0000114C10114C1010114C20114C3000114C40115B1\
+            \010115B20115B5000115B60115BB010115BC0115BD000115BE0115BE0101\
+            \15BF0115C0000115C10115DB010115DC0115DD000115DE01163201011633\
+            \01163A0001163B01163C0101163D01163D0001163E01163E0101163F0116\
+            \40000116410116AA010116AB0116AB000116AC0116AC010116AD0116AD00\
+            \0116AE0116AF010116B00116B5000116B60116B6010116B70116B7000116\
+            \B801171C0101171D01171D0001171E01171E0101171F01171F0001172001\
+            \172101011722011725000117260117260101172701172B0001172C01182E\
+            \0101182F011837000118380118380101183901183A0001183B01193A0101\
+            \193B01193C0001193D01193D0101193E01193E0001193F01194201011943\
+            \011943000119440119D3010119D40119D7000119D80119D9010119DA0119\
+            \DB000119DC0119DF010119E00119E0000119E1011A0001011A01011A0A00\
+            \011A0B011A3201011A33011A3800011A39011A3A01011A3B011A3E00011A\
+            \3F011A4601011A47011A4700011A48011A5001011A51011A5600011A5701\
+            \1A5801011A59011A5B00011A5C011A8901011A8A011A9600011A97011A97\
+            \01011A98011A9900011A9A011B5F01011B60011B6000011B61011B610101\
+            \1B62011B6400011B65011B6501011B66011B6600011B67011C2F01011C30\
+            \011C3600011C37011C3701011C38011C3D00011C3E011C3E01011C3F011C\
+            \3F00011C40011C9101011C92011CA700011CA8011CA901011CAA011CB000\
+            \011CB1011CB101011CB2011CB300011CB4011CB401011CB5011CB600011C\
+            \B7011D3001011D31011D3600011D37011D3901011D3A011D3A00011D3B01\
+            \1D3B01011D3C011D3D00011D3E011D3E01011D3F011D4500011D46011D46\
+            \01011D47011D4700011D48011D8F01011D90011D9100011D92011D940101\
+            \1D95011D9500011D96011D9601011D97011D9700011D98011EF201011EF3\
+            \011EF400011EF5011EFF01011F00011F0100011F02011F3501011F36011F\
+            \3A00011F3B011F3F01011F40011F4000011F41011F4101011F42011F4200\
+            \011F43011F5901011F5A011F5A00011F5B01342F01013430013440000134\
+            \41013446010134470134550001345601611D0101611E0161290001612A01\
+            \612C0101612D01612F00016130016AEF01016AF0016AF400016AF5016B2F\
+            \01016B30016B3600016B37016F4E01016F4F016F4F00016F50016F8E0101\
+            \6F8F016F9200016F93016FDF01016FE0016FE302016FE4016FE400016FE5\
+            \016FEF01016FF0016FF602016FF7016FFF01017000018CD502018CD6018C\
+            \FE01018CFF018D1E02018D1F018D7F01018D80018DF202018DF301AFEF01\
+            \01AFF001AFF30201AFF401AFF40101AFF501AFFB0201AFFC01AFFC0101AF\
+            \FD01AFFE0201AFFF01AFFF0101B00001B1220201B12301B1310101B13201\
+            \B1320201B13301B14F0101B15001B1520201B15301B1540101B15501B155\
+            \0201B15601B1630101B16401B1670201B16801B16F0101B17001B2FB0201\
+            \B2FC01BC9C0101BC9D01BC9E0001BC9F01BC9F0101BCA001BCA30001BCA4\
+            \01CEFF0101CF0001CF2D0001CF2E01CF2F0101CF3001CF460001CF4701D1\
+            \660101D16701D1690001D16A01D1720101D17301D1820001D18301D18401\
+            \01D18501D18B0001D18C01D1A90101D1AA01D1AD0001D1AE01D2410101D2\
+            \4201D2440001D24501D2FF0101D30001D3560201D35701D35F0101D36001\
+            \D3760201D37701D9FF0101DA0001DA360001DA3701DA3A0101DA3B01DA6C\
+            \0001DA6D01DA740101DA7501DA750001DA7601DA830101DA8401DA840001\
+            \DA8501DA9A0101DA9B01DA9F0001DAA001DAA00101DAA101DAAF0001DAB0\
+            \01DFFF0101E00001E0060001E00701E0070101E00801E0180001E01901E0\
+            \1A0101E01B01E0210001E02201E0220101E02301E0240001E02501E02501\
+            \01E02601E02A0001E02B01E08E0101E08F01E08F0001E09001E12F0101E1\
+            \3001E1360001E13701E2AD0101E2AE01E2AE0001E2AF01E2EB0101E2EC01\
+            \E2EF0001E2F001E4EB0101E4EC01E4EF0001E4F001E5ED0101E5EE01E5EF\
+            \0001E5F001E6E20101E6E301E6E30001E6E401E6E50101E6E601E6E60001\
+            \E6E701E6ED0101E6EE01E6EF0001E6F001E6F40101E6F501E6F50001E6F6\
+            \01E8CF0101E8D001E8D60001E8D701E9430101E94401E94A0001E94B01F0\
+            \030101F00401F0040201F00501F0CE0101F0CF01F0CF0201F0D001F18D01\
+            \01F18E01F18E0201F18F01F1900101F19101F19A0201F19B01F1E50101F1\
+            \E601F2020201F20301F20F0101F21001F23B0201F23C01F23F0101F24001\
+            \F2480201F24901F24F0101F25001F2510201F25201F25F0101F26001F265\
+            \0201F26601F2FF0101F30001F3200201F32101F32C0101F32D01F3350201\
+            \F33601F3360101F33701F37C0201F37D01F37D0101F37E01F3930201F394\
+            \01F39F0101F3A001F3CA0201F3CB01F3CE0101F3CF01F3D30201F3D401F3\
+            \DF0101F3E001F3F00201F3F101F3F30101F3F401F3F40201F3F501F3F701\
+            \01F3F801F43E0201F43F01F43F0101F44001F4400201F44101F4410101F4\
+            \4201F4FC0201F4FD01F4FE0101F4FF01F53D0201F53E01F54A0101F54B01\
+            \F54E0201F54F01F54F0101F55001F5670201F56801F5790101F57A01F57A\
+            \0201F57B01F5940101F59501F5960201F59701F5A30101F5A401F5A40201\
+            \F5A501F5FA0101F5FB01F64F0201F65001F67F0101F68001F6C50201F6C6\
+            \01F6CB0101F6CC01F6CC0201F6CD01F6CF0101F6D001F6D20201F6D301F6\
+            \D40101F6D501F6D80201F6D901F6DB0101F6DC01F6DF0201F6E001F6EA01\
+            \01F6EB01F6EC0201F6ED01F6F30101F6F401F6FC0201F6FD01F7DF0101F7\
+            \E001F7EB0201F7EC01F7EF0101F7F001F7F00201F7F101F90B0101F90C01\
+            \F93A0201F93B01F93B0101F93C01F9450201F94601F9460101F94701F9FF\
+            \0201FA0001FA6F0101FA7001FA7C0201FA7D01FA7F0101FA8001FA8A0201\
+            \FA8B01FA8D0101FA8E01FAC60201FAC701FAC70101FAC801FAC80201FAC9\
+            \01FACC0101FACD01FADC0201FADD01FADE0101FADF01FAEA0201FAEB01FA\
+            \EE0101FAEF01FAF80201FAF901FFFF0102000002FFFD0202FFFE02FFFF01\
+            \03000003FFFD0203FFFE0E0000010E00010E0001000E00020E001F010E00\
+            \200E007F000E00800E00FF010E01000E01EF000E01F010FFFF01";
+    end;
+end module body.

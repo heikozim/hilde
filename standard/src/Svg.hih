@@ -1,0 +1,430 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+SVG documents built in one pass, for charts and pictures drawn on the server.
+
+- Every text and every attribute value is escaped; element and attribute names are held to letters, digits and a few signs, so content cannot break out of a tag.
+- The builder writes the bytes in the order of the calls; the same calls give the same bytes on every run and every platform.
+- Coordinates and sizes are integers, so the same values draw the same picture on every machine.
+- beginElement and endElement nest; attribute and attributeInt belong between them, before the first child or text.
+- The scale helpers map a data range onto pixels and choose tick steps of 1, 2 or 5 times a power of ten.
+- A line chart holds series of points, a title and axis labels, and renders to a document that carries a class on every part, so a style sheet can colour it.
+
+    var b: Builder := makeBuilder();
+    beginSvg(&!b, 200, 100);
+    textAt(&!b, 10, 20, "hello");
+    endSvg(&!b);
+    let svg: String := render(b);
+"""
+pragma Targets(Names => "linux openbsd freebsd darwin wasm");
+import Standard.String (
+    String,
+    length
+);
+import Standard.Buffer (
+    Buffer,
+    length as bufferLength
+);
+
+module Standard.Svg is
+    """
+    A document being built.  Linear: render gives the bytes out, and
+    destroyBuilder gives the rest back.
+    """
+    type Builder: Linear;
+
+    """
+    A step between two ticks of an axis: the ticks stand at multiples of
+    multiple times ten to the power of exponent.
+    """
+    record Step: Free is
+        """
+        One, two or five.
+        """
+        multiple: Int64;
+        """
+        A power of ten, nought or more.
+        """
+        exponent: Int64;
+    end;
+
+    """
+    A point of a series, in the units of the data.
+    """
+    record Point: Free is
+        x: Int64;
+        y: Int64;
+    end;
+
+    """
+    The plot area of a chart and the range of the data on it.  The area
+    runs from left and top over width and height; the data runs from xLow
+    to xHigh and from yLow to yHigh, with y growing upwards like the data
+    and not downwards like the pixels.
+    """
+    record Frame: Free is
+        left: Int64;
+        top: Int64;
+        width: Int64;
+        height: Int64;
+        xLow: Int64;
+        xHigh: Int64;
+        yLow: Int64;
+        yHigh: Int64;
+    end;
+
+    """
+    A chart being built: its size, its texts and its series.  Linear:
+    destroyLineChart gives it back.
+    """
+    type LineChart: Linear;
+
+    ---
+    --- Builder
+    ---
+
+    """
+    An empty builder.
+    """
+    function makeBuilder(): Builder
+        ensures elementDepth(&result) = 0;
+
+    """
+    Frees builder, whatever it holds.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyBuilder(builder: Builder): Unit;
+
+    """
+    How many elements are open, that is, how often endElement is still
+    owed.  Nought once the document is finished.
+    No contract: a number read from its argument; its type gives its range, and nothing cheaper holds.
+    """
+    generic [R: Region]
+    function elementDepth(builder: &[Builder, R]): Index;
+
+    """
+    The document as text, and the builder with it.  The caller owes no
+    endElement.
+    """
+    function render(builder: Builder): String
+        requires elementDepth(&builder) = 0;
+
+    ---
+    --- Escaping
+    ---
+
+    """
+    Text with the five characters that a document gives a meaning written
+    as character references: the ampersand, the two angle brackets and the
+    two quotes.  For the content of an element.
+    """
+    generic [R: Region]
+    function escapeText(content: Span[Nat8, R]): String
+        ensures length(&result) >= spanLength(content);
+
+    """
+    Value with the five characters that a document gives a meaning written
+    as character references.  For the value of an attribute, which the
+    builder writes between double quotes.
+    """
+    generic [R: Region]
+    function escapeAttribute(value: Span[Nat8, R]): String
+        ensures length(&result) >= spanLength(value);
+
+    ---
+    --- Elements
+    ---
+
+    """
+    Open an element called name.  The name is held to letters, digits and
+    the signs underscore, colon, point, hyphen, and a letter, underscore or
+    colon first; a call outside that stops the programme.  Attributes
+    belong before the first child or text.
+    """
+    generic [R: Region, N: Region]
+    function beginElement(builder: &![Builder, R], name: Span[Nat8, N]): Unit
+        requires spanLength(name) > 0
+        ensures elementDepth(&builder) = (old(elementDepth(&builder)) + 1);
+
+    """
+    Add an attribute called name with value to the element opened last.
+    The value is escaped; the name is held to the same signs as the name of
+    an element.  A call after the start tag is closed stops the programme.
+    """
+    generic [R: Region, N: Region, V: Region]
+    function attribute(builder: &![Builder, R], name: Span[Nat8, N], value: Span[Nat8, V]): Unit
+        requires elementDepth(&builder) > 0;
+
+    """
+    Add an attribute called name whose value is the number, written in
+    decimal.  A call after the start tag is closed stops the programme.
+    """
+    generic [R: Region, N: Region]
+    function attributeInt(builder: &![Builder, R], name: Span[Nat8, N], value: Int64): Unit
+        requires elementDepth(&builder) > 0;
+
+    """
+    Escaped content into the element opened last.  A call with no element
+    open stops the programme.
+    """
+    generic [R: Region, T: Region]
+    function text(builder: &![Builder, R], content: Span[Nat8, T]): Unit
+        requires elementDepth(&builder) > 0;
+
+    """
+    Close the element opened last: as an empty element when nothing stands
+    in it, else as an end tag.  A call with no element open stops the
+    programme.
+    """
+    generic [R: Region]
+    function endElement(builder: &![Builder, R]): Unit
+        requires elementDepth(&builder) > 0
+        ensures elementDepth(&builder) = (old(elementDepth(&builder)) - 1);
+
+    """
+    Open the root element of a document: with the namespace, the size in
+    width and height, and the box 0 0 width height.  The caller closes it
+    with endSvg.  The tag stays open, so a class or a role can be added.
+    """
+    generic [R: Region]
+    function beginSvg(builder: &![Builder, R], width: Int64, height: Int64): Unit
+        requires (width > 0) and (height > 0)
+        ensures elementDepth(&builder) = (old(elementDepth(&builder)) + 1);
+
+    """
+    Open the root element of a document whose size the page gives, named by
+    the box alone, such as 0 0 600 200.  The caller closes it with endSvg.
+    The tag stays open, so a class or a role can be added.
+    """
+    generic [R: Region, V: Region]
+    function beginSvgViewBox(builder: &![Builder, R], view_box: Span[Nat8, V]): Unit
+        requires spanLength(view_box) > 0
+        ensures elementDepth(&builder) = (old(elementDepth(&builder)) + 1);
+
+    """
+    Close the root element.  A call with no element open stops the
+    programme.
+    """
+    generic [R: Region]
+    function endSvg(builder: &![Builder, R]): Unit
+        requires elementDepth(&builder) > 0
+        ensures elementDepth(&builder) = (old(elementDepth(&builder)) - 1);
+
+    ---
+    --- Shapes
+    ---
+
+    """
+    A path named by its data, such as M 0 0 L 10 10, as an empty element.
+    """
+    generic [R: Region, D: Region]
+    function path(builder: &![Builder, R], d: Span[Nat8, D]): Unit
+        requires spanLength(d) > 0;
+
+    """
+    A polyline through the points xs, ys, as an empty element that fills
+    nothing.  Both spans hold the same count of numbers; a polyline
+    without points is written empty.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function polyline(builder: &![Builder, R], xs: Span[Int64, S], ys: Span[Int64, T]): Unit
+        requires spanLength(xs) = spanLength(ys);
+
+    """
+    The points xs, ys as the value of an attribute called points, for a
+    polyline the caller opens itself to give it a class or a stroke.
+    """
+    generic [R: Region, S: Region, T: Region]
+    function pointsAttribute(builder: &![Builder, R], xs: Span[Int64, S], ys: Span[Int64, T]): Unit
+        requires (spanLength(xs) = spanLength(ys)) and (elementDepth(&builder) > 0);
+
+    """
+    A rectangle from x, y, width wide and height high, as an empty element.
+    """
+    generic [R: Region]
+    function rect(builder: &![Builder, R], x: Int64, y: Int64, width: Int64, height: Int64): Unit
+        requires (width >= 0) and (height >= 0);
+
+    """
+    A rectangle from x, y, width wide and height high, filled with fill,
+    such as a colour or currentColor.
+    """
+    generic [R: Region, F: Region]
+    function rectFilled(builder: &![Builder, R], x: Int64, y: Int64, width: Int64, height: Int64, fill: Span[Nat8, F]): Unit
+        requires (width >= 0) and (height >= 0) and (spanLength(fill) > 0);
+
+    """
+    Escaped content at x, y in an element of its own.
+    """
+    generic [R: Region, T: Region]
+    function textAt(builder: &![Builder, R], x: Int64, y: Int64, content: Span[Nat8, T]): Unit
+        requires elementDepth(&builder) > 0;
+
+    """
+    A circle of the radius r at cx, cy, filled with fill.
+    """
+    generic [R: Region, F: Region]
+    function circleFilled(builder: &![Builder, R], cx: Int64, cy: Int64, r: Int64, fill: Span[Nat8, F]): Unit
+        requires (r > 0) and (spanLength(fill) > 0);
+
+    ---
+    --- Scale and ticks
+    ---
+
+    """
+    The step between the ticks of an axis that spans low to high: about
+    five of them, at a multiple of one, two or five times a power of ten.
+    The same range gives the same step on every run, over the whole range
+    of Int64; a wide range stops the programme nowhere.
+    """
+    function tickStep(low: Int64, high: Int64): Step
+        requires low < high
+        ensures (result.multiple = 1) or (result.multiple = 2) or (result.multiple = 5);
+
+    """
+    The distance between two ticks of the step, in the units of the data.
+    """
+    function stepValue(step: Step): Int64
+        ensures result > 0;
+
+    """
+    The first multiple of the step at or after low.
+    """
+    function firstTick(low: Int64, step: Step): Int64
+        ensures result >= low;
+
+    """
+    The last multiple of the step at or before high.
+    """
+    function lastTick(high: Int64, step: Step): Int64
+        ensures result <= high;
+
+    """
+    The number of a tick written in plain decimal: the digits and a minus
+    sign in front of a negative value, with no exponent and no separators.
+    """
+    function formatTick(value: Int64): String
+        ensures length(&result) > 0;
+
+    """
+    A data value mapped onto the pixels of the axis of x: data_low at
+    pixel_low, data_high at pixel_high, the values between spread evenly,
+    and rounded down to a whole pixel.  A range wider than Int64 is
+    halved before it is mapped, so that no range the contract allows
+    stops the programme.
+    """
+    function mapX(value: Int64, data_low: Int64, data_high: Int64, pixel_low: Int64, pixel_high: Int64): Int64
+        requires (data_low < data_high) and (pixel_low <= pixel_high) and (value >= data_low) and (value <= data_high)
+        ensures (result >= pixel_low) and (result <= pixel_high);
+
+    """
+    A data value mapped onto the pixels of the axis of y, which grows
+    downwards like the pixels and not upwards like the data: data_low at
+    pixel_high, data_high at pixel_low, the values between spread evenly,
+    and rounded down to a whole pixel.  A range wider than Int64 is
+    halved before it is mapped, so that no range the contract allows
+    stops the programme.
+    """
+    function mapY(value: Int64, data_low: Int64, data_high: Int64, pixel_low: Int64, pixel_high: Int64): Int64
+        requires (data_low < data_high) and (pixel_low <= pixel_high) and (value >= data_low) and (value <= data_high)
+        ensures (result >= pixel_low) and (result <= pixel_high);
+
+    """
+    A data value on the axis of x of the frame, at a whole pixel.
+    """
+    function pixelX(frame: Frame, value: Int64): Int64
+        requires (frame.xLow < frame.xHigh) and (frame.width >= 0) and (value >= frame.xLow) and (value <= frame.xHigh)
+        ensures (result >= frame.left) and (result <= (frame.left + frame.width));
+
+    """
+    A data value on the axis of y of the frame, at a whole pixel, with the
+    largest value at the top and the smallest at the bottom.
+    """
+    function pixelY(frame: Frame, value: Int64): Int64
+        requires (frame.yLow < frame.yHigh) and (frame.height >= 0) and (value >= frame.yLow) and (value <= frame.yHigh)
+        ensures (result >= frame.top) and (result <= (frame.top + frame.height));
+
+    """
+    The axis of x of the frame: the line at the bottom, a tick at every
+    step with its number below, each part of the class svg-axis or
+    svg-tick.
+    """
+    generic [R: Region]
+    function drawXAxis(builder: &![Builder, R], frame: Frame): Unit
+        requires (frame.width > 0) and (frame.xLow < frame.xHigh);
+
+    """
+    The axis of y of the frame: the line at the left, a tick at every step
+    with its number beside it, each part of the class svg-axis or svg-tick.
+    """
+    generic [R: Region]
+    function drawYAxis(builder: &![Builder, R], frame: Frame): Unit
+        requires (frame.height > 0) and (frame.yLow < frame.yHigh);
+
+    ---
+    --- Line chart
+    ---
+
+    """
+    The most points one series holds: 1000.  A series with more is cut at
+    the end.
+    """
+    function mostPoints(): Index
+        ensures result = 1000;
+
+    """
+    The most series of a chart: 1000.
+    """
+    function mostSeries(): Index
+        ensures result = 1000;
+
+    """
+    An empty chart width by height, with a title and the labels of the two
+    axes.  The texts are escaped when the chart is rendered.  A text may be
+    empty; an empty title is drawn as nothing.
+    """
+    generic [T: Region, X: Region, Y: Region]
+    function makeLineChart(width: Int64, height: Int64, title: Span[Nat8, T], x_label: Span[Nat8, X], y_label: Span[Nat8, Y]): LineChart
+        requires (width >= 100) and (width <= 10000) and (height >= 100) and (height <= 10000)
+        ensures seriesCount(&result) = 0;
+
+    """
+    Frees chart, whatever it holds.
+    No contract: it only frees or closes what it is given.
+    """
+    function destroyLineChart(chart: LineChart): Unit;
+
+    """
+    How many series the chart holds.
+    """
+    generic [R: Region]
+    function seriesCount(chart: &[LineChart, R]): Index
+        ensures result <= mostSeries();
+
+    """
+    Add a series through the points xs, ys, drawn as a polyline of the
+    class class_name; an empty class draws one without a class.  The points
+    are copied, so the caller keeps its buffers.  A series with more than
+    mostPoints points is cut at the end.
+    """
+    generic [R: Region, S: Region, T: Region, C: Region]
+    function addSeries(chart: &![LineChart, R], xs: &[Buffer[Int64], S], ys: &[Buffer[Int64], T], class_name: Span[Nat8, C]): Unit
+        requires bufferLength(xs) = bufferLength(ys)
+        ensures (seriesCount(&chart) = (old(seriesCount(&chart)) + 1)) or (seriesCount(&chart) = mostSeries());
+
+    """
+    The chart as a document: the box 0 0 width height, the title above the
+    plot, both axes with their ticks, one polyline per series, and the
+    labels below and beside the axes.  Every part carries its class; every
+    text is escaped.  The same chart gives the same bytes on every run.
+    """
+    generic [R: Region]
+    function renderLineChart(chart: &[LineChart, R]): String
+        ensures length(&result) > 0;
+end module.

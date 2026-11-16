@@ -1,0 +1,1 @@
+Test that a module whose body does not parse, compiled with the modules --modules finds for it, is answered with its own parse error (H0009, the chain of comparisons a < b < 1), not with H2017 for Bindings.File importing Standard.String, which the order left unsorted gave.

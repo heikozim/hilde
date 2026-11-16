@@ -1,0 +1,1 @@
+Standard.Map: the words of a sentence counted in a map from String to Index, raised through a write borrow and printed in the order of the keys (001); a map of Strings cannot be dropped whole with destroyFree (002).

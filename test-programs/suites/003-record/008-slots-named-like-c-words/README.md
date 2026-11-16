@@ -1,0 +1,1 @@
+A record and a union whose slots are named like words of C -- long, short, double, default, int, unsigned: built, read with a dot and through a reference, written through a write reference and taken apart.  The C gives each such slot a prefix of its own, where it and its uses agree.

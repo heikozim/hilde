@@ -1,0 +1,1 @@
+A string whose closing quote follows an even number of backslashes ends there: each pair is one escaped backslash.  A lexer that did not take the pairs first would take the quote after the second backslash for an escaped quote.

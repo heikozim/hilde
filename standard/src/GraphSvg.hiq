@@ -1,0 +1,444 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The layout runs in whole numbers only, so the same graph gives the same
+-- bytes on every machine.  The place of a node on the circle comes from
+-- the sine of its turn, taken from four terms of the Taylor series at a
+-- fixed point of 65536, which is exact to a fraction of a pixel over the
+-- sizes the options allow.
+import Standard.Svg (
+    Builder,
+    makeBuilder,
+    render,
+    beginSvg,
+    endSvg,
+    beginElement,
+    endElement,
+    attribute,
+    attributeInt,
+    text
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length,
+    nth,
+    insertBack,
+    storeNth
+);
+import Standard.Graph (
+    Graph,
+    NodeId,
+    EdgeId,
+    nodes,
+    edges,
+    inEdges,
+    edgeSource,
+    edgeTarget,
+    nodeRef,
+    topologicalOrder
+);
+import Standard.Order (
+    equal
+);
+import Standard.Text (
+    formatInt
+);
+
+module body Standard.GraphSvg is
+    constant node_radius: Int64 := 20;
+    constant arrow_length: Int64 := 8;
+    constant arrow_half: Int64 := 4;
+    constant circle_margin: Int64 := 30;
+    constant label_drop: Int64 := 5;
+    constant fixed_one: Int64 := 65536;
+    constant quarter_turn: Int64 := 16384;
+
+    function makeGraphOptions(width: Int64, height: Int64): GraphOptions is
+        let made: GraphOptions := GraphOptions(width => width, height => height, nodeClass => "graph-node",
+            edgeClass => "graph-edge", labelClass => "graph-label", nodeFill => "currentColor",
+            edgeStroke => "currentColor");
+        return made;
+    end;
+
+    function wideIndex(value: Index): Int64 is
+        case toInt64(value) of
+            when Some(value as wide: Int64) do
+                return wide;
+            when None do
+                abort("Standard.GraphSvg: an Index did not fit an Int64");
+        end case;
+    end;
+
+    -- The square root of n rounded down, by Newton's rule; exact, so the
+    -- same n gives the same root on every run.
+    function isqrt(n: Int64): Int64 is
+        if n <= 0 then
+            return 0;
+        end if;
+        var x: Int64 := n;
+        var y: Int64 := (x + (n / x)) / 2;
+        while y < x do
+            x := y;
+            y := (x + (n / x)) / 2;
+        end while;
+        return x;
+    end;
+
+    -- The sine of x for x in radians as a fixed-point number with 65536
+    -- as the one, from four terms of the Taylor series.  Over the range
+    -- the circle uses, a quarter turn, the error stays far under a
+    -- thousandth of the fixed point.
+    function sinFixed(x: Int64): Int64 is
+        var total: Int64 := x;
+        var term: Int64 := x;
+        var k: Int64 := 0;
+        while k < 4 do
+            let two_k: Int64 := (2 * k) + 2;
+            let denom: Int64 := two_k * (two_k + 1);
+            term := (0 - ((term * (x * x)) / (denom * 4294967296)));
+            total := total + term;
+            k := k + 1;
+        end while;
+        return total;
+    end;
+
+    -- The sine of rest/16384 of a quarter turn.
+    function sinQuarter(rest: Int64): Int64 is
+        return sinFixed((rest * 62832) / 10000);
+    end;
+
+    -- The sine of turn/65536 of a full turn, turn from 0 to 65535.
+    function sineOf(turn: Int64): Int64 is
+        let quarter: Int64 := turn / quarter_turn;
+        let rest: Int64 := rem(turn, quarter_turn);
+        if quarter = 0 then
+            return sinQuarter(rest);
+        end if;
+        if quarter = 1 then
+            return sinQuarter(quarter_turn - rest);
+        end if;
+        if quarter = 2 then
+            return 0 - sinQuarter(rest);
+        end if;
+        return 0 - sinQuarter(quarter_turn - rest);
+    end;
+
+    -- The cosine of turn/65536 of a full turn: the sine a quarter turn on.
+    function cosineOf(turn: Int64): Int64 is
+        return sineOf(rem((turn + quarter_turn), fixed_one));
+    end;
+
+    -- Where a node stands in the list of nodes, which is the order of the
+    -- slots.  A node of the graph is always in the list; a miss is a fault
+    -- of this module and stops the programme.
+    generic [I: Region]
+    function rankOf(ids: &[Buffer[NodeId], I], node: NodeId): Index is
+        let n: Index := length(ids);
+        var i: Index := 0;
+        while i < n do
+            let candidate: NodeId := nth(ids, i);
+            if equal(&node, &candidate) then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        abort("Standard.GraphSvg: a node of the graph is missing from its list");
+    end;
+
+    -- The places of the nodes of a graph without a cycle: node v stands on
+    -- the layer after the layers of the nodes its edges come from, the
+    -- layers side by side over the width, the nodes of one layer spread
+    -- over the height in the order of their slots.
+    generic [E: Type, R: Region, I: Region, T: Region, X: Region, Y: Region]
+    function layoutLayered(graph: &[Graph[String, E], R], ids: &[Buffer[NodeId], I], topo: &[Buffer[NodeId], T],
+        xs: &![Buffer[Int64], X], ys: &![Buffer[Int64], Y], width: Int64, height: Int64): Unit is
+        let n: Index := length(ids);
+        var layers: Buffer[Index] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            insertBack(&!layers, 0);
+            i := i + 1;
+        end while;
+        -- The nodes come in the topological order, so the layer of a node
+        -- is settled when its turn comes.
+        var t: Index := 0;
+        while t < length(topo) do
+            let v: NodeId := nth(topo, t);
+            let vr: Index := rankOf(ids, v);
+            var best: Index := nth(&layers, vr);
+            case inEdges(graph, v) of
+                when Some(value as incoming: Buffer[EdgeId]) do
+                    var e: Index := 0;
+                    while e < length(&incoming) do
+                        let edge: EdgeId := nth(&incoming, e);
+                        case edgeSource(graph, edge) of
+                            when Some(value as u: NodeId) do
+                                let ur: Index := rankOf(ids, u);
+                                let candidate: Index := nth(&layers, ur) + 1;
+                                if candidate > best then
+                                    best := candidate;
+                                end if;
+                            when None do
+                                skip;
+                        end case;
+                        e := e + 1;
+                    end while;
+                    destroyFree(incoming);
+                when None do
+                    skip;
+            end case;
+            storeNth(&!layers, vr, best);
+            t := t + 1;
+        end while;
+        -- How many layers there are, how many nodes stand on each, and
+        -- which place in its layer a node holds.
+        var deepest: Index := 0;
+        i := 0;
+        while i < n do
+            let l: Index := nth(&layers, i);
+            if l > deepest then
+                deepest := l;
+            end if;
+            i := i + 1;
+        end while;
+        let layer_count: Index := deepest + 1;
+        var per_layer: Buffer[Index] := allocateEmpty();
+        var seen: Buffer[Index] := allocateEmpty();
+        i := 0;
+        while i < layer_count do
+            insertBack(&!per_layer, 0);
+            insertBack(&!seen, 0);
+            i := i + 1;
+        end while;
+        i := 0;
+        while i < n do
+            let l: Index := nth(&layers, i);
+            let count: Index := nth(&per_layer, l);
+            storeNth(&!per_layer, l, count + 1);
+            i := i + 1;
+        end while;
+        i := 0;
+        while i < n do
+            let li: Int64 := wideIndex(nth(&layers, i));
+            let pos: Int64 := wideIndex(nth(&seen, nth(&layers, i)));
+            let total: Int64 := wideIndex(nth(&per_layer, nth(&layers, i)));
+            let x: Int64 := ((li + 1) * width) / wideIndex(layer_count + 1);
+            let y: Int64 := ((pos + 1) * height) / (total + 1);
+            insertBack(&~xs, x);
+            insertBack(&~ys, y);
+            let here: Index := nth(&layers, i);
+            let so_far: Index := nth(&seen, here);
+            storeNth(&!seen, here, so_far + 1);
+            i := i + 1;
+        end while;
+        destroyFree(layers);
+        destroyFree(per_layer);
+        destroyFree(seen);
+        return nil;
+    end;
+
+    -- The places of the nodes of a graph with a cycle: evenly on a circle
+    -- around the middle of the document, the first at the top, in the
+    -- order of their slots.
+    generic [X: Region, Y: Region]
+    function layoutCircle(n: Index, xs: &![Buffer[Int64], X], ys: &![Buffer[Int64], Y], width: Int64, height: Int64): Unit is
+        if n = 0 then
+            return nil;
+        end if;
+        var smaller: Int64 := height;
+        if width < height then
+            smaller := width;
+        end if;
+        let radius: Int64 := (smaller / 2) - circle_margin;
+        let middle_x: Int64 := width / 2;
+        let middle_y: Int64 := height / 2;
+        let n64: Int64 := wideIndex(n);
+        var i: Index := 0;
+        while i < n do
+            let turn: Int64 := (fixed_one * wideIndex(i)) / n64;
+            let sine: Int64 := sineOf(turn);
+            let cosine: Int64 := cosineOf(turn);
+            insertBack(&~xs, middle_x + ((radius * cosine) / fixed_one));
+            insertBack(&~ys, middle_y - ((radius * sine) / fixed_one));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- One point of a list of points of a polygon: x,y.
+    generic [R: Region]
+    function appendPoint(out: &![StringBuilder, R], x: Int64, y: Int64): Unit is
+        let dx: String := formatInt(x);
+        writeString(&~out, asSpan(&dx));
+        destroyString(dx);
+        writeByte(&~out, ',');
+        let dy: String := formatInt(y);
+        writeString(&~out, asSpan(&dy));
+        destroyString(dy);
+        return nil;
+    end;
+
+    -- The points of an arrowhead: its tip first, then its two wings.
+    function threePoints(x1: Int64, y1: Int64, x2: Int64, y2: Int64, x3: Int64, y3: Int64): String is
+        var out: StringBuilder := makeStringBuilder();
+        appendPoint(&!out, x1, y1);
+        writeByte(&!out, ' ');
+        appendPoint(&!out, x2, y2);
+        writeByte(&!out, ' ');
+        appendPoint(&!out, x3, y3);
+        return finalize(out);
+    end;
+
+    -- One edge: a line from the rim of the circle of its source towards
+    -- the rim of the circle of its target, and the arrowhead on the target.
+    -- An edge whose ends fall together is drawn as nothing.
+    generic [B: Region]
+    function drawEdge(out: &![Builder, B], options: GraphOptions, x1: Int64, y1: Int64, x2: Int64, y2: Int64): Unit is
+        let dx: Int64 := x2 - x1;
+        let dy: Int64 := y2 - y1;
+        let len: Int64 := isqrt((dx * dx) + (dy * dy));
+        if len = 0 then
+            return nil;
+        end if;
+        let ux: Int64 := (dx * fixed_one) / len;
+        let uy: Int64 := (dy * fixed_one) / len;
+        let sx: Int64 := x1 + ((ux * node_radius) / fixed_one);
+        let sy: Int64 := y1 + ((uy * node_radius) / fixed_one);
+        let tx: Int64 := x2 - ((ux * node_radius) / fixed_one);
+        let ty: Int64 := y2 - ((uy * node_radius) / fixed_one);
+        let back_x: Int64 := tx - ((ux * arrow_length) / fixed_one);
+        let back_y: Int64 := ty - ((uy * arrow_length) / fixed_one);
+        let wing1_x: Int64 := back_x + ((uy * arrow_half) / fixed_one);
+        let wing1_y: Int64 := back_y - ((ux * arrow_half) / fixed_one);
+        let wing2_x: Int64 := back_x - ((uy * arrow_half) / fixed_one);
+        let wing2_y: Int64 := back_y + ((ux * arrow_half) / fixed_one);
+        beginElement(&~out, "line");
+        attribute(&~out, "class", options.edgeClass);
+        attribute(&~out, "stroke", options.edgeStroke);
+        attributeInt(&~out, "x1", sx);
+        attributeInt(&~out, "y1", sy);
+        attributeInt(&~out, "x2", back_x);
+        attributeInt(&~out, "y2", back_y);
+        endElement(&~out);
+        beginElement(&~out, "polygon");
+        attribute(&~out, "class", options.edgeClass);
+        attribute(&~out, "fill", options.edgeStroke);
+        let points: String := threePoints(tx, ty, wing1_x, wing1_y, wing2_x, wing2_y);
+        attribute(&~out, "points", asSpan(&points));
+        destroyString(points);
+        endElement(&~out);
+        return nil;
+    end;
+
+    -- Every edge of the graph, in the order of their slots.
+    generic [E: Type, R: Region, I: Region, X: Region, Y: Region, B: Region]
+    function drawEdges(out: &![Builder, B], graph: &[Graph[String, E], R], ids: &[Buffer[NodeId], I],
+        xs: &[Buffer[Int64], X], ys: &[Buffer[Int64], Y], options: GraphOptions): Unit is
+        let all: Buffer[EdgeId] := edges(graph);
+        var e: Index := 0;
+        while e < length(&all) do
+            let edge: EdgeId := nth(&all, e);
+            case edgeSource(graph, edge) of
+                when Some(value as u: NodeId) do
+                    case edgeTarget(graph, edge) of
+                        when Some(value as v: NodeId) do
+                            let ur: Index := rankOf(ids, u);
+                            let vr: Index := rankOf(ids, v);
+                            let x1: Int64 := nth(xs, ur);
+                            let y1: Int64 := nth(ys, ur);
+                            let x2: Int64 := nth(xs, vr);
+                            let y2: Int64 := nth(ys, vr);
+                            drawEdge(&~out, options, x1, y1, x2, y2);
+                        when None do
+                            skip;
+                    end case;
+                when None do
+                    skip;
+            end case;
+            e := e + 1;
+        end while;
+        destroyFree(all);
+        return nil;
+    end;
+
+    -- Every node of the graph, in the order of its slots: its circle and
+    -- its label, the value of the node escaped in the middle.
+    generic [E: Type, R: Region, I: Region, X: Region, Y: Region, B: Region]
+    function drawNodes(out: &![Builder, B], graph: &[Graph[String, E], R], ids: &[Buffer[NodeId], I],
+        xs: &[Buffer[Int64], X], ys: &[Buffer[Int64], Y], options: GraphOptions): Unit is
+        let n: Index := length(ids);
+        var i: Index := 0;
+        while i < n do
+            let id: NodeId := nth(ids, i);
+            let x: Int64 := nth(xs, i);
+            let y: Int64 := nth(ys, i);
+            beginElement(&~out, "circle");
+            attribute(&~out, "class", options.nodeClass);
+            attributeInt(&~out, "cx", x);
+            attributeInt(&~out, "cy", y);
+            attributeInt(&~out, "r", node_radius);
+            attribute(&~out, "fill", options.nodeFill);
+            endElement(&~out);
+            case nodeRef(graph, id) of
+                when Some(value as label: &[String, R]) do
+                    beginElement(&~out, "text");
+                    attribute(&~out, "class", options.labelClass);
+                    attribute(&~out, "text-anchor", "middle");
+                    attributeInt(&~out, "x", x);
+                    attributeInt(&~out, "y", y + label_drop);
+                    text(&~out, asSpan(label));
+                    endElement(&~out);
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [E: Type, R: Region]
+    function renderGraph(graph: &[Graph[String, E], R], options: GraphOptions): String is
+        let ids: Buffer[NodeId] := nodes(graph);
+        let n: Index := length(&ids);
+        var xs: Buffer[Int64] := allocateEmpty();
+        var ys: Buffer[Int64] := allocateEmpty();
+        case topologicalOrder(graph) of
+            when Right(right as topo: Buffer[NodeId]) do
+                layoutLayered(graph, &ids, &topo, &!xs, &!ys, options.width, options.height);
+                destroyFree(topo);
+            when Left(left as cycle: Buffer[EdgeId]) do
+                destroyFree(cycle);
+                layoutCircle(n, &!xs, &!ys, options.width, options.height);
+        end case;
+        var out: Builder := makeBuilder();
+        beginSvg(&!out, options.width, options.height);
+        attribute(&!out, "class", "svg-graph");
+        drawEdges(&!out, graph, &ids, &xs, &ys, options);
+        drawNodes(&!out, graph, &ids, &xs, &ys, options);
+        endSvg(&!out);
+        let made: String := render(out);
+        destroyFree(ids);
+        destroyFree(xs);
+        destroyFree(ys);
+        return made;
+    end;
+end module body.

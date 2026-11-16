@@ -1,0 +1,237 @@
+-- A rank with a programme of its own: the job's programme is /bin/false,
+-- and --rank-program gives rank 0 this programme instead, which joins the
+-- job as its one rank and writes the sum.  The same job without the
+-- option runs /bin/false as rank 0 and ends with its status 1.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    insertBack,
+    removeLast,
+    destroyEmpty
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    formatNat,
+    parseNat
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFile
+);
+import Standard.Arguments (
+    processArguments
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal
+);
+import Standard.IO.Terminal (
+    StandardInput,
+    acquireInput,
+    releaseInput,
+    readLine
+);
+import Standard.SperliLaunch (
+    RunOptions,
+    parseRunArguments,
+    runJob
+);
+import Standard.Sperli (
+    Job,
+    Comm,
+    readJobText,
+    init,
+    rank,
+    size,
+    send,
+    recv,
+    finish
+);
+
+module body Test is
+    -- The words of a job of one rank on the hosts in the file, whose
+    -- programme is /bin/false; with own, rank 0 runs this programme.
+    function words(hosts: Span[Nat8, Static], own: Bool): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        insertBack(&!out, fromLiteral("-n"));
+        insertBack(&!out, fromLiteral("1"));
+        insertBack(&!out, fromLiteral("--hosts"));
+        insertBack(&!out, fromLiteral(hosts));
+        if own then
+            insertBack(&!out, fromLiteral("--rank-program"));
+            insertBack(&!out, fromLiteral("0"));
+            insertBack(&!out, fromLiteral("/proc/self/exe"));
+        end if;
+        insertBack(&!out, fromLiteral("/bin/false"));
+        insertBack(&!out, fromLiteral("rank"));
+        return out;
+    end;
+
+    function destroyWords(list: Buffer[String]): Unit is
+        var rest: Buffer[String] := list;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function writeHosts(path: Span[Nat8, Static], text: Span[Nat8, Static]): Bool is
+        case openWrite(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, text);
+                return closeFile(file) and written;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- One job, with or without the programme of rank 0.
+    function launch(own: Bool): Int32 is
+        let list: Buffer[String] := words("sperli-hosts.txt", own);
+        case parseRunArguments(&list) of
+            when Right(right as options: RunOptions) do
+                destroyWords(list);
+                return runJob(options);
+            when Left(left as code: Int32) do
+                destroyWords(list);
+                return code;
+        end case;
+    end;
+
+    function launcher(): ExitCode is
+        if not writeHosts("sperli-hosts.txt", "localhost\n") then
+            printLn("no host file");
+            return ExitFailure();
+        end if;
+        let own: Int32 := launch(true);
+        print("launcher status ");
+        printLn(own);
+        let shared: Int32 := launch(false);
+        print("launcher status ");
+        printLn(shared);
+        let removed: Bool := removeFile("sperli-hosts.txt");
+        return ExitSuccess();
+    end;
+
+    -- Sends the number of the rank to every other rank, receives theirs,
+    -- and writes the sum.
+    function trade(opened: Comm): Int32 is
+        var comm: Comm := opened;
+        var sum: Nat64 := widen(rank(&comm));
+        var code: Int32 := 0;
+        var other: Nat32 := 0;
+        while other < size(&comm) do
+            if other /= rank(&comm) then
+                let number: String := formatNat(widen(rank(&comm)));
+                if send(&!comm, other, 1, number) /= 0 then
+                    code := 1;
+                end if;
+            end if;
+            other := other + 1;
+        end while;
+        other := 0;
+        while other < size(&comm) do
+            if other /= rank(&comm) then
+                case recv(&!comm, other, 1) of
+                    when Right(right as text: String) do
+                        case parseNat(asSpan(&text)) of
+                            when Some(value as number: Nat64) do
+                                sum := sum + number;
+                            when None do
+                                code := 2;
+                        end case;
+                        destroyString(text);
+                    when Left(left as why: Int32) do
+                        print("recv failed with ");
+                        printLn(why);
+                        code := 3;
+                end case;
+            end if;
+            other := other + 1;
+        end while;
+        print("rank ");
+        print(rank(&comm));
+        print(" of ");
+        print(size(&comm));
+        print(" sum ");
+        printLn(sum);
+        finish(comm);
+        return code;
+    end;
+
+    function widen(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function rankMain(line: String): Int32 is
+        case readJobText(asSpan(&line)) of
+            when Left(left as why: Int32) do
+                destroyString(line);
+                print("the job was refused with ");
+                printLn(why);
+                return 4;
+            when Right(right as job: Job) do
+                destroyString(line);
+                case init(job) of
+                    when Left(left as why: Int32) do
+                        print("init failed with ");
+                        printLn(why);
+                        return 5;
+                    when Right(right as comm: Comm) do
+                        return trade(comm);
+                end case;
+        end case;
+    end;
+
+    function readJobLine(root: RootCapability): String is
+        var mut_root: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!mut_root);
+        var input: StandardInput := acquireInput(&!terminal);
+        let line: String := readLine(&!input);
+        releaseInput(input);
+        releaseTerminal(terminal);
+        surrenderRoot(mut_root);
+        return line;
+    end;
+
+    function exitFor(status: Int32): ExitCode is
+        if status = 0 then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        let arguments: Buffer[String] := processArguments();
+        if length(&arguments) = 0 then
+            destroyEmpty(arguments);
+            surrenderRoot(root);
+            return launcher();
+        end if;
+        destroyWords(arguments);
+        return exitFor(rankMain(readJobLine(root)));
+    end;
+end module body.
