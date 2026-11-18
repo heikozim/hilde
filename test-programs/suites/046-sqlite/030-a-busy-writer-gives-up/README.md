@@ -1,0 +1,1 @@
+Test that a second writer, while the first holds the write lock in a transaction, waits and tries again and gives up after five seconds by the monotonic clock: at least 5000 and less than 6000 milliseconds.  A count of tries alone waited more than seven seconds under load.

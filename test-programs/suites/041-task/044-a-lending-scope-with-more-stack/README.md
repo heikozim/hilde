@@ -1,0 +1,1 @@
+Test that a lending scope opened with openLendingWithStack gives its tasks the stack it asked for: a task reads the lent string and recurses 3000 calls deep, each call holding a String across the next, about 200 KiB of stack and more than the 64 KiB of a task of openLending, and finishes.  A task of a plain lending scope over the same borrow recurses 10 calls deep beside it.

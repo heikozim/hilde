@@ -1,0 +1,143 @@
+-- A failed statement inside a transaction makes its commit fail and
+-- leaves nothing; a rollback leaves nothing; a commit keeps its row.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.DuckDB (
+    Connection,
+    Writing,
+    Reading,
+    DuckError,
+    Values,
+    Cursor,
+    Transaction,
+    describe,
+    isUniqueViolation,
+    isConstraintViolation,
+    isBusy,
+    lastMessage,
+    openWriter,
+    openReader,
+    closeDatabase,
+    migrate,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    withInt64,
+    withText,
+    withNull,
+    start,
+    startWrite,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish
+);
+
+module body Test is
+    function report(label: Span[Nat8, Static], error: DuckError): Unit is
+        print(label);
+        print(": ");
+        print(describe(error));
+        print(", unique ");
+        print(isUniqueViolation(error));
+        print(", constraint ");
+        print(isConstraintViolation(error));
+        print(", busy ");
+        printLn(isBusy(error));
+        return nil;
+    end;
+
+    function written(label: Span[Nat8, Static], result: Either[DuckError, Nat64]): Unit is
+        case result of
+            when Left(left as error: DuckError) do
+                report(label, error);
+            when Right(right as count: Nat64) do
+                print(label);
+                print(": rows ");
+                printLn(count);
+        end case;
+        return nil;
+    end;
+
+    function ended(label: Span[Nat8, Static], failure: Option[DuckError]): Unit is
+        case failure of
+            when Some(value as error: DuckError) do
+                report(label, error);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [M: Free, R: Region]
+    function countRows(db: &![Connection[M], R], label: Span[Nat8, Static], sql: Span[Nat8, Static]): Unit is
+        var rows: Cursor := start(&~db, sql, noValues());
+        while advance(&!rows) do
+            print(label);
+            print(": ");
+            printLn(columnInt64(&rows, 0));
+        end while;
+        ended(label, finish(&~db, rows));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Connection[Writing], R]): Unit is
+        written("create", execute(&~db, "CREATE TABLE items (id BIGINT PRIMARY KEY)", noValues()));
+        case begin(&~db) of
+            when Left(left as error: DuckError) do
+                report("begin", error);
+            when Right(right as transaction: Transaction) do
+                written("insert 1", execute(&~db, "INSERT INTO items VALUES (?)", withInt64(noValues(), 1)));
+                written("insert 1 again", execute(&~db, "INSERT INTO items VALUES (?)", withInt64(noValues(), 1)));
+                case commit(&~db, transaction) of
+                    when Left(left as error: DuckError) do
+                        report("commit", error);
+                    when Right(right as done: Unit) do
+                        printLn("commit: committed");
+                end case;
+        end case;
+        countRows(&~db, "items", "SELECT count(*) FROM items");
+        case begin(&~db) of
+            when Left(left as error: DuckError) do
+                report("begin", error);
+            when Right(right as transaction: Transaction) do
+                written("insert 2", execute(&~db, "INSERT INTO items VALUES (?)", withInt64(noValues(), 2)));
+                rollback(&~db, transaction);
+                printLn("rolled back");
+        end case;
+        countRows(&~db, "items", "SELECT count(*) FROM items");
+        case begin(&~db) of
+            when Left(left as error: DuckError) do
+                report("begin", error);
+            when Right(right as transaction: Transaction) do
+                written("insert 3", execute(&~db, "INSERT INTO items VALUES (?)", withInt64(noValues(), 3)));
+                case commit(&~db, transaction) of
+                    when Left(left as error: DuckError) do
+                        report("commit", error);
+                    when Right(right as done: Unit) do
+                        printLn("commit: committed");
+                end case;
+        end case;
+        countRows(&~db, "items", "SELECT count(*) FROM items");
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openWriter("transactions.duckdb") of
+            when Left(left as error: DuckError) do
+                report("open", error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

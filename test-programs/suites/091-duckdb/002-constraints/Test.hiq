@@ -1,0 +1,129 @@
+-- Each constraint of DuckDB refused and classified: a primary key, a
+-- unique column, not null, a check and a foreign key.  DuckDB names one
+-- error type for every constraint; the duplicate key is told apart by its
+-- words, and only it is a unique violation.  The rows that were refused
+-- are not there.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.DuckDB (
+    Connection,
+    Writing,
+    Reading,
+    DuckError,
+    Values,
+    Cursor,
+    Transaction,
+    describe,
+    isUniqueViolation,
+    isConstraintViolation,
+    isBusy,
+    lastMessage,
+    openWriter,
+    openReader,
+    closeDatabase,
+    migrate,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    withInt64,
+    withText,
+    withNull,
+    start,
+    startWrite,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish
+);
+
+module body Test is
+    function report(label: Span[Nat8, Static], error: DuckError): Unit is
+        print(label);
+        print(": ");
+        print(describe(error));
+        print(", unique ");
+        print(isUniqueViolation(error));
+        print(", constraint ");
+        print(isConstraintViolation(error));
+        print(", busy ");
+        printLn(isBusy(error));
+        return nil;
+    end;
+
+    function written(label: Span[Nat8, Static], result: Either[DuckError, Nat64]): Unit is
+        case result of
+            when Left(left as error: DuckError) do
+                report(label, error);
+            when Right(right as count: Nat64) do
+                print(label);
+                print(": rows ");
+                printLn(count);
+        end case;
+        return nil;
+    end;
+
+    function ended(label: Span[Nat8, Static], failure: Option[DuckError]): Unit is
+        case failure of
+            when Some(value as error: DuckError) do
+                report(label, error);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [M: Free, R: Region]
+    function countRows(db: &![Connection[M], R], label: Span[Nat8, Static], sql: Span[Nat8, Static]): Unit is
+        var rows: Cursor := start(&~db, sql, noValues());
+        while advance(&!rows) do
+            print(label);
+            print(": ");
+            printLn(columnInt64(&rows, 0));
+        end while;
+        ended(label, finish(&~db, rows));
+        return nil;
+    end;
+
+    constant migrations: Span[Nat8, Static] := "102\nCREATE TABLE owners (id BIGINT PRIMARY KEY, name VARCHAR NOT NULL UNIQUE, age BIGINT CHECK (age >= 0))78\nCREATE TABLE pets (id BIGINT PRIMARY KEY, owner BIGINT REFERENCES owners (id))";
+
+    generic [R: Region]
+    function exercise(db: &![Connection[Writing], R]): Unit is
+        case migrate(&~db, migrations) of
+            when Left(left as error: DuckError) do
+                report("migrate", error);
+            when Right(right as applied: Index) do
+                print("migrations: ");
+                printLn(applied);
+        end case;
+        written("first owner", execute(&~db, "INSERT INTO owners (id, name, age) VALUES (?, ?, ?)", withInt64(withText(withInt64(noValues(), 1), "Ada"), 36)));
+        written("same id", execute(&~db, "INSERT INTO owners (id, name, age) VALUES (?, ?, ?)", withInt64(withText(withInt64(noValues(), 1), "Bob"), 40)));
+        written("same name", execute(&~db, "INSERT INTO owners (id, name, age) VALUES (?, ?, ?)", withInt64(withText(withInt64(noValues(), 2), "Ada"), 40)));
+        written("no name", execute(&~db, "INSERT INTO owners (id, name, age) VALUES (?, ?, ?)", withInt64(withNull(withInt64(noValues(), 3)), 40)));
+        written("negative age", execute(&~db, "INSERT INTO owners (id, name, age) VALUES (?, ?, ?)", withInt64(withText(withInt64(noValues(), 4), "Cy"), -1)));
+        written("unknown owner", execute(&~db, "INSERT INTO pets (id, owner) VALUES (?, ?)", withInt64(withInt64(noValues(), 1), 99)));
+        written("known owner", execute(&~db, "INSERT INTO pets (id, owner) VALUES (?, ?)", withInt64(withInt64(noValues(), 2), 1)));
+        written("not sql", execute(&~db, "INSERT INTO nowhere VALUES (?)", withInt64(noValues(), 1)));
+        written("too few values", execute(&~db, "INSERT INTO pets (id, owner) VALUES (?, ?)", withInt64(noValues(), 3)));
+        countRows(&~db, "owners", "SELECT count(*) FROM owners");
+        countRows(&~db, "pets", "SELECT count(*) FROM pets");
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openWriter("constraints.duckdb") of
+            when Left(left as error: DuckError) do
+                report("open", error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

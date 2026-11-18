@@ -1,0 +1,1 @@
+extends over two levels, blocks with super(), a scoped block in a for, include (in a for, seeing the loop variable and not `loop'), macros imported with from, with a default, a literal and a name as arguments. The expected output is Jinja2's on the same templates and data.json.

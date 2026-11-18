@@ -1,0 +1,1 @@
+Test that the commit is read from git: GIT_DIR names a directory of the test whose HEAD holds a fixed hash, the commit comes back as it stands, and the state of the work tree is clean because git status cannot read that directory.

@@ -1,0 +1,250 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Tests for Bindings.File: each function checks what it hands to C, even
+-- when the caller is not Standard.File.  Every refusal is asked for with an
+-- input the kernel would have taken, so a binding that lost its check
+-- answers something else than -1 or None and the assertion fails.  Every
+-- group also has a call that must go through, so a binding that refuses
+-- everything fails as well.
+--
+-- The file read is an empty file the test makes in its working directory,
+-- which answers the end of the file at once: a read that should have been
+-- refused writes nothing even when it is not.  It is not /dev/null, which
+-- a module for WebAssembly is not handed.  The programme started is
+-- /usr/bin/true, which both platforms have; under WASI, which starts no
+-- process, the spawn of the packed block is refused and the test holds
+-- the refusal.
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Text (
+    equal
+);
+import Standard.Platform (
+    systemName
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    destroyString,
+    length,
+    nthByte,
+    storeNth
+);
+import Bindings.File (
+    Spawned,
+    openRead,
+    openWrite,
+    removePath,
+    closeNumber,
+    readInto,
+    spawnPacked,
+    waitPid,
+    environmentInto
+);
+
+module body Standard.Bindings.File.Test is
+    ---
+    --- Helpers
+    ---
+
+    -- Whether this programme runs as a module for WebAssembly.  WASI
+    -- starts no process: spawnPacked answers None for every block there,
+    -- and the test holds the refusal instead of a programme that runs.
+    function onWasi(): Bool is
+        return equal(systemName(), "wasi");
+    end;
+
+    -- The bytes of text and one zero byte after them.
+    function withZero(text: Span[Nat8, Static]): String is
+        let source: String := fromLiteral(text);
+        let size: Index := length(&source);
+        var copy: String := makeString(size + 1, 0);
+        if size > 0 then
+            for i from 0 to size - 1 do
+                storeNth(&!copy, i, nthByte(&source, i));
+            end for;
+        end if;
+        destroyString(source);
+        return copy;
+    end;
+
+    -- first, a zero byte, second, a zero byte.
+    function twoWithZeros(first: Span[Nat8, Static], second: Span[Nat8, Static]): String is
+        let a: String := withZero(first);
+        let b: String := withZero(second);
+        let size_a: Index := length(&a);
+        let size_b: Index := length(&b);
+        var joined: String := makeString(size_a + size_b, 0);
+        for i from 0 to size_a - 1 do
+            storeNth(&!joined, i, nthByte(&a, i));
+        end for;
+        for i from 0 to size_b - 1 do
+            storeNth(&!joined, size_a + i, nthByte(&b, i));
+        end for;
+        destroyString(a);
+        destroyString(b);
+        return joined;
+    end;
+
+    -- Makes the empty file name, with its zero byte, and closes it again.
+    -- True when it was made and closed.
+    function madeEmpty(name: Span[Nat8, Static]): Bool is
+        let path: String := withZero(name);
+        let number: Int32 := openWrite(&path);
+        destroyString(path);
+        if number < 0 then
+            return false;
+        end if;
+        return closeNumber(number);
+    end;
+
+    -- Removes the file name, with its zero byte.  True when it was removed.
+    function removed(name: Span[Nat8, Static]): Bool is
+        let path: String := withZero(name);
+        let gone: Bool := removePath(&path);
+        destroyString(path);
+        return gone;
+    end;
+
+    ---
+    --- Paths
+    ---
+
+    -- a path is checked before it reaches the kernel.
+    function testPath(): Unit is
+        let name: Span[Nat8, Static] := "bindings-file-path.empty";
+        assertTrue(madeEmpty(name), "the empty file was made");
+        let bare: String := fromLiteral(name);
+        assertTrue(openRead(&bare) = -1, "a path without its zero byte is refused");
+        destroyString(bare);
+        let empty: String := makeString(0, 0);
+        assertTrue(openRead(&empty) = -1, "an empty path is refused");
+        destroyString(empty);
+        -- The kernel would open the empty file here, the name before the
+        -- first zero byte, which is not the name that was handed in.
+        let inner: String := twoWithZeros(name, "x");
+        assertTrue(openRead(&inner) = -1, "a path with a zero byte inside is refused");
+        destroyString(inner);
+        let good: String := withZero(name);
+        let number: Int32 := openRead(&good);
+        destroyString(good);
+        assertTrue(number >= 0, "the same path with its zero byte opens");
+        assertTrue(closeNumber(number), "and closes");
+        assertTrue(removed(name), "the empty file was removed");
+        return nil;
+    end;
+
+    ---
+    --- Reading
+    ---
+
+    -- a read never reaches past its buffer.
+    function testRead(): Unit is
+        let name: Span[Nat8, Static] := "bindings-file-read.empty";
+        assertTrue(madeEmpty(name), "the empty file was made");
+        let path: String := withZero(name);
+        let number: Int32 := openRead(&path);
+        destroyString(path);
+        assertTrue(number >= 0, "the empty file opens");
+        var buffer: String := makeString(8, 0);
+        assertTrue(readInto(number, &!buffer, 4, 5) = -1, "at 4, 5 bytes into 8 is refused");
+        assertTrue(readInto(number, &!buffer, 0, 9) = -1, "9 bytes into 8 is refused");
+        assertTrue(readInto(number, &!buffer, 8, 1) = -1, "a read at the end of the buffer is refused");
+        assertTrue(readInto(number, &!buffer, 0, 0) = -1, "a read of nothing is refused");
+        -- The largest count there is: at plus count would not fit in an
+        -- Index, and the check must not compute that sum.
+        let largest: Index := maximum_index;
+        assertTrue(readInto(number, &!buffer, 1, largest) = -1, "a count past every buffer is refused");
+        assertTrue(readInto(number, &!buffer, 4, 4) = 0, "4 bytes at 4 into 8 reach the kernel, which says end of file");
+        destroyString(buffer);
+        assertTrue(closeNumber(number), "the empty file closes");
+        assertTrue(removed(name), "the empty file was removed");
+        return nil;
+    end;
+
+    ---
+    --- Starting a programme
+    ---
+
+    -- True when the programme started and ended with exit code 0; its three
+    -- descriptors are closed.
+    function ranAndEnded(started: Option[Spawned]): Bool is
+        case started of
+            when Some(value as spawned: Spawned) do
+                let closed_input: Bool := closeNumber(spawned.input);
+                let closed_output: Bool := closeNumber(spawned.output);
+                let closed_errors: Bool := closeNumber(spawned.errors);
+                let status: Int32 := waitPid(spawned.pid);
+                return (closed_input and closed_output) and (closed_errors and (status = 0));
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refused(started: Option[Spawned]): Bool is
+        case started of
+            when Some(value as spawned: Spawned) do
+                -- Started although it should not have been: cleaned up, and
+                -- false.
+                let closed_input: Bool := closeNumber(spawned.input);
+                let closed_output: Bool := closeNumber(spawned.output);
+                let closed_errors: Bool := closeNumber(spawned.errors);
+                let status: Int32 := waitPid(spawned.pid);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- a count never reaches past the arguments.
+    function testSpawn(): Unit is
+        -- Two zero bytes and a count of one: the runtime would take the
+        -- first argument only.  This one comes first because it is the
+        -- refusal whose loss is harmless to watch.
+        let two: String := twoWithZeros("/usr/bin/true", "x");
+        assertTrue(refused(spawnPacked(&two, 1)), "a count below the zero bytes is refused");
+        destroyString(two);
+        let one: String := withZero("/usr/bin/true");
+        assertTrue(refused(spawnPacked(&one, 2)), "a count above the zero bytes is refused");
+        assertTrue(refused(spawnPacked(&one, 0)), "a count of 0 is refused");
+        if onWasi() then
+            assertTrue(refused(spawnPacked(&one, 1)), "WASI starts no programme");
+        else
+            assertTrue(ranAndEnded(spawnPacked(&one, 1)), "the count of the zero bytes starts the programme");
+        end if;
+        destroyString(one);
+        let bare: String := fromLiteral("/usr/bin/true");
+        assertTrue(refused(spawnPacked(&bare, 1)), "arguments without a zero byte at the end are refused");
+        destroyString(bare);
+        return nil;
+    end;
+
+    ---
+    --- The environment
+    ---
+
+    -- a name and a buffer are checked before the environment is read.
+    function testEnvironment(): Unit is
+        var buffer: String := makeString(16, 0);
+        let bare: String := fromLiteral("PATH");
+        assertTrue(environmentInto(&bare, &!buffer) = -1, "a name without its zero byte is refused");
+        destroyString(bare);
+        let name: String := withZero("PATH");
+        var none: String := makeString(0, 0);
+        assertTrue(environmentInto(&name, &!none) = -1, "an empty buffer is refused");
+        destroyString(none);
+        assertFalse(environmentInto(&name, &!buffer) = -1, "PATH is read with its zero byte and a buffer");
+        destroyString(name);
+        destroyString(buffer);
+        return nil;
+    end;
+end module body.

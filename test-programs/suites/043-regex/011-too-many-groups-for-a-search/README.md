@@ -1,0 +1,1 @@
+A pattern whose capture table of one search would pass 16,777,216 entries is refused by compile, as a program that is too large is, instead of the first search running out of memory; 1,000 groups are taken.

@@ -1,0 +1,1 @@
+Where Go's html/template and Jinja2 disagree: `+`. On this template and data.json Jinja2 leaves + everywhere and escapes no URL (`/s?q=a+b`); Go writes `&#43;` in text, attributes and a URL path, and `%2b` in a query. @template follows Jinja2's HTML escaping and Go's URL escaping, so the expected output is this implementation's own, reviewed.

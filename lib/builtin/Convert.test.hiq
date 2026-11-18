@@ -1,0 +1,207 @@
+--
+-- Part of the Hilde project, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Tests for the narrowing conversions of Hilde.Pervasive, and they exist
+-- because four of them could never return Some.
+--
+-- Met while building Standard.File: readAll read 19 bytes
+-- from the kernel, handed the count to toIndex, and appended nothing.  The
+-- cause was one shape of mistake made four times -- a limit of one type
+-- embedded as another.  (hilde_int64_t)(SIZE_MAX) is -1 where size_t is 64
+-- bits wide, so value <= SIZE_MAX on an Int64 asked whether the value was
+-- at most -1; and (hilde_index_t)(INT8_MIN) is SIZE_MAX-127, so
+-- value >= INT8_MIN on an Index asked whether an unsigned number was
+-- above almost everything.  Both are always false, and a conversion that is
+-- always None looks exactly like a value that does not fit.
+--
+-- Every case below therefore comes in a pair: one that must convert and one
+-- that must not, so that a conversion which has stopped working cannot pass
+-- by refusing everything.
+--
+-- What is deliberately not asserted: the upper bound of toInt64(Index) and
+-- of toIndex(Int64).  Whether an Index above INT64_MAX exists at all is a
+-- property of the platform, and a test that says "this must be None" would
+-- be a test of the machine it last ran on.
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+
+module body Hilde.Convert.Test is
+    ---
+    --- Helpers
+    ---
+
+    generic [T: Free]
+    function converted(answer: Option[T]): Bool is
+        case answer of
+            when Some(value as inner: T) do
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [T: Free]
+    function valueOr(answer: Option[T], fallback: T): T is
+        case answer of
+            when Some(value as inner: T) do
+                return inner;
+            when None do
+                return fallback;
+        end case;
+    end;
+
+    ---
+    --- Out of an Index, which is unsigned and has no negative side
+    ---
+
+    -- out of an Index.
+    function testFromIndex(): Unit is
+        let five: Index := 5;
+        let int8_ceiling: Index := 127;
+        let over_int8: Index := 128;
+        let int16_ceiling: Index := 32767;
+        let over_int16: Index := 32768;
+
+        let int8_fallback: Int8 := -1;
+        let int16_fallback: Int16 := -1;
+        let int64_fallback: Int64 := -1;
+        let expected8: Int8 := 5;
+        let expected16: Int16 := 5;
+        let expected64: Int64 := 5;
+        let ceiling8: Int8 := 127;
+        let ceiling16: Int16 := 32767;
+
+        -- Int8: it fits, and the value is the value.
+        assertTrue(converted(toInt8(five)), "toInt8 of the Index 5 converts");
+        assertTrue(valueOr(toInt8(five), int8_fallback) = expected8,
+            "toInt8 of the Index 5 is 5");
+        assertTrue(valueOr(toInt8(int8_ceiling), int8_fallback) = ceiling8,
+            "toInt8 of the Index 127 is 127");
+        -- And one above the ceiling, without which the three above would
+        -- pass on a conversion that says yes to everything.
+        assertFalse(converted(toInt8(over_int8)),
+            "toInt8 of the Index 128 refuses");
+
+        -- Int16, the same pair.
+        assertTrue(valueOr(toInt16(five), int16_fallback) = expected16,
+            "toInt16 of the Index 5 is 5");
+        assertTrue(valueOr(toInt16(int16_ceiling), int16_fallback) = ceiling16,
+            "toInt16 of the Index 32767 is 32767");
+        assertFalse(converted(toInt16(over_int16)),
+            "toInt16 of the Index 32768 refuses");
+
+        -- Int64: every Index this test can write fits, so the pair here is
+        -- the value and its identity, not a ceiling.
+        assertTrue(converted(toInt64(five)), "toInt64 of the Index 5 converts");
+        assertTrue(valueOr(toInt64(five), int64_fallback) = expected64,
+            "toInt64 of the Index 5 is 5");
+        return nil;
+    end;
+
+    ---
+    --- Into an Index, where the refusal is the negative side
+    ---
+
+    -- into an Index.
+    function testToIndex(): Unit is
+        let nineteen: Int64 := 19;
+        let zero: Int64 := 0;
+        let negative: Int64 := -1;
+        let fallback: Index := 0;
+        let expected: Index := 19;
+
+        -- This is the one that stopped Standard.File.readAll from
+        -- appending a single byte.
+        assertTrue(converted(toIndex(nineteen)),
+            "toIndex of the Int64 19 converts");
+        assertTrue(valueOr(toIndex(nineteen), fallback) = expected,
+            "toIndex of the Int64 19 is 19");
+        assertTrue(converted(toIndex(zero)), "toIndex of the Int64 0 converts");
+        -- The refusal that must stay one: an Index has no negative side.
+        assertFalse(converted(toIndex(negative)),
+            "toIndex of the Int64 -1 refuses");
+        return nil;
+    end;
+
+    ---
+    --- Out of a float, where the refusal is NaN and a value out of range
+    ---
+
+    -- out of a float.
+    function testFromFloat(): Unit is
+        let big: Float64 := 1.0e10;
+        let minus_one: Float64 := -1.0;
+        let minus_half: Float64 := -0.5;
+        let last_nat8: Float64 := 255.9;
+        let first_over_nat8: Float64 := 256.0;
+        let int32_floor: Float64 := -2147483648.0;
+        let under_int32: Float64 := -2147483649.0;
+        let int64_ceiling: Float64 := 9223372036854775808.0;
+        let max: Float64 := 1.0e308;
+        let ten: Float64 := 10.0;
+        let inf: Float64 := max * ten;
+        let nan: Float64 := inf - inf;
+        let small: Float32 := 3.75;
+        let huge: Float32 := 1.0e10;
+
+        let nat8_fallback: Nat8 := 0;
+        let int32_fallback: Int32 := 0;
+        let expected_nat8: Nat8 := 255;
+        let zero_nat8: Nat8 := 0;
+        let expected_int32: Int32 := -2147483648;
+        let expected_three: Int32 := 3;
+
+        -- Inside the range a value converts, truncated toward zero.
+        assertTrue(valueOr(toNat8(last_nat8), nat8_fallback) = expected_nat8,
+            "toNat8 of 255.9 is 255");
+        assertTrue(valueOr(toNat8(minus_half), expected_nat8) = zero_nat8,
+            "toNat8 of -0.5 is 0");
+        assertTrue(valueOr(toInt32(int32_floor), int32_fallback) = expected_int32,
+            "toInt32 of -2147483648.0 is the floor of Int32");
+        assertTrue(valueOr(toInt32(small), int32_fallback) = expected_three,
+            "toInt32 of the Float32 3.75 is 3");
+        -- One step outside, and the values that fit no integer.
+        assertFalse(converted(toNat8(first_over_nat8)), "toNat8 of 256.0 refuses");
+        assertFalse(converted(toNat8(minus_one)), "toNat8 of -1.0 refuses");
+        assertFalse(converted(toInt32(big)), "toInt32 of 1.0e10 refuses");
+        assertFalse(converted(toInt32(under_int32)), "toInt32 of -2147483649.0 refuses");
+        assertFalse(converted(toInt32(huge)), "toInt32 of the Float32 1.0e10 refuses");
+        assertFalse(converted(toInt64(int64_ceiling)), "toInt64 of 2 to the 63 refuses");
+        assertFalse(converted(toInt64(nan)), "toInt64 of NaN refuses");
+        assertFalse(converted(toNat64(inf)), "toNat64 of infinity refuses");
+        assertFalse(converted(toIndex(nan)), "toIndex of NaN refuses");
+        return nil;
+    end;
+
+    ---
+    --- The controls: members of the same family that were never broken
+    ---
+
+    -- the neighbours that were right.
+    function testControl(): Unit is
+        let five: Index := 5;
+        let nineteen: Int32 := 19;
+        let big: Int64 := 19;
+        let int32_fallback: Int32 := -1;
+        let expected32: Int32 := 5;
+        let index_fallback: Index := 0;
+        let expected_index: Index := 19;
+        let nat64_fallback: Nat64 := 0;
+        let expected_nat64: Nat64 := 19;
+
+        assertTrue(valueOr(toInt32(five), int32_fallback) = expected32,
+            "toInt32 of the Index 5 is 5");
+        assertTrue(valueOr(toIndex(nineteen), index_fallback) = expected_index,
+            "toIndex of the Int32 19 is 19");
+        assertTrue(valueOr(toNat64(big), nat64_fallback) = expected_nat64,
+            "toNat64 of the Int64 19 is 19");
+        return nil;
+    end;
+end module body.

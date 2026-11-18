@@ -1,0 +1,233 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    length,
+    asSpan,
+    destroyString,
+    destroyWiped
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    substring
+);
+import Standard.Libcrypto (
+    randomBytes,
+    sha512,
+    ed25519PublicKey,
+    ed25519Sign,
+    ed25519Verify
+);
+import Standard.MlDsa (
+    MlDsaKey,
+    Level44,
+    keypairFromSeed,
+    publicKeyOf as mlDsaPublicKeyOf,
+    seedOf as mlDsaSeedOf,
+    signWithRandomness as mlDsaSignWithRandomness,
+    verify as mlDsaVerify,
+    destroyMlDsaKey
+);
+
+module body Standard.CompositeSig is
+    constant ml_dsa_public_bytes: Index := 1312;
+    constant ml_dsa_signature_bytes: Index := 2420;
+
+    -- The ML-DSA-44 key, and the seed of Ed25519 with its public key; the
+    -- seed is the whole secret of the Ed25519 half.
+    record CompositeKey: Linear is
+        lattice: MlDsaKey;
+        edSeed: String;
+        edPublic: String;
+        invariant length(&edSeed) = 32;
+        invariant length(&edPublic) = 32;
+    end;
+
+    function publicKeyBytes(): Index is
+        return 1344;
+    end;
+
+    function signatureBytes(): Index is
+        return 2484;
+    end;
+
+    function prefix(): Span[Nat8, Static] is
+        return "CompositeAlgorithmSignatures2025";
+    end;
+
+    function openSshLabel(): Span[Nat8, Static] is
+        return "COMPSIG-MLDSA44-Ed25519-SHA512";
+    end;
+
+    generic [M: Region, E: Region]
+    function keypairFromSeeds(ml_dsa_seed: Span[Nat8, M], ed25519_seed: Span[Nat8, E]): Option[CompositeKey] is
+        case ed25519PublicKey(ed25519_seed) of
+            when Some(value as ed_public: String) do
+                case keypairFromSeed(Level44(), ml_dsa_seed) of
+                    when Some(value as lattice: MlDsaKey) do
+                        let key: CompositeKey := CompositeKey(lattice => lattice, edSeed => fromSpanWiped(ed25519_seed), edPublic => ed_public);
+                        let some: Option[CompositeKey] := Some(value => key);
+                        return some;
+                    when None do
+                        destroyString(ed_public);
+                        let none: Option[CompositeKey] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[CompositeKey] := None();
+                return none;
+        end case;
+    end;
+
+    -- A copy of a span, to be wiped by whoever destroys it.
+    generic [S: Region]
+    function fromSpanWiped(bytes: Span[Nat8, S]): String is
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, bytes);
+        return finalize(builder);
+    end;
+
+    function generateKeyPair(): Option[CompositeKey] is
+        case randomBytes(64) of
+            when Some(value as seeds: String) do
+                let made: Option[CompositeKey] := keypairFromSeeds(substring(asSpan(&seeds), 0, 32), substring(asSpan(&seeds), 32, 64));
+                destroyWiped(seeds);
+                return made;
+            when None do
+                let none: Option[CompositeKey] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region]
+    function publicKeyOf(key: &[CompositeKey, R]): String is
+        let lattice: String := mlDsaPublicKeyOf(&(key->lattice));
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, asSpan(&lattice));
+        writeString(&!builder, asSpan(&(key->edPublic)));
+        destroyString(lattice);
+        return finalize(builder);
+    end;
+
+    generic [R: Region]
+    function seedsOf(key: &[CompositeKey, R]): String is
+        let lattice: String := mlDsaSeedOf(&(key->lattice));
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, asSpan(&lattice));
+        writeString(&!builder, asSpan(&(key->edSeed)));
+        destroyWiped(lattice);
+        return finalize(builder);
+    end;
+
+    -- M' of the draft: the prefix, the label, the length of the context in
+    -- one byte, the context and the SHA-512 of the message.  None when
+    -- libcrypto gives no digest.
+    generic [L: Region, M: Region, C: Region]
+    function messagePrime(label: Span[Nat8, L], message: Span[Nat8, M], context: Span[Nat8, C]): Option[String] is
+        case toNat8(spanLength(context)) of
+            when Some(value as size: Nat8) do
+                case sha512(message) of
+                    when Some(value as digest: String) do
+                        var builder: StringBuilder := makeStringBuilder();
+                        writeString(&!builder, prefix());
+                        writeString(&!builder, label);
+                        writeByte(&!builder, size);
+                        writeString(&!builder, context);
+                        writeString(&!builder, asSpan(&digest));
+                        destroyString(digest);
+                        let some: Option[String] := Some(value => finalize(builder));
+                        return some;
+                    when None do
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, L: Region, M: Region, C: Region]
+    function sign(key: &[CompositeKey, R], label: Span[Nat8, L], message: Span[Nat8, M], context: Span[Nat8, C]): Option[String] is
+        case randomBytes(32) of
+            when Some(value as randomness: String) do
+                let signed: Option[String] := signWithRandomness(key, label, message, context, asSpan(&randomness));
+                destroyWiped(randomness);
+                return signed;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, L: Region, M: Region, C: Region, N: Region]
+    function signWithRandomness(key: &[CompositeKey, R], label: Span[Nat8, L], message: Span[Nat8, M], context: Span[Nat8, C], randomness: Span[Nat8, N]): Option[String] is
+        case messagePrime(label, message, context) of
+            when Some(value as prime: String) do
+                case mlDsaSignWithRandomness(&(key->lattice), asSpan(&prime), label, randomness) of
+                    when Some(value as lattice: String) do
+                        case ed25519Sign(asSpan(&(key->edSeed)), asSpan(&prime)) of
+                            when Some(value as ed: String) do
+                                var builder: StringBuilder := makeStringBuilder();
+                                writeString(&!builder, asSpan(&lattice));
+                                writeString(&!builder, asSpan(&ed));
+                                destroyString(ed);
+                                destroyString(lattice);
+                                destroyString(prime);
+                                let some: Option[String] := Some(value => finalize(builder));
+                                return some;
+                            when None do
+                                destroyString(lattice);
+                                destroyString(prime);
+                                let none: Option[String] := None();
+                                return none;
+                        end case;
+                    when None do
+                        destroyString(prime);
+                        let none: Option[String] := None();
+                        return none;
+                end case;
+            when None do
+                let none: Option[String] := None();
+                return none;
+        end case;
+    end;
+
+    generic [P: Region, L: Region, M: Region, C: Region, G: Region]
+    function verify(public_key: Span[Nat8, P], label: Span[Nat8, L], message: Span[Nat8, M], context: Span[Nat8, C], signature: Span[Nat8, G]): Bool is
+        if (spanLength(public_key) /= publicKeyBytes()) or (spanLength(signature) /= signatureBytes()) then
+            return false;
+        end if;
+        if (spanLength(label) > 255) or (spanLength(context) > 255) then
+            return false;
+        end if;
+        case messagePrime(label, message, context) of
+            when Some(value as prime: String) do
+                let lattice_holds: Bool := mlDsaVerify(Level44(), substring(public_key, 0, ml_dsa_public_bytes), asSpan(&prime), label, substring(signature, 0, ml_dsa_signature_bytes));
+                let ed_holds: Bool := ed25519Verify(substring(public_key, ml_dsa_public_bytes, spanLength(public_key)), asSpan(&prime), substring(signature, ml_dsa_signature_bytes, spanLength(signature)));
+                destroyString(prime);
+                return lattice_holds and ed_holds;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function destroyCompositeKey(key: CompositeKey): Unit is
+        let { lattice: MlDsaKey, edSeed as ed_seed: String, edPublic as ed_public: String } := key;
+        destroyMlDsaKey(lattice);
+        destroyWiped(ed_seed);
+        destroyString(ed_public);
+        return nil;
+    end;
+end module body.

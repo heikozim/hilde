@@ -1,0 +1,1 @@
+The only path from s to y weighs one more than the largest Nat64, and no path leads from s to z. lightestPath answers TooHeavy for the first and Unreachable for the second, never a weight that wrapped round and never an abort; after z is removed, its number gives UnknownNode. The weight of the one path from s to x is exactly the largest Nat64, and it is given.
