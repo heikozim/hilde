@@ -1,0 +1,348 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The slots of Standard.Database for DuckDB.  A connection, a
+-- transaction and a cursor of Standard.DuckDB are erased into the
+-- database's own types and revealed here, as the type they were erased
+-- with: writing says whether a connection was opened for writing.
+import Standard.Buffer (
+    Buffer,
+    destroyEmpty,
+    remove,
+    length as bufferLength
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Bindings.Database (
+    Erased,
+    erase,
+    unerase,
+    reveal,
+    revealWrite
+);
+import Standard.Database (
+    Database,
+    Writing,
+    Reading,
+    DuckDBBackend,
+    DbError,
+    Values,
+    Value,
+    IntValue,
+    FloatValue,
+    BoolValue,
+    TimeValue,
+    TextValue,
+    BytesValue,
+    NullValue,
+    takeValues,
+    ColumnKind,
+    NullKind,
+    IntKind,
+    FloatKind,
+    BoolKind,
+    TimeKind,
+    TextKind,
+    BytesKind,
+    Column,
+    IntColumn,
+    FloatColumn,
+    BoolColumn,
+    TextColumn,
+    ErrorKind,
+    writerOf,
+    readerOf,
+    duckdbClose,
+    duckdbMigrate,
+    duckdbBegin,
+    duckdbEnd,
+    duckdbStart,
+    duckdbExecute,
+    duckdbAdvance,
+    duckdbColumn,
+    duckdbFinish,
+    duckdbKind
+);
+import Standard.DuckDB (
+    Connection,
+    Writing as DuckWriting,
+    Reading as DuckReading,
+    DuckError,
+    Transaction as DuckTransaction,
+    Values as DuckValues,
+    Cursor as DuckCursor,
+    describe as duckDescribe,
+    isUniqueViolation as duckIsUniqueViolation,
+    isConstraintViolation as duckIsConstraintViolation,
+    isBusy as duckIsBusy,
+    openWriter as duckOpenWriter,
+    openReader as duckOpenReader,
+    closeDatabase as duckClose,
+    migrate as duckMigrate,
+    begin as duckBegin,
+    commit as duckCommit,
+    rollback as duckRollback,
+    noValues as duckNoValues,
+    withInt64 as duckWithInt64,
+    withFloat64 as duckWithFloat64,
+    withBool as duckWithBool,
+    withTimestamp as duckWithTimestamp,
+    withText as duckWithText,
+    withBytes as duckWithBytes,
+    withNull as duckWithNull,
+    start as duckStart,
+    execute as duckExecute,
+    advance as duckAdvance,
+    columnInt64 as duckColumnInt64,
+    columnFloat64 as duckColumnFloat64,
+    columnBool as duckColumnBool,
+    columnTimestamp as duckColumnTimestamp,
+    columnText as duckColumnText,
+    columnBytes as duckColumnBytes,
+    isNullColumn as duckIsNullColumn,
+    finish as duckFinish
+);
+
+module body Standard.Database.DuckDB is
+    ---
+    --- The connection, transaction and cursor behind an erased box
+    ---
+
+    generic [R: Region]
+    function writer(connection: &![Erased, R]): &![Connection[DuckWriting], R] is
+        return revealWrite(connection);
+    end;
+
+    generic [R: Region]
+    function reader(connection: &![Erased, R]): &![Connection[DuckReading], R] is
+        return revealWrite(connection);
+    end;
+
+    generic [R: Region]
+    function rowsToAdvance(rows: &![Erased, R]): &![DuckCursor, R] is
+        return revealWrite(rows);
+    end;
+
+    generic [R: Region]
+    function rowsToRead(rows: &[Erased, R]): &[DuckCursor, R] is
+        return reveal(rows);
+    end;
+
+    function failed(error: DuckError): DbError is
+        return DbError(backend => DuckDBBackend(), code => error.code);
+    end;
+
+    ---
+    --- Opening
+    ---
+
+    generic [R: Region]
+    function openDuckDB(path: Span[Nat8, R]): Either[DbError, Database[Writing]] is
+        case duckOpenWriter(path) of
+            when Left(left as error: DuckError) do
+                return Left(left => failed(error));
+            when Right(right as connection: Connection[DuckWriting]) do
+                return Right(right => writerOf(erase(connection), DuckDBBackend()));
+        end case;
+    end;
+
+    generic [R: Region]
+    function openDuckDBReader(path: Span[Nat8, R]): Either[DbError, Database[Reading]] is
+        case duckOpenReader(path) of
+            when Left(left as error: DuckError) do
+                return Left(left => failed(error));
+            when Right(right as connection: Connection[DuckReading]) do
+                return Right(right => readerOf(erase(connection), DuckDBBackend()));
+        end case;
+    end;
+
+    ---
+    --- The slots
+    ---
+
+    pragma Implements(Name => "Standard.Database.duckdbClose");
+    function closeDuckDB(connection: Erased, writing: Bool): Unit is
+        if writing then
+            let open: Connection[DuckWriting] := unerase(connection);
+            duckClose(open);
+        else
+            let open: Connection[DuckReading] := unerase(connection);
+            duckClose(open);
+        end if;
+        return nil;
+    end;
+
+    pragma Implements(Name => "Standard.Database.duckdbMigrate");
+    generic [R: Region]
+    function migrateDuckDB(connection: &![Erased, R], migrations: Span[Nat8, Static]): Either[DbError, Index] is
+        case duckMigrate(writer(connection), migrations) of
+            when Left(left as error: DuckError) do
+                return Left(left => failed(error));
+            when Right(right as count: Index) do
+                return Right(right => count);
+        end case;
+    end;
+
+    function begun(result: Either[DuckError, DuckTransaction]): Either[DbError, Erased] is
+        case result of
+            when Left(left as error: DuckError) do
+                return Left(left => failed(error));
+            when Right(right as transaction: DuckTransaction) do
+                return Right(right => erase(transaction));
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.duckdbBegin");
+    generic [R: Region]
+    function beginDuckDB(connection: &![Erased, R], writing: Bool): Either[DbError, Erased] is
+        if writing then
+            return begun(duckBegin(writer(connection)));
+        else
+            return begun(duckBegin(reader(connection)));
+        end if;
+    end;
+
+    function done(result: Either[DuckError, Unit]): Either[DbError, Unit] is
+        case result of
+            when Left(left as error: DuckError) do
+                return Left(left => failed(error));
+            when Right(right as ended: Unit) do
+                return Right(right => nil);
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.duckdbEnd");
+    generic [R: Region]
+    function endDuckDB(connection: &![Erased, R], writing: Bool, transaction: Erased, keep: Bool): Either[DbError, Unit] is
+        let inner: DuckTransaction := unerase(transaction);
+        if writing then
+            if keep then
+                return done(duckCommit(writer(connection), inner));
+            else
+                duckRollback(writer(connection), inner);
+            end if;
+        else
+            if keep then
+                return done(duckCommit(reader(connection), inner));
+            else
+                duckRollback(reader(connection), inner);
+            end if;
+        end if;
+        return Right(right => nil);
+    end;
+
+    function toDuck(values: Values): DuckValues is
+        var list: Buffer[Value] := takeValues(values);
+        var out: DuckValues := duckNoValues();
+        while bufferLength(&list) > 0 do
+            case remove(&!list, 0) of
+                when IntValue(value as v: Int64) do
+                    out := duckWithInt64(out, v);
+                when FloatValue(value as v: Float64) do
+                    out := duckWithFloat64(out, v);
+                when BoolValue(value as v: Bool) do
+                    out := duckWithBool(out, v);
+                when TimeValue(value as v: Int64) do
+                    out := duckWithTimestamp(out, v);
+                when TextValue(value as s: String) do
+                    out := duckWithText(out, asSpan(&s));
+                    destroyString(s);
+                when BytesValue(value as s: String) do
+                    out := duckWithBytes(out, asSpan(&s));
+                    destroyString(s);
+                when NullValue do
+                    out := duckWithNull(out);
+            end case;
+        end while;
+        destroyEmpty(list);
+        return out;
+    end;
+
+    generic [M: Free, R: Region]
+    function run(connection: &![Connection[M], R], sql: Span[Nat8, Static], values: Values): Erased is
+        return erase(duckStart(connection, sql, toDuck(values)));
+    end;
+
+    pragma Implements(Name => "Standard.Database.duckdbStart");
+    generic [R: Region]
+    function startDuckDB(connection: &![Erased, R], writing: Bool, sql: Span[Nat8, Static], values: Values): Erased is
+        if writing then
+            return run(writer(connection), sql, values);
+        else
+            return run(reader(connection), sql, values);
+        end if;
+    end;
+
+    pragma Implements(Name => "Standard.Database.duckdbExecute");
+    generic [R: Region]
+    function executeDuckDB(connection: &![Erased, R], sql: Span[Nat8, Static], values: Values): Either[DbError, Nat64] is
+        case duckExecute(writer(connection), sql, toDuck(values)) of
+            when Left(left as error: DuckError) do
+                return Left(left => failed(error));
+            when Right(right as count: Nat64) do
+                return Right(right => count);
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.duckdbAdvance");
+    generic [R: Region]
+    function advanceDuckDB(rows: &![Erased, R]): Bool is
+        return duckAdvance(rowsToAdvance(rows));
+    end;
+
+    pragma Implements(Name => "Standard.Database.duckdbColumn");
+    generic [R: Region]
+    function columnDuckDB(rows: &[Erased, R], index: Int32, kind: ColumnKind): Column[R] is
+        let cursor: &[DuckCursor, R] := rowsToRead(rows);
+        case kind of
+            when NullKind do
+                return BoolColumn(value => duckIsNullColumn(cursor, index));
+            when IntKind do
+                return IntColumn(value => duckColumnInt64(cursor, index));
+            when FloatKind do
+                return FloatColumn(value => duckColumnFloat64(cursor, index));
+            when BoolKind do
+                return BoolColumn(value => duckColumnBool(cursor, index));
+            when TimeKind do
+                return IntColumn(value => duckColumnTimestamp(cursor, index));
+            when TextKind do
+                return TextColumn(value => duckColumnText(cursor, index));
+            when BytesKind do
+                return TextColumn(value => duckColumnBytes(cursor, index));
+        end case;
+    end;
+
+    function finished(result: Option[DuckError]): Option[DbError] is
+        case result of
+            when Some(value as error: DuckError) do
+                return Some(value => failed(error));
+            when None do
+                return None();
+        end case;
+    end;
+
+    pragma Implements(Name => "Standard.Database.duckdbFinish");
+    generic [R: Region]
+    function finishDuckDB(connection: &![Erased, R], writing: Bool, rows: Erased): Option[DbError] is
+        let cursor: DuckCursor := unerase(rows);
+        if writing then
+            return finished(duckFinish(writer(connection), cursor));
+        else
+            return finished(duckFinish(reader(connection), cursor));
+        end if;
+    end;
+
+    pragma Implements(Name => "Standard.Database.duckdbKind");
+    function kindDuckDB(code: Int32): ErrorKind is
+        let error: DuckError := DuckError(code => code);
+        return ErrorKind(unique => duckIsUniqueViolation(error), constraint => duckIsConstraintViolation(error), busy => duckIsBusy(error), text => duckDescribe(error));
+    end;
+end module body.

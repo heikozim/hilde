@@ -1,0 +1,140 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Database (
+    Backend,
+    SqliteBackend,
+    SqlCipherBackend,
+    DbError,
+    isUniqueViolation,
+    isConstraintViolation,
+    isBusy,
+    Database,
+    Writing,
+    Transaction,
+    Cursor,
+    noValues,
+    execute,
+    begin,
+    commit,
+    rollback,
+    start,
+    advance,
+    columnInt64,
+    finish,
+    closeDatabase
+);
+import Standard.Database.Sqlite (
+    openSqlite,
+    isSqliteDatabase,
+    sqliteConnection
+);
+import Standard.SqlCipher (
+    SqlError,
+    noValues as cipherNoValues,
+    execute as cipherExecute
+);
+
+module body Standard.Database.Sqlite.Test is
+    function error(backend: Backend, code: Int32): DbError is
+        return DbError(backend => backend, code => code);
+    end;
+
+    -- The classes for SQLite's extended codes, and a code that is in no class.
+    function testClasses(): Unit is
+        assertTrue(isUniqueViolation(error(SqliteBackend(), 2067)), "SQLite unique");
+        assertTrue(isUniqueViolation(error(SqlCipherBackend(), 1555)), "SQLCipher primary key");
+        assertTrue(isConstraintViolation(error(SqliteBackend(), 2067)), "unique is a constraint");
+        assertTrue(isConstraintViolation(error(SqliteBackend(), 787)), "SQLite foreign key");
+        assertTrue(isConstraintViolation(error(SqliteBackend(), 1299)), "SQLite not null");
+        assertTrue(not isUniqueViolation(error(SqliteBackend(), 787)), "a foreign key is not unique");
+        assertTrue(isBusy(error(SqliteBackend(), 5)), "SQLite busy");
+        assertTrue(isBusy(error(SqliteBackend(), 517)), "SQLite busy snapshot");
+        assertTrue(isBusy(error(SqlCipherBackend(), 6)), "SQLCipher locked");
+        assertTrue(not isBusy(error(SqliteBackend(), 19)), "a constraint is not busy");
+        return nil;
+    end;
+
+    -- The rows of the table t.
+    generic [R: Region]
+    function rowsOf(db: &![Database[Writing], R]): Int64 is
+        var cursor: Cursor := start(&~db, "SELECT count(*) FROM t", noValues());
+        var count: Int64 := -1;
+        if advance(&!cursor) then
+            count := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as error: DbError) do
+                return -2;
+            when None do
+                return count;
+        end case;
+    end;
+
+    -- One row through the lent connection and one through the database,
+    -- in one transaction, kept or taken back.
+    generic [R: Region]
+    function writeBoth(db: &![Database[Writing], R], keep: Bool): Bool is
+        case begin(&~db) of
+            when Left(left as error: DbError) do
+                return false;
+            when Right(right as open: Transaction) do
+                let lent: Either[SqlError, Nat64] := cipherExecute(sqliteConnection(&~db), "INSERT INTO t (n) VALUES (1)", cipherNoValues());
+                let own: Either[DbError, Nat64] := execute(&~db, "INSERT INTO t (n) VALUES (2)", noValues());
+                var wrote: Bool := true;
+                case lent of
+                    when Left(left as error: SqlError) do
+                        wrote := false;
+                    when Right(right as changed: Nat64) do
+                        skip;
+                end case;
+                case own of
+                    when Left(left as error: DbError) do
+                        wrote := false;
+                    when Right(right as changed: Nat64) do
+                        skip;
+                end case;
+                if keep then
+                    case commit(&~db, open) of
+                        when Left(left as error: DbError) do
+                            return false;
+                        when Right(right as done: Unit) do
+                            return wrote;
+                    end case;
+                else
+                    rollback(&~db, open);
+                    return wrote;
+                end if;
+        end case;
+    end;
+
+    -- The connection a database lends takes part in its transactions.
+    function testLentConnection(): Unit is
+        case openSqlite(":memory:") of
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                assertTrue(isSqliteDatabase(&db), "a database of this driver");
+                case execute(&!db, "CREATE TABLE t (n INTEGER NOT NULL) STRICT", noValues()) of
+                    when Right(right as changed: Nat64) do
+                        skip;
+                    when Left(left as error: DbError) do
+                        assertTrue(false, "the table");
+                end case;
+                assertTrue(writeBoth(&!db, false), "two rows written, then taken back");
+                assertTrue(rowsOf(&!db) = 0, "the rollback takes back both");
+                assertTrue(writeBoth(&!db, true), "two rows written and kept");
+                assertTrue(rowsOf(&!db) = 2, "the commit keeps both");
+                closeDatabase(db);
+            when Left(left as error: DbError) do
+                assertTrue(false, "an open database");
+        end case;
+        return nil;
+    end;
+end module body.

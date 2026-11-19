@@ -1,0 +1,403 @@
+-- A new job that resumes an older one, and checkpoints by time: the
+-- programme starts itself as the ranks of jobs on localhost with a
+-- checkpoint directory.  The first job of two ranks writes two checkpoints
+-- and ends.  The second, started with --resume last, resumes the epochs of
+-- the first, each rank its own state, and writes a third checkpoint under
+-- its own id.  The third job has three ranks and resumes the second: a
+-- checkpoint of another size, refused with H1623.  The fourth job asks
+-- checkpointDue every 100 ms for three seconds with --checkpoint-every 1
+-- and checkpoints when it is due.  A job with --resume and no checkpoint
+-- directory is refused before any rank starts.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length,
+    insertBack,
+    removeLast,
+    destroyEmpty
+);
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    equal,
+    formatNat
+);
+import Standard.File (
+    FileDescriptor,
+    openWrite,
+    writeAll,
+    closeFile,
+    removeFile,
+    removeDirectory
+);
+import Standard.Arguments (
+    processArguments,
+    programPath
+);
+import Standard.IO (
+    TerminalCapability,
+    acquireTerminal,
+    releaseTerminal
+);
+import Standard.IO.Terminal (
+    StandardInput,
+    acquireInput,
+    releaseInput,
+    readLine
+);
+import Standard.Task (
+    sleepFor
+);
+import Standard.SperliLaunch (
+    RunOptions,
+    parseRunArguments,
+    runJob
+);
+import Standard.SperliCkpt (
+    jobDirectory,
+    jobKeyPath,
+    lastJobPath,
+    resumeJobId,
+    pruneEpochs
+);
+import Standard.Sperli (
+    Job,
+    Comm,
+    readJobText,
+    init,
+    rank,
+    finish,
+    useCheckpoints,
+    checkpoint,
+    checkpointEpoch,
+    checkpointDue,
+    resume
+);
+
+module body Test is
+    ---
+    --- The launcher
+    ---
+
+    function checkpointDirectory(): Span[Nat8, Static] is
+        return "sperli-resume-suite";
+    end;
+
+    function words(ranks: Span[Nat8, Static], mode: Span[Nat8, Static], with_directory: Bool, resume_last: Bool, every: Bool): Buffer[String] is
+        var out: Buffer[String] := allocateEmpty();
+        insertBack(&!out, fromLiteral("-n"));
+        insertBack(&!out, fromLiteral(ranks));
+        insertBack(&!out, fromLiteral("--hosts"));
+        insertBack(&!out, fromLiteral("sperli-resume-hosts.txt"));
+        if with_directory then
+            insertBack(&!out, fromLiteral("--checkpoint-dir"));
+            insertBack(&!out, fromLiteral(checkpointDirectory()));
+        end if;
+        if resume_last then
+            insertBack(&!out, fromLiteral("--resume"));
+            insertBack(&!out, fromLiteral("last"));
+        end if;
+        if every then
+            insertBack(&!out, fromLiteral("--checkpoint-every"));
+            insertBack(&!out, fromLiteral("1"));
+        end if;
+        insertBack(&!out, programPath());
+        insertBack(&!out, fromLiteral(mode));
+        return out;
+    end;
+
+    function destroyWords(list: Buffer[String]): Unit is
+        var rest: Buffer[String] := list;
+        while length(&rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function writeHosts(): Bool is
+        case openWrite("sperli-resume-hosts.txt") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let written: Bool := writeAll(&!file, "localhost\nlocalhost\nlocalhost\n");
+                return closeFile(file) and written;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function job(ranks: Span[Nat8, Static], mode: Span[Nat8, Static], with_directory: Bool, resume_last: Bool, every: Bool): Int32 is
+        print("job ");
+        print(mode);
+        print(" of ");
+        printLn(ranks);
+        let list: Buffer[String] := words(ranks, mode, with_directory, resume_last, every);
+        var status: Int32 := 0;
+        case parseRunArguments(&list) of
+            when Right(right as options: RunOptions) do
+                destroyWords(list);
+                status := runJob(options);
+            when Left(left as code: Int32) do
+                destroyWords(list);
+                status := code;
+        end case;
+        print("launcher status ");
+        printLn(status);
+        return status;
+    end;
+
+    -- The id of the last job started over the directory, kept for the
+    -- clean up at the end.
+    generic [R: Region]
+    function rememberLast(ids: &![Buffer[String], R]): Unit is
+        case resumeJobId(checkpointDirectory(), "last") of
+            when Some(value as id: String) do
+                insertBack(&~ids, id);
+            when None do
+                printLn("no last job");
+        end case;
+        return nil;
+    end;
+
+    function cleanUp(ids: Buffer[String]): Unit is
+        var rest: Buffer[String] := ids;
+        while length(&rest) > 0 do
+            let id: String := removeLast(&!rest);
+            pruneEpochs(checkpointDirectory(), asSpan(&id), 1000000);
+            let key_path: String := jobKeyPath(checkpointDirectory(), asSpan(&id));
+            let key_gone: Bool := removeFile(asSpan(&key_path));
+            destroyString(key_path);
+            let job_path: String := jobDirectory(checkpointDirectory(), asSpan(&id));
+            let job_gone: Bool := removeDirectory(asSpan(&job_path));
+            destroyString(job_path);
+            destroyString(id);
+        end while;
+        destroyEmpty(rest);
+        let last_path: String := lastJobPath(checkpointDirectory());
+        let last_gone: Bool := removeFile(asSpan(&last_path));
+        destroyString(last_path);
+        let top_gone: Bool := removeDirectory(checkpointDirectory());
+        print("checkpoint directory removed ");
+        printLn(top_gone);
+        return nil;
+    end;
+
+    function launcher(): ExitCode is
+        if not writeHosts() then
+            printLn("no host file");
+            return ExitFailure();
+        end if;
+        var ids: Buffer[String] := allocateEmpty();
+        var good: Bool := job("2", "write", true, false, false) = 0;
+        rememberLast(&!ids);
+        good := (job("2", "resume", true, true, false) = 0) and good;
+        rememberLast(&!ids);
+        good := (job("3", "bigger", true, true, false) = 0) and good;
+        rememberLast(&!ids);
+        good := (job("2", "every", true, false, true) = 0) and good;
+        rememberLast(&!ids);
+        good := (job("2", "write", false, true, false) = 1614) and good;
+        cleanUp(ids);
+        let removed: Bool := removeFile("sperli-resume-hosts.txt");
+        if good then
+            return ExitSuccess();
+        end if;
+        return ExitFailure();
+    end;
+
+    ---
+    --- The ranks
+    ---
+
+    function widen(value: Nat32): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function stateOf(me: Nat32, step: Nat32): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "state of rank ");
+        let number: String := formatNat(widen(me));
+        writeString(&!out, asSpan(&number));
+        destroyString(number);
+        writeString(&!out, " at step ");
+        let at: String := formatNat(widen(step));
+        writeString(&!out, asSpan(&at));
+        destroyString(at);
+        return finalize(out);
+    end;
+
+    generic [R: Region]
+    function writeStep(comm: &![Comm, R], me: Nat32, step: Nat32): Bool is
+        let state: String := stateOf(me, step);
+        let code: Int32 := checkpoint(&~comm, &state);
+        destroyString(state);
+        return code = 0;
+    end;
+
+    generic [R: Region]
+    function writeJob(comm: &![Comm, R], me: Nat32): Bool is
+        var good: Bool := writeStep(&~comm, me, 1);
+        good := writeStep(&~comm, me, 2) and good;
+        good := (checkpointEpoch(&~comm) = 2) and good;
+        print("rank ");
+        print(me);
+        print(" wrote two checkpoints ");
+        printLn(good);
+        return good;
+    end;
+
+    generic [R: Region]
+    function resumeJob(comm: &![Comm, R], me: Nat32): Bool is
+        let back: Either[Int32, String] := resume(&~comm);
+        case back of
+            when Right(right as state: String) do
+                let wanted: String := stateOf(me, 2);
+                var good: Bool := equal(asSpan(&state), asSpan(&wanted)) and (checkpointEpoch(&~comm) = 2);
+                destroyString(wanted);
+                destroyString(state);
+                print("rank ");
+                print(me);
+                print(" resumed epoch 2 of the older job with its own state ");
+                printLn(good);
+                good := writeStep(&~comm, me, 3) and good;
+                good := (checkpointEpoch(&~comm) = 3) and good;
+                print("rank ");
+                print(me);
+                print(" wrote epoch 3 under its own job ");
+                printLn(good);
+                return good;
+            when Left(left as code: Int32) do
+                print("rank ");
+                print(me);
+                print(" resume refused with H");
+                printLn(code);
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function biggerJob(comm: &![Comm, R], me: Nat32): Bool is
+        let back: Either[Int32, String] := resume(&~comm);
+        case back of
+            when Right(right as state: String) do
+                destroyString(state);
+                print("rank ");
+                print(me);
+                printLn(" resumed a job of another size");
+                return false;
+            when Left(left as code: Int32) do
+                if me = 0 then
+                    print("rank 0 resume refused with H");
+                    printLn(code);
+                    return code = 1623;
+                end if;
+                printLn("the others resume refused");
+                return true;
+        end case;
+    end;
+
+    generic [R: Region]
+    function everyJob(comm: &![Comm, R], me: Nat32): Bool is
+        var due: Nat32 := 0;
+        var good: Bool := true;
+        var step: Nat32 := 0;
+        while step < 30 do
+            sleepFor(100);
+            if checkpointDue(&~comm) then
+                due := due + 1;
+                good := writeStep(&~comm, me, step) and good;
+            end if;
+            step := step + 1;
+        end while;
+        print("rank ");
+        print(me);
+        print(" was told at least twice and at most four times ");
+        printLn((due >= 2) and (due <= 4));
+        print("rank ");
+        print(me);
+        print(" wrote a checkpoint each time ");
+        printLn(good and (checkpointEpoch(&~comm) = widen(due)));
+        return good and (due >= 2) and (due <= 4);
+    end;
+
+    function rankMain(line: String, mode: String): ExitCode is
+        case readJobText(asSpan(&line)) of
+            when Left(left as why: Int32) do
+                destroyString(line);
+                destroyString(mode);
+                print("the job was refused with ");
+                printLn(why);
+                return ExitStatus(status => 4);
+            when Right(right as given: Job) do
+                destroyString(line);
+                case init(given) of
+                    when Left(left as why: Int32) do
+                        destroyString(mode);
+                        print("init failed with ");
+                        printLn(why);
+                        return ExitStatus(status => 5);
+                    when Right(right as opened: Comm) do
+                        var comm: Comm := opened;
+                        let me: Nat32 := rank(&comm);
+                        useCheckpoints(&!comm, checkpointDirectory());
+                        var good: Bool := false;
+                        if equal(asSpan(&mode), "write") then
+                            good := writeJob(&!comm, me);
+                        end if;
+                        if equal(asSpan(&mode), "resume") then
+                            good := resumeJob(&!comm, me);
+                        end if;
+                        if equal(asSpan(&mode), "bigger") then
+                            good := biggerJob(&!comm, me);
+                        end if;
+                        if equal(asSpan(&mode), "every") then
+                            good := everyJob(&!comm, me);
+                        end if;
+                        destroyString(mode);
+                        finish(comm);
+                        if good then
+                            return ExitSuccess();
+                        end if;
+                        return ExitFailure();
+                end case;
+        end case;
+    end;
+
+    function readJobLine(root: RootCapability): String is
+        var mut_root: RootCapability := root;
+        var terminal: TerminalCapability := acquireTerminal(&!mut_root);
+        var input: StandardInput := acquireInput(&!terminal);
+        let line: String := readLine(&!input);
+        releaseInput(input);
+        releaseTerminal(terminal);
+        surrenderRoot(mut_root);
+        return line;
+    end;
+
+    function main(root: RootCapability): ExitCode is
+        var arguments: Buffer[String] := processArguments();
+        if length(&arguments) = 0 then
+            destroyEmpty(arguments);
+            surrenderRoot(root);
+            return launcher();
+        end if;
+        let mode: String := removeLast(&!arguments);
+        destroyWords(arguments);
+        return rankMain(readJobLine(root), mode);
+    end;
+end module body.

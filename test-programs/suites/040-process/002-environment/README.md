@@ -1,0 +1,1 @@
+Standard.File.environmentValue: HILDE_TREE, which the runner sets, names the tree; a variable nobody sets is None; HILDE_TEST_EMPTY, which the runner sets to the empty string, is Some with length 0; the limit is 65536 bytes.

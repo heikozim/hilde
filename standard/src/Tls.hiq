@@ -1,0 +1,365 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- A safe module: a Client holds the connection of Bindings.Tls, which does
+-- the work with addresses, and every call goes there.  A client made over
+-- a socket also holds that socket, so that the descriptor cannot be closed
+-- while the connection still reads and writes through its number.
+import Standard.String (
+    String,
+    asSpan,
+    fromLiteral,
+    destroyString
+);
+import Standard.File (
+    FileDescriptor,
+    closeFile,
+    fileNumber,
+    openRead,
+    readAll
+);
+import Bindings.Tls (
+    Client as Connection,
+    connect as bindConnect,
+    connectSocket as bindConnectSocket,
+    connectAs as bindConnectAs,
+    connectSocketAs as bindConnectSocketAs,
+    connectSocketAsTls13 as bindConnectSocketAsTls13,
+    send as bindSend,
+    receive as bindReceive,
+    sendWithin as bindSendWithin,
+    receiveWithin as bindReceiveWithin,
+    closeClient as bindCloseClient,
+    Server as BindServer,
+    makeServer as bindMakeServer,
+    makeServerFromMemory as bindMakeServerFromMemory,
+    acceptSocket as bindAcceptSocket,
+    closeServer as bindCloseServer,
+    makeVerifyingServer as bindMakeVerifyingServer,
+    makeVerifyingServerTls13 as bindMakeVerifyingServerTls13,
+    makeVerifyingServerFromMemory as bindMakeVerifyingServerFromMemory,
+    peerCertificateProvided as bindPeerCertificateProvided,
+    peerSubject as bindPeerSubject,
+    peerHash as bindPeerHash,
+    startHeartbeat as bindStartHeartbeat,
+    setHeartbeatInterval as bindSetHeartbeatInterval,
+    heartbeatFailed as bindHeartbeatFailed,
+    heartbeatRounds as bindHeartbeatRounds
+);
+
+module body Standard.Tls is
+    record Client: Linear is
+        connection: Connection;
+        socket: Option[FileDescriptor];
+    end;
+
+    generic [H: Region, P: Region, C: Region]
+    function connect(host: Span[Nat8, H], port: Span[Nat8, P], ca_file: Span[Nat8, C]): Either[String, Client] is
+        case bindConnect(host, port, ca_file) of
+            when Left(left as message: String) do
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let none: Option[FileDescriptor] := None();
+                let made: Either[String, Client] := Right(right => Client(connection => connection, socket => none));
+                return made;
+        end case;
+    end;
+
+    generic [H: Region, C: Region]
+    function connectOver(socket: FileDescriptor, host: Span[Nat8, H], ca_file: Span[Nat8, C], milliseconds: Nat32): Either[String, Client] is
+        let number: Int32 := fileNumber(&socket);
+        case bindConnectSocket(number, host, ca_file, milliseconds) of
+            when Left(left as message: String) do
+                let closed: Bool := closeFile(socket);
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let held: Option[FileDescriptor] := Some(value => socket);
+                let made: Either[String, Client] := Right(right => Client(connection => connection, socket => held));
+                return made;
+        end case;
+    end;
+
+    function overSocket(made: Either[String, Connection], socket: FileDescriptor): Either[String, Client] is
+        case made of
+            when Left(left as message: String) do
+                let closed: Bool := closeFile(socket);
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let held: Option[FileDescriptor] := Some(value => socket);
+                let client: Either[String, Client] := Right(right => Client(connection => connection, socket => held));
+                return client;
+        end case;
+    end;
+
+    -- The TLS of OpenBSD, LibreSSL, takes RSA and ECDSA certificates only:
+    -- its libssl has no certificate type and no signature algorithm for
+    -- Ed25519.  So that a programme behaves the same on every system, an
+    -- Ed25519 key is refused here, before the library is asked.
+    function ed25519Refused(): String is
+        return fromLiteral("Standard.Tls: an Ed25519 key is refused, TLS takes RSA and ECDSA keys");
+    end;
+
+    -- Whether text holds part at the byte at.
+    generic [R: Region, S: Region]
+    function holdsAt(text: Span[Nat8, R], at: Index, part: Span[Nat8, S]): Bool is
+        if at + spanLength(part) > spanLength(text) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(part) do
+            if text[at + i] /= part[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether PEM text holds an Ed25519 private key.  The key is PKCS 8,
+    -- whose first twelve bytes end in the object identifier 1.3.101.112 of
+    -- Ed25519; in base64 those are the 16 characters MC4CAQAwBQYDK2Vw, or
+    -- MFECAQEwBQYDK2Vw when the public key is written too, so characters
+    -- 8 to 15 of the base64 are BQYDK2Vw.  Text without such a key is left
+    -- to the library, whose words then say what is wrong with it.
+    generic [R: Region]
+    function pemIsEd25519(pem: Span[Nat8, R]): Bool is
+        let begin: Span[Nat8, Static] := "-----BEGIN PRIVATE KEY-----";
+        let mark: Span[Nat8, Static] := "BQYDK2Vw";
+        var at: Index := 0;
+        while at < spanLength(pem) do
+            if holdsAt(pem, at, begin) then
+                var content: Index := at + spanLength(begin);
+                while (content < spanLength(pem)) and ((pem[content] = 13) or (pem[content] = 10)) do
+                    content := content + 1;
+                end while;
+                if holdsAt(pem, content + 8, mark) then
+                    return true;
+                end if;
+            end if;
+            at := at + 1;
+        end while;
+        return false;
+    end;
+
+    -- Whether the file at path holds an Ed25519 private key.  A file that
+    -- cannot be read is left to the library as well.
+    generic [R: Region]
+    function fileIsEd25519(path: Span[Nat8, R]): Bool is
+        case openRead(path) of
+            when Some(value as file: FileDescriptor) do
+                var file_var: FileDescriptor := file;
+                let read: Option[String] := readAll(&!file_var);
+                let closed: Bool := closeFile(file_var);
+                case read of
+                    when Some(value as text: String) do
+                        let found: Bool := pemIsEd25519(asSpan(&text));
+                        destroyString(text);
+                        return found;
+                    when None do
+                        return false;
+                end case;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refusedClient(): Either[String, Client] is
+        let failed: Either[String, Client] := Left(left => ed25519Refused());
+        return failed;
+    end;
+
+    function refusedServer(): Either[String, Server] is
+        let failed: Either[String, Server] := Left(left => ed25519Refused());
+        return failed;
+    end;
+
+    generic [H: Region, P: Region, C: Region, E: Region, K: Region]
+    function connectAs(host: Span[Nat8, H], port: Span[Nat8, P], ca_file: Span[Nat8, C], certificate_file: Span[Nat8, E], key_file: Span[Nat8, K]): Either[String, Client] is
+        if fileIsEd25519(key_file) then
+            return refusedClient();
+        end if;
+        case bindConnectAs(host, port, ca_file, certificate_file, key_file) of
+            when Left(left as message: String) do
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let none: Option[FileDescriptor] := None();
+                let made: Either[String, Client] := Right(right => Client(connection => connection, socket => none));
+                return made;
+        end case;
+    end;
+
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function connectOverAs(socket: FileDescriptor, host: Span[Nat8, H], ca_file: Span[Nat8, C], certificate_file: Span[Nat8, E], key_file: Span[Nat8, K], milliseconds: Nat32): Either[String, Client] is
+        if fileIsEd25519(key_file) then
+            let closed: Bool := closeFile(socket);
+            return refusedClient();
+        else
+            let number: Int32 := fileNumber(&socket);
+            return overSocket(bindConnectSocketAs(number, host, ca_file, certificate_file, key_file, milliseconds), socket);
+        end if;
+    end;
+
+    generic [H: Region, C: Region, E: Region, K: Region]
+    function connectOverAsTls13(socket: FileDescriptor, host: Span[Nat8, H], ca_file: Span[Nat8, C], certificate_file: Span[Nat8, E], key_file: Span[Nat8, K], milliseconds: Nat32): Either[String, Client] is
+        if fileIsEd25519(key_file) then
+            let closed: Bool := closeFile(socket);
+            return refusedClient();
+        else
+            let number: Int32 := fileNumber(&socket);
+            return overSocket(bindConnectSocketAsTls13(number, host, ca_file, certificate_file, key_file, milliseconds), socket);
+        end if;
+    end;
+
+    generic [R: Region]
+    function peerCertificateProvided(client: &[Client, R]): Bool is
+        return bindPeerCertificateProvided(&(client->connection));
+    end;
+
+    generic [R: Region]
+    function peerSubject(client: &[Client, R]): Option[String] is
+        return bindPeerSubject(&(client->connection));
+    end;
+
+    generic [R: Region]
+    function peerHash(client: &[Client, R]): Option[String] is
+        return bindPeerHash(&(client->connection));
+    end;
+
+    generic [R: Region, S: Region]
+    function send(client: &![Client, R], data: Span[Nat8, S]): Either[String, Unit] is
+        return bindSend(&!(client->connection), data);
+    end;
+
+    generic [R: Region]
+    function receive(client: &![Client, R], most: Index): Either[String, String] is
+        return bindReceive(&!(client->connection), most);
+    end;
+
+    -- Bindings.Tls holds the socket's number as well and refuses a time
+    -- limit on a client made by connect, so these only pass on.
+    generic [R: Region, S: Region]
+    function sendWithin(client: &![Client, R], data: Span[Nat8, S], milliseconds: Nat32): Either[String, Unit] is
+        return bindSendWithin(&!(client->connection), data, milliseconds);
+    end;
+
+    generic [R: Region]
+    function receiveWithin(client: &![Client, R], most: Index, milliseconds: Nat32): Either[String, String] is
+        return bindReceiveWithin(&!(client->connection), most, milliseconds);
+    end;
+
+    function closeClient(client: Client): Unit is
+        let { connection: Connection, socket: Option[FileDescriptor] } := client;
+        bindCloseClient(connection);
+        case socket of
+            when Some(value as held: FileDescriptor) do
+                let closed: Bool := closeFile(held);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, F: Region]
+    function startHeartbeat(client: &![Client, R], frame: Span[Nat8, F], interval: Nat32): Bool is
+        return bindStartHeartbeat(&!(client->connection), frame, interval);
+    end;
+
+    function setHeartbeatInterval(interval: Nat32): Unit is
+        bindSetHeartbeatInterval(interval);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function heartbeatFailed(client: &[Client, R]): Bool is
+        return bindHeartbeatFailed(&(client->connection));
+    end;
+
+    function heartbeatRounds(): Nat64 is
+        return bindHeartbeatRounds();
+    end;
+
+    record Server: Linear is
+        inner: BindServer;
+    end;
+
+    function wrapServer(made: Either[String, BindServer]): Either[String, Server] is
+        case made of
+            when Left(left as message: String) do
+                let failed: Either[String, Server] := Left(left => message);
+                return failed;
+            when Right(right as inner: BindServer) do
+                let server: Either[String, Server] := Right(right => Server(inner => inner));
+                return server;
+        end case;
+    end;
+
+    generic [C: Region, K: Region]
+    function makeServer(certificate_file: Span[Nat8, C], key_file: Span[Nat8, K]): Either[String, Server] is
+        if fileIsEd25519(key_file) then
+            return refusedServer();
+        end if;
+        return wrapServer(bindMakeServer(certificate_file, key_file));
+    end;
+
+    generic [C: Region, K: Region]
+    function makeServerFromMemory(certificate: Span[Nat8, C], key: Span[Nat8, K]): Either[String, Server] is
+        if pemIsEd25519(key) then
+            return refusedServer();
+        end if;
+        return wrapServer(bindMakeServerFromMemory(certificate, key));
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServer(certificate_file: Span[Nat8, C], key_file: Span[Nat8, K], client_ca_file: Span[Nat8, A]): Either[String, Server] is
+        if fileIsEd25519(key_file) then
+            return refusedServer();
+        end if;
+        return wrapServer(bindMakeVerifyingServer(certificate_file, key_file, client_ca_file));
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServerTls13(certificate_file: Span[Nat8, C], key_file: Span[Nat8, K], client_ca_file: Span[Nat8, A]): Either[String, Server] is
+        if fileIsEd25519(key_file) then
+            return refusedServer();
+        end if;
+        return wrapServer(bindMakeVerifyingServerTls13(certificate_file, key_file, client_ca_file));
+    end;
+
+    generic [C: Region, K: Region, A: Region]
+    function makeVerifyingServerFromMemory(certificate: Span[Nat8, C], key: Span[Nat8, K], client_ca: Span[Nat8, A]): Either[String, Server] is
+        if pemIsEd25519(key) then
+            return refusedServer();
+        end if;
+        return wrapServer(bindMakeVerifyingServerFromMemory(certificate, key, client_ca));
+    end;
+
+    generic [R: Region]
+    function acceptOver(server: &[Server, R], socket: FileDescriptor, milliseconds: Nat32): Either[String, Client] is
+        let number: Int32 := fileNumber(&socket);
+        case bindAcceptSocket(&(server->inner), number, milliseconds) of
+            when Left(left as message: String) do
+                let closed: Bool := closeFile(socket);
+                let failed: Either[String, Client] := Left(left => message);
+                return failed;
+            when Right(right as connection: Connection) do
+                let held: Option[FileDescriptor] := Some(value => socket);
+                let made: Either[String, Client] := Right(right => Client(connection => connection, socket => held));
+                return made;
+        end case;
+    end;
+
+    function closeServer(server: Server): Unit is
+        let { inner: BindServer } := server;
+        bindCloseServer(inner);
+        return nil;
+    end;
+end module body.

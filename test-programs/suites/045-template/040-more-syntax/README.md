@@ -1,0 +1,1 @@
+Every form of the Jinja2 syntax beyond the first set, compared byte for byte with Jinja2 3.1.6 on the same template and data.json: set, with, filter, call and caller(), import ... as, the six filters, the operators, loop.first, loop.last and loop.cycle printed, unpacking a Pair, a for with a condition, and a subscript with a name in quotes.

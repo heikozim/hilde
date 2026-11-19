@@ -1,0 +1,1 @@
+An @embed with twelve arguments: $10, $11 and $12 are the tenth, eleventh and twelfth argument, not the first followed by a digit.  1 + 2 + ... + 9 is 45, 10 * 10 + 11 * 10 + 12 * 100 is 1410, so the sum is 1455.  A marker past the last argument and $0 stay as they stand: the string "$13 $0" has 7 bytes with its end, plus 1 is 8.

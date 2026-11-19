@@ -1,0 +1,180 @@
+-- Standard.Tls.connect in a task, on one worker, to a host that does not
+-- answer: a listener whose queue of connections is full, so that the
+-- kernel drops the next connection attempt and the connect waits.  main,
+-- which let the task run first, must run again within one second while the
+-- task still waits.  main then closes the listener, the next attempt is
+-- refused, and the task ends with a failed connection.
+import Standard.String (
+    String,
+    fromLiteral,
+    makeString,
+    storeNth,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    formatNat
+);
+import Standard.File (
+    environmentValue,
+    FileDescriptor,
+    TcpListener,
+    ConnectFailure,
+    closeFile,
+    listenTcp,
+    tcpListenerPort,
+    closeTcpListener,
+    connectTcp
+);
+import Standard.Time (
+    monotonicNanos
+);
+import Standard.Task (
+    Scope,
+    Task,
+    openScope,
+    closeScope,
+    spawn,
+    join,
+    yieldNow
+);
+import Standard.Tls (
+    Client,
+    connect,
+    closeClient
+);
+
+module body Test is
+    function now(): Nat64 is
+        case monotonicNanos() of
+            when Some(value as t: Nat64) do
+                return t;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function widen(value: Nat16): Nat64 is
+        case toNat64(value) of
+            when Some(value as at: Nat64) do
+                return at;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function loopback(): String is
+        var address: String := makeString(4, 0);
+        storeNth(&!address, 0, 127);
+        storeNth(&!address, 3, 1);
+        return address;
+    end;
+
+    -- A file of the tree, from HILDE_TREE.  The connect fails before a
+    -- handshake, so the CA file is read but never used.
+    function inTree(rest: Span[Nat8, Static]): String is
+        let name: String := fromLiteral("HILDE_TREE");
+        var out: StringBuilder := makeStringBuilder();
+        case environmentValue(asSpan(&name)) of
+            when Some(value as tree: String) do
+                writeString(&!out, asSpan(&tree));
+                destroyString(tree);
+            when None do
+                skip;
+        end case;
+        destroyString(name);
+        let tail: String := fromLiteral(rest);
+        writeString(&!out, asSpan(&tail));
+        destroyString(tail);
+        return finalize(out);
+    end;
+
+    -- Connects over TLS to the listener at port.
+    function connector(port: Nat16): Unit is
+        let service: String := formatNat(widen(port));
+        let ca: String := inTree("/test-programs/suites/052-tls/README.md");
+        case connect("127.0.0.1", asSpan(&service), asSpan(&ca)) of
+            when Right(right as client: Client) do
+                printLn("the task connected");
+                closeClient(client);
+            when Left(left as message: String) do
+                printLn("the task's connection failed");
+                destroyString(message);
+        end case;
+        destroyString(service);
+        destroyString(ca);
+        return nil;
+    end;
+
+    -- The listener's queue is full: the task's connect waits, and main
+    -- must run again while it does.
+    function waiting(listener: TcpListener, port: Nat16): Unit is
+        case openScope() of
+            when Some(value as opened: Scope) do
+                var scope: Scope := opened;
+                let work: Fn[Nat16, Unit] := connector;
+                case spawn(&!scope, work, port) of
+                    when Right(right as task: Task[Unit]) do
+                        let before: Nat64 := now();
+                        yieldNow();
+                        let after: Nat64 := now();
+                        let second: Nat64 := 1000000000;
+                        if (after - before) < second then
+                            printLn("main ran while the task connected");
+                        else
+                            printLn("main waited for the connect");
+                        end if;
+                        let closed: Bool := closeTcpListener(listener);
+                        join(task);
+                    when Left(left as back: Nat16) do
+                        let closed: Bool := closeTcpListener(listener);
+                        printLn("the task did not start");
+                end case;
+                closeScope(scope);
+            when None do
+                let closed: Bool := closeTcpListener(listener);
+                printLn("no scope");
+        end case;
+        return nil;
+    end;
+
+    -- Holds left more connections to port open, then goes on with a full
+    -- queue.  The kernel queues one more connection than the backlog of
+    -- 128.
+    function fill(listener: TcpListener, port: Nat16, left: Nat32): Unit is
+        if left = 0 then
+            waiting(listener, port);
+            return nil;
+        end if;
+        let address: String := loopback();
+        case connectTcp(asSpan(&address), port, 1000) of
+            when Right(right as socket: FileDescriptor) do
+                fill(listener, port, left - 1);
+                let closed: Bool := closeFile(socket);
+            when Left(left as why: ConnectFailure) do
+                let closed: Bool := closeTcpListener(listener);
+                printLn("the queue did not fill");
+        end case;
+        destroyString(address);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        let address: String := loopback();
+        case listenTcp(asSpan(&address), 0) of
+            when Some(value as listener: TcpListener) do
+                let port: Nat16 := tcpListenerPort(&listener);
+                fill(listener, port, 129);
+            when None do
+                printLn("listenTcp failed");
+        end case;
+        destroyString(address);
+        return ExitSuccess();
+    end;
+end module body.

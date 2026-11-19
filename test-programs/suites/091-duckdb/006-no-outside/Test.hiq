@@ -1,0 +1,142 @@
+-- SQL cannot reach outside the database file: reading another file,
+-- writing one, and loading an extension are refused, and the setting that
+-- would allow them cannot be changed back, since the configuration is
+-- locked.  A plain statement still runs, so the refusals are not a
+-- connection that refuses everything.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.DuckDB (
+    Connection,
+    Writing,
+    Reading,
+    DuckError,
+    Values,
+    Cursor,
+    Transaction,
+    describe,
+    isUniqueViolation,
+    isConstraintViolation,
+    isBusy,
+    lastMessage,
+    openWriter,
+    openReader,
+    closeDatabase,
+    migrate,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    withInt64,
+    withText,
+    withNull,
+    start,
+    startWrite,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish
+);
+
+module body Test is
+    function report(label: Span[Nat8, Static], error: DuckError): Unit is
+        print(label);
+        print(": ");
+        print(describe(error));
+        print(", unique ");
+        print(isUniqueViolation(error));
+        print(", constraint ");
+        print(isConstraintViolation(error));
+        print(", busy ");
+        printLn(isBusy(error));
+        return nil;
+    end;
+
+    function written(label: Span[Nat8, Static], result: Either[DuckError, Nat64]): Unit is
+        case result of
+            when Left(left as error: DuckError) do
+                report(label, error);
+            when Right(right as count: Nat64) do
+                print(label);
+                print(": rows ");
+                printLn(count);
+        end case;
+        return nil;
+    end;
+
+    function ended(label: Span[Nat8, Static], failure: Option[DuckError]): Unit is
+        case failure of
+            when Some(value as error: DuckError) do
+                report(label, error);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [M: Free, R: Region]
+    function countRows(db: &![Connection[M], R], label: Span[Nat8, Static], sql: Span[Nat8, Static]): Unit is
+        var rows: Cursor := start(&~db, sql, noValues());
+        while advance(&!rows) do
+            print(label);
+            print(": ");
+            printLn(columnInt64(&rows, 0));
+        end while;
+        ended(label, finish(&~db, rows));
+        return nil;
+    end;
+
+    generic [R: Region]
+    function refused(db: &![Connection[Writing], R], label: Span[Nat8, Static], sql: Span[Nat8, Static]): Unit is
+        var rows: Cursor := start(&~db, sql, noValues());
+        var seen: Index := 0;
+        while advance(&!rows) do
+            seen := seen + 1;
+        end while;
+        case finish(&~db, rows) of
+            when Some(value as error: DuckError) do
+                print(label);
+                print(": refused, ");
+                printLn(describe(error));
+            when None do
+                print(label);
+                print(": ran, rows ");
+                printLn(seen);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Connection[Writing], R]): Unit is
+        refused(&~db, "plain", "SELECT 40 + 2");
+        refused(&~db, "read a file", "SELECT * FROM read_csv('/etc/hostname')");
+        refused(&~db, "read a file as text", "SELECT * FROM read_text('/etc/hostname')");
+        refused(&~db, "write a file", "COPY (SELECT 1) TO 'leak.csv'");
+        refused(&~db, "attach a file", "ATTACH 'other.duckdb' AS other");
+        refused(&~db, "read over http", "SELECT * FROM read_csv('http://127.0.0.1:9/x.csv')");
+        -- An extension a build links in loads without reading a file, as
+        -- httpfs does in some builds; spatial is linked into none, so its
+        -- load would have to read one.
+        refused(&~db, "load an extension", "LOAD spatial");
+        refused(&~db, "install an extension", "INSTALL httpfs");
+        refused(&~db, "allow outside access", "SET enable_external_access = true");
+        refused(&~db, "plain again", "SELECT 40 + 2");
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openWriter("outside.duckdb") of
+            when Left(left as error: DuckError) do
+                report("open", error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

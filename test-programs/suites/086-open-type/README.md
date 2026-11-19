@@ -1,0 +1,1 @@
+H3055 names the type left open and its type parameters; 002 is the same error as one line of JSON.  001 and 002 hold a None whose parameter is the callee's own type variable; 003 shows a None that its place decides: a returned Right, a parameter of Option[Int32] and a let two constructors up.

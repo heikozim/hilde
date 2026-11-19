@@ -1,0 +1,199 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue
+);
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.Text (
+    equal
+);
+import Standard.File (
+    removeFile
+);
+import Standard.Database (
+    Backend,
+    DuckDBBackend,
+    DbError,
+    isUniqueViolation,
+    isConstraintViolation,
+    isBusy,
+    backendOf,
+    Database,
+    Writing,
+    Reading,
+    Transaction,
+    Cursor,
+    noValues,
+    withInt64,
+    withText,
+    execute,
+    begin,
+    commit,
+    rollback,
+    start,
+    advance,
+    columnInt64,
+    columnText,
+    finish,
+    createConfigTable,
+    setConfig,
+    getConfig,
+    closeDatabase
+);
+import Standard.Database.DuckDB (
+    openDuckDB,
+    openDuckDBReader
+);
+import Standard.DuckDB (
+    duplicate_key,
+    write_conflict,
+    statement_refused
+);
+
+module body Standard.Database.DuckDB.Test is
+    function error(backend: Backend, code: Int32): DbError is
+        return DbError(backend => backend, code => code);
+    end;
+
+    -- The classes of the codes of Standard.DuckDB, and a code in no class.
+    function testClasses(): Unit is
+        assertTrue(isUniqueViolation(error(DuckDBBackend(), duplicate_key)), "DuckDB duplicate key");
+        assertTrue(isConstraintViolation(error(DuckDBBackend(), duplicate_key)), "a duplicate key is a constraint");
+        assertTrue(isBusy(error(DuckDBBackend(), write_conflict)), "DuckDB write conflict");
+        assertTrue(not isUniqueViolation(error(DuckDBBackend(), statement_refused)), "a refused statement is not unique");
+        assertTrue(not isBusy(error(DuckDBBackend(), statement_refused)), "a refused statement is not busy");
+        return nil;
+    end;
+
+    -- The sum of the column n of t, or -1 when the read failed.  DuckDB sums
+    -- integers of 64 bits into one of 128 bits, so the sum is cast back.
+    generic [M: Free, R: Region]
+    function sumOf(db: &![Database[M], R]): Int64 is
+        var cursor: Cursor := start(&~db, "SELECT CAST(coalesce(sum(n), 0) AS BIGINT) FROM t", noValues());
+        var sum: Int64 := -1;
+        if advance(&!cursor) then
+            sum := columnInt64(&cursor, 0);
+        end if;
+        case finish(&~db, cursor) of
+            when Some(value as failure: DbError) do
+                return -1;
+            when None do
+                return sum;
+        end case;
+    end;
+
+    generic [R: Region]
+    function wrote(db: &![Database[Writing], R], sql: Span[Nat8, Static], n: Int64): Bool is
+        case execute(&~db, sql, withInt64(noValues(), n)) of
+            when Left(left as failure: DbError) do
+                return false;
+            when Right(right as changed: Nat64) do
+                return changed = 1;
+        end case;
+    end;
+
+    -- A file of its own: a table, a transaction taken back and one kept,
+    -- a duplicate key classed, the config table, and the file read again
+    -- by a reader.
+    function testRoundTrip(): Unit is
+        let path: Span[Nat8, Static] := "hilde-database-duckdb-test.duckdb";
+        let gone: Bool := removeFile(path);
+        case openDuckDB(path) of
+            when Left(left as failure: DbError) do
+                assertTrue(false, "an open database");
+            when Right(right as opened: Database[Writing]) do
+                var db: Database[Writing] := opened;
+                case backendOf(&db) of
+                    when DuckDBBackend do
+                        skip;
+                    when SqliteBackend | SqlCipherBackend | PostgresBackend | MariaDBBackend do
+                        assertTrue(false, "the backend is DuckDB");
+                end case;
+                case execute(&!db, "CREATE TABLE t (n BIGINT PRIMARY KEY)", noValues()) of
+                    when Left(left as failure: DbError) do
+                        assertTrue(false, "the table");
+                    when Right(right as changed: Nat64) do
+                        skip;
+                end case;
+                case begin(&!db) of
+                    when Left(left as failure: DbError) do
+                        assertTrue(false, "a transaction");
+                    when Right(right as open: Transaction) do
+                        assertTrue(wrote(&!db, "INSERT INTO t VALUES (?)", 40), "a row in the transaction");
+                        rollback(&!db, open);
+                end case;
+                assertTrue(sumOf(&!db) = 0, "the rollback takes the row back");
+                case begin(&!db) of
+                    when Left(left as failure: DbError) do
+                        assertTrue(false, "a transaction");
+                    when Right(right as open: Transaction) do
+                        assertTrue(wrote(&!db, "INSERT INTO t VALUES (?)", 40), "a row kept");
+                        assertTrue(wrote(&!db, "INSERT INTO t VALUES (?)", 2), "a second row kept");
+                        case commit(&!db, open) of
+                            when Left(left as failure: DbError) do
+                                assertTrue(false, "the commit");
+                            when Right(right as done: Unit) do
+                                skip;
+                        end case;
+                end case;
+                assertTrue(sumOf(&!db) = 42, "the commit keeps both rows");
+                case execute(&!db, "INSERT INTO t VALUES (?)", withInt64(noValues(), 2)) of
+                    when Left(left as failure: DbError) do
+                        assertTrue(isUniqueViolation(failure), "a duplicate key is a unique violation");
+                    when Right(right as changed: Nat64) do
+                        assertTrue(false, "a duplicate key is refused");
+                end case;
+                case createConfigTable(&!db) of
+                    when Left(left as failure: DbError) do
+                        assertTrue(false, "the config table");
+                    when Right(right as made: Unit) do
+                        skip;
+                end case;
+                case setConfig(&!db, "colour", "blue") of
+                    when Left(left as failure: DbError) do
+                        assertTrue(false, "a setting");
+                    when Right(right as set: Unit) do
+                        skip;
+                end case;
+                case setConfig(&!db, "colour", "green") of
+                    when Left(left as failure: DbError) do
+                        assertTrue(false, "a setting replaced");
+                    when Right(right as set: Unit) do
+                        skip;
+                end case;
+                case getConfig(&!db, "colour") of
+                    when Right(right as found: Option[String]) do
+                        case found of
+                            when Some(value as text: String) do
+                                assertTrue(equal(asSpan(&text), "green"), "the setting replaced");
+                                destroyString(text);
+                            when None do
+                                assertTrue(false, "the setting is there");
+                        end case;
+                    when Left(left as failure: DbError) do
+                        assertTrue(false, "the setting read");
+                end case;
+                closeDatabase(db);
+        end case;
+        case openDuckDBReader(path) of
+            when Left(left as failure: DbError) do
+                assertTrue(false, "a reader of the file");
+            when Right(right as opened: Database[Reading]) do
+                var reader: Database[Reading] := opened;
+                assertTrue(sumOf(&!reader) = 42, "the reader sees what was kept");
+                closeDatabase(reader);
+        end case;
+        let removed: Bool := removeFile(path);
+        assertTrue(removed, "the file removed");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,149 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Standard.Sqlite: the storage class of a column, read from rows that
+-- hold each of the five classes, among them a text where the schema
+-- asks for a boolean, which a reader of integers silently reads as the
+-- integer 0 and which the storage class still reports as a text.
+import Standard.Testing (
+    assertTrue,
+    assertFailure
+);
+import Standard.Sqlite (
+    Connection,
+    Writing,
+    Cursor,
+    Values,
+    SqlError,
+    Storage,
+    IntegerStorage,
+    RealStorage,
+    TextStorage,
+    BlobStorage,
+    NullStorage,
+    describe,
+    openWriter,
+    closeDatabase,
+    start,
+    advance,
+    finish,
+    noValues,
+    withInt64,
+    withFloat64,
+    withText,
+    withBlob,
+    withInt64OrNull,
+    columnInt64,
+    columnCount,
+    columnStorage
+);
+
+module body Standard.Sqlite.Test is
+    -- 1 for IntegerStorage, 2 RealStorage, 3 TextStorage, 4 BlobStorage,
+    -- 5 NullStorage, so an assertion can compare two classes.
+    function storageNumber(storage: Storage): Int32 is
+        case storage of
+            when IntegerStorage do
+                return 1;
+            when RealStorage do
+                return 2;
+            when TextStorage do
+                return 3;
+            when BlobStorage do
+                return 4;
+            when NullStorage do
+                return 5;
+        end case;
+    end;
+
+    -- Runs sql with values bound and reports a failure of it.  The table
+    -- is made by hand, so its rows may hold what the compile-time check
+    -- of @query would refuse: a text where the schema asks for a boolean.
+    generic [R: Region]
+    function run(db: &![Connection[Writing], R], sql: Span[Nat8, Static], values: Values): Unit is
+        var cursor: Cursor := start(&~db, sql, values);
+        while advance(&!cursor) do
+            skip;
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as error: SqlError) do
+                print(sql);
+                print(": ");
+                printLn(describe(error));
+                assertFailure("the statement failed");
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    -- One row with a value of every storage class, and one row of nulls;
+    -- the storage class of each column is what columnStorage reports,
+    -- while a reader of integers answers 0 for the text of the boolean.
+    -- columnCount answers the columns of the select, and 0 for a delete.
+    function testColumnStorage(): Unit is
+        case openWriter(":memory:") of
+            when Left(left as error: SqlError) do
+                printLn(describe(error));
+                assertFailure("the in-memory database did not open");
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                run(&!db, "CREATE TABLE things (n INTEGER, x REAL, flag BOOLEAN, b BLOB)", noValues());
+                var full: Values := noValues();
+                full := withInt64(full, 7);
+                full := withFloat64(full, 2.5);
+                full := withText(full, "true");
+                full := withBlob(full, "a note as a blob");
+                run(&!db, "INSERT INTO things (n, x, flag, b) VALUES (?, ?, ?, ?)", full);
+                var empty: Values := noValues();
+                empty := withInt64OrNull(empty, None());
+                run(&!db, "INSERT INTO things (n) VALUES (?)", empty);
+                var cursor: Cursor := start(&!db, "SELECT n, x, flag, b FROM things", noValues());
+                assertTrue(columnCount(&cursor) = 4, "the select has four columns");
+                if advance(&!cursor) then
+                    assertTrue(storageNumber(columnStorage(&cursor, 0)) = 1, "an integer is held as an integer");
+                    assertTrue(storageNumber(columnStorage(&cursor, 1)) = 2, "a real is held as a real");
+                    assertTrue(storageNumber(columnStorage(&cursor, 2)) = 3, "the text 'true' in a BOOLEAN column is held as a text");
+                    assertTrue(storageNumber(columnStorage(&cursor, 3)) = 4, "a blob is held as a blob");
+                    let zero: Int64 := columnInt64(&cursor, 2);
+                    assertTrue(zero = 0, "a reader of integers answers 0 for the text 'true'");
+                else
+                    assertFailure("the first row is not there");
+                end if;
+                if advance(&!cursor) then
+                    assertTrue(storageNumber(columnStorage(&cursor, 0)) = 5, "a null is held as no value");
+                    assertTrue(storageNumber(columnStorage(&cursor, 1)) = 5, "a null real is held as no value");
+                    assertTrue(storageNumber(columnStorage(&cursor, 2)) = 5, "a null BOOLEAN column is held as no value");
+                    assertTrue(storageNumber(columnStorage(&cursor, 3)) = 5, "a null blob is held as no value");
+                else
+                    assertFailure("the second row is not there");
+                end if;
+                case finish(&!db, cursor) of
+                    when Some(value as error: SqlError) do
+                        printLn(describe(error));
+                        assertFailure("the select failed");
+                    when None do
+                        skip;
+                end case;
+                var none: Cursor := start(&!db, "DELETE FROM things WHERE n = 99", noValues());
+                assertTrue(columnCount(&none) = 0, "a statement that returns no rows has no columns");
+                while advance(&!none) do
+                    skip;
+                end while;
+                case finish(&!db, none) of
+                    when Some(value as error: SqlError) do
+                        printLn(describe(error));
+                        assertFailure("the delete failed");
+                    when None do
+                        skip;
+                end case;
+                closeDatabase(db);
+        end case;
+        return nil;
+    end;
+end module body.

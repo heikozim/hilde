@@ -1,0 +1,1 @@
+Test that the runtime holds a packed list of texts against its length: two texts in five bytes are two and not three, a block without a last zero byte and an empty one are refused, and a spawn of /bin/true whose count names one argument more than the block holds is refused instead of reading past the block.

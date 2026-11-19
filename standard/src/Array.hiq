@@ -1,0 +1,627 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    initialize,
+    destroyFree,
+    length as bufferLength,
+    storeNth,
+    getSpan
+);
+import Bindings.Array (
+    loadFloat64,
+    loadFloat32,
+    loadInt64,
+    loadInt32,
+    float64Byte,
+    float32Byte,
+    int64Byte,
+    int32Byte
+);
+
+module body Standard.Array is
+    -- Four numbers, one for each axis a shape can have.
+    record Quad: Free is
+        n0: Index;
+        n1: Index;
+        n2: Index;
+        n3: Index;
+    end;
+
+    -- The extents of the axes below rank; the others are 1.
+    record Shape: Free is
+        axes: Index;
+        extents: Quad;
+        invariant (axes >= 1) and (axes <= 4);
+        invariant (extents.n0 >= 1) and (extents.n1 >= 1);
+        invariant (extents.n2 >= 1) and (extents.n3 >= 1);
+    end;
+
+    -- The bytes of the elements, packed little endian in row-major order.
+    record Array: Linear is
+        kind: Nat8;
+        form: Shape;
+        bytes: Buffer[Nat8];
+        invariant isElementType(kind);
+        invariant bufferLength(&bytes) = (count(form) * elementSize(kind));
+    end;
+
+    -- Strides count elements, not bytes.  The first element of the view is
+    -- at offset.  A step of 0 repeats the elements of an axis.
+    record View[R: Region]: Free is
+        kind: Nat8;
+        form: Shape;
+        strides: Quad;
+        offset: Index;
+        bytes: Span[Nat8, R];
+        invariant isElementType(kind);
+        invariant spanLength(bytes) > 0;
+        invariant offset < 2147483648;
+    end;
+
+    ---
+    --- Limits and element types
+    ---
+
+    function maxRank(): Index is
+        return 4;
+    end;
+
+    function maxElements(): Index is
+        return 2147483648;
+    end;
+
+    function nat8Type(): Nat8 is
+        return 0;
+    end;
+
+    function int32Type(): Nat8 is
+        return 1;
+    end;
+
+    function int64Type(): Nat8 is
+        return 2;
+    end;
+
+    function float32Type(): Nat8 is
+        return 5;
+    end;
+
+    function float64Type(): Nat8 is
+        return 6;
+    end;
+
+    function boolType(): Nat8 is
+        return 7;
+    end;
+
+    function isElementType(code: Nat8): Bool is
+        return (((code = 0) or (code = 1)) or ((code = 2) or (code = 5))) or ((code = 6) or (code = 7));
+    end;
+
+    function elementSize(code: Nat8): Index is
+        if (code = 1) or (code = 5) then
+            return 4;
+        end if;
+        if (code = 2) or (code = 6) then
+            return 8;
+        end if;
+        return 1;
+    end;
+
+    ---
+    --- Quads
+    ---
+
+    function quadAt(q: Quad, axis: Index): Index is
+        if axis = 0 then
+            return q.n0;
+        end if;
+        if axis = 1 then
+            return q.n1;
+        end if;
+        if axis = 2 then
+            return q.n2;
+        end if;
+        return q.n3;
+    end;
+
+    function quadWith(q: Quad, axis: Index, value: Index): Quad is
+        if axis = 0 then
+            return Quad(n0 => value, n1 => q.n1, n2 => q.n2, n3 => q.n3);
+        end if;
+        if axis = 1 then
+            return Quad(n0 => q.n0, n1 => value, n2 => q.n2, n3 => q.n3);
+        end if;
+        if axis = 2 then
+            return Quad(n0 => q.n0, n1 => q.n1, n2 => value, n3 => q.n3);
+        end if;
+        return Quad(n0 => q.n0, n1 => q.n1, n2 => q.n2, n3 => value);
+    end;
+
+    function ones(): Quad is
+        return Quad(n0 => 1, n1 => 1, n2 => 1, n3 => 1);
+    end;
+
+    ---
+    --- Shapes
+    ---
+
+    function shape1(a: Index): Shape is
+        return Shape(axes => 1, extents => Quad(n0 => a, n1 => 1, n2 => 1, n3 => 1));
+    end;
+
+    function shape2(a: Index, b: Index): Shape is
+        return Shape(axes => 2, extents => Quad(n0 => a, n1 => b, n2 => 1, n3 => 1));
+    end;
+
+    function shape3(a: Index, b: Index, c: Index): Shape is
+        return Shape(axes => 3, extents => Quad(n0 => a, n1 => b, n2 => c, n3 => 1));
+    end;
+
+    function shape4(a: Index, b: Index, c: Index, d: Index): Shape is
+        return Shape(axes => 4, extents => Quad(n0 => a, n1 => b, n2 => c, n3 => d));
+    end;
+
+    function rank(form: Shape): Index is
+        return form.axes;
+    end;
+
+    function extent(form: Shape, axis: Index): Index is
+        return quadAt(form.extents, axis);
+    end;
+
+    function paddedExtent(form: Shape, axis: Index): Index is
+        return quadAt(form.extents, axis);
+    end;
+
+    function count(form: Shape): Index is
+        return ((form.extents.n0 * form.extents.n1) * form.extents.n2) * form.extents.n3;
+    end;
+
+    function sameShape(a: Shape, b: Shape): Bool is
+        if a.axes /= b.axes then
+            return false;
+        end if;
+        var axis: Index := 0;
+        while axis < a.axes do
+            if quadAt(a.extents, axis) /= quadAt(b.extents, axis) then
+                return false;
+            end if;
+            axis := axis + 1;
+        end while;
+        return true;
+    end;
+
+    -- The extent of the shape counted from the last axis, back = 0, or 1
+    -- when the shape has no such axis.
+    function extentFromEnd(form: Shape, back: Index): Index is
+        if back < form.axes then
+            return quadAt(form.extents, (form.axes - 1) - back);
+        end if;
+        return 1;
+    end;
+
+    function isBroadcastable(source: Shape, target: Shape): Bool is
+        if source.axes > target.axes then
+            return false;
+        end if;
+        var back: Index := 0;
+        while back < source.axes do
+            let have: Index := extentFromEnd(source, back);
+            if (have /= 1) and (have /= extentFromEnd(target, back)) then
+                return false;
+            end if;
+            back := back + 1;
+        end while;
+        return true;
+    end;
+
+    function broadcastShapes(a: Shape, b: Shape): Option[Shape] is
+        var axes: Index := a.axes;
+        if b.axes > axes then
+            axes := b.axes;
+        end if;
+        var extents: Quad := ones();
+        var back: Index := 0;
+        while back < axes do
+            let x: Index := extentFromEnd(a, back);
+            let y: Index := extentFromEnd(b, back);
+            var joined: Index := x;
+            if x = 1 then
+                joined := y;
+            else if (y /= 1) and (y /= x) then
+                let none: Option[Shape] := None();
+                return none;
+            end if;
+            extents := quadWith(extents, (axes - 1) - back, joined);
+            back := back + 1;
+        end while;
+        let some: Option[Shape] := Some(value => Shape(axes => axes, extents => extents));
+        return some;
+    end;
+
+    function productShape(a: Shape, b: Shape): Shape is
+        return shape2(extent(a, 0), extent(b, 1));
+    end;
+
+    function broadcastCount(a: Shape, b: Shape): Index is
+        case broadcastShapes(a, b) of
+            when Some(value as form: Shape) do
+                return count(form);
+            when None do
+                return 0;
+        end case;
+    end;
+
+    ---
+    --- Owning arrays
+    ---
+
+    function zeros(kind: Nat8, form: Shape): Array is
+        let bytes: Buffer[Nat8] := initialize(count(form) * elementSize(kind), 0);
+        return Array(kind => kind, form => form, bytes => bytes);
+    end;
+
+    function destroy(a: Array): Unit is
+        let { kind as kind: Nat8, form as form: Shape, bytes as bytes: Buffer[Nat8] } := a;
+        destroyFree(bytes);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function elementType(a: &[Array, R]): Nat8 is
+        return a->kind;
+    end;
+
+    generic [R: Region]
+    function shape(a: &[Array, R]): Shape is
+        return a->form;
+    end;
+
+    generic [R: Region]
+    function size(a: &[Array, R]): Index is
+        return count(a->form);
+    end;
+
+    generic [R: Region]
+    function byteCount(a: &[Array, R]): Index is
+        return count(a->form) * elementSize(a->kind);
+    end;
+
+    -- Store one byte of the packed elements.
+    generic [R: Region]
+    function putByte(a: &![Array, R], position: Index, value: Nat8): Unit is
+        storeNth(&!(a->bytes), position, value);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setNat8(a: &![Array, R], k: Index, value: Nat8): Unit is
+        return putByte(&~a, k, value);
+    end;
+
+    generic [R: Region]
+    function writeInt32(a: &![Array, R], at: Index, value: Int32): Unit is
+        var i: Index := 0;
+        while i < 4 do
+            putByte(&~a, at + i, int32Byte(value, i));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setInt32(a: &![Array, R], k: Index, value: Int32): Unit is
+        return writeInt32(&~a, k * 4, value);
+    end;
+
+    generic [R: Region]
+    function writeInt64(a: &![Array, R], at: Index, value: Int64): Unit is
+        var i: Index := 0;
+        while i < 8 do
+            putByte(&~a, at + i, int64Byte(value, i));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setInt64(a: &![Array, R], k: Index, value: Int64): Unit is
+        return writeInt64(&~a, k * 8, value);
+    end;
+
+    generic [R: Region]
+    function writeFloat32(a: &![Array, R], at: Index, value: Float32): Unit is
+        var i: Index := 0;
+        while i < 4 do
+            putByte(&~a, at + i, float32Byte(value, i));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setFloat32(a: &![Array, R], k: Index, value: Float32): Unit is
+        return writeFloat32(&~a, k * 4, value);
+    end;
+
+    generic [R: Region]
+    function writeFloat64(a: &![Array, R], at: Index, value: Float64): Unit is
+        var i: Index := 0;
+        while i < 8 do
+            putByte(&~a, at + i, float64Byte(value, i));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setFloat64(a: &![Array, R], k: Index, value: Float64): Unit is
+        return writeFloat64(&~a, k * 8, value);
+    end;
+
+    generic [R: Region]
+    function setBool(a: &![Array, R], k: Index, value: Bool): Unit is
+        var byte: Nat8 := 0;
+        if value then
+            byte := 1;
+        end if;
+        return putByte(&~a, k, byte);
+    end;
+
+    ---
+    --- Views
+    ---
+
+    -- The strides of a packed array of the shape, row-major.
+    function packedStrides(form: Shape): Quad is
+        var strides: Quad := Quad(n0 => 0, n1 => 0, n2 => 0, n3 => 0);
+        var run: Index := 1;
+        var axis: Index := form.axes;
+        while axis > 0 do
+            axis := axis - 1;
+            strides := quadWith(strides, axis, run);
+            run := run * quadAt(form.extents, axis);
+        end while;
+        return strides;
+    end;
+
+    generic [R: Region]
+    function view(a: &[Array, R]): View[R] is
+        let n: Index := bufferLength(&(a->bytes));
+        let bytes: Span[Nat8, R] := getSpan(&(a->bytes), 0, n - 1);
+        return View(kind => a->kind, form => a->form, strides => packedStrides(a->form), offset => 0, bytes => bytes);
+    end;
+
+    generic [R: Region]
+    function viewElementType(v: View[R]): Nat8 is
+        return v.kind;
+    end;
+
+    generic [R: Region]
+    function viewShape(v: View[R]): Shape is
+        return v.form;
+    end;
+
+    generic [R: Region]
+    function viewRank(v: View[R]): Index is
+        return v.form.axes;
+    end;
+
+    generic [R: Region]
+    function viewSize(v: View[R]): Index is
+        return count(v.form);
+    end;
+
+    generic [R: Region]
+    function viewExtent(v: View[R], axis: Index): Index is
+        return quadAt(v.form.extents, axis);
+    end;
+
+    generic [R: Region]
+    function viewStride(v: View[R], axis: Index): Index is
+        return quadAt(v.strides, axis);
+    end;
+
+    generic [R: Region]
+    function viewOffset(v: View[R]): Index is
+        return v.offset;
+    end;
+
+    generic [R: Region]
+    function isContiguous(v: View[R]): Bool is
+        let packed: Quad := packedStrides(v.form);
+        var axis: Index := 0;
+        while axis < v.form.axes do
+            if (quadAt(v.form.extents, axis) > 1) and (quadAt(v.strides, axis) /= quadAt(packed, axis)) then
+                return false;
+            end if;
+            axis := axis + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function sliceAxis(v: View[R], axis: Index, start: Index, stop: Index, step: Index): View[R] is
+        let span: Index := stop - start;
+        let kept: Index := ((span - 1) / step) + 1;
+        let stride: Index := quadAt(v.strides, axis);
+        return View(kind => v.kind, form => Shape(axes => v.form.axes, extents => quadWith(v.form.extents, axis, kept)), strides => quadWith(v.strides, axis, stride * step), offset => v.offset + (start * stride), bytes => v.bytes);
+    end;
+
+    generic [R: Region]
+    function pick(v: View[R], axis: Index, at: Index): View[R] is
+        var extents: Quad := ones();
+        var strides: Quad := Quad(n0 => 0, n1 => 0, n2 => 0, n3 => 0);
+        var out: Index := 0;
+        var src: Index := 0;
+        while src < v.form.axes do
+            if src /= axis then
+                extents := quadWith(extents, out, quadAt(v.form.extents, src));
+                strides := quadWith(strides, out, quadAt(v.strides, src));
+                out := out + 1;
+            end if;
+            src := src + 1;
+        end while;
+        return View(kind => v.kind, form => Shape(axes => v.form.axes - 1, extents => extents), strides => strides, offset => v.offset + (at * quadAt(v.strides, axis)), bytes => v.bytes);
+    end;
+
+    generic [R: Region]
+    function swapAxes(v: View[R], a: Index, b: Index): View[R] is
+        let ea: Index := quadAt(v.form.extents, a);
+        let eb: Index := quadAt(v.form.extents, b);
+        let sa: Index := quadAt(v.strides, a);
+        let sb: Index := quadAt(v.strides, b);
+        let extents: Quad := quadWith(quadWith(v.form.extents, a, eb), b, ea);
+        let strides: Quad := quadWith(quadWith(v.strides, a, sb), b, sa);
+        return View(kind => v.kind, form => Shape(axes => v.form.axes, extents => extents), strides => strides, offset => v.offset, bytes => v.bytes);
+    end;
+
+    generic [R: Region]
+    function broadcast(v: View[R], target: Shape): View[R] is
+        var strides: Quad := Quad(n0 => 0, n1 => 0, n2 => 0, n3 => 0);
+        var axis: Index := 0;
+        while axis < target.axes do
+            let back: Index := (target.axes - 1) - axis;
+            if back < v.form.axes then
+                let source: Index := (v.form.axes - 1) - back;
+                if quadAt(v.form.extents, source) = quadAt(target.extents, axis) then
+                    strides := quadWith(strides, axis, quadAt(v.strides, source));
+                end if;
+            end if;
+            axis := axis + 1;
+        end while;
+        return View(kind => v.kind, form => target, strides => strides, offset => v.offset, bytes => v.bytes);
+    end;
+
+    generic [R: Region]
+    function ordinal(v: View[R], c0: Index, c1: Index, c2: Index, c3: Index): Index is
+        let e: Quad := v.form.extents;
+        return (((((c0 * e.n1) + c1) * e.n2) + c2) * e.n3) + c3;
+    end;
+
+    -- The position in elements, in the bytes of the view, of the element at
+    -- the ordinal k.
+    generic [R: Region]
+    function elementPosition(v: View[R], k: Index): Index is
+        var rest: Index := k;
+        var position: Index := v.offset;
+        var axis: Index := v.form.axes;
+        while axis > 0 do
+            axis := axis - 1;
+            let width: Index := quadAt(v.form.extents, axis);
+            position := position + (rem(rest, width) * quadAt(v.strides, axis));
+            rest := rest / width;
+        end while;
+        return position;
+    end;
+
+    -- The byte offset of the element at the ordinal k.  A view that looks
+    -- outside its bytes stops the programme.
+    generic [R: Region]
+    function byteAt(v: View[R], k: Index): Index is
+        let width: Index := elementSize(v.kind);
+        let at: Index := elementPosition(v, k) * width;
+        if (at + width) > spanLength(v.bytes) then
+            abort("an array view reaches past its bytes");
+        end if;
+        return at;
+    end;
+
+    generic [R: Region]
+    function getNat8(v: View[R], k: Index): Nat8 is
+        return v.bytes[byteAt(v, k)];
+    end;
+
+    generic [R: Region]
+    function getInt32(v: View[R], k: Index): Int32 is
+        return loadInt32(v.bytes, byteAt(v, k));
+    end;
+
+    generic [R: Region]
+    function getInt64(v: View[R], k: Index): Int64 is
+        return loadInt64(v.bytes, byteAt(v, k));
+    end;
+
+    generic [R: Region]
+    function getFloat32(v: View[R], k: Index): Float32 is
+        return loadFloat32(v.bytes, byteAt(v, k));
+    end;
+
+    generic [R: Region]
+    function getFloat64(v: View[R], k: Index): Float64 is
+        return loadFloat64(v.bytes, byteAt(v, k));
+    end;
+
+    generic [R: Region]
+    function getBool(v: View[R], k: Index): Bool is
+        return v.bytes[byteAt(v, k)] /= 0;
+    end;
+
+    generic [R: Region]
+    function copy(v: View[R]): Array is
+        var out: Array := zeros(v.kind, v.form);
+        let width: Index := elementSize(v.kind);
+        let total: Index := count(v.form);
+        var k: Index := 0;
+        while k < total do
+            let at: Index := byteAt(v, k);
+            var b: Index := 0;
+            while b < width do
+                putByte(&!out, (k * width) + b, v.bytes[at + b]);
+                b := b + 1;
+            end while;
+            k := k + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region]
+    function packedBytes(a: &[Array, R]): Span[Nat8, R] is
+        let n: Index := bufferLength(&(a->bytes));
+        return getSpan(&(a->bytes), 0, n - 1);
+    end;
+
+    generic [R: Region]
+    function fromPacked(kind: Nat8, form: Shape, bytes: Span[Nat8, R]): Option[Array] is
+        if not isElementType(kind) then
+            let none: Option[Array] := None();
+            return none;
+        end if;
+        let width: Index := elementSize(kind);
+        let given: Index := spanLength(bytes);
+        -- The bytes must be exactly the packed form.  The product of the
+        -- count and the width of an element can be larger than an Index of a
+        -- target with a 32-bit Index holds, but the length of the bytes
+        -- cannot, so the comparison goes over the division.
+        if (rem(given, width) /= 0) or ((given / width) /= count(form)) then
+            let none: Option[Array] := None();
+            return none;
+        end if;
+        let total: Index := given;
+        var i: Index := 0;
+        if kind = 7 then
+            while i < total do
+                if bytes[i] > 1 then
+                    let none: Option[Array] := None();
+                    return none;
+                end if;
+                i := i + 1;
+            end while;
+        end if;
+        var out: Array := zeros(kind, form);
+        i := 0;
+        while i < total do
+            putByte(&!out, i, bytes[i]);
+            i := i + 1;
+        end while;
+        let some: Option[Array] := Some(value => out);
+        return some;
+    end;
+end module body.

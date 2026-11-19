@@ -1,0 +1,826 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The rules are held by a digest that scripts/unicode/make-grapheme-
+-- tables.py computes with ICU's character break iterator: over the
+-- boundaries of every text of one, two and three representatives, one code
+-- point of each class, and of twenty longer texts.  The examples are
+-- written as the hexadecimal of their UTF-8, since the source is ASCII.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    insertBack,
+    length as bufferLength,
+    nth
+);
+import Standard.Text (
+    hexToBytes
+);
+import Standard.Utf8 (
+    CodePoint,
+    makeCodePoint,
+    appendCodePoint
+);
+import Standard.Testing (
+    assertTrue
+);
+import Standard.Grapheme (
+    clusterEnd,
+    countClusters,
+    pointWidth,
+    clusterWidth,
+    countColumns,
+    fittingEnd,
+    lineEnd,
+    countLines
+);
+
+module body Standard.Grapheme.Test is
+    -- The number of clusters of the UTF-8 given in hexadecimal, or none.
+    function clustersOf(hex: Span[Nat8, Static]): Option[Index] is
+        case hexToBytes(hex) of
+            when Some(value as text: String) do
+                let count: Option[Index] := countClusters(asSpan(&text));
+                destroyString(text);
+                return count;
+            when None do
+                abort("Standard.Grapheme.Test: the hexadecimal of an example is not well formed");
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    function counts(hex: Span[Nat8, Static], want: Index): Bool is
+        case clustersOf(hex) of
+            when Some(value as got: Index) do
+                return got = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refused(hex: Span[Nat8, Static]): Bool is
+        case clustersOf(hex) of
+            when Some(value as got: Index) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function testExamples(): Unit is
+        assertTrue(counts("", 0), "the empty text has no cluster");
+        assertTrue(counts("616263", 3), "three letters are three clusters");
+        assertTrue(counts("65cc81", 1), "e and a combining acute are one");
+        assertTrue(counts("0d0a", 1), "CR LF is one");
+        assertTrue(counts("0d0d0a", 2), "CR, then CR LF");
+        assertTrue(counts("f09f87a9f09f87aaf09f87ab", 2), "three regional indicators are a flag and one left over");
+        assertTrue(counts("f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6", 1), "a family joined by zero width joiners is one");
+        assertTrue(counts("e0a495e0a58de0a4b7e0a4bf", 1), "a Devanagari conjunct with its vowel sign is one");
+        assertTrue(counts("e0a495e0a58d61", 2), "a linker before a letter of another script does not join");
+        assertTrue(counts("e18480e185a1e186a8", 1), "a Hangul syllable in its three parts is one");
+        assertTrue(counts("d880d880d9a1", 1), "two Arabic number signs join the digit after them");
+        return nil;
+    end;
+
+    function testRefusal(): Unit is
+        assertTrue(refused("ff"), "a byte that is not UTF-8 is refused");
+        assertTrue(refused("61ff"), "a text with such a byte is refused");
+        case hexToBytes("61ff62") of
+            when Some(value as text: String) do
+                case clusterEnd(asSpan(&text), 0) of
+                    when Some(value as stop: Index) do
+                        assertTrue(stop = 1, "the cluster ends before a byte that is not UTF-8");
+                    when None do
+                        assertTrue(false, "the cluster ends before a byte that is not UTF-8");
+                end case;
+                case clusterEnd(asSpan(&text), 1) of
+                    when Some(value as stop: Index) do
+                        assertTrue(false, "no cluster starts at a byte that is not UTF-8");
+                    when None do
+                        assertTrue(true, "no cluster starts at a byte that is not UTF-8");
+                end case;
+                case clusterEnd(asSpan(&text), 3) of
+                    when Some(value as stop: Index) do
+                        assertTrue(false, "no cluster starts at the end");
+                    when None do
+                        assertTrue(true, "no cluster starts at the end");
+                end case;
+                destroyString(text);
+            when None do
+                assertTrue(false, "the hexadecimal of the test is well formed");
+        end case;
+        return nil;
+    end;
+
+    ---
+    --- The display width
+    ---
+
+    -- The count of columns of the UTF-8 given in hexadecimal, or none.
+    function columnsOf(hex: Span[Nat8, Static]): Option[Index] is
+        case hexToBytes(hex) of
+            when Some(value as text: String) do
+                let total: Option[Index] := countColumns(asSpan(&text));
+                destroyString(text);
+                return total;
+            when None do
+                abort("Standard.Grapheme.Test: the hexadecimal of an example is not well formed");
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    function columns(hex: Span[Nat8, Static], want: Index): Bool is
+        case columnsOf(hex) of
+            when Some(value as got: Index) do
+                return got = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refusedColumns(hex: Span[Nat8, Static]): Bool is
+        case columnsOf(hex) of
+            when Some(value as got: Index) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- The width of the cluster that starts at the byte start of the text
+    -- of the hexadecimal, or none.
+    function clusterColumns(hex: Span[Nat8, Static], start: Index): Option[Index] is
+        case hexToBytes(hex) of
+            when Some(value as text: String) do
+                let w: Option[Index] := clusterWidth(asSpan(&text), start);
+                destroyString(text);
+                return w;
+            when None do
+                abort("Standard.Grapheme.Test: the hexadecimal of an example is not well formed");
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    function clusterColumnsAre(hex: Span[Nat8, Static], start: Index, want: Index): Bool is
+        case clusterColumns(hex, start) of
+            when Some(value as got: Index) do
+                return got = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The end of the prefix that fits the limit, or none.
+    function fitting(hex: Span[Nat8, Static], limit: Index): Option[Index] is
+        case hexToBytes(hex) of
+            when Some(value as text: String) do
+                let stop: Option[Index] := fittingEnd(asSpan(&text), limit);
+                destroyString(text);
+                return stop;
+            when None do
+                abort("Standard.Grapheme.Test: the hexadecimal of an example is not well formed");
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    function fittingIs(hex: Span[Nat8, Static], limit: Index, want: Index): Bool is
+        case fitting(hex, limit) of
+            when Some(value as got: Index) do
+                return got = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function refusedFitting(hex: Span[Nat8, Static], limit: Index): Bool is
+        case fitting(hex, limit) of
+            when Some(value as got: Index) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    -- The number of lines at the limit, or none.
+    function linesOf(hex: Span[Nat8, Static], limit: Index): Option[Index] is
+        case hexToBytes(hex) of
+            when Some(value as text: String) do
+                let count: Option[Index] := countLines(asSpan(&text), limit);
+                destroyString(text);
+                return count;
+            when None do
+                abort("Standard.Grapheme.Test: the hexadecimal of an example is not well formed");
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    function linesAre(hex: Span[Nat8, Static], limit: Index, want: Index): Bool is
+        case linesOf(hex, limit) of
+            when Some(value as got: Index) do
+                return got = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The end of the line that starts at the byte start, or none.
+    function lineStop(hex: Span[Nat8, Static], limit: Index, start: Index): Option[Index] is
+        case hexToBytes(hex) of
+            when Some(value as text: String) do
+                let stop: Option[Index] := lineEnd(asSpan(&text), limit, start);
+                destroyString(text);
+                return stop;
+            when None do
+                abort("Standard.Grapheme.Test: the hexadecimal of an example is not well formed");
+                let none: Option[Index] := None();
+                return none;
+        end case;
+    end;
+
+    function lineStopIs(hex: Span[Nat8, Static], limit: Index, start: Index, want: Index): Bool is
+        case lineStop(hex, limit, start) of
+            when Some(value as got: Index) do
+                return got = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether stop is the end of a cluster of the text: 0, the length, or
+    -- the end a cluster that starts at 0 or later ends at.
+    generic [R: Region]
+    function boundary(text: Span[Nat8, R], stop: Index): Bool is
+        let size: Index := spanLength(text);
+        if stop >= size then
+            return stop = size;
+        end if;
+        var pos: Index := 0;
+        while pos < size do
+            if pos = stop then
+                return true;
+            end if;
+            case clusterEnd(text, pos) of
+                when Some(value as next: Index) do
+                    pos := next;
+                when None do
+                    return false;
+            end case;
+        end while;
+        return false;
+    end;
+
+    -- The count of columns of the clusters before stop; none when stop is
+    -- not the end of a cluster.
+    generic [R: Region]
+    function columnsBefore(text: Span[Nat8, R], stop: Index): Option[Index] is
+        var pos: Index := 0;
+        var total: Index := 0;
+        var valid: Bool := true;
+        while valid and (pos < stop) do
+            case clusterEnd(text, pos) of
+                when Some(value as next: Index) do
+                    case clusterWidth(text, pos) of
+                        when Some(value as w: Index) do
+                            total := total + w;
+                            pos := next;
+                        when None do
+                            valid := false;
+                    end case;
+                when None do
+                    valid := false;
+            end case;
+        end while;
+        if valid and (pos = stop) then
+            let some: Option[Index] := Some(value => total);
+            return some;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    -- The count of columns of the clusters of the line from begin to stop;
+    -- none when stop is not the end of a cluster.
+    generic [R: Region]
+    function columnsBetween(text: Span[Nat8, R], begin: Index, stop: Index): Option[Index] is
+        var pos: Index := begin;
+        var total: Index := 0;
+        var valid: Bool := true;
+        while valid and (pos < stop) do
+            case clusterEnd(text, pos) of
+                when Some(value as next: Index) do
+                    case clusterWidth(text, pos) of
+                        when Some(value as w: Index) do
+                            total := total + w;
+                            pos := next;
+                        when None do
+                            valid := false;
+                    end case;
+                when None do
+                    valid := false;
+            end case;
+        end while;
+        if valid and (pos = stop) then
+            let some: Option[Index] := Some(value => total);
+            return some;
+        end if;
+        let none: Option[Index] := None();
+        return none;
+    end;
+
+    -- Whether the prefix that fits the limit ends at a cluster boundary,
+    -- holds at most the limit, and one cluster more does not fit.
+    generic [R: Region]
+    function fits(text: Span[Nat8, R], limit: Index): Bool is
+        case fittingEnd(text, limit) of
+            when None do
+                return false;
+            when Some(value as stop: Index) do
+                case columnsBefore(text, stop) of
+                    when None do
+                        return false;
+                    when Some(value as total: Index) do
+                        if total > limit then
+                            return false;
+                        end if;
+                        let size: Index := spanLength(text);
+                        if stop >= size then
+                            return true;
+                        end if;
+                        case clusterWidth(text, stop) of
+                            when Some(value as w: Index) do
+                                return (total + w) > limit;
+                            when None do
+                                return false;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    -- Whether wrapping holds for the text at the width: the ends of the
+    -- lines and the starts of the next ones are ends of clusters, every
+    -- line is at most width columns wide unless it holds one cluster, the
+    -- lines together hold the columns of the text, and countLines says
+    -- the count of the lines of the walk.
+    generic [R: Region]
+    function wraps(text: Span[Nat8, R], limit: Index): Bool is
+        let size: Index := spanLength(text);
+        case countLines(text, limit) of
+            when None do
+                return false;
+            when Some(value as want: Index) do
+                var at: Index := 0;
+                var lines: Index := 0;
+                var shown: Index := 0;
+                var ok: Bool := true;
+                while ok and (at < size) do
+                    let begin: Index := at;
+                    case lineEnd(text, limit, at) of
+                        when None do
+                            ok := false;
+                        when Some(value as stop: Index) do
+                            if stop < begin then
+                                ok := false;
+                            else if not boundary(text, stop) then
+                                ok := false;
+                            else
+                                case columnsBetween(text, begin, stop) of
+                                    when None do
+                                        ok := false;
+                                    when Some(value as line: Index) do
+                                        var count: Index := 0;
+                                        var pos: Index := begin;
+                                        while pos < stop do
+                                            case clusterEnd(text, pos) of
+                                                when Some(value as next: Index) do
+                                                    count := count + 1;
+                                                    pos := next;
+                                                when None do
+                                                    ok := false;
+                                                    pos := stop;
+                                            end case;
+                                        end while;
+                                        shown := shown + line;
+                                        if (line > limit) and (count > 1) then
+                                            ok := false;
+                                        end if;
+                                        -- the start of the next line: after a
+                                        -- carriage return or a line feed, else
+                                        -- at the end of this line
+                                        if (stop < size) and ok then
+                                            let byte: Nat8 := text[stop];
+                                            if (byte = '\n') or (byte = '\r') then
+                                                case clusterEnd(text, stop) of
+                                                    when Some(value as next: Index) do
+                                                        at := next;
+                                                    when None do
+                                                        ok := false;
+                                                end case;
+                                            else
+                                                at := stop;
+                                            end if;
+                                        else
+                                            at := stop;
+                                        end if;
+                                end case;
+                            end if;
+                            lines := lines + 1;
+                    end case;
+                    if ok and (at <= begin) then
+                        ok := false;
+                    end if;
+                end while;
+                if ok then
+                    ok := (lines = want) and (at = size);
+                end if;
+                if ok then
+                    case countColumns(text) of
+                        when Some(value as total: Index) do
+                            ok := shown = total;
+                        when None do
+                            ok := false;
+                    end case;
+                end if;
+                return ok;
+        end case;
+    end;
+
+    -- Whether every limit from 0 to 8 gives a prefix at a cluster boundary
+    -- that holds the rules of fits.
+    function fitsHex(hex: Span[Nat8, Static]): Bool is
+        case hexToBytes(hex) of
+            when Some(value as text: String) do
+                var ok: Bool := true;
+                var limit: Index := 0;
+                while ok and (limit < 9) do
+                    ok := fits(asSpan(&text), limit);
+                    limit := limit + 1;
+                end while;
+                destroyString(text);
+                return ok;
+            when None do
+                abort("Standard.Grapheme.Test: the hexadecimal of an example is not well formed");
+                let no: Bool := false;
+                return no;
+        end case;
+    end;
+
+    -- Whether every width from 1 to 8 wraps by the rules of wraps.
+    function wrapsHex(hex: Span[Nat8, Static]): Bool is
+        case hexToBytes(hex) of
+            when Some(value as text: String) do
+                var ok: Bool := true;
+                var cut: Index := 1;
+                while ok and (cut < 9) do
+                    ok := wraps(asSpan(&text), cut);
+                    cut := cut + 1;
+                end while;
+                destroyString(text);
+                return ok;
+            when None do
+                abort("Standard.Grapheme.Test: the hexadecimal of an example is not well formed");
+                let no: Bool := false;
+                return no;
+        end case;
+    end;
+
+    function testWidths(): Unit is
+        assertTrue(pointWidth(#x61) = 1, "a letter is one column");
+        assertTrue(pointWidth(#x6771) = 2, "a CJK ideograph is two columns");
+        assertTrue(pointWidth(#xFF21) = 2, "a fullwidth letter is two columns");
+        assertTrue(pointWidth(#x2460) = 1, "an ambiguous character is one column");
+        assertTrue(pointWidth(#x301) = 0, "a combining acute is no column");
+        assertTrue(pointWidth(#x9) = 0, "a control character is no column");
+        assertTrue(pointWidth(#x200D) = 0, "a zero width joiner is no column");
+        assertTrue(pointWidth(#xFE0F) = 0, "a variation selector is no column");
+        assertTrue(pointWidth(#x1100) = 2, "a Hangul leading jamo is two columns");
+        assertTrue(pointWidth(#x1161) = 1, "a Hangul vowel jamo alone is one column");
+        assertTrue(pointWidth(#x1F1E9) = 2, "a regional indicator is shown as emoji");
+        assertTrue(pointWidth(#x2764) = 1, "a heart without a selector is narrow");
+        assertTrue(pointWidth(#x10FFFF) = 1, "an unassigned code point is one column");
+        assertTrue(clusterColumnsAre("61cc81", 0, 1), "a letter with a combining acute is one column");
+        assertTrue(clusterColumnsAre("e0a495e0a58de0a4b7e0a4bf", 0, 1), "a Devanagari conjunct is one column");
+        assertTrue(clusterColumnsAre("e18480e185a1e186a8", 0, 2), "a Hangul syllable in parts is two columns");
+        assertTrue(clusterColumnsAre("f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6", 0, 2), "a family joined by zero width joiners is two columns");
+        assertTrue(clusterColumnsAre("f09f87a9f09f87aa", 0, 2), "a flag is two columns");
+        assertTrue(clusterColumnsAre("f09f87a9f09f87aaf09f87ab", 8, 2), "a regional indicator left over is two columns");
+        assertTrue(clusterColumnsAre("e299a5efb88f", 0, 2), "a heart with the variation selector 16 is two columns");
+        assertTrue(clusterColumnsAre("f09f9880efb88e", 0, 1), "an emoji with the variation selector 15 is one column");
+        assertTrue(clusterColumnsAre("cc81", 0, 0), "a cluster of a combining acute alone is no column");
+        assertTrue(clusterColumnsAre("e291a0", 0, 1), "an ambiguous character is one column");
+        assertTrue(clusterColumnsAre("61", 5, 1) = false, "no cluster starts at the end");
+        assertTrue(columns("", 0), "the empty text has no columns");
+        assertTrue(columns("6162636465", 5), "five letters are five columns");
+        assertTrue(columns("61cc816263", 3), "the combining acute adds no column");
+        assertTrue(columns("e69db1e6b48b", 4), "two CJK ideographs are four columns");
+        assertTrue(columns("efbca1", 2), "a fullwidth letter is two columns");
+        assertTrue(columns("e291a0", 1), "an ambiguous character is one column");
+        assertTrue(columns("610162", 2), "a control character adds no column");
+        assertTrue(columns("f09f87a9f09f87aaf09f87ab", 4), "a flag and a regional indicator are four columns");
+        assertTrue(columns("e0b881e0b8b1e0b897", 2), "two Thai clusters are two columns");
+        assertTrue(refusedColumns("61ff"), "a text with a byte that is not UTF-8 has no count of columns");
+        return nil;
+    end;
+
+    function testFitting(): Unit is
+        assertTrue(fittingIs("", 3, 0), "the empty text fits nothing and ends at 0");
+        assertTrue(fittingIs("61cc816263", 0, 0), "a limit of no column cuts everything");
+        assertTrue(fittingIs("61cc816263", 1, 3), "the limit of one column keeps the letter with its mark");
+        assertTrue(fittingIs("61cc816263", 2, 4), "the limit of two columns keeps two clusters");
+        assertTrue(fittingIs("61cc816263", 3, 5), "the limit of three columns keeps the whole text");
+        assertTrue(fittingIs("e69db1e6b48b", 1, 0), "a wide cluster that does not fit leaves the prefix empty");
+        assertTrue(fittingIs("e69db1e6b48b", 2, 3), "the limit of two columns keeps one CJK ideograph");
+        assertTrue(fittingIs("e69db1e6b48b", 3, 3), "a wide cluster does not fit half into the rest");
+        assertTrue(fittingIs("e69db1e6b48b", 4, 6), "the limit of four columns keeps both ideographs");
+        assertTrue(fittingIs("f09f87a9f09f87aa61", 1, 0), "a flag wider than the limit leaves the prefix empty");
+        assertTrue(fittingIs("f09f87a9f09f87aa61", 2, 8), "the flag fits the limit of two columns whole");
+        assertTrue(fittingIs("f09f87a9f09f87aa61", 3, 9), "the flag and the letter fit three columns");
+        assertTrue(fittingIs("f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a661", 1, 0), "a family joined by zero width joiners is not cut");
+        assertTrue(fittingIs("f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a661", 2, 25), "the family fits the limit of two columns whole");
+        assertTrue(fittingIs("f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a661", 3, 26), "the family and the letter fit three columns");
+        assertTrue(refusedFitting("61ff", 5), "a text with a byte that is not UTF-8 has no fitting end");
+        assertTrue(fitsHex("61cc816263"), "every limit of the letters ends at a cluster");
+        assertTrue(fitsHex("e69db1e6b48b"), "every limit of the ideographs ends at a cluster");
+        assertTrue(fitsHex("f09f87a9f09f87aaf09f87ab"), "every limit of the regional indicators ends at a cluster");
+        assertTrue(fitsHex("f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a661"), "every limit of the family ends at a cluster");
+        assertTrue(fitsHex("e0a495e0a58de0a4b7e0a4bf61"), "every limit of the conjunct ends at a cluster");
+        assertTrue(fitsHex("e0b881e0b8b1e0b897"), "every limit of the Thai clusters ends at a cluster");
+        assertTrue(fitsHex("e18480e185a1e186a861"), "every limit of the Hangul parts ends at a cluster");
+        assertTrue(fitsHex("e299a5efb88f61"), "every limit of the heart with its selector ends at a cluster");
+        return nil;
+    end;
+
+    function testWrapping(): Unit is
+        assertTrue(linesAre("", 3, 0), "the empty text wraps into no line");
+        assertTrue(linesAre("6162636465", 2, 3), "five letters wrap into three lines of two columns");
+        assertTrue(lineStopIs("6162636465", 2, 0, 2), "the first line ends after two letters");
+        assertTrue(lineStopIs("6162636465", 2, 2, 4), "the second line ends after two more");
+        assertTrue(lineStopIs("6162636465", 2, 4, 5), "the last line holds the fifth letter");
+        assertTrue(linesAre("610a6364", 10, 2), "a line feed breaks the line though the width is far");
+        assertTrue(lineStopIs("610a6364", 10, 0, 1), "the line ends before the line feed");
+        assertTrue(lineStopIs("610a6364", 10, 2, 4), "the next line starts after the line feed");
+        assertTrue(linesAre("610a0a62", 10, 3), "two line feeds in a row hold an empty line");
+        assertTrue(lineStopIs("610a0a62", 10, 2, 2), "the empty line ends where it starts");
+        assertTrue(linesAre("0d0a", 10, 1), "a carriage return and a line feed hold one empty line");
+        assertTrue(linesAre("610a", 10, 1), "a line feed at the end starts no line");
+        assertTrue(linesAre("e69db1e6b48b", 2, 2), "two ideographs of two columns wrap into two lines");
+        assertTrue(linesAre("e69db1e6b48b", 3, 2), "an ideograph does not share a line of three columns");
+        assertTrue(linesAre("e69db1e6b48b", 1, 2), "a line holds one wide cluster though it is too wide");
+        assertTrue(linesAre("f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a6", 1, 1), "a family joined by zero width joiners stays one line");
+        assertTrue(wrapsHex("6162636465"), "every width wraps the letters at cluster ends");
+        assertTrue(wrapsHex("61cc816263"), "every width wraps the letters with their mark at cluster ends");
+        assertTrue(wrapsHex("610a6364"), "every width wraps around the line feed at cluster ends");
+        assertTrue(wrapsHex("610a0a62"), "every width wraps the empty line at cluster ends");
+        assertTrue(wrapsHex("e69db1e6b48b"), "every width wraps the ideographs at cluster ends");
+        assertTrue(wrapsHex("f09f87a9f09f87aaf09f87ab"), "every width wraps the regional indicators at cluster ends");
+        assertTrue(wrapsHex("f09f91a8e2808df09f91a9e2808df09f91a7e2808df09f91a661"), "every width wraps the family at cluster ends");
+        assertTrue(wrapsHex("e0a495e0a58de0a4b7e0a4bf61"), "every width wraps the conjunct at cluster ends");
+        assertTrue(wrapsHex("e0b881e0b8b1e0b897"), "every width wraps the Thai clusters at cluster ends");
+        assertTrue(wrapsHex("e18480e185a1e186a861"), "every width wraps the Hangul parts at cluster ends");
+        assertTrue(wrapsHex("e299a5efb88f61"), "every width wraps the heart with its selector at cluster ends");
+        return nil;
+    end;
+
+    ---
+    --- The digest
+    ---
+
+    -- One code point of each class, as --digest prints them, six
+    -- hexadecimal digits each.
+    function representatives(): Span[Nat8, Static] is
+        return "00000000000A00000D0000610000A900030000060000090300091500094D\
+            \0011000011600011A800200C00200D00AC0000AC0101F1E6";
+    end;
+
+    -- The longer texts of the generator: six hexadecimal digits a code
+    -- point, a bar after each text.
+    function extraTexts(): Span[Nat8, Static] is
+        return "01F1E901F1EA01F1EB01F1F701F1EE|00006101F1E901F1EA01F1EB|01F4\
+            \6901F3FD00200D01F52C|01F46800200D01F46900200D01F46700200D01F\
+            \466|01F46900200D000061|00006100200D01F469|00276400FE0F00200D\
+            \01F525|00091500094D00093700093F|00091500093C00094D000937|000\
+            \91500094D00200D000937|00091500094D00094D000937|0009150003010\
+            \00937|00091500094D000061|0009950009CD0009B70009CD0009A3|0011\
+            \000011610011A8001100|00AC000011A80011A8001161|00AC0100116100\
+            \11A8|00000D00000A00030100000D00000D00000A|000600000600000661\
+            \000301|000E01000E33000E33000301|";
+    end;
+
+    function pointAt(list: Span[Nat8, Static], at: Index): Index is
+        var total: Index := 0;
+        var i: Index := 0;
+        while i < 6 do
+            let byte: Nat8 := list[at + i];
+            var digit: Nat8 := byte - '0';
+            if byte >= 'A' then
+                digit := (byte - 'A') + 10;
+            end if;
+            case toIndex(digit) of
+                when Some(value as d: Index) do
+                    total := (total * 16) + d;
+                when None do
+                    abort("Standard.Grapheme.Test: a digit did not fit an Index");
+            end case;
+            i := i + 1;
+        end while;
+        return total;
+    end;
+
+    function hashByte(hash: Nat32, byte: Nat8): Nat32 is
+        let prime: Nat32 := 16777619;
+        case toNat32(byte) of
+            when Some(value as wide: Nat32) do
+                return modularMultiply(bitwiseXor(hash, wide), prime);
+            when None do
+                abort("Standard.Grapheme.Test: a byte did not fit a Nat32");
+        end case;
+    end;
+
+    -- The hash after the decimal digits of value.
+    function hashDecimal(hash: Nat32, value: Index): Nat32 is
+        var h: Nat32 := hash;
+        if value >= 10 then
+            h := hashDecimal(h, value / 10);
+        end if;
+        let ten: Index := 10;
+        case toNat8(rem(value, ten)) of
+            when Some(value as digit: Nat8) do
+                return hashByte(h, digit + '0');
+            when None do
+                abort("Standard.Grapheme.Test: a digit did not fit a Nat8");
+        end case;
+    end;
+
+    -- The number of bytes of the code point in UTF-8.
+    function width(point: Index): Index is
+        if point < #x80 then
+            return 1;
+        end if;
+        if point < #x800 then
+            return 2;
+        end if;
+        if point < #x10000 then
+            return 3;
+        end if;
+        return 4;
+    end;
+
+    generic [B: Region]
+    function append(builder: &![StringBuilder, B], scalar: Index): Unit is
+        case toNat32(scalar) of
+            when Some(value as wide: Nat32) do
+                case makeCodePoint(wide) of
+                    when Some(value as point: CodePoint) do
+                        appendCodePoint(&~builder, point);
+                    when None do
+                        abort("Standard.Grapheme.Test: not a code point");
+                end case;
+            when None do
+                abort("Standard.Grapheme.Test: not a Nat32");
+        end case;
+        return nil;
+    end;
+
+    -- The hash after the boundaries of the text of the code points, as the
+    -- oracle prints them: code point offsets separated by spaces, 0 and the
+    -- number of code points included, and a newline.
+    generic [R: Region]
+    function hashText(hash: Nat32, points: &[Buffer[Index], R]): Nat32 is
+        let count: Index := bufferLength(points);
+        var builder: StringBuilder := makeStringBuilder();
+        -- starts holds the byte offset of each code point and, last, the
+        -- length of the text.
+        var starts: Buffer[Index] := allocateEmpty();
+        var bytes: Index := 0;
+        var k: Index := 0;
+        while k < count do
+            insertBack(&!starts, bytes);
+            append(&!builder, nth(points, k));
+            bytes := bytes + width(nth(points, k));
+            k := k + 1;
+        end while;
+        insertBack(&!starts, bytes);
+        let text: String := finalize(builder);
+        var h: Nat32 := hashByte(hash, '0');
+        var at: Index := 0;
+        while at < bytes do
+            case clusterEnd(asSpan(&text), at) of
+                when Some(value as stop: Index) do
+                    var j: Index := 0;
+                    while j <= count do
+                        if nth(&starts, j) = stop then
+                            h := hashByte(h, ' ');
+                            h := hashDecimal(h, j);
+                        end if;
+                        j := j + 1;
+                    end while;
+                    at := stop;
+                when None do
+                    abort("Standard.Grapheme.Test: a text of the digest was refused");
+                    at := bytes;
+            end case;
+        end while;
+        destroyString(text);
+        destroyFree(starts);
+        return hashByte(h, '\n');
+    end;
+
+    -- The hash after the text of the code points given.
+    function hashOf(hash: Nat32, a: Index, b: Index, c: Index, size: Index): Nat32 is
+        let reps: Span[Nat8, Static] := representatives();
+        var points: Buffer[Index] := allocateEmpty();
+        insertBack(&!points, pointAt(reps, a * 6));
+        if size >= 2 then
+            insertBack(&!points, pointAt(reps, b * 6));
+        end if;
+        if size >= 3 then
+            insertBack(&!points, pointAt(reps, c * 6));
+        end if;
+        let h: Nat32 := hashText(hash, &points);
+        destroyFree(points);
+        return h;
+    end;
+
+    -- A list of code points with nothing in it.
+    function emptyPoints(): Buffer[Index] is
+        let empty: Buffer[Index] := allocateEmpty();
+        return empty;
+    end;
+
+    -- The digest of --digest: the texts of one, two and three
+    -- representatives, in that order, then the longer texts.
+    function digest(): Nat32 is
+        var hash: Nat32 := 2166136261;
+        let first: Index := 0;
+        let n: Index := spanLength(representatives()) / 6;
+        var a: Index := 0;
+        while a < n do
+            hash := hashOf(hash, a, 0, 0, 1);
+            a := a + 1;
+        end while;
+        a := first;
+        while a < n do
+            var b: Index := 0;
+            while b < n do
+                hash := hashOf(hash, a, b, 0, 2);
+                b := b + 1;
+            end while;
+            a := a + 1;
+        end while;
+        a := first;
+        while a < n do
+            var b: Index := 0;
+            while b < n do
+                var c: Index := 0;
+                while c < n do
+                    hash := hashOf(hash, a, b, c, 3);
+                    c := c + 1;
+                end while;
+                b := b + 1;
+            end while;
+            a := a + 1;
+        end while;
+        let extra: Span[Nat8, Static] := extraTexts();
+        var points: Buffer[Index] := allocateEmpty();
+        var at: Index := 0;
+        while at < spanLength(extra) do
+            if extra[at] = '|' then
+                hash := hashText(hash, &points);
+                destroyFree(points);
+                points := emptyPoints();
+                at := at + 1;
+            else
+                insertBack(&!points, pointAt(extra, at));
+                at := at + 6;
+            end if;
+        end while;
+        destroyFree(points);
+        return hash;
+    end;
+
+    function testDigest(): Unit is
+        let want: Nat32 := 4053743472;
+        assertTrue(digest() = want, "the boundaries of 6194 texts are those of ICU 78.3");
+        return nil;
+    end;
+end module body.

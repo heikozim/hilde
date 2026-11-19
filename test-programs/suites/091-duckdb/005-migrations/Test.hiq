@@ -1,0 +1,131 @@
+-- migrate applies what the database has not seen, finds a database with
+-- more migrations than the programme knows, and undoes a migration that
+-- fails half way: its first statement made a table, its second fails, and
+-- the table is not there afterwards, nor its number in the ledger.
+import Standard.String (
+    String,
+    destroyString,
+    asSpan
+);
+import Standard.DuckDB (
+    Connection,
+    Writing,
+    Reading,
+    DuckError,
+    Values,
+    Cursor,
+    Transaction,
+    describe,
+    isUniqueViolation,
+    isConstraintViolation,
+    isBusy,
+    lastMessage,
+    openWriter,
+    openReader,
+    closeDatabase,
+    migrate,
+    begin,
+    commit,
+    rollback,
+    noValues,
+    withInt64,
+    withText,
+    withNull,
+    start,
+    startWrite,
+    execute,
+    advance,
+    columnInt64,
+    columnText,
+    finish
+);
+
+module body Test is
+    function report(label: Span[Nat8, Static], error: DuckError): Unit is
+        print(label);
+        print(": ");
+        print(describe(error));
+        print(", unique ");
+        print(isUniqueViolation(error));
+        print(", constraint ");
+        print(isConstraintViolation(error));
+        print(", busy ");
+        printLn(isBusy(error));
+        return nil;
+    end;
+
+    function written(label: Span[Nat8, Static], result: Either[DuckError, Nat64]): Unit is
+        case result of
+            when Left(left as error: DuckError) do
+                report(label, error);
+            when Right(right as count: Nat64) do
+                print(label);
+                print(": rows ");
+                printLn(count);
+        end case;
+        return nil;
+    end;
+
+    function ended(label: Span[Nat8, Static], failure: Option[DuckError]): Unit is
+        case failure of
+            when Some(value as error: DuckError) do
+                report(label, error);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [M: Free, R: Region]
+    function countRows(db: &![Connection[M], R], label: Span[Nat8, Static], sql: Span[Nat8, Static]): Unit is
+        var rows: Cursor := start(&~db, sql, noValues());
+        while advance(&!rows) do
+            print(label);
+            print(": ");
+            printLn(columnInt64(&rows, 0));
+        end while;
+        ended(label, finish(&~db, rows));
+        return nil;
+    end;
+
+    constant both: Span[Nat8, Static] := "30\nCREATE TABLE first (id BIGINT)31\nCREATE TABLE second (id BIGINT)";
+    constant first: Span[Nat8, Static] := "30\nCREATE TABLE first (id BIGINT)";
+    constant broken: Span[Nat8, Static] := "30\nCREATE TABLE first (id BIGINT)31\nCREATE TABLE second (id BIGINT)61\nCREATE TABLE half (id BIGINT); INSERT INTO nowhere VALUES (1)";
+
+    generic [R: Region]
+    function apply(db: &![Connection[Writing], R], label: Span[Nat8, Static], migrations: Span[Nat8, Static]): Unit is
+        case migrate(&~db, migrations) of
+            when Left(left as error: DuckError) do
+                report(label, error);
+            when Right(right as applied: Index) do
+                print(label);
+                print(": applied ");
+                printLn(applied);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function exercise(db: &![Connection[Writing], R]): Unit is
+        apply(&~db, "both", both);
+        apply(&~db, "first only", first);
+        apply(&~db, "both again", both);
+        apply(&~db, "a third that fails half way", broken);
+        countRows(&~db, "ledger", "SELECT count(*) FROM hilde_migrations");
+        countRows(&~db, "tables named half", "SELECT count(*) FROM information_schema.tables WHERE table_name = 'half'");
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        case openWriter("migrations.duckdb") of
+            when Left(left as error: DuckError) do
+                report("open", error);
+                return ExitFailure();
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                exercise(&!db);
+                closeDatabase(db);
+        end case;
+        return ExitSuccess();
+    end;
+end module body.

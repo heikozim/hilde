@@ -1,0 +1,81 @@
+import Standard.String (
+    String,
+    fromLiteral,
+    destroyString,
+    length,
+    nthByte
+);
+import Standard.Task (
+    Lending,
+    openLending,
+    closeLending,
+    Task,
+    spawnLending,
+    join
+);
+
+module body Test is
+    function byteValue(byte: Nat8): Int64 is
+        case toInt64(byte) of
+            when Some(value: Int64) do
+                return value;
+            when None do
+                return -100000;
+        end case;
+    end;
+
+    -- Read every byte of the lent string, many times over, and give back
+    -- the sum of one pass: 1650 for "concurrent reads".  No task writes;
+    -- all of them read the same string, at once, on eight workers
+    -- (env.txt), through read references of one borrow --
+    -- which under ThreadSanitizer is the check that sharing it needs no
+    -- lock.
+    generic [R: Region]
+    function checksum(word: &[String, R]): Int64 is
+        let size: Index := length(word);
+        var one: Int64 := 0;
+        var pass: Int32 := 0;
+        while pass < 200 do
+            var sum: Int64 := 0;
+            for i from 0 to size - 1 do
+                sum := sum + byteValue(nthByte(word, i));
+            end for;
+            one := sum;
+            pass := pass + 1;
+        end while;
+        return one;
+    end;
+
+    -- left tasks, all started before any is joined.
+    generic [R: Region, S: Region]
+    function many(scope: &![Lending[R], S], w: &[String, R], left: Int32): Int64 is
+        if left = 0 then
+            return 0;
+        end if;
+        let work: Fn[&[String, R], Int64] := checksum;
+        case spawnLending(&~scope, work, w) of
+            when Right(right as task: Task[Int64]) do
+                let rest: Int64 := many(&~scope, w, left - 1);
+                return rest + join(task);
+            when Left(left as back: &[String, R]) do
+                return -1;
+        end case;
+    end;
+
+    -- Sixteen tasks: 16 * 1650 = 26400.
+    function main(): ExitCode is
+        let word: String := fromLiteral("concurrent reads");
+        borrow w: &[String, rho] := &word do
+            case openLending(w) of
+                when Some(value as opened: Lending[rho]) do
+                    var scope: Lending[rho] := opened;
+                    printLn(many(&!scope, w, 16));
+                    closeLending(scope);
+                when None do
+                    skip;
+            end case;
+        end borrow;
+        destroyString(word);
+        return ExitSuccess();
+    end;
+end module body.

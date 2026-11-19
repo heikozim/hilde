@@ -1,0 +1,1640 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The generated crate lives in target/rust: Cargo.toml, lib.rs, a copy of
+-- the toolchain file and of rust/Cargo.lock, and .cargo/config.toml, which
+-- points crates.io at rust/vendor.  cargo is started through sh, which
+-- changes into target/rust, so that rustup and cargo find the files there,
+-- and which joins its standard error to its output, so that a long build
+-- log cannot fill a pipe this process does not read yet.  sh gets the
+-- directory and the words of cargo as arguments, never as text of the
+-- script.
+import Standard.String (
+    String,
+    destroyString,
+    fromSpan,
+    fromLiteral,
+    makeEmpty,
+    asSpan,
+    length
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeByte,
+    writeString,
+    finalize
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    length as bufferLength,
+    nth,
+    nthRef,
+    insertBack,
+    swapNth,
+    removeFirst,
+    removeLast,
+    destroyEmpty,
+    destroyFree
+);
+import Standard.Text (
+    equal,
+    trim,
+    lines,
+    startsWith,
+    endsWith,
+    contains,
+    indexOf,
+    substring,
+    toLower,
+    formatNat
+);
+import Standard.Toml (
+    Toml,
+    TomlError,
+    readToml,
+    destroyToml,
+    stringAt
+);
+import Standard.Semver (
+    formatVersion
+);
+import Standard.File (
+    environmentValue
+);
+import Standard.Arguments (
+    destroyArguments
+);
+import Pkg.Report (
+    Problem,
+    problemOf
+);
+import Pkg.Manifest (
+    Manifest,
+    Crate,
+    Requirement,
+    prefixOf,
+    readManifest,
+    destroyManifest
+);
+import Pkg.Get (
+    Got
+);
+import Pkg.Files (
+    readText,
+    writeText,
+    isThere,
+    isDirectory,
+    joinPath,
+    makeDirectories,
+    directoryNames
+);
+import Pkg.Process (
+    Ran,
+    findProgram,
+    runProgram,
+    destroyRan
+);
+
+module body Pkg.Rust is
+    generic [P: Region]
+    function libraryName(prefix: Span[Nat8, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "hilde_rust_");
+        var i: Index := 0;
+        while i < spanLength(prefix) do
+            let byte: Nat8 := prefix[i];
+            if byte = '.' then
+                writeByte(&!out, '_');
+            else if (byte >= 'A') and (byte <= 'Z') then
+                writeByte(&!out, byte + 32);
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    function isSmall(byte: Nat8): Bool is
+        return (byte >= 'a') and (byte <= 'z');
+    end;
+
+    function isDigit(byte: Nat8): Bool is
+        return (byte >= '0') and (byte <= '9');
+    end;
+
+    generic [R: Region]
+    function isBridgeName(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        if (size = 0) or (size > 64) then
+            return false;
+        end if;
+        if not isSmall(text[0]) then
+            return false;
+        end if;
+        var i: Index := 1;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if not ((isSmall(byte) or isDigit(byte)) or (byte = '_')) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function isTriple(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        if (size = 0) or (size > 64) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if not ((((isSmall(byte) or isDigit(byte)) or (byte = '_')) or (byte = '.')) or (byte = '-')) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [B: Region, P: Region]
+    function writeQuoted(out: &![StringBuilder, B], text: Span[Nat8, P]): Unit is
+        writeByte(&~out, '"');
+        writeString(&~out, text);
+        writeByte(&~out, '"');
+        return nil;
+    end;
+
+    -- The version of the package without its v, as cargo writes one.
+    generic [R: Region]
+    function packageVersion(manifest: &[Manifest, R]): String is
+        let text: String := formatVersion(manifest->version);
+        let bare: String := fromSpan(substring(asSpan(&text), 1, length(&text)));
+        destroyString(text);
+        return bare;
+    end;
+
+    generic [B: Region, R: Region]
+    function writeCrate(out: &![StringBuilder, B], crate: &[Crate, R]): Unit is
+        writeString(&~out, asSpan(&(crate->name)));
+        writeString(&~out, " = { version = \"=");
+        writeString(&~out, asSpan(&(crate->version)));
+        writeByte(&~out, '"');
+        if not (crate->defaultFeatures) then
+            writeString(&~out, ", default-features = false");
+        end if;
+        let features: &[Buffer[String], R] := &(crate->features);
+        if bufferLength(features) > 0 then
+            writeString(&~out, ", features = [");
+            var i: Index := 0;
+            while i < bufferLength(features) do
+                if i > 0 then
+                    writeString(&~out, ", ");
+                end if;
+                writeQuoted(&~out, asSpan(nthRef(features, i)));
+                i := i + 1;
+            end while;
+            writeByte(&~out, ']');
+        end if;
+        writeString(&~out, " }\n");
+        return nil;
+    end;
+
+    generic [R: Region, K: Region, H: Region, C: Region]
+    function cargoManifest(manifest: &[Manifest, R], crates: &[Buffer[Crate], K], helper: Span[Nat8, H], channel: Span[Nat8, C]): String is
+        let name: String := libraryName(asSpan(&(manifest->name)));
+        let version: String := packageVersion(manifest);
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "# Written by hilde rust from hilde.toml at every build; changes here are lost.\n");
+        writeString(&!out, "[package]\nname = ");
+        writeQuoted(&!out, asSpan(&name));
+        writeString(&!out, "\nversion = ");
+        writeQuoted(&!out, asSpan(&version));
+        writeString(&!out, "\nedition = \"2021\"\nrust-version = ");
+        writeQuoted(&!out, channel);
+        writeString(&!out, "\npublish = false\n\n[lib]\nname = ");
+        writeQuoted(&!out, asSpan(&name));
+        writeString(&!out, "\npath = \"lib.rs\"\ncrate-type = [\"staticlib\"]\n\n[dependencies]\nhilde-bridge = { path = ");
+        writeQuoted(&!out, helper);
+        writeString(&!out, " }\n");
+        var i: Index := 0;
+        while i < bufferLength(crates) do
+            writeCrate(&!out, nthRef(crates, i));
+            i := i + 1;
+        end while;
+        writeString(&!out, "\n[profile.dev]\npanic = \"unwind\"\n\n[profile.release]\npanic = \"unwind\"\n\n[workspace]\n");
+        destroyString(name);
+        destroyString(version);
+        return finalize(out);
+    end;
+
+    generic [B: Region]
+    function librarySource(bridges: &[Buffer[Bridge], B]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "// Written by hilde rust at every build: one staticlib with every bridge module\n// of the package and of its dependencies, so that the standard library of Rust is linked once.\n");
+        var i: Index := 0;
+        while i < bufferLength(bridges) do
+            let bridge: &[Bridge, B] := nthRef(bridges, i);
+            writeString(&!out, "\n#[path = \"../../");
+            writeString(&!out, asSpan(&(bridge->path)));
+            writeString(&!out, "\"]\npub mod ");
+            writeString(&!out, asSpan(&(bridge->name)));
+            writeString(&!out, ";\n");
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    generic [N: Region, V: Region, D: Region, L: Region]
+    function pkgConfigText(name: Span[Nat8, N], version: Span[Nat8, V], directory: Span[Nat8, D], native: Span[Nat8, L]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "Name: ");
+        writeString(&!out, name);
+        writeString(&!out, "\nDescription: the Rust crates and bridge modules of a Hilde package, one staticlib\nVersion: ");
+        writeString(&!out, version);
+        writeString(&!out, "\nLibs: -L${pcfiledir}/");
+        writeString(&!out, directory);
+        writeString(&!out, " -l");
+        writeString(&!out, name);
+        if spanLength(native) > 0 then
+            writeByte(&!out, ' ');
+            writeString(&!out, native);
+        end if;
+        writeString(&!out, "\nCflags:\n");
+        return finalize(out);
+    end;
+
+    -- The pkg-config file of the library of a dependency: it is named
+    -- after the library the dependency declares, and links the one
+    -- staticlib of the package.
+    generic [N: Region, V: Region, L: Region, D: Region, T: Region]
+    function aliasPkgConfigText(name: Span[Nat8, N], version: Span[Nat8, V], library: Span[Nat8, L], directory: Span[Nat8, D], native: Span[Nat8, T]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "Name: ");
+        writeString(&!out, name);
+        writeString(&!out, "\nDescription: the Rust crates and bridge modules of a Hilde package, one staticlib\nVersion: ");
+        writeString(&!out, version);
+        writeString(&!out, "\nLibs: -L${pcfiledir}/");
+        writeString(&!out, directory);
+        writeString(&!out, " -l");
+        writeString(&!out, library);
+        if spanLength(native) > 0 then
+            writeByte(&!out, ' ');
+            writeString(&!out, native);
+        end if;
+        writeString(&!out, "\nCflags:\n");
+        return finalize(out);
+    end;
+
+    -- The line without blanks, quotes and what follows a #.
+    generic [R: Region]
+    function squeezed(line: Span[Nat8, R]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(line) do
+            let byte: Nat8 := line[i];
+            if byte = '#' then
+                return finalize(out);
+            end if;
+            if not (((((byte = ' ') or (byte = '\t')) or (byte = '"')) or (byte = '\'')) or (byte = ',')) then
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- A line sets panic to abort when, squeezed, it holds panic=abort, or
+    -- it ends in panic= and the next line, squeezed, starts with abort, or
+    -- it ends in -C, --codegen or -Cpanic and the next starts with
+    -- panic=abort or =abort.
+    generic [R: Region]
+    function setsPanicAbort(text: Span[Nat8, R]): Bool is
+        let all: Buffer[Span[Nat8, R]] := lines(text);
+        var before: String := makeEmpty();
+        var found: Bool := false;
+        var i: Index := 0;
+        while (i < bufferLength(&all)) and (not found) do
+            let line: String := squeezed(nth(&all, i));
+            if contains(asSpan(&line), "panic=abort") then
+                found := true;
+            else if endsWith(asSpan(&before), "panic=") and startsWith(asSpan(&line), "abort") then
+                found := true;
+            else if endsWith(asSpan(&before), "panic") and startsWith(asSpan(&line), "=abort") then
+                found := true;
+            end if;
+            destroyString(before);
+            before := line;
+            i := i + 1;
+        end while;
+        destroyString(before);
+        destroyFree(all);
+        return found;
+    end;
+
+    generic [R: Region]
+    function startsAt(text: Span[Nat8, R], at: Index, part: Span[Nat8, Static]): Bool is
+        return startsWith(substring(text, at, spanLength(text)), part);
+    end;
+
+    function isBlank(byte: Nat8): Bool is
+        return (((byte = ' ') or (byte = '\t')) or (byte = '\n')) or (byte = '\r');
+    end;
+
+    -- Whether the function that starts at at is guarded: the first brace
+    -- after it opens its body, and the body starts with a guard.  A
+    -- semicolon before the brace is a declaration without a body.
+    generic [R: Region]
+    function guardedAt(text: Span[Nat8, R], at: Index): Bool is
+        let size: Index := spanLength(text);
+        var i: Index := at;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if byte = ';' then
+                return true;
+            end if;
+            if byte = '{' then
+                var j: Index := i + 1;
+                while (j < size) and isBlank(text[j]) do
+                    j := j + 1;
+                end while;
+                return startsAt(text, j, "hilde_bridge::guard");
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function isWordByte(byte: Nat8): Bool is
+        return (((isSmall(byte) or isDigit(byte)) or (byte = '_')) or ((byte >= 'A') and (byte <= 'Z')));
+    end;
+
+    -- Whether a function starts at at: pub fn, pub unsafe fn or extern "C"
+    -- fn, not in the middle of a word.
+    generic [R: Region]
+    function functionAt(text: Span[Nat8, R], at: Index): Bool is
+        if at > 0 then
+            if isWordByte(text[at - 1]) then
+                return false;
+            end if;
+        end if;
+        return (startsAt(text, at, "pub fn ") or startsAt(text, at, "pub unsafe fn ")) or startsAt(text, at, "extern \"C\" fn ");
+    end;
+
+    generic [R: Region]
+    function firstUnguarded(text: Span[Nat8, R]): Option[Index] is
+        let size: Index := spanLength(text);
+        var line: Index := 1;
+        var comment: Bool := false;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if byte = '\n' then
+                line := line + 1;
+                comment := false;
+            else if comment then
+                skip;
+            else if startsAt(text, i, "//") then
+                comment := true;
+            else if functionAt(text, i) then
+                if not guardedAt(text, i) then
+                    return Some(value => line);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    generic [R: Region]
+    function isChannel(text: Span[Nat8, R]): Bool is
+        let size: Index := spanLength(text);
+        var dots: Index := 0;
+        var digits: Index := 0;
+        var i: Index := 0;
+        while i < size do
+            let byte: Nat8 := text[i];
+            if byte = '.' then
+                if digits = 0 then
+                    return false;
+                end if;
+                dots := dots + 1;
+                digits := 0;
+            else if isDigit(byte) then
+                digits := digits + 1;
+            else
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return ((dots = 1) or (dots = 2)) and (digits > 0);
+    end;
+
+    generic [R: Region]
+    function channelOf(text: Span[Nat8, R]): Option[String] is
+        case readToml(text) of
+            when Right(right as doc: Toml) do
+                let found: Option[String] := stringAt(&doc, "toolchain.channel");
+                destroyToml(doc);
+                case found of
+                    when Some(value as channel: String) do
+                        if isChannel(asSpan(&channel)) then
+                            return Some(value => channel);
+                        end if;
+                        destroyString(channel);
+                        return None();
+                    when None do
+                        return None();
+                end case;
+            when Left(left as error: TomlError) do
+                return None();
+        end case;
+    end;
+
+    function isNativeByte(byte: Nat8): Bool is
+        return ((((((isWordByte(byte) or (byte = '-')) or (byte = '.')) or (byte = '/')) or (byte = '=')) or (byte = '+')) or (byte = ':')) or (byte = ' ');
+    end;
+
+    generic [R: Region]
+    function nativeLibraries(output: Span[Nat8, R]): Option[String] is
+        let all: Buffer[Span[Nat8, R]] := lines(output);
+        var i: Index := 0;
+        while i < bufferLength(&all) do
+            let line: Span[Nat8, R] := nth(&all, i);
+            case indexOf(line, "native-static-libs:") of
+                when Some(value as at: Index) do
+                    let words: Span[Nat8, R] := trim(substring(line, at + 19, spanLength(line)));
+                    destroyFree(all);
+                    var j: Index := 0;
+                    while j < spanLength(words) do
+                        if not isNativeByte(words[j]) then
+                            return None();
+                        end if;
+                        j := j + 1;
+                    end while;
+                    return Some(value => fromSpan(words));
+                when None do
+                    skip;
+            end case;
+            i := i + 1;
+        end while;
+        destroyFree(all);
+        return None();
+    end;
+
+    ---
+    --- The build
+    ---
+
+    generic [A: Region, B: Region, C: Region]
+    function said(a: Span[Nat8, A], b: Span[Nat8, B], c: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, a);
+        writeString(&!out, b);
+        writeString(&!out, c);
+        return finalize(out);
+    end;
+
+    function gotWith(problem: Problem): Got is
+        var problems: Buffer[Problem] := allocateEmpty();
+        insertBack(&!problems, problem);
+        return Got(count => 0, summary => makeEmpty(), problems => problems);
+    end;
+
+    function fine(count: Index, summary: String): Got is
+        return Got(count => count, summary => summary, problems => allocateEmpty());
+    end;
+
+    function destroyBridges(bridges: Buffer[Bridge]): Unit is
+        var rest: Buffer[Bridge] := bridges;
+        while bufferLength(&rest) > 0 do
+            destroyBridge(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyCrates(crates: Buffer[Crate]): Unit is
+        var rest: Buffer[Crate] := crates;
+        while bufferLength(&rest) > 0 do
+            crateDrop(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function crateDrop(crate: Crate): Unit is
+        let { name: String, version: String, defaultFeatures as default_features: Bool, features: Buffer[String] } := crate;
+        destroyString(name);
+        destroyString(version);
+        destroyArguments(features);
+        return nil;
+    end;
+
+    function destroyManifests(manifests: Buffer[Manifest]): Unit is
+        var rest: Buffer[Manifest] := manifests;
+        while bufferLength(&rest) > 0 do
+            destroyManifest(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    function destroyBridge(bridge: Bridge): Unit is
+        let { name: String, path: String } := bridge;
+        destroyString(name);
+        destroyString(path);
+        return nil;
+    end;
+
+    -- The prefix in small letters, a dot made an underscore: the part
+    -- before the name of the file that keeps the bridge modules of two
+    -- dependencies apart in the one lib.rs.
+    generic [P: Region]
+    function lowerPrefix(prefix: Span[Nat8, P]): String is
+        var out: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i < spanLength(prefix) do
+            let byte: Nat8 := prefix[i];
+            if byte = '.' then
+                writeByte(&!out, '_');
+            else if (byte >= 'A') and (byte <= 'Z') then
+                writeByte(&!out, byte + 32);
+            else
+                writeByte(&!out, byte);
+            end if;
+            i := i + 1;
+        end while;
+        return finalize(out);
+    end;
+
+    -- The crate with its name, version and features copied.
+    generic [R: Region]
+    function crateCopy(crate: &[Crate, R]): Crate is
+        var features: Buffer[String] := allocateEmpty();
+        let list: &[Buffer[String], R] := &(crate->features);
+        var i: Index := 0;
+        while i < bufferLength(list) do
+            insertBack(&!features, fromSpan(asSpan(nthRef(list, i))));
+            i := i + 1;
+        end while;
+        return Crate(
+            name => fromSpan(asSpan(&(crate->name))),
+            version => fromSpan(asSpan(&(crate->version))),
+            defaultFeatures => crate->defaultFeatures,
+            features => features
+        );
+    end;
+
+    -- Whether the feature stands in the list.
+    generic [R: Region, F: Region]
+    function featureIn(list: &[Buffer[String], R], feature: Span[Nat8, F]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(list) do
+            if equal(asSpan(nthRef(list, i)), feature) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The two crates of one name and version as one: the default features
+    -- on when either asks for them, every feature of both once.
+    generic [A: Region, B: Region]
+    function crateMerged(first: &[Crate, A], second: &[Crate, B]): Crate is
+        var features: Buffer[String] := allocateEmpty();
+        let held: &[Buffer[String], A] := &(first->features);
+        var i: Index := 0;
+        while i < bufferLength(held) do
+            insertBack(&!features, fromSpan(asSpan(nthRef(held, i))));
+            i := i + 1;
+        end while;
+        let more: &[Buffer[String], B] := &(second->features);
+        var j: Index := 0;
+        while j < bufferLength(more) do
+            let feature: &[String, B] := nthRef(more, j);
+            let present: Bool := featureIn(&features, asSpan(feature));
+            if not present then
+                insertBack(&!features, fromSpan(asSpan(feature)));
+            end if;
+            j := j + 1;
+        end while;
+        return Crate(
+            name => fromSpan(asSpan(&(first->name))),
+            version => fromSpan(asSpan(&(first->version))),
+            defaultFeatures => (first->defaultFeatures) or (second->defaultFeatures),
+            features => features
+        );
+    end;
+
+    -- Where the crate of the name stands in the list, or None.
+    generic [R: Region, N: Region]
+    function crateNamed(crates: &[Buffer[Crate], R], name: Span[Nat8, N]): Option[Index] is
+        var i: Index := 0;
+        while i < bufferLength(crates) do
+            let held: &[Crate, R] := nthRef(crates, i);
+            if equal(asSpan(&(held->name)), name) then
+                return Some(value => i);
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    -- Whether the prefix was read already.
+    generic [V: Region, P: Region]
+    function prefixSeen(visited: &[Buffer[String], V], prefix: Span[Nat8, P]): Bool is
+        var i: Index := 0;
+        while i < bufferLength(visited) do
+            if equal(asSpan(nthRef(visited, i)), prefix) then
+                return true;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- The last lines of what cargo printed, at most about 2000 bytes, for a
+    -- message.
+    generic [R: Region]
+    function tail(text: Span[Nat8, R]): Span[Nat8, R] is
+        let size: Index := spanLength(text);
+        if size <= 2000 then
+            return trim(text);
+        end if;
+        return trim(substring(text, size - 2000, size));
+    end;
+
+    -- The bridge modules in a directory of the package, by their module
+    -- names, sorted; a file that is not a bridge name with .rs is a
+    -- problem, and so is a directory without one.  The module of a bridge
+    -- of a dependency is named with its prefix in small letters before
+    -- the name of the file, so that two packages never meet.
+    generic [R: Region, D: Region, P: Region]
+    function bridgesInDirectory(root: Span[Nat8, R], directory: Span[Nat8, D], prefix: Span[Nat8, P]): Either[Problem, Buffer[Bridge]] is
+        let dir: String := joinPath(root, directory);
+        case directoryNames(asSpan(&dir)) of
+            when Some(value as names: Buffer[String]) do
+                var out: Buffer[Bridge] := allocateEmpty();
+                var bad: Option[Problem] := None();
+                var i: Index := 0;
+                while i < bufferLength(&names) do
+                    let file: String := fromSpan(asSpan(nthRef(&names, i)));
+                    var stem: String := makeEmpty();
+                    if endsWith(asSpan(&file), ".rs") then
+                        destroyString(stem);
+                        stem := fromSpan(substring(asSpan(&file), 0, length(&file) - 3));
+                    end if;
+                    if isBridgeName(asSpan(&stem)) then
+                        if spanLength(prefix) = 0 then
+                            insertBack(&!out, Bridge(name => stem, path => said(directory, "/", asSpan(&file))));
+                        else
+                            let name: String := said(prefix, "_", asSpan(&stem));
+                            insertBack(&!out, Bridge(name => name, path => said(directory, "/", asSpan(&file))));
+                            destroyString(stem);
+                        end if;
+                    else
+                        destroyString(stem);
+                        case bad of
+                            when Some(value as p: Problem) do
+                                bad := Some(value => p);
+                            when None do
+                                let held: String := said(directory, " holds ", asSpan(&file));
+                                bad := Some(value => problemOf(1537, said(asSpan(&held), ", which is no bridge module", ""), fromLiteral("a bridge module is a file name.rs, name in small letters, digits and _, such as sheet.rs")));
+                                destroyString(held);
+                        end case;
+                    end if; destroyString(file);
+                    i := i + 1;
+                end while;
+                destroyArguments(names);
+                destroyString(dir);
+                case bad of
+                    when Some(value as p: Problem) do
+                        destroyBridges(out);
+                        return Left(left => p);
+                    when None do
+                        skip;
+                end case;
+                if bufferLength(&out) = 0 then
+                    destroyBridges(out);
+                    return Left(left => problemOf(1537, said(directory, " holds no bridge module, so nothing reaches the Rust crates", ""), fromLiteral("write a bridge module in the directory, name.rs with the name in small letters, digits and _, that reaches the crates through hilde_bridge::guard")));
+                end if;
+                return Right(right => out);
+            when None do
+                let p: Problem := problemOf(1537, said("the directory ", directory, " cannot be read"), fromLiteral("write a bridge module in the directory, name.rs with the name in small letters, digits and _, that reaches the crates through hilde_bridge::guard"));
+                destroyString(dir);
+                return Left(left => p);
+        end case;
+    end;
+
+    -- Whether the package brings Rust: crates in its manifest, or bridge
+    -- modules in vendor/<prefix>/rust/bridge.
+    generic [R: Region, M: Region]
+    function dependencyRust(root: Span[Nat8, R], package: &[Manifest, M]): Bool is
+        if bufferLength(&(package->crates)) > 0 then
+            return true;
+        end if;
+        let sub: String := said("vendor/", asSpan(&(package->name)), "/rust/bridge");
+        let full: String := joinPath(root, asSpan(&sub));
+        let there: Bool := isDirectory(asSpan(&full));
+        destroyString(full);
+        destroyString(sub);
+        return there;
+    end;
+
+    -- The manifests of the packages in vendor/ that hilde.toml requires,
+    -- and the packages they require, each once; H1543 for a requirement
+    -- whose package is not in vendor/.  The prefixes to read are held in
+    -- a queue, so that a ring of requirements cannot go round forever.
+    generic [R: Region, M: Region]
+    function dependenciesOf(root: Span[Nat8, R], manifest: &[Manifest, M]): Either[Problem, Buffer[Manifest]] is
+        var out: Buffer[Manifest] := allocateEmpty();
+        var visited: Buffer[String] := allocateEmpty();
+        var queue: Buffer[String] := allocateEmpty();
+        var i: Index := 0;
+        let needs: &[Buffer[Requirement], M] := &(manifest->needs);
+        while i < bufferLength(needs) do
+            let need: &[Requirement, M] := nthRef(needs, i);
+            insertBack(&!queue, fromSpan(asSpan(&(need->prefix))));
+            i := i + 1;
+        end while;
+        var missed: Option[Problem] := None();
+        var stop: Bool := false;
+        while (bufferLength(&queue) > 0) and (not stop) do
+            let prefix: String := removeFirst(&!queue);
+            let fresh: Bool := not prefixSeen(&visited, asSpan(&prefix));
+            if fresh then
+                insertBack(&!visited, fromSpan(asSpan(&prefix)));
+                let file: String := said("vendor/", asSpan(&prefix), "/hilde.toml");
+                let path: String := joinPath(root, asSpan(&file));
+                destroyString(file);
+                case readText(asSpan(&path)) of
+                    when Some(value as text: String) do
+                        case readManifest(asSpan(&text)) of
+                            when Right(right as package: Manifest) do
+                                destroyString(text);
+                                borrow held: &[Manifest, Q] := &package do
+                                    let more: &[Buffer[Requirement], Q] := &(held->needs);
+                                    var k: Index := 0;
+                                    while k < bufferLength(more) do
+                                        let need: &[Requirement, Q] := nthRef(more, k);
+                                        insertBack(&!queue, fromSpan(asSpan(&(need->prefix))));
+                                        k := k + 1;
+                                    end while;
+                                end borrow;
+                                insertBack(&!out, package);
+                            when Left(left as p: Problem) do
+                                destroyString(text);
+                                missed := either(Some(value => p), missed);
+                                stop := true;
+                        end case;
+                    when None do
+                        missed := either(Some(value => problemOf(1543, said("the dependency ", asSpan(&prefix), " of hilde.toml is not in vendor/"), said("run hilde get, so that the package of ", asSpan(&prefix), " comes into vendor/"))), missed);
+                        stop := true;
+                end case;
+                destroyString(path);
+            end if;
+            destroyString(prefix);
+        end while;
+        destroyArguments(queue);
+        case missed of
+            when Some(value as p: Problem) do
+                destroyManifests(out);
+                destroyArguments(visited);
+                return Left(left => p);
+            when None do
+                destroyArguments(visited);
+                return Right(right => out);
+        end case;
+    end;
+
+    -- H1542 for the crate named twice with two versions: one hilde.toml
+    -- of the build has one, another has the other.
+    generic [A: Region, B: Region, C: Region]
+    function crateConflict(name: Span[Nat8, A], first: Span[Nat8, B], second: Span[Nat8, C]): Problem is
+        var message: StringBuilder := makeStringBuilder();
+        writeString(&!message, "the Rust crate ");
+        writeString(&!message, name);
+        writeString(&!message, " has the version ");
+        writeString(&!message, first);
+        writeString(&!message, " in one hilde.toml of the build and the version ");
+        writeString(&!message, second);
+        writeString(&!message, " in another; one exact version holds for every package of the build");
+        return problemOf(1542, finalize(message), fromLiteral("pin the same version of the crate in every hilde.toml, or leave it out where it is not used"));
+    end;
+
+    -- The crates of one package added to the list: a name not there yet is
+    -- copied in, one there with the same version is merged with it, and
+    -- one there with another version is H1542.  The list comes back; on a
+    -- problem it is given up.
+    generic [C: Region]
+    function addCrates(crates: &[Buffer[Crate], C], out: Buffer[Crate]): Either[Problem, Buffer[Crate]] is
+        var list: Buffer[Crate] := out;
+        var i: Index := 0;
+        while i < bufferLength(crates) do
+            let crate: &[Crate, C] := nthRef(crates, i);
+            let at: Option[Index] := crateNamed(&list, asSpan(&(crate->name)));
+            case at of
+                when None do
+                    insertBack(&!list, crateCopy(crate));
+                when Some(value as place: Index) do
+                    let held: Crate := swapNth(&!list, place, crateCopy(crate));
+                    var same: Bool := false;
+                    var held_name: String := makeEmpty();
+                    var held_version: String := makeEmpty();
+                    borrow view: &[Crate, Q] := &held do
+                        same := equal(asSpan(&(view->version)), asSpan(&(crate->version)));
+                        if not same then
+                            destroyString(held_name);
+                            destroyString(held_version);
+                            held_name := fromSpan(asSpan(&(view->name)));
+                            held_version := fromSpan(asSpan(&(view->version)));
+                        end if;
+                    end borrow;
+                    if same then
+                        destroyString(held_name);
+                        destroyString(held_version);
+                        let better: Crate := crateMerged(&held, crate);
+                        crateDrop(held);
+                        let old: Crate := swapNth(&!list, place, better);
+                        crateDrop(old);
+                    else
+                        let p: Problem := crateConflict(asSpan(&held_name), asSpan(&held_version), asSpan(&(crate->version)));
+                        destroyString(held_name);
+                        destroyString(held_version);
+                        crateDrop(held);
+                        destroyCrates(list);
+                        return Left(left => p);
+                    end if;
+            end case;
+            i := i + 1;
+        end while;
+        return Right(right => list);
+    end;
+
+    -- The crates of the dependencies from d on added to the list.
+    generic [D: Region]
+    function gatherDependencyCrates(dependencies: &[Buffer[Manifest], D], d: Index, out: Buffer[Crate]): Either[Problem, Buffer[Crate]] is
+        if d >= bufferLength(dependencies) then
+            return Right(right => out);
+        end if;
+        let dep: &[Manifest, D] := nthRef(dependencies, d);
+        case addCrates(&(dep->crates), out) of
+            when Left(left as p: Problem) do
+                return Left(left => p);
+            when Right(right as read: Buffer[Crate]) do
+                return gatherDependencyCrates(dependencies, d + 1, read);
+        end case;
+    end;
+
+    -- The crates of the manifest and of every dependency, each name once
+    -- at one exact version; the features of both in one when the versions
+    -- agree.
+    generic [M: Region, D: Region]
+    function gatheredCrates(manifest: &[Manifest, M], dependencies: &[Buffer[Manifest], D]): Either[Problem, Buffer[Crate]] is
+        case addCrates(&(manifest->crates), allocateEmpty()) of
+            when Left(left as p: Problem) do
+                return Left(left => p);
+            when Right(right as read: Buffer[Crate]) do
+                return gatherDependencyCrates(dependencies, 0, read);
+        end case;
+    end;
+
+    -- The bridge modules of the package and of every dependency that
+    -- brings Rust: the own ones from rust/bridge, those of a dependency
+    -- from vendor/<prefix>/rust/bridge, named with its prefix in small
+    -- letters before the name of the file, so that two packages never
+    -- meet in the one lib.rs.
+    generic [R: Region, M: Region, D: Region]
+    function gatheredBridges(root: Span[Nat8, R], manifest: &[Manifest, M], dependencies: &[Buffer[Manifest], D]): Either[Problem, Buffer[Bridge]] is
+        var out: Buffer[Bridge] := allocateEmpty();
+        let dir: String := joinPath(root, "rust/bridge");
+        let bridged: Bool := isDirectory(asSpan(&dir));
+        destroyString(dir);
+        if bridged then
+            case bridgesInDirectory(root, "rust/bridge", "") of
+                when Right(right as own: Buffer[Bridge]) do
+                    var taken: Buffer[Bridge] := own;
+                    while bufferLength(&taken) > 0 do
+                        insertBack(&!out, removeFirst(&!taken));
+                    end while;
+                    destroyEmpty(taken);
+                when Left(left as p: Problem) do
+                    destroyBridges(out);
+                    return Left(left => p);
+            end case;
+        else
+            if bufferLength(&(manifest->crates)) > 0 then
+                destroyBridges(out);
+                return Left(left => problemOf(1537, fromLiteral("hilde.toml names Rust crates and there is no directory rust/bridge"), fromLiteral("write a bridge module rust/bridge/name.rs that reaches the crates through hilde_bridge::guard")));
+            end if;
+        end if;
+        var d: Index := 0;
+        while d < bufferLength(dependencies) do
+            let package: &[Manifest, D] := nthRef(dependencies, d);
+            if dependencyRust(root, package) then
+                let name: String := fromSpan(asSpan(&(package->name)));
+                let sub: String := said("vendor/", asSpan(&name), "/rust/bridge");
+                let prefix_name: String := lowerPrefix(asSpan(&name));
+                destroyString(name);
+                case bridgesInDirectory(root, asSpan(&sub), asSpan(&prefix_name)) of
+                    when Right(right as own: Buffer[Bridge]) do
+                        var taken: Buffer[Bridge] := own;
+                        while bufferLength(&taken) > 0 do
+                            insertBack(&!out, removeFirst(&!taken));
+                        end while;
+                        destroyEmpty(taken);
+                    when Left(left as p: Problem) do
+                        destroyString(sub);
+                        destroyString(prefix_name);
+                        destroyBridges(out);
+                        return Left(left => p);
+                end case;
+                destroyString(sub);
+                destroyString(prefix_name);
+            end if;
+            d := d + 1;
+        end while;
+        return Right(right => out);
+    end;
+
+    -- H1537 for the first bridge with a function that is not guarded.
+    generic [R: Region, B: Region]
+    function unguarded(root: Span[Nat8, R], bridges: &[Buffer[Bridge], B]): Option[Problem] is
+        var i: Index := 0;
+        while i < bufferLength(bridges) do
+            let bridge: &[Bridge, B] := nthRef(bridges, i);
+            let file: String := fromSpan(asSpan(&(bridge->path)));
+            let path: String := joinPath(root, asSpan(&file));
+            case readText(asSpan(&path)) of
+                when Some(value as text: String) do
+                    let first: Option[Index] := firstUnguarded(asSpan(&text));
+                    destroyString(text);
+                    case first of
+                        when Some(value as line: Index) do
+                            var message: StringBuilder := makeStringBuilder();
+                            writeString(&!message, "the function at line ");
+                            case toNat64(line) of
+                                when Some(value as n: Nat64) do
+                                    let digits: String := formatNat(n);
+                                    writeString(&!message, asSpan(&digits));
+                                    destroyString(digits);
+                                when None do
+                                    skip;
+                            end case;
+                            writeString(&!message, " of ");
+                            writeString(&!message, asSpan(&file));
+                            writeString(&!message, " does not run its body under hilde_bridge::guard, so a panic in it would end the programme");
+                            destroyString(path);
+                            destroyString(file);
+                            return Some(value => problemOf(1537, finalize(message), fromLiteral("start the body with hilde_bridge::guard(|| ...), guard_or or guard_code, or write it with hilde_bridge::export!")));
+                        when None do
+                            skip;
+                    end case;
+                when None do
+                    let p: Problem := problemOf(1537, said("the bridge module ", asSpan(&path), " cannot be read"), fromLiteral("check that it may be read"));
+                    destroyString(path);
+                    destroyString(file);
+                    return Some(value => p);
+            end case;
+            destroyString(path);
+            destroyString(file);
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    -- H1536 when the variable is set and sets panic to abort.
+    function abortInVariable(name: Span[Nat8, Static], whole: Bool): Option[Problem] is
+        case environmentValue(name) of
+            when Some(value as text: String) do
+                var aborts: Bool := setsPanicAbort(asSpan(&text));
+                if whole then
+                    let plain: String := squeezed(asSpan(&text));
+                    aborts := equal(asSpan(&plain), "abort");
+                    destroyString(plain);
+                end if;
+                destroyString(text);
+                if aborts then
+                    return Some(value => problemOf(1536, said("the environment variable ", name, " sets panic to abort, and with abort catch_unwind catches nothing, so a panic in a bridge would end the programme"), said("unset ", name, " or set it to unwind")));
+                end if;
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- H1536 when the configuration file at path is there and sets panic to
+    -- abort.
+    generic [P: Region]
+    function abortInFile(path: Span[Nat8, P]): Option[Problem] is
+        case readText(path) of
+            when Some(value as text: String) do
+                let aborts: Bool := setsPanicAbort(asSpan(&text));
+                destroyString(text);
+                if aborts then
+                    return Some(value => problemOf(1536, said("the cargo configuration ", path, " sets panic to abort, and with abort catch_unwind catches nothing, so a panic in a bridge would end the programme"), fromLiteral("remove the line, or write panic = \"unwind\"")));
+                end if;
+                return None();
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The first of two problems; the second is dropped.
+    function either(first: Option[Problem], second: Option[Problem]): Option[Problem] is
+        case first of
+            when Some(value as p: Problem) do
+                case second of
+                    when Some(value as q: Problem) do
+                        let { code: Int64, message: String, suggestion: String } := q;
+                        destroyString(message);
+                        destroyString(suggestion);
+                    when None do
+                        skip;
+                end case;
+                return Some(value => p);
+            when None do
+                return second;
+        end case;
+    end;
+
+    -- The two configuration files cargo reads in a directory.
+    generic [D: Region]
+    function abortInDirectory(directory: Span[Nat8, D]): Option[Problem] is
+        let toml: String := joinPath(directory, ".cargo/config.toml");
+        let old: String := joinPath(directory, ".cargo/config");
+        let found: Option[Problem] := either(abortInFile(asSpan(&toml)), abortInFile(asSpan(&old)));
+        destroyString(toml);
+        destroyString(old);
+        return found;
+    end;
+
+    -- Everything that may set panic to abort for the build: the variables
+    -- cargo reads for the profile and for rustc, and the configuration
+    -- files of the package, of the four directories above it and of the
+    -- home of cargo.
+    generic [R: Region]
+    function abortAnywhere(root: Span[Nat8, R]): Option[Problem] is
+        var found: Option[Problem] := abortInVariable("CARGO_PROFILE_RELEASE_PANIC", true);
+        found := either(found, abortInVariable("CARGO_PROFILE_DEV_PANIC", true));
+        found := either(found, abortInVariable("RUSTFLAGS", false));
+        found := either(found, abortInVariable("CARGO_ENCODED_RUSTFLAGS", false));
+        found := either(found, abortInVariable("CARGO_BUILD_RUSTFLAGS", false));
+        found := either(found, abortInVariable("CARGO_PROFILE_RELEASE_RUSTFLAGS", false));
+        found := either(found, abortInDirectory(root));
+        let rust: String := joinPath(root, "rust");
+        found := either(found, abortInDirectory(asSpan(&rust)));
+        destroyString(rust);
+        let target: String := joinPath(root, "target");
+        found := either(found, abortInDirectory(asSpan(&target)));
+        destroyString(target);
+        var up: String := joinPath(root, "..");
+        var i: Index := 0;
+        while i < 4 do
+            found := either(found, abortInDirectory(asSpan(&up)));
+            let next: String := joinPath(asSpan(&up), "..");
+            destroyString(up);
+            up := next;
+            i := i + 1;
+        end while;
+        destroyString(up);
+        case environmentValue("CARGO_HOME") of
+            when Some(value as home: String) do
+                let toml: String := joinPath(asSpan(&home), "config.toml");
+                let old: String := joinPath(asSpan(&home), "config");
+                found := either(found, either(abortInFile(asSpan(&toml)), abortInFile(asSpan(&old))));
+                destroyString(toml);
+                destroyString(old);
+                destroyString(home);
+            when None do
+                case environmentValue("HOME") of
+                    when Some(value as home: String) do
+                        found := either(found, abortInDirectory(asSpan(&home)));
+                        destroyString(home);
+                    when None do
+                        skip;
+                end case;
+        end case;
+        return found;
+    end;
+
+    -- cargo: HILDE_CARGO when it is set, else cargo on PATH.
+    function cargoPath(): Option[String] is
+        case environmentValue("HILDE_CARGO") of
+            when Some(value as path: String) do
+                if length(&path) > 0 then
+                    return Some(value => path);
+                end if;
+                destroyString(path);
+            when None do
+                skip;
+        end case;
+        return findProgram("cargo");
+    end;
+
+    -- The guard crate and the toolchain of the Hilde tree at hilde; the
+    -- path of the crate is made absolute from target/rust when hilde is
+    -- relative.
+    generic [H: Region]
+    function helperPath(hilde: Span[Nat8, H]): String is
+        let crate: String := joinPath(hilde, "rust/hilde-bridge");
+        if startsWith(hilde, "/") then
+            return crate;
+        end if;
+        let relative: String := joinPath("../..", asSpan(&crate));
+        destroyString(crate);
+        return relative;
+    end;
+
+    -- Writes every file of the generated crate; H1519 when one cannot be.
+    generic [R: Region, M: Region, K: Region, B: Region, H: Region, C: Region, O: Region, L: Region]
+    function writeCrateFiles(root: Span[Nat8, R], manifest: &[Manifest, M], crates: &[Buffer[Crate], K], bridges: &[Buffer[Bridge], B], helper: Span[Nat8, H], channel: Span[Nat8, C], toolchain: Span[Nat8, O], lock: Span[Nat8, L], vendored: Bool, offline: Bool): Option[Problem] is
+        let dir: String := joinPath(root, "target/rust/.cargo");
+        let made: Bool := makeDirectories(asSpan(&dir));
+        destroyString(dir);
+        if not made then
+            return Some(value => problemOf(1519, said("target/rust cannot be made in ", root, ""), fromLiteral("check that the package may be written")));
+        end if;
+        let cargo: String := cargoManifest(manifest, crates, helper, channel);
+        let source: String := librarySource(bridges);
+        var config: StringBuilder := makeStringBuilder();
+        writeString(&!config, "# Written by hilde rust at every build.\n");
+        if offline then
+            writeString(&!config, "[net]\noffline = true\n");
+        end if;
+        if vendored then
+            writeString(&!config, "\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"../../rust/vendor\"\n");
+        end if;
+        let config_text: String := finalize(config);
+        var ok: Bool := writeAt(root, "target/rust/Cargo.toml", asSpan(&cargo));
+        ok := ok and writeAt(root, "target/rust/lib.rs", asSpan(&source));
+        ok := ok and writeAt(root, "target/rust/rust-toolchain.toml", toolchain);
+        ok := ok and writeAt(root, "target/rust/.cargo/config.toml", asSpan(&config_text));
+        if spanLength(lock) > 0 then
+            ok := ok and writeAt(root, "target/rust/Cargo.lock", lock);
+        end if;
+        destroyString(cargo);
+        destroyString(source);
+        destroyString(config_text);
+        if not ok then
+            return Some(value => problemOf(1519, said("the files of target/rust cannot be written in ", root, ""), fromLiteral("check that the package may be written")));
+        end if;
+        return None();
+    end;
+
+    generic [R: Region, T: Region]
+    function writeAt(root: Span[Nat8, R], file: Span[Nat8, Static], text: Span[Nat8, T]): Bool is
+        let path: String := joinPath(root, file);
+        let ok: Bool := writeText(asSpan(&path), text);
+        destroyString(path);
+        return ok;
+    end;
+
+    -- Runs cargo through sh in target/rust with the words, its errors
+    -- joined to its output.
+    generic [R: Region, C: Region, W: Region]
+    function runCargo(root: Span[Nat8, R], cargo: Span[Nat8, C], words: &[Buffer[String], W]): Either[Problem, Ran] is
+        var arguments: Buffer[String] := allocateEmpty();
+        insertBack(&!arguments, fromLiteral("-c"));
+        insertBack(&!arguments, fromLiteral("cd \"$1\" || exit 125; shift; exec \"$@\" 2>&1"));
+        insertBack(&!arguments, fromLiteral("hilde-rust"));
+        insertBack(&!arguments, joinPath(root, "target/rust"));
+        insertBack(&!arguments, fromSpan(cargo));
+        var i: Index := 0;
+        while i < bufferLength(words) do
+            insertBack(&!arguments, fromSpan(asSpan(nthRef(words, i))));
+            i := i + 1;
+        end while;
+        let ran: Either[Problem, Ran] := runProgram("/bin/sh", &arguments);
+        destroyArguments(arguments);
+        return ran;
+    end;
+
+    -- The words of cargo for a build: rustc of the library alone, offline,
+    -- with the lock file as it is, in release, for the triple when one is
+    -- named, and rustc asked for the native libraries.
+    generic [T: Region]
+    function buildWords(triple: Span[Nat8, T]): Buffer[String] is
+        var words: Buffer[String] := allocateEmpty();
+        insertBack(&!words, fromLiteral("rustc"));
+        insertBack(&!words, fromLiteral("--offline"));
+        insertBack(&!words, fromLiteral("--locked"));
+        insertBack(&!words, fromLiteral("--release"));
+        insertBack(&!words, fromLiteral("--lib"));
+        insertBack(&!words, fromLiteral("--target-dir"));
+        insertBack(&!words, fromLiteral("build"));
+        if spanLength(triple) > 0 then
+            insertBack(&!words, fromLiteral("--target"));
+            insertBack(&!words, fromSpan(triple));
+        end if;
+        insertBack(&!words, fromLiteral("--"));
+        insertBack(&!words, fromLiteral("--print"));
+        insertBack(&!words, fromLiteral("native-static-libs"));
+        return words;
+    end;
+
+    -- Where cargo writes the library, relative to target/rust.
+    generic [T: Region]
+    function releaseDir(triple: Span[Nat8, T]): String is
+        if spanLength(triple) > 0 then
+            return said("build/", triple, "/release");
+        end if;
+        return fromLiteral("build/release");
+    end;
+
+    -- The pkg-config directory, relative to the package.
+    generic [T: Region]
+    function pkgConfigDir(triple: Span[Nat8, T]): String is
+        if spanLength(triple) > 0 then
+            return said("target/rust/pkgconfig/", triple, "");
+        end if;
+        return fromLiteral("target/rust/pkgconfig");
+    end;
+
+    -- H1538 unless the release directory holds exactly one static library,
+    -- the one of the name.
+    generic [R: Region, D: Region, N: Region]
+    function oneLibrary(root: Span[Nat8, R], release: Span[Nat8, D], name: Span[Nat8, N]): Option[Problem] is
+        let dir: String := said("target/rust/", release, "");
+        let path: String := joinPath(root, asSpan(&dir));
+        let file: String := said("lib", name, ".a");
+        var count: Index := 0;
+        var ours: Bool := false;
+        case directoryNames(asSpan(&path)) of
+            when Some(value as names: Buffer[String]) do
+                var i: Index := 0;
+                while i < bufferLength(&names) do
+                    let entry: String := fromSpan(asSpan(nthRef(&names, i)));
+                    if endsWith(asSpan(&entry), ".a") then
+                        count := count + 1;
+                        if equal(asSpan(&entry), asSpan(&file)) then
+                            ours := true;
+                        end if;
+                    end if;
+                    destroyString(entry);
+                    i := i + 1;
+                end while;
+                destroyArguments(names);
+            when None do
+                skip;
+        end case;
+        destroyString(path);
+        if not ours then
+            let where: String := said(" to ", asSpan(&dir), "");
+            let p: Problem := problemOf(1538, said("cargo ended and wrote no ", asSpan(&file), asSpan(&where)), fromLiteral("the crate in target/rust is a staticlib; run hilde rust again and read what cargo printed"));
+            destroyString(where);
+            destroyString(dir);
+            destroyString(file);
+            return Some(value => p);
+        end if;
+        if count /= 1 then
+            let p: Problem := problemOf(1538, said(asSpan(&dir), " holds another static library beside ", asSpan(&file)), fromLiteral("a binary takes one Rust staticlib, or the standard library of Rust is linked twice; remove target/rust/build and build again"));
+            destroyString(dir);
+            destroyString(file);
+            return Some(value => p);
+        end if;
+        destroyString(dir);
+        destroyString(file);
+        return None();
+    end;
+
+    -- The pkg-config file, from the native libraries of this build, or the
+    -- file there is when cargo found nothing to build and printed none.
+    -- Every dependency that brings Rust gets a file named after its own
+    -- library, which links the one staticlib.
+    generic [R: Region, N: Region, V: Region, T: Region, O: Region, D: Region]
+    function writePkgConfig(root: Span[Nat8, R], name: Span[Nat8, N], version: Span[Nat8, V], triple: Span[Nat8, T], output: Span[Nat8, O], dependencies: &[Buffer[Manifest], D]): Option[Problem] is
+        let dir: String := pkgConfigDir(triple);
+        let base: String := joinPath(root, asSpan(&dir));
+        let file: String := said(name, ".pc", "");
+        let path: String := joinPath(asSpan(&base), asSpan(&file));
+        destroyString(file);
+        destroyString(dir);
+        case nativeLibraries(output) of
+            when Some(value as native: String) do
+                let made: Bool := makeDirectories(asSpan(&base));
+                let release: String := releaseDir(triple);
+                var relative: String := said("../", asSpan(&release), "");
+                if spanLength(triple) > 0 then
+                    let deeper: String := said("../", asSpan(&relative), "");
+                    destroyString(relative);
+                    relative := deeper;
+                end if;
+                let text: String := pkgConfigText(name, version, asSpan(&relative), asSpan(&native));
+                var ok: Bool := made and writeText(asSpan(&path), asSpan(&text));
+                destroyString(text);
+                var d: Index := 0;
+                while (d < bufferLength(dependencies)) and ok do
+                    let dep: &[Manifest, D] := nthRef(dependencies, d);
+                    let alias: String := libraryName(asSpan(&(dep->name)));
+                    let dep_version: String := packageVersion(dep);
+                    let alias_file: String := said(asSpan(&alias), ".pc", "");
+                    let alias_path: String := joinPath(asSpan(&base), asSpan(&alias_file));
+                    let alias_text: String := aliasPkgConfigText(asSpan(&alias), asSpan(&dep_version), name, asSpan(&relative), asSpan(&native));
+                    ok := ok and writeText(asSpan(&alias_path), asSpan(&alias_text));
+                    destroyString(alias_text);
+                    destroyString(alias_path);
+                    destroyString(alias_file);
+                    destroyString(dep_version);
+                    destroyString(alias);
+                    d := d + 1;
+                end while;
+                destroyString(relative);
+                destroyString(release);
+                destroyString(native);
+                destroyString(base);
+                if not ok then
+                    let p: Problem := problemOf(1519, said(asSpan(&path), " cannot be written", ""), fromLiteral("check that the package may be written"));
+                    destroyString(path);
+                    return Some(value => p);
+                end if;
+                destroyString(path);
+                return None();
+            when None do
+                destroyString(base);
+                if isThere(asSpan(&path)) then
+                    destroyString(path);
+                    return None();
+                end if;
+                let p: Problem := problemOf(1538, said("cargo printed no native-static-libs line, and there is no ", asSpan(&path), ""), fromLiteral("remove target/rust/build and run hilde rust again, so that rustc builds the library and prints the line"));
+                destroyString(path);
+                return Some(value => p);
+        end case;
+    end;
+
+    generic [R: Region]
+    function readAt(root: Span[Nat8, R], file: Span[Nat8, Static]): Option[String] is
+        let path: String := joinPath(root, file);
+        let text: Option[String] := readText(asSpan(&path));
+        destroyString(path);
+        return text;
+    end;
+
+    generic [R: Region, H: Region, T: Region]
+    function buildRust(root: Span[Nat8, R], hilde: Span[Nat8, H], triple: Span[Nat8, T], vendor: Bool): Got is
+        if (spanLength(triple) > 0) and (not isTriple(triple)) then
+            return gotWith(problemOf(1541, said("the target ", triple, " is not a target of rustc"), fromLiteral("name it as rustc does, such as aarch64-unknown-linux-gnu, or leave it out for this system")));
+        end if;
+        case readAt(root, "hilde.toml") of
+            when Some(value as toml: String) do
+                let read: Either[Problem, Manifest] := readManifest(asSpan(&toml));
+                destroyString(toml);
+                case read of
+                    when Right(right as manifest: Manifest) do
+                        let got: Got := buildManifest(root, &manifest, hilde, triple, vendor);
+                        destroyManifest(manifest);
+                        return got;
+                    when Left(left as p: Problem) do
+                        return gotWith(p);
+                end case;
+            when None do
+                return gotWith(problemOf(1501, said("no hilde.toml in ", root, ""), fromLiteral("run hilde rust in the directory of the package")));
+        end case;
+    end;
+
+    generic [R: Region, M: Region, H: Region, T: Region]
+    function buildManifest(root: Span[Nat8, R], manifest: &[Manifest, M], hilde: Span[Nat8, H], triple: Span[Nat8, T], vendor: Bool): Got is
+        var deps: Buffer[Manifest] := allocateEmpty();
+        case dependenciesOf(root, manifest) of
+            when Right(right as read: Buffer[Manifest]) do
+                destroyEmpty(deps);
+                deps := read;
+            when Left(left as p: Problem) do
+                destroyEmpty(deps);
+                return gotWith(p);
+        end case;
+        var crates: Buffer[Crate] := allocateEmpty();
+        case gatheredCrates(manifest, &deps) of
+            when Right(right as read: Buffer[Crate]) do
+                destroyEmpty(crates);
+                crates := read;
+            when Left(left as p: Problem) do
+                destroyEmpty(crates);
+                destroyManifests(deps);
+                return gotWith(p);
+        end case;
+        var bridges: Buffer[Bridge] := allocateEmpty();
+        case gatheredBridges(root, manifest, &deps) of
+            when Right(right as read: Buffer[Bridge]) do
+                destroyEmpty(bridges);
+                bridges := read;
+            when Left(left as p: Problem) do
+                destroyEmpty(bridges);
+                destroyCrates(crates);
+                destroyManifests(deps);
+                return gotWith(p);
+        end case;
+        if (bufferLength(&crates) = 0) and (bufferLength(&bridges) = 0) then
+            destroyBridges(bridges);
+            destroyCrates(crates);
+            destroyManifests(deps);
+            return fine(0, fromLiteral("hilde rust: hilde.toml names no Rust crate and there is no rust/bridge, nothing to build"));
+        end if;
+        let got: Got := buildBridges(root, manifest, &deps, &crates, &bridges, hilde, triple, vendor);
+        destroyBridges(bridges);
+        destroyCrates(crates);
+        destroyManifests(deps);
+        return got;
+    end;
+
+    generic [R: Region, M: Region, D: Region, K: Region, B: Region, H: Region, T: Region]
+    function buildBridges(root: Span[Nat8, R], manifest: &[Manifest, M], dependencies: &[Buffer[Manifest], D], crates: &[Buffer[Crate], K], bridges: &[Buffer[Bridge], B], hilde: Span[Nat8, H], triple: Span[Nat8, T], vendor: Bool): Got is
+        case unguarded(root, bridges) of
+            when Some(value as p: Problem) do
+                return gotWith(p);
+            when None do
+                skip;
+        end case;
+        case abortAnywhere(root) of
+            when Some(value as p: Problem) do
+                return gotWith(p);
+            when None do
+                skip;
+        end case;
+        let toolchain_path: String := joinPath(hilde, "rust-toolchain.toml");
+        case readText(asSpan(&toolchain_path)) of
+            when Some(value as toolchain: String) do
+                destroyString(toolchain_path);
+                case channelOf(asSpan(&toolchain)) of
+                    when Some(value as channel: String) do
+                        let got: Got := buildWith(root, manifest, dependencies, crates, bridges, hilde, triple, vendor, asSpan(&toolchain), asSpan(&channel));
+                        destroyString(channel);
+                        destroyString(toolchain);
+                        return got;
+                    when None do
+                        destroyString(toolchain);
+                        return gotWith(problemOf(1540, said("the rust-toolchain.toml beside the compiler in ", hilde, " names no channel X.Y.Z"), fromLiteral("write channel = \"1.88.0\" in its table toolchain")));
+                end case;
+            when None do
+                let p: Problem := problemOf(1540, said("there is no ", asSpan(&toolchain_path), ", which pins the Rust of every package"), fromLiteral("install Hilde with its directory rust and its rust-toolchain.toml beside the compiler"));
+                destroyString(toolchain_path);
+                return gotWith(p);
+        end case;
+    end;
+
+    generic [R: Region, M: Region, D: Region, K: Region, B: Region, H: Region, T: Region, O: Region, C: Region]
+    function buildWith(root: Span[Nat8, R], manifest: &[Manifest, M], dependencies: &[Buffer[Manifest], D], crates: &[Buffer[Crate], K], bridges: &[Buffer[Bridge], B], hilde: Span[Nat8, H], triple: Span[Nat8, T], vendor: Bool, toolchain: Span[Nat8, O], channel: Span[Nat8, C]): Got is
+        let helper_cargo: String := joinPath(hilde, "rust/hilde-bridge/Cargo.toml");
+        let helper_there: Bool := isThere(asSpan(&helper_cargo));
+        destroyString(helper_cargo);
+        if not helper_there then
+            return gotWith(problemOf(1540, said("there is no guard crate rust/hilde-bridge beside the compiler in ", hilde, ""), fromLiteral("install Hilde with its directory rust beside the compiler")));
+        end if;
+        let lock_text: String := textOrEmpty(readAt(root, "rust/Cargo.lock"));
+        let vendor_dir: String := joinPath(root, "rust/vendor");
+        let vendored: Bool := isDirectory(asSpan(&vendor_dir));
+        destroyString(vendor_dir);
+        if (not vendor) and (length(&lock_text) = 0) then
+            destroyString(lock_text);
+            return gotWith(problemOf(1539, fromLiteral("there is no rust/Cargo.lock, and cargo builds only from a lock file that is checked in"), fromLiteral("run hilde rust --vendor once where the network is, and check in rust/Cargo.lock and rust/vendor")));
+        end if;
+        let needs_vendor: Bool := bufferLength(crates) > 0;
+        if ((not vendor) and needs_vendor) and (not vendored) then
+            destroyString(lock_text);
+            return gotWith(problemOf(1539, fromLiteral("there is no rust/vendor, and cargo builds only from the sources checked in"), fromLiteral("run hilde rust --vendor once where the network is, and check in rust/Cargo.lock and rust/vendor")));
+        end if;
+        let helper: String := helperPath(hilde);
+        let written: Option[Problem] := writeCrateFiles(root, manifest, crates, bridges, asSpan(&helper), channel, toolchain, asSpan(&lock_text), ((not vendor) and needs_vendor) and vendored, not vendor);
+        destroyString(helper);
+        destroyString(lock_text);
+        case written of
+            when Some(value as p: Problem) do
+                return gotWith(p);
+            when None do
+                skip;
+        end case;
+        case cargoPath() of
+            when Some(value as cargo: String) do
+                let got: Got := runBuild(root, manifest, dependencies, bridges, asSpan(&cargo), triple, vendor);
+                destroyString(cargo);
+                return got;
+            when None do
+                return gotWith(problemOf(1535, fromLiteral("hilde.toml names Rust crates, and there is no cargo on PATH and no HILDE_CARGO"), fromLiteral("install the Rust of rust-toolchain.toml, or name cargo in HILDE_CARGO")));
+        end case;
+    end;
+
+    function textOrEmpty(text: Option[String]): String is
+        case text of
+            when Some(value as t: String) do
+                return t;
+            when None do
+                return makeEmpty();
+        end case;
+    end;
+
+    generic [R: Region, M: Region, D: Region, B: Region, C: Region, T: Region]
+    function runBuild(root: Span[Nat8, R], manifest: &[Manifest, M], dependencies: &[Buffer[Manifest], D], bridges: &[Buffer[Bridge], B], cargo: Span[Nat8, C], triple: Span[Nat8, T], vendor: Bool): Got is
+        if vendor then
+            return runVendor(root, cargo);
+        end if;
+        let words: Buffer[String] := buildWords(triple);
+        let ran: Either[Problem, Ran] := runCargo(root, cargo, &words);
+        destroyArguments(words);
+        case ran of
+            when Right(right as r: Ran) do
+                let { exitCode as exit_code: Int32, output: String, errors: String } := r;
+                destroyString(errors);
+                if exit_code /= 0 then
+                    let p: Problem := problemOf(1538, said("cargo did not build the Rust crates:\n", tail(asSpan(&output)), ""), fromLiteral("correct what cargo says; it ran offline from rust/Cargo.lock and rust/vendor"));
+                    destroyString(output);
+                    return gotWith(p);
+                end if;
+                let name: String := libraryName(asSpan(&(manifest->name)));
+                let release: String := releaseDir(triple);
+                let version: String := packageVersion(manifest);
+                var found: Option[Problem] := oneLibrary(root, asSpan(&release), asSpan(&name));
+                case found of
+                    when Some(value as p: Problem) do
+                        found := Some(value => p);
+                    when None do
+                        found := writePkgConfig(root, asSpan(&name), asSpan(&version), triple, asSpan(&output), dependencies);
+                end case;
+                destroyString(output);
+                destroyString(version);
+                case found of
+                    when Some(value as p: Problem) do
+                        destroyString(name);
+                        destroyString(release);
+                        return gotWith(p);
+                    when None do
+                        skip;
+                end case;
+                var summary: StringBuilder := makeStringBuilder();
+                writeString(&!summary, "hilde rust: one staticlib target/rust/");
+                writeString(&!summary, asSpan(&release));
+                writeString(&!summary, "/lib");
+                writeString(&!summary, asSpan(&name));
+                writeString(&!summary, ".a with ");
+                let count: Index := bufferLength(bridges);
+                if count = 1 then
+                    writeString(&!summary, "1 bridge module");
+                else
+                    let digits: String := countText(count);
+                    writeString(&!summary, asSpan(&digits));
+                    destroyString(digits);
+                    writeString(&!summary, " bridge modules");
+                end if;
+                destroyString(name);
+                destroyString(release);
+                return fine(count, finalize(summary));
+            when Left(left as p: Problem) do
+                return gotWith(p);
+        end case;
+    end;
+
+    function countText(n: Index): String is
+        case toNat64(n) of
+            when Some(value as wide: Nat64) do
+                return formatNat(wide);
+            when None do
+                abort("Pkg.Rust: a count did not fit a Nat64");
+        end case;
+    end;
+
+    -- cargo vendor into rust/vendor, then the lock file back to rust.
+    generic [R: Region, C: Region]
+    function runVendor(root: Span[Nat8, R], cargo: Span[Nat8, C]): Got is
+        var words: Buffer[String] := allocateEmpty();
+        insertBack(&!words, fromLiteral("vendor"));
+        insertBack(&!words, fromLiteral("--versioned-dirs"));
+        insertBack(&!words, fromLiteral("../../rust/vendor"));
+        let ran: Either[Problem, Ran] := runCargo(root, cargo, &words);
+        destroyArguments(words);
+        case ran of
+            when Right(right as r: Ran) do
+                let { exitCode as exit_code: Int32, output: String, errors: String } := r;
+                destroyString(errors);
+                if exit_code /= 0 then
+                    let p: Problem := problemOf(1538, said("cargo vendor did not fetch the Rust crates:\n", tail(asSpan(&output)), ""), fromLiteral("correct what cargo says; cargo vendor is the one step that needs the network"));
+                    destroyString(output);
+                    return gotWith(p);
+                end if;
+                destroyString(output);
+                case readAt(root, "target/rust/Cargo.lock") of
+                    when Some(value as lock: String) do
+                        let ok: Bool := writeAt(root, "rust/Cargo.lock", asSpan(&lock));
+                        destroyString(lock);
+                        if not ok then
+                            return gotWith(problemOf(1519, said("rust/Cargo.lock cannot be written in ", root, ""), fromLiteral("check that the package may be written")));
+                        end if;
+                        return fine(1, fromLiteral("hilde rust: the crates are in rust/vendor and the lock file in rust/Cargo.lock; check both in"));
+                    when None do
+                        return gotWith(problemOf(1538, fromLiteral("cargo vendor ended and left no target/rust/Cargo.lock"), fromLiteral("run hilde rust --vendor again and read what cargo printed")));
+                end case;
+            when Left(left as p: Problem) do
+                return gotWith(p);
+        end case;
+    end;
+end module body.
